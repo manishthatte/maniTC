@@ -1,0 +1,467 @@
+// assembler.rs — text assembler for T3ISA
+use super::isa::*;
+use std::collections::HashMap;
+
+// ---------------------------------------------------------------------------
+
+// Assembler
+// ---------------------------------------------------------------------------
+
+/// Find the first `:` in `line` that is NOT part of `::` (path separator).
+/// Returns the byte index of that colon, or None.
+fn find_label_colon(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' {
+            let prev_colon = i > 0 && bytes[i - 1] == b':';
+            let next_colon = bytes.get(i + 1).copied() == Some(b':');
+            if !prev_colon && !next_colon {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, HashMap<usize, i64>), String> {
+    let mut raw_instrs: Vec<RawInstr> = Vec::new();
+    let mut label_map: HashMap<String, usize> = HashMap::new();
+    let mut string_data: HashMap<String, String> = HashMap::new();
+    let mut float_data_src: HashMap<String, i64> = HashMap::new();
+    let mut in_data = false;
+    let mut in_float = false;
+
+    // ---- Pass 1: collect labels, strings, float literals, raw instruction list ----
+    for raw_line in asm_text.lines() {
+        let line = strip_comment(raw_line).trim().to_string();
+        if line.is_empty() { continue; }
+
+        if line == ".float:" || line == ".float" {
+            in_float = true;
+            in_data = false;
+            continue;
+        }
+        if line == ".data:" || line == ".data" {
+            in_data = true;
+            in_float = false;
+            continue;
+        }
+        if line == ".globals:" || line == ".globals" {
+            in_data = false;
+            in_float = false;
+            continue;
+        }
+
+        if in_float {
+            if let Some(cp) = line.find(':') {
+                let lbl = line[..cp].trim().to_string();
+                let rest = line[cp+1..].trim();
+                if let Some(s) = rest.strip_prefix(".float64") {
+                    if let Ok(bits) = s.trim().parse::<i64>() {
+                        float_data_src.insert(lbl, bits);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if in_data {
+            // Expect:  label: .string "content"
+            if let Some(cp) = line.find(':') {
+                let lbl  = line[..cp].trim().to_string();
+                let rest = line[cp+1..].trim();
+                if let Some(s) = rest.strip_prefix(".string") {
+                    let content = parse_string_literal(s.trim());
+                    string_data.insert(lbl, content);
+                }
+            }
+            continue;
+        }
+
+        // "  label:" style (label on its own line)
+        if line.ends_with(':') && !line.contains(|c: char| c.is_whitespace()) {
+            let lbl = line.trim_end_matches(':').to_string();
+            label_map.insert(lbl, raw_instrs.len());
+            continue;
+        }
+
+        // "label:  INSTR ..." or "label:" with trailing content
+        // Use find_label_colon to skip ':' that is part of '::' (path separator).
+        if let Some(cp) = find_label_colon(&line) {
+            let maybe_lbl = line[..cp].trim();
+            // A label candidate has no whitespace and only identifier/path chars.
+            let is_label = !maybe_lbl.is_empty()
+                && maybe_lbl.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ':');
+            if is_label {
+                label_map.insert(maybe_lbl.to_string(), raw_instrs.len());
+                let after = line[cp+1..].trim();
+                if !after.is_empty() {
+                    raw_instrs.push(parse_raw_instr(after)?);
+                }
+                continue;
+            }
+        }
+
+        // Regular instruction line
+        let raw = parse_raw_instr(&line)?;
+        // TBRANCH expands to 3 words — add 2 placeholders so label offsets are correct
+        let is_tbranch = raw.mnemonic == "TBRANCH";
+        raw_instrs.push(raw);
+        if is_tbranch {
+            raw_instrs.push(RawInstr { mnemonic: "__TBRANCH_W1".to_string(), operands: vec![] });
+            raw_instrs.push(RawInstr { mnemonic: "__TBRANCH_W2".to_string(), operands: vec![] });
+        }
+    }
+
+    // Assign string labels to addresses past the code
+    let code_size = raw_instrs.len();
+    let str_base = code_size + 1024;
+    let mut str_keys: Vec<String> = string_data.keys().cloned().collect();
+    str_keys.sort();
+    for (i, key) in str_keys.iter().enumerate() {
+        label_map.insert(key.clone(), str_base + i);
+    }
+
+    // Build resolved string data: address → content (using same base as label_map)
+    let mut resolved_strings: HashMap<usize, String> = HashMap::new();
+    for (i, key) in str_keys.iter().enumerate() {
+        if let Some(content) = string_data.get(key) {
+            resolved_strings.insert(str_base + i, content.clone());
+        }
+    }
+
+    // Assign float labels to addresses past the string addresses
+    let float_base = str_base + str_keys.len();
+    let mut float_keys: Vec<String> = float_data_src.keys().cloned().collect();
+    float_keys.sort();
+    for (i, key) in float_keys.iter().enumerate() {
+        label_map.insert(key.clone(), float_base + i);
+    }
+    let float_data_out: HashMap<usize, i64> = float_keys.iter().enumerate()
+        .map(|(i, k)| (float_base + i, float_data_src[k]))
+        .collect();
+
+    // ---- Pass 2: encode ----
+    let mut words = Vec::with_capacity(raw_instrs.len());
+    let mut i = 0;
+    while i < raw_instrs.len() {
+        let raw = &raw_instrs[i];
+        if raw.mnemonic == "TBRANCH" {
+            // Expand to 3 words: TBR_POS rcond Lpos, TBR_ZERO rcond Lzero, JUMP Lneg
+            let ops = &raw.operands;
+            let rcond = parse_reg(ops.get(0).map(|s| s.as_str()).unwrap_or("R0"))
+                .map_err(|e| e)? as i64;
+            let addr_pos  = resolve_label(ops.get(1).map(|s| s.as_str()).unwrap_or("0"), &label_map)?;
+            let addr_zero = resolve_label(ops.get(2).map(|s| s.as_str()).unwrap_or("0"), &label_map)?;
+            let addr_neg  = resolve_label(ops.get(3).map(|s| s.as_str()).unwrap_or("0"), &label_map)?;
+            words.push(encode_wide(Opcode::TbrPos,  rcond, addr_pos));
+            words.push(encode_wide(Opcode::TbrZero, rcond, addr_zero));
+            words.push(encode_wide(Opcode::Jump,    0,     addr_neg));
+            i += 3; // skip the 2 placeholder entries too
+        } else if raw.mnemonic.starts_with("__TBRANCH_W") {
+            // placeholder — already emitted above, skip
+            i += 1;
+        } else {
+            words.push(encode_raw(raw, i, &label_map)?);
+            i += 1;
+        }
+    }
+
+    Ok((words, resolved_strings, float_data_out))
+}
+
+#[derive(Debug, Clone)]
+struct RawInstr {
+    mnemonic: String,
+    operands: Vec<String>,
+}
+
+fn strip_comment(line: &str) -> &str {
+    // Skip ';' characters that are inside double-quoted strings.
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_string = !in_string,
+            b'\\' if in_string => i += 1, // skip escaped char
+            b';' if !in_string => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+fn parse_string_literal(s: &str) -> String {
+    let s = s.trim();
+    let inner = if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        &s[1..s.len()-1]
+    } else {
+        s
+    };
+    let mut out = String::new();
+    let mut it = inner.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('n')  => out.push('\n'),
+                Some('t')  => out.push('\t'),
+                Some('r')  => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some('"')  => out.push('"'),
+                Some(x)    => { out.push('\\'); out.push(x); }
+                None       => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn parse_raw_instr(line: &str) -> Result<RawInstr, String> {
+    let line = line.trim();
+    let (mnemonic, rest) = if let Some(sp) = line.find(|c: char| c.is_whitespace()) {
+        (line[..sp].to_uppercase(), line[sp..].trim().to_string())
+    } else {
+        (line.to_uppercase(), String::new())
+    };
+    let operands = if rest.is_empty() { Vec::new() } else { split_operands(&rest) };
+    Ok(RawInstr { mnemonic, operands })
+}
+
+fn split_operands(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur   = String::new();
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '[' => { depth += 1; cur.push(c); }
+            ']' => { if depth > 0 { depth -= 1; } cur.push(c); }
+            ',' if depth == 0 => { parts.push(cur.trim().to_string()); cur.clear(); }
+            _   => { cur.push(c); }
+        }
+    }
+    if !cur.trim().is_empty() { parts.push(cur.trim().to_string()); }
+    parts
+}
+
+fn parse_reg(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    let upper = s.to_uppercase();
+    if upper.starts_with('R') {
+        let n = upper[1..].parse::<usize>().map_err(|_| format!("Bad register: {}", s))?;
+        if n > 26 {
+            return Err(format!("Register out of range (R0-R26): {}", s));
+        }
+        Ok(n)
+    } else {
+        Err(format!("Expected register, got: {}", s))
+    }
+}
+
+fn parse_imm(s: &str, label_map: &HashMap<String, usize>) -> Result<i64, String> {
+    let s = s.trim().trim_start_matches('#');
+    if let Ok(n) = s.parse::<i64>() { return Ok(n); }
+    if let Some(&a) = label_map.get(s) { return Ok(a as i64); }
+    // Case-insensitive lookup
+    for (k, v) in label_map {
+        if k.eq_ignore_ascii_case(s) { return Ok(*v as i64); }
+    }
+    Err(format!("Cannot resolve: {}", s))
+}
+
+fn parse_mem(s: &str) -> Result<(usize, i64), String> {
+    let s = s.trim().trim_start_matches('[').trim_end_matches(']');
+    // Find last '+' or '-' that separates base from offset.
+    // Allow negative offsets: [R2+#-5] or [R2-#5]
+    if let Some(pos) = s.rfind('+') {
+        let base = parse_reg(s[..pos].trim())?;
+        let off  = s[pos+1..].trim().trim_start_matches('#').parse::<i64>().unwrap_or(0);
+        return Ok((base, off));
+    }
+    if let Some(pos) = s.rfind('-') {
+        // Make sure it's not part of the register name
+        if pos > 0 {
+            let base = parse_reg(s[..pos].trim())?;
+            let off  = -(s[pos+1..].trim().trim_start_matches('#').parse::<i64>().unwrap_or(0));
+            return Ok((base, off));
+        }
+    }
+    let base = parse_reg(s)?;
+    Ok((base, 0))
+}
+
+fn resolve_label(s: &str, label_map: &HashMap<String, usize>) -> Result<i64, String> {
+    let s = s.trim();
+    if let Ok(n) = s.trim_start_matches('#').parse::<i64>() { return Ok(n); }
+    if let Some(&a) = label_map.get(s) { return Ok(a as i64); }
+    for (k, v) in label_map {
+        if k.eq_ignore_ascii_case(s) { return Ok(*v as i64); }
+    }
+    Err(format!("Undefined label: {}", s))
+}
+
+fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> Result<i64, String> {
+    let ops = &raw.operands;
+    let n = ops.len();
+
+    macro_rules! reg {
+        ($i:expr) => {{
+            if $i >= n { return Err(format!("Too few operands for {} at pc={}", raw.mnemonic, pc)); }
+            parse_reg(&ops[$i])? as i64
+        }};
+    }
+    // reg_or_zero!: if operand is an immediate #n, treat as register 0 (always-zero)
+    // and put n in the imm field instead
+    macro_rules! reg_or_imm_pair {
+        ($ri:expr, $ii:expr) => {{
+            if $ri >= n {
+                return Err(format!("Too few operands for {} at pc={}", raw.mnemonic, pc));
+            }
+            let s = ops[$ri].trim();
+            if s.starts_with('#') || s.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '-') {
+                let imm_val = parse_imm(s, label_map)?;
+                (0i64, imm_val)  // register 0, immediate = n
+            } else {
+                (parse_reg(s)? as i64, 0i64)
+            }
+        }};
+    }
+    macro_rules! imm {
+        ($i:expr) => {{
+            if $i >= n { return Err(format!("Too few operands for {} at pc={}", raw.mnemonic, pc)); }
+            parse_imm(&ops[$i], label_map)?
+        }};
+    }
+    macro_rules! lbl {
+        ($i:expr) => {{
+            if $i >= n { return Err(format!("Too few operands for {} at pc={}", raw.mnemonic, pc)); }
+            resolve_label(&ops[$i], label_map)?
+        }};
+    }
+    macro_rules! mem {
+        ($i:expr) => {{
+            if $i >= n { return Err(format!("Too few operands for {} at pc={}", raw.mnemonic, pc)); }
+            parse_mem(&ops[$i])?
+        }};
+    }
+
+    let word = match raw.mnemonic.as_str() {
+        "NOP"  => encode(Opcode::Nop,  0, 0, 0, 0),
+        "HALT" => encode(Opcode::Halt, 0, 0, 0, 0),
+        "RET"  => encode(Opcode::Ret,  0, 0, 0, 0),
+
+        "TADD" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tadd, reg!(0), reg!(1), r2, imv) }
+        "TSUB" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tsub, reg!(0), reg!(1), r2, imv) }
+        "TMUL" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmul, reg!(0), reg!(1), r2, imv) }
+        "TDIV" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tdiv, reg!(0), reg!(1), r2, imv) }
+        "TMOD" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmod, reg!(0), reg!(1), r2, imv) }
+        "TAND" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tand, reg!(0), reg!(1), r2, imv) }
+        "TOR"  => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tor,  reg!(0), reg!(1), r2, imv) }
+        "TMIN" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmin, reg!(0), reg!(1), r2, imv) }
+        "TMAX" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmax, reg!(0), reg!(1), r2, imv) }
+        "TCMP" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tcmp, reg!(0), reg!(1), r2, imv) }
+
+        "TNEG" => encode(Opcode::Tneg, reg!(0), reg!(1), 0, 0),
+        "TNOT" => encode(Opcode::Tnot, reg!(0), reg!(1), 0, 0),
+        "MOV"  => encode(Opcode::Mov,  reg!(0), reg!(1), 0, 0),
+
+        "TSHI" => {
+            let shift = if n >= 3 { imm!(2) } else { 0 };
+            encode(Opcode::Tshi, reg!(0), reg!(1), 0, shift)
+        }
+        "TSHR" => {
+            let shift = if n >= 3 { imm!(2) } else { 0 };
+            encode(Opcode::Tshr, reg!(0), reg!(1), 0, shift)
+        }
+
+        "BAND" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Band, reg!(0), reg!(1), r2, imv) }
+        "BOR"  => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Bor,  reg!(0), reg!(1), r2, imv) }
+        "BXOR" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Bxor, reg!(0), reg!(1), r2, imv) }
+        "BSHL" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Bshl, reg!(0), reg!(1), r2, imv) }
+        "BSHR" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Bshr, reg!(0), reg!(1), r2, imv) }
+
+        "TLIT" => {
+            let r = reg!(0);
+            let imm_val = imm!(1);
+            encode_wide(Opcode::Tlit, r, imm_val)
+        }
+
+        "LOAD" => {
+            let r1 = reg!(0);
+            let (r2, off) = mem!(1);
+            encode(Opcode::Load, r1, r2 as i64, 0, off)
+        }
+        "STORE" => {
+            let r1 = reg!(0);
+            let (r2, off) = mem!(1);
+            encode(Opcode::Store, r1, r2 as i64, 0, off)
+        }
+        "LOADT" => {
+            // LOADT Rd, [Ra+imm] — load single trit (clamped -1/0/+1)
+            let r1 = reg!(0);
+            let (r2, off) = mem!(1);
+            encode(Opcode::Loadt, r1, r2 as i64, 0, off)
+        }
+        "STORET" => {
+            // STORET Rs, [Ra+imm] — store single trit (clamped -1/0/+1)
+            let r1 = reg!(0);
+            let (r2, off) = mem!(1);
+            encode(Opcode::Storet, r1, r2 as i64, 0, off)
+        }
+
+        "JUMP" => {
+            let addr = lbl!(0);
+            encode_wide(Opcode::Jump, 0, addr)
+        }
+        "CALL" => {
+            let addr = lbl!(0);
+            encode_wide(Opcode::Call, 0, addr)
+        }
+        "CALLR" => {
+            // CALLR Rx — call through register
+            let r1 = reg!(0);
+            encode(Opcode::Callr, r1, 0, 0, 0)
+        }
+
+        // TBRANCH is handled as a pseudo-instruction in assemble() — expanded to
+        // TBR_POS + TBR_ZERO + JUMP (3 words).  It never reaches encode_raw().
+
+        "SYSCALL" => {
+            let sc = imm!(0);
+            encode_wide(Opcode::Syscall, 0, sc)
+        }
+
+        other => return Err(format!("Unknown mnemonic '{}' at pc={}", other, pc)),
+    };
+
+    Ok(word)
+}
+
+// ---------------------------------------------------------------------------
+// Binary I/O
+// ---------------------------------------------------------------------------
+
+pub fn write_t3_binary(words: &[i64], path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    for &w in words {
+        f.write_all(&w.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+pub fn read_t3_binary(path: &str) -> std::io::Result<Vec<i64>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    let mut words = Vec::new();
+    for chunk in buf.chunks_exact(8) {
+        let arr: [u8; 8] = chunk.try_into().unwrap();
+        words.push(i64::from_le_bytes(arr));
+    }
+    Ok(words)
+}

@@ -1,0 +1,38 @@
+=== 09 Type Casting ===
+-- int→float --
+PASS cast: int→float→*2→int: 5*2=10
+PASS cast: 0 as float as int = 0
+PASS cast: -7 as float as int = -7
+-- float→int --
+PASS cast: 3.9→int = 3 (truncate)
+PASS cast: -2.7→int = -2 (truncate toward zero)
+PASS cast: 1.0→int = 1
+PASS cast: 0.0→int = 0
+-- trit→int --
+PASS cast: + as int = 1
+PASS cast: 0 as int = 0
+PASS cast: - as int = -1
+-- int→trit --
+PASS cast: 1 as trit = +
+PASS cast: 0 as trit = 0
+PASS cast: -1 as trit = -
+-- bool→int --
+PASS cast: true as int = 1
+PASS cast: false as int = 0
+-- int→bool --
+PASS cast: 1 as bool = true
+PASS cast: 0 as bool = false
+-- narrow/wide casts --
+PASS cast: int→tryte→int: 8
+PASS cast: int→t9→int: 100
+PASS cast: int→t27→int: 1000000
+PASS cast: -42→tryte→int
+-- float arithmetic --
+PASS cast: 10/3=3 (int div)
+PASS cast: (10.0/3.0) as int = 3
+PASS cast: 10.0/3.0 has fractional part
+-- chained casts --
+PASS cast-chain: 5*1.5 as int = 7
+PASS cast-chain: + → int → trit → +
+Done.
+

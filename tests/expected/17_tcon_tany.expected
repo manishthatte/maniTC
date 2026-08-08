@@ -1,0 +1,37 @@
+=== 17 tcon/tany operators ===
+-- tcon truth table --
+PASS tcon: +,+=+
+PASS tcon: +,0=0
+PASS tcon: +,-=0
+PASS tcon: 0,+=0
+PASS tcon: 0,0=0
+PASS tcon: 0,-=0
+PASS tcon: -,+=0
+PASS tcon: -,0=0
+PASS tcon: -,-=-
+-- tany truth table --
+PASS tany: +,+=+
+PASS tany: +,0=+
+PASS tany: +,-=+
+PASS tany: 0,+=+
+PASS tany: 0,0=0
+PASS tany: 0,-=-
+PASS tany: -,+= +
+PASS tany: -,0=-
+PASS tany: -,-=-
+-- tcon laws --
+PASS tcon-idem: +tcon+=+
+PASS tcon-idem: 0tcon0=0
+PASS tcon-idem: -tcon-=-
+PASS tcon-comm: +tcon-=0
+PASS tcon-comm: -tcon+=0
+PASS tcon-zero: +tcon0=0
+PASS tcon-zero: -tcon0=0
+-- tany laws --
+PASS tany-idem: +tany+=+
+PASS tany-idem: 0tany0=0
+PASS tany-idem: -tany-=-
+PASS tany-id: +tany0=+
+PASS tany-id: -tany0=-
+PASS tany-id: 0tany0=0
+Done.

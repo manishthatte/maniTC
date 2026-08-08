@@ -1,0 +1,93 @@
+=== 06 Collections ===
+-- Vec --
+PASS vec: initial len=0
+PASS vec: after 3 pushes len=3
+PASS vec: get[0]=10
+PASS vec: get[1]=20
+PASS vec: get[2]=30
+PASS vec: pop=30
+PASS vec: after pop len=2
+PASS vec-set: v[1]=99
+PASS vec-set: v[0]=1
+PASS vec-set: v[2]=3
+PASS vec-contains: 10
+PASS vec-contains: !99
+PASS vec-contains: 5
+PASS vec-contains: 15
+PASS vec-sort: [0]=1
+PASS vec-sort: [1]=1
+PASS vec-sort: [2]=3
+PASS vec-sort: [3]=4
+PASS vec-sort: [4]=5
+PASS vec-map: len=3
+PASS vec-map: [0]=2
+PASS vec-map: [1]=4
+PASS vec-map: [2]=6
+PASS vec-filter: len=2
+PASS vec-filter: [0]=2
+PASS vec-filter: [1]=4
+PASS vec-fold: sum=15
+PASS vec-fold: product=120
+PASS vec-rev: [0]=3
+PASS vec-rev: [1]=2
+PASS vec-rev: [2]=1
+PASS vec-remove: len=2
+PASS vec-remove: [0]=10
+PASS vec-remove: [1]=30
+PASS vec-for: sum=12
+-- Map --
+PASS map: initial len=0
+PASS map: len=3
+PASS map: get a=1
+PASS map: get b=2
+PASS map: get c=3
+PASS map-overwrite: k=99
+PASS map-overwrite: len=1
+PASS map-ck: x
+PASS map-ck: !y
+PASS map-get-or: existing=42
+PASS map-get-or: missing=0
+PASS map-get-or: missing=-1
+PASS map-remove: len=1
+PASS map-remove: !a
+PASS map-remove: b
+PASS map-freq: apple=2
+PASS map-freq: banana=1
+PASS map-freq: cherry=1
+-- Set --
+PASS set: initial len=0
+PASS set: len=3
+PASS set: contains 1
+PASS set: contains 2
+PASS set: !contains 9
+PASS set-remove: len=1
+PASS set-remove: !10
+PASS set-remove: 20
+PASS set-inter: len=2
+PASS set-inter: 2
+PASS set-inter: 3
+PASS set-inter: !1
+PASS set-inter: !4
+PASS set-union: len=3
+PASS set-union: 1
+PASS set-union: 2
+PASS set-union: 3
+PASS set-diff: len=2
+PASS set-diff: 1
+PASS set-diff: 3
+PASS set-diff: !2
+PASS set-subset: small⊆big
+PASS set-subset: !big⊆small
+-- Deque --
+PASS deque-stack: pop=3
+PASS deque-stack: pop=2
+PASS deque-stack: pop=1
+PASS deque-stack: len=0
+PASS deque-queue: front=10
+PASS deque-queue: front=20
+PASS deque-queue: front=30
+PASS deque-mixed: front=3
+PASS deque-mixed: back=7
+PASS deque-mixed: len=3
+Done.
+

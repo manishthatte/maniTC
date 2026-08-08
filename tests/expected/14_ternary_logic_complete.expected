@@ -1,0 +1,129 @@
+=== 14 Ternary Logic Complete ===
+-- full tand table --
+PASS tand: +,+=+
+PASS tand: +,0=0
+PASS tand: +,-=-
+PASS tand: 0,+=0
+PASS tand: 0,0=0
+PASS tand: 0,-=-
+PASS tand: -,+=-
+PASS tand: -,0=-
+PASS tand: -,-=-
+-- full tor table --
+PASS tor: +,+=+
+PASS tor: +,0=+
+PASS tor: +,-=+
+PASS tor: 0,+=+
+PASS tor: 0,0=0
+PASS tor: 0,-=0
+PASS tor: -,+=-
+PASS tor: -,0=0
+PASS tor: -,-=-
+-- full tnot table --
+PASS tnot: tnot(+)=-
+PASS tnot: tnot(0)=0
+PASS tnot: tnot(-)=+
+PASS tnot: ~~(+)=+
+PASS tnot: ~~(0)=0
+PASS tnot: ~~(-)=-
+-- full txor table --
+PASS txor: +,+=0
+PASS txor: +,0=+
+PASS txor: +,-=+
+PASS txor: 0,+=+
+PASS txor: 0,0=0
+PASS txor: 0,-=+
+PASS txor: -,+=+
+PASS txor: -,0=+
+PASS txor: -,-=0
+-- De Morgan exhaustive --
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+PASS de-morgan-1: all pairs
+PASS de-morgan-2: all pairs
+-- absorption laws --
+PASS absorb: +∧(+∨0)=+
+PASS absorb: +∧(+∨-)=+
+PASS absorb: 0∧(0∨+)=0
+PASS absorb: -∧(-∨0)=-
+PASS absorb: +∨(+∧0)=+
+PASS absorb: 0∨(0∧-)=0
+PASS absorb: -∨(-∧+)=-
+-- idempotent laws --
+PASS idem: +∧+=+
+PASS idem: 0∧0=0
+PASS idem: -∧-=-
+PASS idem: +∨+=+
+PASS idem: 0∨0=0
+PASS idem: -∨-=-
+-- excluded middle fails --
+PASS 3VL: excluded-middle fails for unknown
+PASS 3VL: excluded-middle holds for +
+PASS 3VL: excluded-middle holds for -
+-- non-contradiction fails --
+PASS 3VL: non-contradiction fails for unknown
+PASS 3VL: non-contradiction holds for +
+PASS 3VL: non-contradiction holds for -
+-- trit_median full --
+PASS median: +,+,+=+
+PASS median: 0,0,0=0
+PASS median: -,-,-=-
+PASS median: +,+,0=+
+PASS median: +,+,-=+
+PASS median: 0,0,+=0
+PASS median: 0,0,-=0
+PASS median: -,-,+=−
+PASS median: -,-,0=-
+PASS median: +,0,-=0
+PASS median: -,0,+=0
+PASS median: +,-,0=0
+-- bool3 full tables --
+PASS bool3-tand T,T=T
+PASS bool3-tand T,U=U
+PASS bool3-tand T,F=F
+PASS bool3-tand U,T=U
+PASS bool3-tand U,U=U
+PASS bool3-tand U,F=F
+PASS bool3-tand F,T=F
+PASS bool3-tand F,U=F
+PASS bool3-tand F,F=F
+PASS bool3-tor T,T=T
+PASS bool3-tor T,U=T
+PASS bool3-tor T,F=T
+PASS bool3-tor U,T=T
+PASS bool3-tor U,U=U
+PASS bool3-tor U,F=U
+PASS bool3-tor F,T=T
+PASS bool3-tor F,U=U
+PASS bool3-tor F,F=F
+-- ternary shift --
+PASS tshift-left: 4<<1 = 12
+PASS tshift-left: 1<<3 = 27
+PASS tshift-right: 27>>1 = 9
+PASS tshift-right: 9>>2 = 1
+PASS tshift: left-then-right roundtrip 13
+-- trit_count more --
+PASS trit-cnt: 0→1
+PASS trit-cnt: 1→1
+PASS trit-cnt: -1→1
+PASS trit-cnt: 2→2
+PASS trit-cnt: -2→2
+PASS trit-cnt: 13→3
+PASS trit-cnt: -13→3
+PASS trit-cnt: 14 needs 4 trits
+Done.
+

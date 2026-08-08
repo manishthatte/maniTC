@@ -1,0 +1,54 @@
+=== 03 Functions ===
+-- basic --
+PASS basic: add(3,4)=7
+PASS basic: mul(6,7)=42
+PASS basic: square(9)=81
+-- multiple returns --
+PASS multi-ret: sign(5)=1
+PASS multi-ret: sign(-3)=-1
+PASS multi-ret: sign(0)=0
+PASS abs: abs(-7)=7
+PASS abs: abs(7)=7
+-- recursion --
+PASS rec: 0!=1
+PASS rec: 1!=1
+PASS rec: 5!=120
+PASS rec: fib(0)=0
+PASS rec: fib(1)=1
+PASS rec: fib(10)=55
+PASS rec: pow(2,10)=1024
+PASS rec: pow(3,4)=81
+PASS rec: pow(5,0)=1
+-- mutual recursion --
+PASS mutual: is_even(0)
+PASS mutual: is_odd(1)
+PASS mutual: is_even(4)
+PASS mutual: is_odd(7)
+PASS mutual: !is_even(3)
+-- lambdas --
+PASS lambda: double(5)=10
+PASS lambda: inc(9)=10
+PASS lambda: compose inc then dbl
+PASS lambda: compose dbl then inc
+PASS lambda: apply2 add
+PASS lambda: apply2 mul
+-- generics --
+PASS generic: identity(42)=42
+PASS generic: max(7,3)=7
+PASS generic: max(3,7)=7
+PASS generic: min(7,3)=3
+PASS generic: clamp(5,0,10)=5
+PASS generic: clamp(-1,0,10)=0
+PASS generic: clamp(15,0,10)=10
+-- fn result --
+PASS fn-result: make_adder(5)(10)=15
+PASS fn-result: make_adder(0)(10)=10
+PASS fn-result: make_adder(-3)(10)=7
+-- tail expr --
+PASS tail: double_if_positive(5)=10
+PASS tail: double_if_positive(-3)=-3
+PASS tail: double_if_positive(0)=0
+-- void --
+PASS void: fn returns normally
+Done.
+

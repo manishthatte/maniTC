@@ -1,0 +1,118 @@
+=== 13 Numeric Edge Cases ===
+-- identity ops --
+PASS id: n+0=n
+PASS id: n-0=n
+PASS id: n*1=n
+PASS id: n/1=n
+PASS id: n*0=0
+PASS id: 0/n=0
+PASS id: 0+0=0
+PASS id: 0-0=0
+PASS id: 0*0=0
+-- negation --
+PASS neg: -0=0
+PASS neg: --5=5
+PASS neg: --0=0
+PASS neg: -1=-1
+PASS neg: -(-1)=1
+PASS neg: -(a+b)=-a-b
+-- div truncation --
+PASS div-trunc: 7/2=3
+PASS div-trunc: 1/2=0
+PASS div-trunc: 9/3=3
+PASS div-trunc: 10/3=3
+PASS div-trunc: -7/2=-3
+PASS div-trunc: -1/2=0
+PASS div-trunc: -9/3=-3
+PASS div-trunc: 7/-2=-3
+PASS div-trunc: 1/-2=0
+PASS div-trunc: -7/-2=3
+PASS div-trunc: -9/-3=3
+-- modulo --
+PASS mod: 7%3=1
+PASS mod: 9%3=0
+PASS mod: 10%3=1
+PASS mod: 1%1=0
+PASS mod: -7%3=-1
+PASS mod: -9%3=0
+PASS mod: -10%3=-1
+PASS mod: 7%-3=1
+PASS mod: -7%-3=-1
+PASS mod: 42%1=0
+PASS mod: -5%1=0
+PASS mod: 0%1=0
+-- divmod invariant --
+PASS divmod: 17,5
+PASS divmod: -17,5
+PASS divmod: 17,-5
+PASS divmod: -17,-5
+PASS divmod: 100,7
+PASS divmod: 1,3
+PASS divmod: 0,7
+-- large numbers --
+PASS large: 10^9 * 1000 / 1000 = 10^9
+PASS large: 10^9 + 10^9 = 2*10^9
+PASS large: 10^12 - 10^9 = 999*10^9
+-- power --
+PASS pow: 2^0=1
+PASS pow: 2^1=2
+PASS pow: 2^10=1024
+PASS pow: 3^5=243
+PASS pow: 10^6=10^6
+PASS pow: 1^100=1
+PASS pow: -1^1=-1
+PASS pow: -1^2=1
+PASS pow: -1^3=-1
+-- gcd/lcm --
+PASS gcd: gcd(12,8)=4
+PASS gcd: gcd(9,6)=3
+PASS gcd: gcd(17,13)=1
+PASS gcd: gcd(0,5)=5
+PASS gcd: gcd(5,0)=5
+PASS gcd: gcd(7,7)=7
+PASS lcm: lcm(4,6)=12
+PASS lcm: lcm(3,5)=15
+PASS lcm: lcm(0,5)=0
+PASS lcm: lcm(7,7)=7
+-- bt extremes --
+PASS bt-extreme: 0t+=1
+PASS bt-extreme: 0t-=-1
+PASS bt-extreme: 0t+++=13
+PASS bt-extreme: 0t---= -13
+PASS bt-extreme: -(max)=min
+PASS bt-extreme: -(min)=max
+PASS bt-extreme: 0t+0-=8
+PASS bt-extreme: 0t-0+=-8
+-- bt roundtrip --
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+PASS bt-roundtrip: value
+-- abs --
+PASS abs: abs(5)=5
+PASS abs: abs(-5)=5
+PASS abs: abs(0)=0
+PASS abs: abs(-1)=1
+PASS abs: abs(100)=100
+-- comparison boundary --
+PASS cmp-bnd: 0 < 1
+PASS cmp-bnd: -1 < 0
+PASS cmp-bnd: -1 < 1
+PASS cmp-bnd: 0 == 0
+PASS cmp-bnd: -1 == -1
+PASS cmp-bnd: 1 > 0
+PASS cmp-bnd: 0 >= 0
+PASS cmp-bnd: 1 >= 0
+PASS cmp-bnd: 0 <= 0
+PASS cmp-bnd: 0 <= 1
+PASS cmp-bnd: !(0 < 0)
+PASS cmp-bnd: !(1 < 1)
+Done.
+

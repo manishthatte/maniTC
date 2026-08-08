@@ -1,0 +1,59 @@
+=== 11 String Operations ===
+-- equality --
+PASS str-eq: hello==hello
+PASS str-eq: hello!=world
+PASS str-eq: empty==empty
+PASS str-eq: empty!=space
+-- length --
+PASS str-len: empty=0
+PASS str-len: a=1
+PASS str-len: hello=5
+PASS str-len: two words=9
+-- concat --
+PASS str-concat: foo+bar=foobar
+PASS str-concat: empty+abc
+PASS str-concat: abc+empty
+PASS str-concat: empty+empty
+-- contains --
+PASS str-contains: 'hello'
+PASS str-contains: 'world'
+PASS str-contains: ' '
+PASS str-contains: !xyz
+PASS str-contains: empty
+PASS str-contains: self
+-- find --
+PASS str-find: 'a' at 0
+PASS str-find: 'b' at 1
+PASS str-find: 'abc' at 0
+PASS str-find: 'z' not found
+PASS str-find: '' at 0
+-- trim --
+PASS str-trim: spaces
+PASS str-trim: noop
+PASS str-trim: all-spaces→empty
+-- replace --
+PASS str-replace: bb→XX
+PASS str-replace: no-match stays same
+PASS str-replace: delete a
+-- slice --
+PASS str-slice: 0..3 = 'hel'
+PASS str-slice: 1..4 = 'ell'
+PASS str-slice: whole
+PASS str-slice: empty range
+-- int↔str --
+PASS int→str: 42
+PASS int→str: -7
+PASS int→str: 0
+PASS str→int: '42'=42
+PASS str→int: '-7'=-7
+PASS str→int: '0'=0
+-- fmt::format --
+PASS fmt: x={}
+PASS fmt: 3+4=7
+PASS fmt: no-args
+-- str in conditional --
+PASS str-cond: hello
+PASS str-cond: bye
+PASS str-cond: other
+Done.
+

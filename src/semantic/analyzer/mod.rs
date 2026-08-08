@@ -1,0 +1,813 @@
+// semantic/analyzer/mod.rs — SemanticAnalyzer: struct, builtins, declarations, type checking.
+// check_expr is in expressions.rs.
+
+mod expressions;
+
+use std::collections::HashMap;
+use super::types::*;
+use super::scope::SymbolTable;
+use crate::ast::{self, *};
+use crate::error::{CompileError, CompileResult, CompileWarning, WarningKind, WarningCollector};
+
+// ---------------------------------------------------------------------------
+// "Did you mean?" helpers
+// ---------------------------------------------------------------------------
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let la = a.len();
+    let lb = b.len();
+    let mut dp = vec![vec![0usize; lb + 1]; la + 1];
+    for i in 0..=la { dp[i][0] = i; }
+    for j in 0..=lb { dp[0][j] = j; }
+    for i in 1..=la {
+        for j in 1..=lb {
+            let cost = if a.as_bytes()[i - 1] == b.as_bytes()[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[la][lb]
+}
+
+fn did_you_mean(name: &str, candidates: impl Iterator<Item = String>) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for c in candidates {
+        if c.len() < 3 { continue; }
+        let d = levenshtein(name, &c);
+        if d <= 3 {
+            if best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                best = Some((d, c));
+            }
+        }
+    }
+    best.map(|(_, c)| format!(" — did you mean '{}'?", c))
+}
+
+// ---------------------------------------------------------------------------
+// Semantic Analyzer
+// ---------------------------------------------------------------------------
+
+pub struct SemanticAnalyzer {
+    pub(crate) symbols: SymbolTable,
+    pub(crate) functions: HashMap<String, (Vec<ManiType>, ManiType)>,
+    pub(crate) structs: HashMap<String, Vec<(String, ManiType)>>,
+    pub(crate) enums: HashMap<String, Vec<(String, Vec<ManiType>)>>,
+    pub(crate) current_fn_ret: ManiType,
+    pub(crate) file: String,
+    pub(crate) lambda_counter: usize,
+    pub(crate) lambda_fns: Vec<TypedFnDef>,
+    // User-defined impl method return types: type_name → method_name → return_type
+    pub(crate) user_method_types: HashMap<String, HashMap<String, ManiType>>,
+    // Trait definitions: trait_name → [(method_name, param_types, ret_type, has_default_body)]
+    pub(crate) trait_defs: HashMap<String, Vec<(String, Vec<ManiType>, ManiType, bool)>>,
+    // Trait implementations: (type_name, trait_name)
+    pub(crate) trait_impls: std::collections::HashSet<(String, String)>,
+    // Generic type parameters in current scope: param_name → resolved_type
+    pub(crate) type_params: HashMap<String, ManiType>,
+    // Struct field pub visibility: struct_name → [(field_name, is_pub)]
+    pub(crate) struct_pub_fields: HashMap<String, Vec<(String, bool)>>,
+    // The type of `self` in the current impl block (for `Self` resolution)
+    pub(crate) current_impl_type: Option<String>,
+    /// Base directory of the source file being compiled (for resolving relative imports)
+    pub(crate) source_dir: std::path::PathBuf,
+    /// Set of modules already loaded (prevents circular imports)
+    pub(crate) loaded_modules: std::collections::HashSet<std::path::PathBuf>,
+    /// Warning collector
+    pub warnings: WarningCollector,
+    /// Track which variables have been read (for unused variable detection)
+    pub(crate) read_vars: std::collections::HashSet<String>,
+    /// Names registered by register_builtins (user functions may shadow these)
+    pub(crate) builtin_names: std::collections::HashSet<String>,
+}
+
+impl SemanticAnalyzer {
+    pub fn new() -> Self {
+        let mut analyzer = SemanticAnalyzer {
+            symbols: SymbolTable::new(),
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            current_fn_ret: ManiType::Void,
+            file: String::from("<input>"),
+            lambda_counter: 0,
+            lambda_fns: Vec::new(),
+            user_method_types: HashMap::new(),
+            trait_defs: HashMap::new(),
+            trait_impls: std::collections::HashSet::new(),
+            type_params: HashMap::new(),
+            struct_pub_fields: HashMap::new(),
+            current_impl_type: None,
+            source_dir: std::path::PathBuf::from("."),
+            loaded_modules: std::collections::HashSet::new(),
+            warnings: WarningCollector::new(),
+            read_vars: std::collections::HashSet::new(),
+            builtin_names: std::collections::HashSet::new(),
+        };
+        analyzer.register_builtins();
+        analyzer
+    }
+
+    pub fn with_file(file: impl Into<String>) -> Self {
+        let mut a = Self::new();
+        a.file = file.into();
+        a.source_dir = std::path::Path::new(&a.file)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        a
+    }
+
+    fn register_builtins(&mut self) {
+        use ManiType::*;
+
+        // Helper: construct a builtin table entry.
+        // Each entry is (name, param_types, return_type).
+        type Entry = (&'static str, Vec<ManiType>, ManiType);
+
+        // Shorthand slices for common patterns.
+        let ii  = vec![Int, Int];
+        let iiii = vec![Int, Int, Int, Int];
+        let s   = vec![Str];
+        let sii = vec![Str, Int, Int];
+        let ss  = vec![Str, Str];
+        let sss = vec![Str, Str, Str];
+        let is_ = vec![Int, Int, Str];   // renamed to avoid conflict with `is`
+        let si_  = vec![Str, Int];
+
+        // Entries grouped by subsystem.
+        let entries: Vec<Entry> = vec![
+            // I/O intrinsics
+            ("println",       vec![Unknown], Void),
+            ("print",         vec![Unknown], Void),
+            // Math
+            ("abs",           vec![Int],     Int),
+            ("sqrt",          vec![Float],   Float),
+            // fmt module
+            ("fmt::format",      vec![Str, Unknown], Str),
+            ("fmt::show_int",    vec![Int],           Str),
+            ("fmt::show_float",  vec![Float],         Str),
+            ("fmt::show_bool",   vec![Bool],          Str),
+            // String operations
+            ("str_len",          s.clone(),           Int),
+            ("str_find",         ss.clone(),          Int),
+            ("str_concat",       ss.clone(),          Str),
+            ("str_slice",        sii.clone(),         Str),
+            ("str_substr",       sii.clone(),         Str),
+            ("str_trim",         s.clone(),           Str),
+            ("str_replace",      sss.clone(),         Str),
+            ("str_parse_int",    s.clone(),           Int),
+            ("str_ends_with",    ss.clone(),          Bool),
+            ("str_starts_with",  ss.clone(),          Bool),
+            ("str_from_int",     vec![Int],           Str),
+            ("str_from_char",    vec![Int],           Str),
+            ("str_to_upper",     s.clone(),           Str),
+            ("str_to_lower",     s.clone(),           Str),
+            // async module
+            ("async::yield_now",   vec![],                 Void),
+            ("async::sleep",       vec![Int],              Void),
+            ("async::spawn_task",  vec![Unknown],          Generic("Task".to_string(), vec![Unknown])),
+            ("async::select",      vec![Unknown],          Unknown),
+            // time module
+            ("time::sleep",     vec![Int], Void),
+            ("env_timestamp",   vec![],    Str),
+            ("env_date",        vec![],    Str),
+            ("env_time",        vec![],    Str),
+            // Filesystem
+            ("fs_list_dir_open",  s.clone(),    Int),
+            ("fs_list_dir_entry", vec![Int],    Str),
+            ("fs_copy",           ss.clone(),   Int),
+            ("fs_move",           ss.clone(),   Int),
+            ("fs_mkdir",          s.clone(),    Int),
+            ("fs_is_dir",         s.clone(),    Int),
+            ("fs_file_size",      s.clone(),    Int),
+            ("fs_read_file",      s.clone(),    Str),
+            ("fs_write_file",     ss.clone(),   Void),
+            ("fs_copy_file",      ss.clone(),   Void),
+            ("fs_rename",         ss.clone(),   Void),
+            ("fs_delete",         s.clone(),    Int),
+            // Path helpers
+            ("path_join",         ss.clone(),   Str),
+            ("path_parent",       s.clone(),    Str),
+            ("path_file_name",    s.clone(),    Str),
+            // Shell / process
+            ("process_spawn",   s.clone(),  Int),
+            ("shell_exec",      s.clone(),  Str),
+            // Network
+            ("net_http_get",    s.clone(),  Str),
+            // Terminal (TUI)
+            ("terminal_set_raw",      vec![], Int),
+            ("terminal_set_cooked",   vec![], Int),
+            ("terminal_get_rows",     vec![], Int),
+            ("terminal_get_cols",     vec![], Int),
+            ("io_read_char",          vec![], Int),
+            ("io_read_key",           vec![], Int),
+            ("io_clear_screen",       vec![], Int),
+            ("io_move_cursor",        ii.clone(), Int),
+            ("io_set_reverse",        vec![], Int),
+            ("io_reset_attr",         vec![], Int),
+            ("io_set_bold",           vec![], Int),
+            // SDL2 GUI — window / render
+            ("gui_init",          is_.clone(),  Int),
+            ("gui_quit",          vec![],       Int),
+            ("gui_clear",         vec![],       Int),
+            ("gui_present",       vec![],       Int),
+            ("gui_set_color",     iiii.clone(), Int),
+            ("gui_fill_rect",     iiii.clone(), Int),
+            ("gui_draw_rect",     iiii.clone(), Int),
+            ("gui_draw_line",     iiii.clone(), Int),
+            ("gui_draw_text",     sii.clone(),  Int),
+            ("gui_draw_text_lg",  sii.clone(),  Int),
+            ("gui_text_width",    s.clone(),    Int),
+            ("gui_font_height",   vec![],       Int),
+            ("gui_window_width",  vec![],       Int),
+            ("gui_window_height", vec![],       Int),
+            // SDL2 GUI — events
+            ("gui_poll_event",        vec![],      Int),
+            ("gui_wait_event",        vec![Int],   Int),
+            ("gui_event_type",        vec![],      Int),
+            ("gui_event_key",         vec![],      Int),
+            ("gui_mouse_x",           vec![],      Int),
+            ("gui_mouse_y",           vec![],      Int),
+            ("gui_mouse_btn",         vec![],      Int),
+            ("gui_event_text_char",   vec![],      Int),
+            ("gui_event_text_str",    vec![],      Str),
+            ("gui_wheel_dy",          vec![],      Int),
+            ("gui_ticks",             vec![],      Int),
+            ("gui_delay",             vec![Int],   Int),
+            // SDL2 GUI — named key constants (all return Int)
+            ("gui_key_return",    vec![], Int), ("gui_key_escape",  vec![], Int),
+            ("gui_key_backspace", vec![], Int), ("gui_key_delete",  vec![], Int),
+            ("gui_key_up",        vec![], Int), ("gui_key_down",    vec![], Int),
+            ("gui_key_left",      vec![], Int), ("gui_key_right",   vec![], Int),
+            ("gui_key_home",      vec![], Int), ("gui_key_end",     vec![], Int),
+            ("gui_key_pageup",    vec![], Int), ("gui_key_pagedown",vec![], Int),
+            ("gui_key_tab",       vec![], Int), ("gui_key_space",   vec![], Int),
+            ("gui_key_f1",  vec![], Int), ("gui_key_f2",  vec![], Int),
+            ("gui_key_f3",  vec![], Int), ("gui_key_f4",  vec![], Int),
+            ("gui_key_f5",  vec![], Int), ("gui_key_f6",  vec![], Int),
+            ("gui_key_f7",  vec![], Int), ("gui_key_f8",  vec![], Int),
+            ("gui_key_f9",  vec![], Int), ("gui_key_f10", vec![], Int),
+            ("gui_key_f11", vec![], Int), ("gui_key_f12", vec![], Int),
+            ("gui_key_mod_ctrl",  vec![], Int),
+            ("gui_key_mod_shift", vec![], Int),
+            ("gui_key_mod_alt",   vec![], Int),
+            // SDL2 GUI — clipboard
+            ("gui_clipboard_get", vec![],   Str),
+            ("gui_clipboard_set", s.clone(), Void),
+        ];
+
+        for (name, params, ret) in entries {
+            self.functions.insert(name.to_string(), (params, ret));
+        }
+
+        // Letter keys a–z: gui_key_a .. gui_key_z
+        for ch in b'a'..=b'z' {
+            self.functions.insert(format!("gui_key_{}", ch as char), (vec![], Int));
+        }
+
+        // Concurrency primitives (opaque generic return types — not representable in static table)
+        let chan_ty = Generic("Channel".to_string(), vec![Unknown]);
+        self.functions.insert("channel".to_string(),     (vec![], chan_ty.clone()));
+        self.functions.insert("channel_new".to_string(), (vec![], chan_ty));
+        self.functions.insert("Mutex::new".to_string(),
+            (vec![Unknown], Generic("Mutex".to_string(), vec![Unknown])));
+        self.functions.insert("AtomicTrit::new".to_string(), (vec![Trit],  Struct("AtomicTrit".to_string())));
+        self.functions.insert("Barrier::new".to_string(),    (vec![Int],   Struct("Barrier".to_string())));
+        self.functions.insert("Semaphore::new".to_string(),  (vec![Int],   Struct("Semaphore".to_string())));
+
+        // Record all registered names so user functions may shadow them.
+        self.builtin_names = self.functions.keys().cloned().collect();
+
+        // Suppress unused-variable warnings for the shorthand vectors constructed above.
+        drop(si_);
+    }
+
+    fn err(&self, span: Span, msg: impl Into<String>) -> CompileError {
+        CompileError::type_err(&self.file, span.line, span.col, msg)
+    }
+
+    // Convert AST type to ManiType
+    fn resolve_type(&self, ty: &Type) -> CompileResult<ManiType> {
+        match ty {
+            Type::Named(name, span) => {
+                // Generic type params take priority over everything else
+                if let Some(ty) = self.type_params.get(name.as_str()) {
+                    return Ok(ty.clone());
+                }
+                Ok(self.name_to_manitype(name, *span)?)
+            }
+            Type::Path(parts, span) => {
+                // Join path and resolve
+                let joined = parts.join("::");
+                self.name_to_manitype(&joined, *span)
+            }
+            Type::Generic(name, args, _span) => {
+                let resolved_args: CompileResult<Vec<ManiType>> =
+                    args.iter().map(|a| self.resolve_type(a)).collect();
+                let resolved_args = resolved_args?;
+                match name.as_str() {
+                    "Result" => Ok(ManiType::Generic("Result".to_string(), resolved_args)),
+                    "Option" => Ok(ManiType::Generic("Option".to_string(), resolved_args)),
+                    "Vec" => Ok(ManiType::Generic("Vec".to_string(), resolved_args)),
+                    "Map" => Ok(ManiType::Generic("Map".to_string(), resolved_args)),
+                    "Set" => Ok(ManiType::Generic("Set".to_string(), resolved_args)),
+                    "Deque" => Ok(ManiType::Generic("Deque".to_string(), resolved_args)),
+                    "TernaryTrie" => Ok(ManiType::Generic("TernaryTrie".to_string(), resolved_args)),
+                    "Channel" => Ok(ManiType::Generic("Channel".to_string(), resolved_args)),
+                    "Mutex" => Ok(ManiType::Generic("Mutex".to_string(), resolved_args)),
+                    "AtomicTrit" => Ok(ManiType::Struct("AtomicTrit".to_string())),
+                    "Barrier" => Ok(ManiType::Struct("Barrier".to_string())),
+                    "Semaphore" => Ok(ManiType::Struct("Semaphore".to_string())),
+                    "Pair" => Ok(ManiType::Generic("Pair".to_string(), resolved_args)),
+                    "Range" => Ok(ManiType::Generic("Range".to_string(), resolved_args)),
+                    _ => {
+                        // Check if it's a known struct
+                        if self.structs.contains_key(name.as_str()) {
+                            Ok(ManiType::Struct(name.clone()))
+                        } else {
+                            // Permissive: treat as unknown generic
+                            Ok(ManiType::Generic(name.clone(), resolved_args))
+                        }
+                    }
+                }
+            }
+            Type::Array(inner, size, _) => {
+                let inner_ty = self.resolve_type(inner)?;
+                Ok(ManiType::Array(Box::new(inner_ty), *size))
+            }
+            Type::Tuple(types, _) => {
+                let resolved: CompileResult<Vec<ManiType>> =
+                    types.iter().map(|t| self.resolve_type(t)).collect();
+                Ok(ManiType::Tuple(resolved?))
+            }
+            Type::Fn(params, ret, _) => {
+                let param_tys: CompileResult<Vec<ManiType>> =
+                    params.iter().map(|p| self.resolve_type(p)).collect();
+                let ret_ty = self.resolve_type(ret)?;
+                Ok(ManiType::Fn(param_tys?, Box::new(ret_ty)))
+            }
+            Type::Ref(inner, _, _) => self.resolve_type(inner),
+            Type::Ptr(inner, _, _) => self.resolve_type(inner),
+            Type::Infer(_) => Ok(ManiType::Unknown),
+        }
+    }
+
+    fn name_to_manitype(&self, name: &str, _span: Span) -> CompileResult<ManiType> {
+        match name {
+            // `Self` resolves to the current impl type
+            "Self" => {
+                if let Some(impl_ty) = &self.current_impl_type {
+                    return Ok(ManiType::Struct(impl_ty.clone()));
+                }
+                return Ok(ManiType::Unknown);
+            }
+            "int" | "i64" => Ok(ManiType::Int),
+            "float" | "f64" => Ok(ManiType::Float),
+            "bool" => Ok(ManiType::Bool),
+            "bool3" | "tribool" | "T3Bool" => Ok(ManiType::Bool3),
+            "trit" => Ok(ManiType::Trit),
+            "tryte" => Ok(ManiType::Tryte),
+            "t9" => Ok(ManiType::T9),
+            "t27" | "word" => Ok(ManiType::T27),
+            "t54" => Ok(ManiType::T54),
+            "trint" => Ok(ManiType::T54), // trint is a source-level alias for t54
+            "tfloat" => Ok(ManiType::Tfloat),
+            "str" | "String" => Ok(ManiType::Str),
+            "char" => Ok(ManiType::Char),
+            "void" | "()" => Ok(ManiType::Void),
+            // Concurrency types treated as opaque structs
+            "AtomicTrit" | "Barrier" | "Semaphore" | "MutexGuard" => {
+                Ok(ManiType::Struct(name.to_string()))
+            }
+            _ => {
+                if self.structs.contains_key(name) {
+                    Ok(ManiType::Struct(name.to_string()))
+                } else if self.enums.contains_key(name) {
+                    Ok(ManiType::Enum(name.to_string()))
+                } else {
+                    // Unknown type — emit Unknown to allow partial compilation
+                    // In strict mode this would be an error
+                    Ok(ManiType::Unknown)
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Public entry point
+    // ---------------------------------------------------------------------------
+
+    pub fn analyze(&mut self, program: &Program) -> CompileResult<TypedProgram> {
+        // First pass: collect type definitions and function signatures
+        self.collect_declarations(program)?;
+
+        // Second pass: type-check function bodies
+        let mut typed_fns = Vec::new();
+        let mut typed_globals = Vec::new();
+        let mut structs_out = Vec::new();
+        let mut enums_out = Vec::new();
+
+        for item in &program.items {
+            match item {
+                Item::FnDef(f) => {
+                    typed_fns.push(self.check_fn(f)?);
+                }
+                Item::StructDef(s) => {
+                    structs_out.push(s.clone());
+                }
+                Item::EnumDef(e) => {
+                    enums_out.push(e.clone());
+                }
+                Item::ImplBlock(imp) => {
+                    self.current_impl_type = Some(imp.ty.clone());
+                    for method in &imp.methods {
+                        // Check under the qualified name so IR sees TypeName::method
+                        let mut qm = method.clone();
+                        qm.name = format!("{}::{}", imp.ty, method.name);
+                        typed_fns.push(self.check_fn(&qm)?);
+                    }
+                    // Feature 3: for methods in the trait that the impl doesn't override,
+                    // include the default implementations
+                    if let Some(trait_name) = &imp.trait_.clone() {
+                        if let Some(trait_methods) = self.trait_defs.get(trait_name).cloned() {
+                            let provided: std::collections::HashSet<String> =
+                                imp.methods.iter().map(|m| m.name.clone()).collect();
+                            // Look for trait default methods not overridden
+                            for item in &program.items {
+                                if let Item::TraitDef(tr) = item {
+                                    if &tr.name == trait_name {
+                                        for method in &tr.methods {
+                                            if !provided.contains(&method.name) && method.body.is_some() {
+                                                // Use default implementation: emit it under the qualified name
+                                                let mut qm = method.clone();
+                                                qm.name = format!("{}::{}", imp.ty, method.name);
+                                                typed_fns.push(self.check_fn(&qm)?);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = trait_methods; // suppress unused warning
+                        }
+                    }
+                    self.current_impl_type = None;
+                }
+                Item::TraitDef(tr) => {
+                    for method in &tr.methods {
+                        if method.body.is_some() {
+                            typed_fns.push(self.check_fn(method)?);
+                        }
+                    }
+                }
+                Item::GlobalVar(gv) => {
+                    let ty = self.resolve_type(&gv.ty)?;
+                    let init = if let Some(e) = &gv.val {
+                        Some(self.check_expr(e, Some(&ty))?)
+                    } else {
+                        None
+                    };
+                    typed_globals.push(TypedGlobal {
+                        name: gv.name.clone(),
+                        ty,
+                        init,
+                        is_pub: gv.is_pub,
+                    });
+                }
+                Item::UseDecl(_) => {
+                    // No type checking needed for use declarations
+                }
+            }
+        }
+
+        // Append any lambdas discovered during type-checking
+        typed_fns.append(&mut self.lambda_fns);
+
+        Ok(TypedProgram {
+            functions: typed_fns,
+            structs: structs_out,
+            struct_fields: self.structs.clone(),
+            enums: enums_out,
+            globals: typed_globals,
+        })
+    }
+
+    fn collect_declarations(&mut self, program: &Program) -> CompileResult<()> {
+        // Pass 1: collect structs, enums, functions, traits, globals, use-decls.
+        // ImplBlocks are deferred to pass 2 so that trait validation always sees
+        // fully populated trait_defs regardless of source order.
+        for item in &program.items {
+            match item {
+                Item::StructDef(s) => {
+                    let mut fields = Vec::new();
+                    let mut pub_fields = Vec::new();
+                    for f in &s.fields {
+                        let ty = self.resolve_type(&f.ty)?;
+                        fields.push((f.name.clone(), ty));
+                        pub_fields.push((f.name.clone(), f.is_pub));
+                    }
+                    self.structs.insert(s.name.clone(), fields);
+                    self.struct_pub_fields.insert(s.name.clone(), pub_fields);
+                }
+                Item::EnumDef(e) => {
+                    let mut variants = Vec::new();
+                    for v in &e.variants {
+                        let field_tys: CompileResult<Vec<ManiType>> =
+                            v.fields.iter().map(|f| self.resolve_type(f)).collect();
+                        variants.push((v.name.clone(), field_tys?));
+                    }
+                    self.enums.insert(e.name.clone(), variants);
+                }
+                Item::FnDef(f) => {
+                    self.register_fn(f)?;
+                }
+                Item::TraitDef(tr) => {
+                    // Store trait signatures for later validation of impl-for-trait blocks
+                    let mut methods = Vec::new();
+                    for method in &tr.methods {
+                        let saved = self.type_params.clone();
+                        for gp in &method.generics {
+                            self.type_params.insert(gp.clone(), ManiType::Unknown);
+                        }
+                        let param_tys: Vec<ManiType> = method.params.iter()
+                            .map(|p| self.resolve_type(&p.ty).unwrap_or(ManiType::Unknown))
+                            .collect();
+                        let ret_ty = if let Some(rt) = &method.ret_ty {
+                            self.resolve_type(rt).unwrap_or(ManiType::Unknown)
+                        } else {
+                            ManiType::Void
+                        };
+                        let has_default = method.body.is_some();
+                        self.type_params = saved;
+                        methods.push((method.name.clone(), param_tys, ret_ty, has_default));
+                        // Register default method implementations if they have a body
+                        if method.body.is_some() {
+                            self.register_fn(method)?;
+                        }
+                    }
+                    self.trait_defs.insert(tr.name.clone(), methods);
+                }
+                Item::GlobalVar(gv) => {
+                    let ty = self.resolve_type(&gv.ty)?;
+                    self.symbols.define(&gv.name, ty, false);
+                }
+                Item::UseDecl(u) => {
+                    self.resolve_use(u)?;
+                }
+                Item::ImplBlock(_) => {} // deferred to pass 2
+            }
+        }
+
+        // Pass 2: process impl blocks — all traits are now registered.
+        for item in &program.items {
+            if let Item::ImplBlock(imp) = item {
+                self.current_impl_type = Some(imp.ty.clone());
+                for method in &imp.methods {
+                    // Register under the qualified name TypeName::method_name
+                    let mut qm = method.clone();
+                    qm.name = format!("{}::{}", imp.ty, method.name);
+                    self.register_fn(&qm)?;
+                    // Track the return type for method-call resolution
+                    let ret_ty = if let Some(rt) = &method.ret_ty {
+                        self.resolve_type(rt).unwrap_or(ManiType::Unknown)
+                    } else {
+                        ManiType::Void
+                    };
+                    self.user_method_types
+                        .entry(imp.ty.clone())
+                        .or_default()
+                        .insert(method.name.clone(), ret_ty);
+                }
+                // Validate trait implementation: every required method must be present
+                if let Some(trait_name) = &imp.trait_ {
+                    if let Some(required) = self.trait_defs.get(trait_name).cloned() {
+                        let provided: std::collections::HashSet<String> =
+                            imp.methods.iter().map(|m| m.name.clone()).collect();
+                        for (method_name, _, _, has_default) in &required {
+                            if !provided.contains(method_name) && !has_default {
+                                return Err(self.err(
+                                    imp.span,
+                                    format!(
+                                        "type '{}' implements trait '{}' but is missing required method '{}'",
+                                        imp.ty, trait_name, method_name
+                                    ),
+                                ));
+                            }
+                        }
+                    } else {
+                        return Err(self.err(
+                            imp.span,
+                            format!("unknown trait '{}'", trait_name),
+                        ));
+                    }
+                    self.trait_impls.insert((imp.ty.clone(), trait_name.clone()));
+                }
+                self.current_impl_type = None;
+            }
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Module system: use-declaration resolution
+    // ---------------------------------------------------------------------------
+
+    /// Known standard library module names (matching stdlib/ directory)
+    const STDLIB_MODULES: &'static [&'static str] = &[
+        "io", "math", "ternary", "collections", "fmt", "str",
+        "sync", "async", "env", "time", "fs", "net",
+    ];
+
+    fn resolve_use(&mut self, decl: &UseDecl) -> CompileResult<()> {
+        if decl.path.is_empty() {
+            return Ok(());
+        }
+
+        if decl.path[0] == "std" {
+            // Standard library — validate the module name exists.
+            // All stdlib functions are already registered as builtins.
+            if decl.path.len() >= 2 {
+                let mod_name = &decl.path[1];
+                if !Self::STDLIB_MODULES.contains(&mod_name.as_str()) {
+                    return Err(self.err(
+                        decl.span,
+                        format!("unknown standard library module: std::{}", mod_name),
+                    ));
+                }
+            }
+            Ok(())
+        } else {
+            // User module — resolve to filesystem
+            self.load_user_module(decl)
+        }
+    }
+
+    fn load_user_module(&mut self, decl: &UseDecl) -> CompileResult<()> {
+        // Build path: foo::bar → source_dir/foo/bar.mt
+        let mut module_path = self.source_dir.clone();
+        for part in &decl.path {
+            module_path = module_path.join(part);
+        }
+        module_path.set_extension("mt");
+
+        // Check if already loaded (circular import guard)
+        let canonical = module_path.canonicalize().unwrap_or(module_path.clone());
+        if self.loaded_modules.contains(&canonical) {
+            return Ok(()); // Already loaded
+        }
+        self.loaded_modules.insert(canonical.clone());
+
+        // Read and parse the module file
+        let source = std::fs::read_to_string(&module_path).map_err(|e| {
+            self.err(
+                decl.span,
+                format!(
+                    "cannot load module '{}': {} (looked in {})",
+                    decl.path.join("::"),
+                    e,
+                    module_path.display()
+                ),
+            )
+        })?;
+
+        let file_str = module_path.to_string_lossy().to_string();
+        let mut lexer = crate::lexer::Lexer::with_file(&source, &file_str);
+        let tokens = lexer.tokenize()?;
+
+        let mut parser = crate::parser::Parser::with_file(tokens, &file_str);
+        let program = parser.parse()?;
+
+        // Build module prefix from path: foo::bar → "foo::bar"
+        let prefix = decl.path.join("::");
+
+        // Register all public definitions from the module with prefixed names
+        for item in &program.items {
+            match item {
+                Item::FnDef(f) => {
+                    let full_name = format!("{}::{}", prefix, f.name);
+                    let param_types: Vec<ManiType> = f
+                        .params
+                        .iter()
+                        .map(|p| self.resolve_type(&p.ty).unwrap_or(ManiType::Unknown))
+                        .collect();
+                    let ret_ty = f
+                        .ret_ty
+                        .as_ref()
+                        .map(|t| self.resolve_type(t).unwrap_or(ManiType::Unknown))
+                        .unwrap_or(ManiType::Void);
+                    self.functions.insert(full_name, (param_types, ret_ty));
+                }
+                Item::StructDef(s) => {
+                    let full_name = format!("{}::{}", prefix, s.name);
+                    let fields: Vec<(String, ManiType)> = s
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.name.clone(),
+                                self.resolve_type(&f.ty).unwrap_or(ManiType::Unknown),
+                            )
+                        })
+                        .collect();
+                    self.structs.insert(full_name, fields);
+                }
+                Item::EnumDef(e) => {
+                    let full_name = format!("{}::{}", prefix, e.name);
+                    let variants: Vec<(String, Vec<ManiType>)> = e
+                        .variants
+                        .iter()
+                        .map(|v| {
+                            let types: Vec<ManiType> = v
+                                .fields
+                                .iter()
+                                .map(|t| self.resolve_type(t).unwrap_or(ManiType::Unknown))
+                                .collect();
+                            (v.name.clone(), types)
+                        })
+                        .collect();
+                    self.enums.insert(full_name, variants);
+                }
+                _ => {} // Ignore use decls, impl blocks, etc. in imported modules
+            }
+        }
+
+        Ok(())
+    }
+
+    fn register_fn(&mut self, f: &FnDef) -> CompileResult<()> {
+        // Reject duplicate user-defined function names (builtins may be shadowed)
+        if self.functions.contains_key(&f.name) && !self.builtin_names.contains(&f.name) {
+            return Err(self.err(f.span, format!("duplicate function definition `{}`", f.name)));
+        }
+        // Push generic type params as Unknown so they resolve correctly
+        let saved_type_params = self.type_params.clone();
+        for gp in &f.generics {
+            self.type_params.insert(gp.clone(), ManiType::Unknown);
+        }
+        let param_tys: CompileResult<Vec<ManiType>> =
+            f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+        let param_tys = param_tys?;
+        let ret_ty = if let Some(rt) = &f.ret_ty {
+            self.resolve_type(rt)?
+        } else {
+            ManiType::Void
+        };
+        self.functions.insert(f.name.clone(), (param_tys, ret_ty));
+        self.type_params = saved_type_params;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Function checking
+    // ---------------------------------------------------------------------------
+
+    fn check_fn(&mut self, f: &FnDef) -> CompileResult<TypedFnDef> {
+        // Push generic type params as Unknown for this function's scope
+        let saved_type_params = std::mem::take(&mut self.type_params);
+        for gp in &f.generics {
+            self.type_params.insert(gp.clone(), ManiType::Unknown);
+        }
+
+        let ret_ty = if let Some(rt) = &f.ret_ty {
+            self.resolve_type(rt)?
+        } else {
+            ManiType::Void
+        };
+        let old_ret = self.current_fn_ret.clone();
+        self.current_fn_ret = ret_ty.clone();
+
+        self.symbols.push_scope();
+        let mut typed_params = Vec::new();
+        for p in &f.params {
+            let ty = self.resolve_type(&p.ty)?;
+            self.symbols.define(&p.name, ty.clone(), false);
+            typed_params.push(TypedParam { name: p.name.clone(), ty });
+        }
+
+        let body = if let Some(block) = &f.body {
+            Some(self.check_block(block)?)
+        } else {
+            None
+        };
+        self.symbols.pop_scope();
+        self.current_fn_ret = old_ret;
+        self.type_params = saved_type_params;
+
+        Ok(TypedFnDef {
+            name: f.name.clone(),
+            params: typed_params,
+            ret_ty,
+            body,
+            is_pub: f.is_pub,
+            is_async: f.is_async,
+        })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Block and statement checking
+    // ---------------------------------------------------------------------------
+
+}
+
+mod stmts;
+mod type_inference;

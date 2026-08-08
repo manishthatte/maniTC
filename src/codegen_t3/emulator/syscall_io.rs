@@ -1,0 +1,465 @@
+// emulator/syscall_io.rs — I/O syscalls: print, read, strings, floats, time, env.
+// Syscall ranges: 0-16, 60-69, 127-132, 200-202, 210-220, 540, 550-551.
+use super::*;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+impl Emulator {
+    pub(super) fn do_syscall_io(&mut self, num: i64) {
+        match num {
+            0 => {
+                // print trit
+                let t = self.regs[1];
+                let s = if t > 0 { "+".to_string() } else if t == 0 { "0".to_string() } else { "-".to_string() };
+                self.output.push(s);
+            }
+            1 => {
+                // print int
+                self.output.push(self.regs[1].to_string());
+            }
+            2 => {
+                // print float — bitcast i64 → f64
+                let bits = self.regs[1] as u64;
+                let f = f64::from_bits(bits);
+                self.output.push(format!("{}", f));
+            }
+            3 => {
+                // print string at R1 address
+                let addr = self.regs[1] as usize;
+                let s = if let Some(content) = self.string_data.get(&addr) {
+                    content.clone()
+                } else {
+                    // Try null-terminated read from memory
+                    let mut buf = String::new();
+                    let mut a = addr;
+                    while a < self.memory.len() && self.memory[a] != 0 {
+                        buf.push(self.memory[a] as u8 as char);
+                        a += 1;
+                    }
+                    buf
+                };
+                self.output.push(s);
+            }
+            4 => {
+                self.output.push("\n".to_string());
+            }
+            5 => {
+                // read int
+                let v = if let Some(val) = self.input_queue.pop_front() {
+                    val
+                } else {
+                    let mut line = String::new();
+                    let _ = std::io::stdin().read_line(&mut line);
+                    line.trim().parse::<i64>().unwrap_or(0)
+                };
+                self.regs[1] = clamp27(v);
+            }
+            6 => {
+                self.halted = true;
+            }
+            7 => {
+                // t27_to_str / print_t27_ternary: R1 = t27 value
+                // Formats value as balanced ternary string, stores in heap, returns address in R1.
+                let val = self.regs[1];
+                let s = Self::t27_to_ternary_str(val);
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            8 => {
+                // trits_to_str: R1 = length-prefixed array ptr (memory[R1] = len, then trits)
+                let ptr = self.regs[1] as usize;
+                let len = self.memory.get(ptr).copied().unwrap_or(0) as usize;
+                let mut s = String::new();
+                for i in 0..len {
+                    let t = self.memory.get(ptr + 1 + i).copied().unwrap_or(0);
+                    s.push(if t > 0 { '+' } else if t == 0 { '0' } else { '-' });
+                }
+                if s.is_empty() { s = "0".to_string(); }
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            9 => {
+                // trit_count: R1 = n, returns number of balanced ternary digits in R1
+                let mut n = self.regs[1];
+                if n == 0 { self.regs[1] = 1; return; }
+                let mut count = 0i64;
+                while n != 0 {
+                    let rem = n.rem_euclid(3);
+                    let d = if rem <= 1 { rem as i64 } else { -1i64 };
+                    n = (n - d) / 3;
+                    count += 1;
+                }
+                self.regs[1] = count;
+            }
+            10 => {
+                // to_balanced_ternary: R1 = int, returns ptr to length-prefixed [trit] array
+                // Format: memory[ptr] = len, memory[ptr+1..ptr+1+len] = trits (LST-first)
+                let mut n = self.regs[1];
+                let mut digits = Vec::new();
+                if n == 0 {
+                    digits.push(0i64);
+                } else {
+                    while n != 0 {
+                        let rem = n.rem_euclid(3);
+                        let d = if rem <= 1 { rem as i64 } else { -1i64 };
+                        digits.push(d);
+                        n = (n - d) / 3;
+                    }
+                }
+                let mut words = vec![digits.len() as i64];
+                words.extend_from_slice(&digits);
+                let addr = self.heap_alloc_array(&words);
+                self.regs[1] = addr as i64;
+            }
+            11 => {
+                // from_balanced_ternary: R1 = ptr to length-prefixed [trit] array, returns int
+                let ptr = self.regs[1] as usize;
+                let len = self.memory.get(ptr).copied().unwrap_or(0) as usize;
+                let mut result = 0i64;
+                let mut base = 1i64;
+                for i in 0..len {
+                    let t = self.memory.get(ptr + 1 + i).copied().unwrap_or(0);
+                    result += t * base;
+                    base *= 3;
+                }
+                self.regs[1] = result;
+            }
+            12 => {
+                // pack_trits: R1 = ptr to length-prefixed [trit] array, returns t27
+                let ptr = self.regs[1] as usize;
+                let len = self.memory.get(ptr).copied().unwrap_or(0) as usize;
+                let mut result = 0i64;
+                let mut base = 1i64;
+                for i in 0..len {
+                    let t = self.memory.get(ptr + 1 + i).copied().unwrap_or(0);
+                    result += t * base;
+                    base *= 3;
+                }
+                self.regs[1] = clamp27(result);
+            }
+            13 => {
+                // unpack_trits: R1 = t27 value, returns ptr to raw [trit; 27] array (no length prefix)
+                let mut val = self.regs[1];
+                let mut trits = [0i64; 27];
+                for i in 0..27 {
+                    let rem = val.rem_euclid(3);
+                    let d = if rem <= 1 { rem as i64 } else { -1i64 };
+                    trits[i] = d;
+                    val = (val - d) / 3;
+                }
+                let addr = self.heap_alloc_array(&trits);
+                self.regs[1] = addr as i64;
+            }
+            14 => {
+                // fmt::show_int: R1 = int value, returns str ptr in R1
+                let n = self.regs[1];
+                let s = n.to_string();
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            15 => {
+                // fmt::align_right: R1=str_ptr, R21=width, R22=fill_char → returns new str ptr in R1
+                let str_addr = self.regs[1] as usize;
+                let width = self.regs[21] as usize;
+                let fill = char::from_u32(self.regs[22] as u32).unwrap_or(' ');
+                let s = if let Some(content) = self.string_data.get(&str_addr) {
+                    content.clone()
+                } else { String::new() };
+                let padded = if s.len() < width {
+                    let pad: String = std::iter::repeat(fill).take(width - s.len()).collect();
+                    format!("{}{}", pad, s)
+                } else {
+                    s
+                };
+                let addr = self.heap_alloc_str(padded);
+                self.regs[1] = addr as i64;
+            }
+            16 => {
+                // print_bool: R1 = 1 (true) or 0 (false), outputs "true"/"false"
+                let s = if self.regs[1] != 0 { "true".to_string() } else { "false".to_string() };
+                self.output.push(s);
+            }
+
+            // ----------------------------------------------------------------
+            // String syscalls (60-69)
+            // ----------------------------------------------------------------
+            60 => {
+                // str_len(ptr=R1) → R1 = length
+                let s = self.get_string_r1();
+                self.regs[1] = s.len() as i64;
+            }
+            61 => {
+                // str_concat(p1=R1, p2=R2) → R1 = new ptr
+                let s1 = self.get_string_r1();
+                let addr2 = self.regs[2] as usize;
+                let s2 = if let Some(s) = self.string_data.get(&addr2) {
+                    s.clone()
+                } else { self.read_lp_string(addr2) };
+                let combined = format!("{}{}", s1, s2);
+                let addr = self.heap_alloc_str(combined);
+                self.regs[1] = addr as i64;
+            }
+            62 => {
+                // str_slice(ptr=R1, start=R2, end=R3) → R1 = new ptr
+                let s = self.get_string_r1();
+                let start = (self.regs[2] as usize).min(s.len());
+                let end = (self.regs[3] as usize).min(s.len());
+                let sliced = s[start.min(end)..end].to_string();
+                let addr = self.heap_alloc_str(sliced);
+                self.regs[1] = addr as i64;
+            }
+            63 => {
+                // str_contains(p1=R1, p2=R2) → R1 = bool
+                let s1 = self.get_string_r1();
+                let addr2 = self.regs[2] as usize;
+                let s2 = if let Some(s) = self.string_data.get(&addr2) {
+                    s.clone()
+                } else { self.read_lp_string(addr2) };
+                self.regs[1] = if s1.contains(s2.as_str()) { 1 } else { 0 };
+            }
+            64 => {
+                // str_find(p1=R1, p2=R2) → R1 = index or -1
+                let s1 = self.get_string_r1();
+                let addr2 = self.regs[2] as usize;
+                let s2 = if let Some(s) = self.string_data.get(&addr2) {
+                    s.clone()
+                } else { self.read_lp_string(addr2) };
+                let idx = s1.find(s2.as_str()).map(|i| i as i64).unwrap_or(-1);
+                self.regs[1] = idx;
+            }
+            65 => {
+                // str_to_int(ptr=R1) → R1 = int
+                let s = self.get_string_r1();
+                self.regs[1] = s.trim().parse::<i64>().unwrap_or(0);
+            }
+            66 => {
+                // int_to_str(val=R1) → R1 = ptr
+                let n = self.regs[1];
+                let s = n.to_string();
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            67 => {
+                // str_split(ptr=R1, delim=R2) → R1 = Vec handle of str ptrs
+                let s = self.get_string_r1();
+                let addr2 = self.regs[2] as usize;
+                let delim = if let Some(d) = self.string_data.get(&addr2) {
+                    d.clone()
+                } else { self.read_lp_string(addr2) };
+                let parts: Vec<i64> = s.split(delim.as_str())
+                    .map(|part| {
+                        let a = self.heap_ptr;
+                        self.heap_alloc_str(part.to_string()) as i64;
+                        a as i64
+                    })
+                    .collect();
+                let vec_handle = self.heap_alloc_obj(HeapObj::Vec(parts));
+                self.regs[1] = vec_handle as i64;
+            }
+            68 => {
+                // str_trim(ptr=R1) → R1 = new ptr
+                let s = self.get_string_r1();
+                let trimmed = s.trim().to_string();
+                let addr = self.heap_alloc_str(trimmed);
+                self.regs[1] = addr as i64;
+            }
+            69 => {
+                // str_replace(ptr=R1, find=R2, replace=R3) → R1 = new ptr
+                let s = self.get_string_r1();
+                let addr2 = self.regs[2] as usize;
+                let addr3 = self.regs[3] as usize;
+                let find_s = if let Some(d) = self.string_data.get(&addr2) {
+                    d.clone()
+                } else { self.read_lp_string(addr2) };
+                let repl_s = if let Some(d) = self.string_data.get(&addr3) {
+                    d.clone()
+                } else { self.read_lp_string(addr3) };
+                let result = s.replace(find_s.as_str(), repl_s.as_str());
+                let addr = self.heap_alloc_str(result);
+                self.regs[1] = addr as i64;
+            }
+
+            // ----------------------------------------------------------------
+            // String comparison (200) and t27 shifts (201-202)
+            // ----------------------------------------------------------------
+            200 => {
+                // str_eq(p1=R1, p2=R2) → R1 = 1 if equal, 0 if not
+                let s1 = self.get_string_r1();
+                let addr2 = self.regs[2] as usize;
+                let s2 = if let Some(s) = self.string_data.get(&addr2) {
+                    s.clone()
+                } else { self.read_lp_string(addr2) };
+                self.regs[1] = if s1 == s2 { 1 } else { 0 };
+            }
+            201 => {
+                // t27_shift_left(R1=n, R2=k) → R1 = n * 3^k
+                let n = self.regs[1];
+                let k = self.regs[2];
+                let mut factor = 1i64;
+                for _ in 0..k { factor *= 3; }
+                self.regs[1] = n * factor;
+            }
+            202 => {
+                // t27_shift_right(R1=n, R2=k) → R1 = n / 3^k  (truncating)
+                let n = self.regs[1];
+                let k = self.regs[2];
+                let mut factor = 1i64;
+                for _ in 0..k { factor *= 3; }
+                self.regs[1] = if factor == 0 { 0 } else { n / factor };
+            }
+
+            // ----------------------------------------------------------------
+            // Float syscalls (210-220)
+            // ----------------------------------------------------------------
+            210 => {
+                // itof: R1 = int → R1 = f64 bits
+                let i = self.regs[1];
+                self.regs[1] = (i as f64).to_bits() as i64;
+            }
+            211 => {
+                // ftoi: R1 = f64 bits → R1 = int (truncate toward zero)
+                let f = f64::from_bits(self.regs[1] as u64);
+                self.regs[1] = f as i64;
+            }
+            212 => {
+                // fadd: R1 + R2 → R1
+                let a = f64::from_bits(self.regs[1] as u64);
+                let b = f64::from_bits(self.regs[2] as u64);
+                self.regs[1] = (a + b).to_bits() as i64;
+            }
+            213 => {
+                // fsub: R1 - R2 → R1
+                let a = f64::from_bits(self.regs[1] as u64);
+                let b = f64::from_bits(self.regs[2] as u64);
+                self.regs[1] = (a - b).to_bits() as i64;
+            }
+            214 => {
+                // fmul: R1 * R2 → R1
+                let a = f64::from_bits(self.regs[1] as u64);
+                let b = f64::from_bits(self.regs[2] as u64);
+                self.regs[1] = (a * b).to_bits() as i64;
+            }
+            215 => {
+                // fdiv: R1 / R2 → R1
+                let a = f64::from_bits(self.regs[1] as u64);
+                let b = f64::from_bits(self.regs[2] as u64);
+                self.regs[1] = (a / b).to_bits() as i64;
+            }
+            216 => {
+                // fcmp: compare R1, R2 → R1 = +1/0/-1 (like TCMP for floats)
+                let a = f64::from_bits(self.regs[1] as u64);
+                let b = f64::from_bits(self.regs[2] as u64);
+                self.regs[1] = if a > b { 1 } else if a < b { -1 } else { 0 };
+            }
+            219 => {
+                // float_load: R1 = address → R1 = float bits at that address
+                let addr = self.regs[1] as usize;
+                if let Some(&bits) = self.float_data.get(&addr) {
+                    self.regs[1] = bits;
+                } else {
+                    self.regs[1] = 0;
+                }
+            }
+            220 => {
+                // fneg: R1 = -R1 (flip IEEE 754 sign bit, bit 63)
+                self.regs[1] = self.regs[1] ^ (1i64 << 63);
+            }
+
+            // ----------------------------------------------------------------
+            // fmt_format / fmt_show_* (127-132)
+            // ----------------------------------------------------------------
+            127 => {
+                // fmt_format(template_ptr=R1, arg0=R2, arg1=R3, ...) → R1 = result str ptr
+                let tmpl = self.get_string_r1();
+                let placeholder_count = tmpl.matches("{}").count();
+                let arg_strs: Vec<String> = (0..placeholder_count).map(|i| {
+                    let val = if i + 2 < self.regs.len() { self.regs[i + 2] } else { 0 };
+                    let addr = val as usize;
+                    if let Some(s) = self.string_data.get(&addr) {
+                        s.clone()
+                    } else {
+                        val.to_string()
+                    }
+                }).collect();
+                let mut out = String::new();
+                let mut arg_iter = arg_strs.iter();
+                let mut chars = tmpl.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '{' && chars.peek() == Some(&'}') {
+                        chars.next();
+                        out.push_str(arg_iter.next().map(|s| s.as_str()).unwrap_or(""));
+                    } else {
+                        out.push(c);
+                    }
+                }
+                let addr = self.heap_alloc_str(out);
+                self.regs[1] = addr as i64;
+            }
+            128 => {
+                // fmt_show_int(val=R1) → R1 = str ptr
+                let n = self.regs[1];
+                let s = n.to_string();
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            129 => {
+                // fmt_show_float(val=R1) → R1 = str ptr (val is f64 bits as i64)
+                let bits = self.regs[1] as u64;
+                let f = f64::from_bits(bits);
+                let s = format!("{}", f);
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            130 => {
+                // fmt_show_bool(val=R1) → R1 = str ptr
+                let b = self.regs[1];
+                let s = if b != 0 { "true".to_string() } else { "false".to_string() };
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            132 => {
+                // fmt::align_left: R1=str_ptr, R21=width, R22=fill_char → returns new str ptr
+                let str_addr = self.regs[1] as usize;
+                let width = self.regs[21] as usize;
+                let fill = char::from_u32(self.regs[22] as u32).unwrap_or(' ');
+                let s = if let Some(content) = self.string_data.get(&str_addr) {
+                    content.clone()
+                } else {
+                    self.read_lp_string(str_addr)
+                };
+                let padded = if s.len() < width {
+                    let pad: String = std::iter::repeat(fill).take(width - s.len()).collect();
+                    format!("{}{}", s, pad)
+                } else {
+                    s
+                };
+                let addr = self.heap_alloc_str(padded);
+                self.regs[1] = addr as i64;
+            }
+
+            // ----------------------------------------------------------------
+            // Time (540) and env (550-551)
+            // ----------------------------------------------------------------
+            540 => {
+                // time_now() -> R1 (Unix timestamp as milliseconds, i64)
+                let ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.regs[1] = ms;
+            }
+            550 => {
+                // env_exit(code: R1) — exit the process immediately
+                let code = self.regs[1] as i32;
+                std::process::exit(code);
+            }
+            #[allow(unreachable_patterns)]
+            551 => {
+                // env_args() -> R1 — returns a Vec handle (empty for now)
+                let h = self.heap_alloc_obj(HeapObj::Vec(Vec::new()));
+                self.regs[1] = h as i64;
+            }
+
+            _ => unreachable!("do_syscall_io: unexpected num={}", num),
+        }
+    }
+}

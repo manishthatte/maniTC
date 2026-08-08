@@ -1,0 +1,53 @@
+THE MANIT RUNTIME LIBRARY EXCEPTION
+Version 1.0, 9 August 2026
+
+Copyright © 2026 Manish Jagdish Thatte
+
+This is an Additional Permission under Section 7 of the GNU Affero General
+Public License, version 3 ("AGPLv3"), applying to the ManiT Runtime Library
+as defined below. It is granted by Manish Jagdish Thatte, the copyright
+holder of the ManiT compiler (manitc) and the ManiT Runtime Library.
+
+0. Definitions.
+
+"The Compiler" means the ManiT compiler (manitc), licensed under AGPLv3.
+
+"The Runtime Library" means the files contained in the `runtime/` and
+`stdlib/` directories of the manitc source distribution, in source form or
+in any compiled, translated, or linked form, including copies of their
+code that the Compiler embeds into its output.
+
+"Target Code" means output produced by running the Compiler on a program
+written in the ManiT language: LLVM IR, T3ISA assembly or binary (.t3s,
+.t3b), object code, executables, or equivalent forms.
+
+"Independent Program" means a ManiT program that is not itself a modified
+version of the Compiler or of the Runtime Library.
+
+1. Grant of Additional Permission.
+
+You have permission to convey Target Code of an Independent Program,
+combined or linked with the Runtime Library, under license terms of your
+choice. The AGPLv3 obligations of the Compiler and the Runtime Library do
+NOT extend to such Target Code merely because the Runtime Library is
+combined with it or embedded in it.
+
+2. What this exception does NOT cover.
+
+This permission does not apply to:
+  (a) the Compiler itself, or any modified version of it;
+  (b) the Runtime Library itself, or any modified version of it, when
+      distributed other than as part of Target Code of an Independent
+      Program.
+Modifications to the Compiler or to the Runtime Library remain governed by
+AGPLv3 in full, including its network-use provisions.
+
+3. No other change.
+
+Except as stated above, the AGPLv3 applies unmodified. This exception does
+not limit any rights you would otherwise have under the AGPLv3, and it may
+be removed by you from copies you convey (AGPLv3 §7).
+
+In plain words: programs you write in ManiT and compile with manitc are
+YOURS — release them under any license you like, closed or open. Only the
+compiler and the runtime/stdlib themselves are copyleft.

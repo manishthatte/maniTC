@@ -1,0 +1,59 @@
+=== 12 Advanced Closures ===
+-- lambda literals --
+PASS lambda: inc(5)=6
+PASS lambda: double(5)=10
+PASS lambda: neg(5)=-5
+PASS lambda: square(4)=16
+PASS lambda: zero(99)=0
+-- composition --
+PASS compose: inc then double: 3→8
+PASS compose: double then inc: 3→7
+PASS compose: inc then square: 4→25
+PASS compose: square then inc: 4→17
+-- twice --
+PASS twice: inc 5→7
+PASS twice: double 3→12
+-- n-times --
+PASS n-times: 0 inc(5)=5
+PASS n-times: 3 inc(5)=8
+PASS n-times: 5 inc(0)=5
+PASS n-times: 4 double(1)=16
+-- pipeline map→filter→fold --
+PASS pipeline: doubled[0]=2
+PASS pipeline: doubled[4]=10
+PASS pipeline: big len=2
+PASS pipeline: big[0]=8
+PASS pipeline: big[1]=10
+PASS pipeline: sum=18
+-- map complex --
+PASS map-complex: -15→-10
+PASS map-complex: -5→-5
+PASS map-complex: 0→0
+PASS map-complex: 5→5
+PASS map-complex: 15→10
+-- filter complex --
+PASS filter-complex: perfect squares len=5
+PASS filter-complex: [0]=0
+PASS filter-complex: [1]=1
+PASS filter-complex: [2]=4
+PASS filter-complex: [3]=9
+PASS filter-complex: [4]=16
+-- fold complex --
+PASS fold: max=5
+PASS fold: min=1
+PASS fold: count>2=3
+PASS fold: sum=14
+-- two-arg closures --
+PASS 2-arg: add(7,3)=10
+PASS 2-arg: sub(7,3)=4
+PASS 2-arg: mul(7,3)=21
+PASS 2-arg: max2(7,3)=7
+PASS 2-arg: max2(3,7)=7
+-- named fn as arg --
+PASS named-fn: increment(4)=5
+PASS named-fn: decrement(4)=3
+PASS named-fn: negate(4)=-4
+PASS named-fn: twice-inc(5)=7
+PASS named-fn: n-times 5 inc(0)=5
+Done.
+

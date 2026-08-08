@@ -1,0 +1,8 @@
+/target
+*.ll
+*.o
+a.out
+*.t3b
+*.t3s
+*.t3d
+*.t3f

@@ -1,0 +1,74 @@
+=== 02 Operators ===
+-- arithmetic --
+PASS add: 3+4=7
+PASS sub: 10-3=7
+PASS mul: 6*7=42
+PASS div: 20/4=5
+PASS mod: 17%5=2
+PASS neg: -(-5)=5
+PASS div-trunc: 7/2=3
+PASS div-trunc: -7/2=-3
+PASS mod-sign: 7%3=1
+PASS mod-sign: -7%3=-1
+PASS chain: 2+3*4=14
+PASS chain: (2+3)*4=20
+PASS chain: 10-2-3=5
+-- comparison --
+PASS cmp: ==
+PASS cmp: !=
+PASS cmp: <
+PASS cmp: <=
+PASS cmp: >
+PASS cmp: >=
+PASS cmp-neg: !=
+PASS cmp-neg: !>
+-- logical --
+PASS logical: T&&T
+PASS logical: T&&F=F
+PASS logical: T||F
+PASS logical: F||F=F
+PASS logical: !F
+PASS logical: !!T
+PASS short-circuit: &&
+PASS short-circuit: x not mutated
+-- bitwise --
+PASS bitwise: 6&3=2
+PASS bitwise: 6|3=7
+PASS bitwise: 6^3=5
+PASS bitwise: 1<<3=8
+PASS bitwise: 8>>2=2
+PASS bitwise: ~0 via xor: -1^0=-1
+-- compound assign --
+PASS compound: +=
+PASS compound: -=
+PASS compound: *=
+PASS compound: /=
+-- ternary logic --
+PASS tand: + tand + = +
+PASS tand: + tand 0 = 0
+PASS tand: + tand - = -
+PASS tand: 0 tand 0 = 0
+PASS tand: 0 tand - = -
+PASS tand: - tand - = -
+PASS tor: + tor + = +
+PASS tor: + tor 0 = +
+PASS tor: + tor - = +
+PASS tor: 0 tor 0 = 0
+PASS tor: 0 tor - = 0
+PASS tor: - tor - = -
+PASS tnot: tnot + = -
+PASS tnot: tnot 0 = 0
+PASS tnot: tnot - = +
+PASS txor: + txor + = 0
+PASS txor: + txor 0 = +
+PASS txor: + txor - = +
+PASS txor: - txor - = 0
+PASS txor: 0 txor - = +
+-- precedence --
+PASS prec: 2+3==5
+PASS prec: -2*3=-6
+PASS prec: 2+3*4=14
+PASS prec: 1+1<<1=4
+PASS prec: 2&3|4=6
+Done.
+

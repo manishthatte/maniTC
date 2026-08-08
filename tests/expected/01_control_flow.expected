@@ -1,0 +1,46 @@
+=== 01 Control Flow ===
+-- if/elif/else --
+PASS if: x>5
+PASS if: x==7
+PASS if: not-negative
+PASS elif: branch3
+PASS if-expr: big
+PASS if-expr: elif
+PASS nested-if: both
+-- tif --
+PASS tif: pos arm
+PASS tif: zer arm
+PASS tif: neg arm
+PASS tif-bool3: true
+PASS tif-bool3: unknown
+PASS tif-bool3: false
+-- match --
+PASS match-int: 42
+PASS match-wild: wildcard
+PASS match-guard: medium
+PASS match-or: 1|2|3
+PASS match-or: fallthrough
+PASS match-expr: zero
+PASS match-expr: one
+PASS match-expr: negative
+PASS match-expr: other
+-- for --
+PASS for: range sum
+PASS for: inclusive range
+PASS for: empty range
+PASS for: nested 3x3=9
+-- while --
+PASS while: 5!=120
+PASS while: no-execute
+-- loop/break/continue --
+PASS loop: break at 5
+PASS continue: odd sum
+PASS break: in for at 7
+-- return --
+PASS return: negative
+PASS return: zero
+PASS return: positive
+-- block expr --
+PASS block-expr: 3^2+4^2=25
+Done.
+
