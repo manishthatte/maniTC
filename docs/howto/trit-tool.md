@@ -1,5 +1,8 @@
 # HOW-TO: trit build tool
 
+> **Note (initial public release):** the `trit` build tool is not included in
+> this release — it ships later. This document is a preview of its interface.
+
 `trit` is the official build tool and package manager for maniT projects. It
 handles project scaffolding, compilation, testing, formatting, and documentation
 generation.

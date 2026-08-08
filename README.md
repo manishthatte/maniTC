@@ -18,6 +18,9 @@ the ground floor.
 
 ## Quick start
 
+**New here? Read [GETTING_STARTED.md](GETTING_STARTED.md)** — the full
+handbook from install to booting THATTEOS.
+
 ```sh
 cargo build --release
 
@@ -34,8 +37,8 @@ clang-19 hello.ll manit_runtime.o -o hello -lm && ./hello
 ./target/release/manitc bench examples/fibonacci.mt
 ```
 
-Fifteen example programs live in `examples/` — from `fibonacci.mt` to a
-ternary neural network. Start with `docs/howto/getting-started.md`, then the
+Seventeen example programs live in `examples/` — from `fibonacci.mt` to a
+ternary neural network. Start with [GETTING_STARTED.md](GETTING_STARTED.md), then the
 [language reference](docs/language-reference.md), the
 [stdlib reference](docs/stdlib-reference.md), and the
 [T3ISA reference](docs/t3isa-reference.md).

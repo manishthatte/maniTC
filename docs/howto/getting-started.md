@@ -90,6 +90,10 @@ clang a.ll -o hello
 
 ## 3. Using the build tool
 
+> **Note (initial public release):** the `trit` build tool described in
+> sections 3, 10 and 11 is not included in this release — it ships later.
+> Everything else in this guide works with `manitc` alone.
+
 Create a new project:
 
 ```bash
