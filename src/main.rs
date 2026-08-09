@@ -168,6 +168,16 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
             })?;
             println!("[LLVM] wrote {}", ll_path.display());
 
+            // A18: `output.with_extension("ll")` is a no-op when -o already
+            // names a .ll file, so ll_path and output are the same path and
+            // linking would overwrite the IR we just wrote with the ELF
+            // binary. Asking for a .ll output means "emit LLVM IR", so stop
+            // here instead: the caller (e.g. thatteos/build.sh) links itself.
+            if ll_path == *output {
+                println!("[LLVM] IR-only output (-o names a .ll file) — not linking");
+                return Ok(());
+            }
+
             // Resolve the runtime C source and decide how to build it — full
             // (SDL2 + libcurl) or minimal. See runtime_link.
             let runtime_c_path = runtime_link::resolve_source(Some(&file)).map_err(|e| {
