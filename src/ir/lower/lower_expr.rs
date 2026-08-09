@@ -1,7 +1,7 @@
 // ir/lower/lower_expr.rs — Expression and pointer lowering for IRLowerer.
 
 use super::IRLowerer;
-use super::helpers::{binop_to_ir, unop_to_ir};
+use super::helpers::{array_value_ty, binop_to_ir, slot_access_ty, unop_to_ir};
 use crate::ir::types::*;
 use crate::ast::{BinOpKind, UnOpKind};
 use crate::semantic::{ManiType, TypedExpr, TypedExprKind};
@@ -34,7 +34,8 @@ impl IRLowerer {
                     self.emit(IRInstr::Load {
                         dst: dst.clone(),
                         ptr: IRValue::Temp(alloca),
-                        ty: var_ty,
+                        // Array-typed locals hold a pointer; load it as one.
+                        ty: array_value_ty(&var_ty),
                     });
                     IRValue::Temp(dst)
                 } else if name.contains("::") {
@@ -47,11 +48,9 @@ impl IRLowerer {
                             }
                         }
                     }
-                    // Not a known enum variant — global or function ref
-                    IRValue::Global(name.clone())
+                    self.lower_global_read(name)
                 } else {
-                    // Global or function ref
-                    IRValue::Global(name.clone())
+                    self.lower_global_read(name)
                 }
             }
 
@@ -347,21 +346,35 @@ impl IRLowerer {
             }
 
             TypedExprKind::Call(callee, args) => {
-                // Detect print intrinsics
+                // Detect print intrinsics. Bare `print`/`println` are
+                // variadic line-printers: every argument is printed in
+                // order by its type, followed by one newline (all example
+                // and ThatteOS call sites treat one call as one line).
                 if let TypedExprKind::Ident(name) = &callee.kind {
                     if name == "println" || name == "print" {
-                        if let Some(first_arg) = args.first() {
-                            let val = self.lower_expr(first_arg);
-                            match &first_arg.ty {
+                        for arg in args {
+                            let val = self.lower_expr(arg);
+                            match &arg.ty {
                                 ManiType::Str => self.emit(IRInstr::PrintStr(val)),
                                 ManiType::Int => self.emit(IRInstr::PrintInt(val)),
                                 ManiType::Float => self.emit(IRInstr::PrintFloat(val)),
                                 ManiType::Bool3 => self.emit(IRInstr::PrintBool3(val)),
                                 ManiType::Trit => self.emit(IRInstr::PrintTrit(val)),
+                                ManiType::Tryte
+                                | ManiType::T9
+                                | ManiType::T27
+                                | ManiType::T54
+                                | ManiType::Bool
+                                | ManiType::Char
+                                | ManiType::Unknown => {
+                                    self.emit(IRInstr::PrintInt(val))
+                                }
                                 _ => self.emit(IRInstr::PrintStr(val)),
                             }
-                            return IRValue::Void;
                         }
+                        let nl = self.intern_string("\n");
+                        self.emit(IRInstr::PrintStr(IRValue::Const(IRConst::Str(nl))));
+                        return IRValue::Void;
                     }
                 }
 
@@ -376,9 +389,52 @@ impl IRLowerer {
                     false
                 };
 
+                // fmt::format(tmpl, [a, b, ...]) — the argument array is a
+                // syntactic wrapper: both backends receive the elements as
+                // individual trailing arguments (T3 syscall 127 reads them
+                // from R2.., the C runtime via varargs). Splat a literal
+                // array; a non-literal array value has no known arity here
+                // and falls through unchanged.
+                let is_fmt_format = matches!(
+                    &callee.kind,
+                    TypedExprKind::Ident(n) if n == "fmt::format" || n == "fmt_format"
+                );
+
+                let callee_param_manitys = match &callee.kind {
+                    TypedExprKind::Ident(n) => self.fn_param_manitys.get(n).cloned(),
+                    _ => None,
+                };
+
                 let mut arg_vals = Vec::new();
-                for arg in args {
-                    arg_vals.push(self.lower_expr(arg));
+                for (arg_i, arg) in args.iter().enumerate() {
+                    if is_fmt_format && arg_i > 0 {
+                        // Substitution arguments (everything after the
+                        // template) become individual string arguments:
+                        // a literal array is splatted, and non-string
+                        // values go through the matching fmt::show_*
+                        // conversion so the runtime only ever sees
+                        // strings for its {} slots.
+                        if let TypedExprKind::Array(elems) = &arg.kind {
+                            for elem in elems {
+                                let v = self.lower_expr(elem);
+                                let v = self.fmt_arg_to_str(v, &elem.ty);
+                                arg_vals.push(v);
+                            }
+                            continue;
+                        }
+                        let v = self.lower_expr(arg);
+                        let v = self.fmt_arg_to_str(v, &arg.ty);
+                        arg_vals.push(v);
+                        continue;
+                    }
+                    let mut v = self.lower_expr(arg);
+                    if let Some(ptys) = &callee_param_manitys {
+                        if let Some(pty) = ptys.get(arg_i) {
+                            let pty = pty.clone();
+                            v = self.coerce_value(v, &arg.ty, &pty);
+                        }
+                    }
+                    arg_vals.push(v);
                 }
 
                 if is_indirect {
@@ -422,10 +478,16 @@ impl IRLowerer {
                                 if **elem_mty == ManiType::Trit {
                                     let n = *n;
                                     let raw_ptr = arg_vals[0].clone();
+                                    // The runtime/emulator expect one word per slot:
+                                    // memory[ptr] = len, memory[ptr+1+i] = trit i
+                                    // (see read_lp_string / syscall pack_trits).
+                                    // Use I64 slots throughout so the length word
+                                    // never overlaps trit slots and the buffer is
+                                    // large enough on the byte-scaled LLVM path.
                                     let buf_t = self.fresh_temp();
                                     self.emit(IRInstr::Alloca {
                                         dst: buf_t.clone(),
-                                        ty: IRType::Array(Box::new(IRType::Trit), n + 1),
+                                        ty: IRType::Array(Box::new(IRType::I64), n + 1),
                                     });
                                     let lp_t = self.fresh_temp();
                                     self.emit(IRInstr::GetPtr { dst: lp_t.clone(), ptr: IRValue::Temp(buf_t.clone()), idx: IRValue::Const(IRConst::Int(0)), ty: IRType::I64 });
@@ -436,14 +498,18 @@ impl IRLowerer {
                                         let ev_t = self.fresh_temp();
                                         self.emit(IRInstr::Load { dst: ev_t.clone(), ptr: IRValue::Temp(sp_t), ty: IRType::Trit });
                                         let dp_t = self.fresh_temp();
-                                        self.emit(IRInstr::GetPtr { dst: dp_t.clone(), ptr: IRValue::Temp(buf_t.clone()), idx: IRValue::Const(IRConst::Int((j + 1) as i64)), ty: IRType::Trit });
-                                        self.emit(IRInstr::Store { ptr: IRValue::Temp(dp_t), val: IRValue::Temp(ev_t), ty: IRType::Trit });
+                                        self.emit(IRInstr::GetPtr { dst: dp_t.clone(), ptr: IRValue::Temp(buf_t.clone()), idx: IRValue::Const(IRConst::Int((j + 1) as i64)), ty: IRType::I64 });
+                                        self.emit(IRInstr::Store { ptr: IRValue::Temp(dp_t), val: IRValue::Temp(ev_t), ty: IRType::I64 });
                                     }
                                     arg_vals[0] = IRValue::Temp(buf_t);
                                 }
                             }
                         }
                     }
+
+                    // Hidden trailing lengths for `[T]` (unsized array) params.
+                    let typed_args: Vec<&TypedExpr> = args.iter().collect();
+                    self.append_unsized_len_args(&func_name, &typed_args, &mut arg_vals);
 
                     if ty == IRType::Void {
                         self.emit(IRInstr::Call {
@@ -461,6 +527,8 @@ impl IRLowerer {
                             self.emit(IRInstr::Call { dst: Some(dst.clone()), func: func_name, args: arg_vals, ret_ty: ty });
                             IRValue::Temp(dst)
                         }
+                    } else if let IRType::Array(_, _) = ty {
+                        self.lower_array_call(func_name, arg_vals, ty)
                     } else {
                         let dst = self.fresh_temp();
                         self.emit(IRInstr::Call {
@@ -483,6 +551,11 @@ impl IRLowerer {
                 let obj_ty_display = obj.ty.display();
                 let base_type = strip_generics(obj_ty_display.as_str());
                 let func_name = format!("{}::{}", base_type, method);
+                // Hidden trailing lengths for `[T]` (unsized array) params —
+                // method params include self, so prepend the receiver.
+                let typed_args: Vec<&TypedExpr> =
+                    std::iter::once(obj.as_ref()).chain(args.iter()).collect();
+                self.append_unsized_len_args(&func_name, &typed_args, &mut arg_vals);
                 if ty == IRType::Void {
                     self.emit(IRInstr::Call {
                         dst: None,
@@ -499,6 +572,8 @@ impl IRLowerer {
                         self.emit(IRInstr::Call { dst: Some(dst.clone()), func: func_name, args: arg_vals, ret_ty: ty });
                         IRValue::Temp(dst)
                     }
+                } else if let IRType::Array(_, _) = ty {
+                    return self.lower_array_call(func_name, arg_vals, ty);
                 } else {
                     let dst = self.fresh_temp();
                     self.emit(IRInstr::Call {
@@ -541,18 +616,19 @@ impl IRLowerer {
 
                 let obj_val = self.lower_expr(obj);
                 let idx = IRValue::Const(IRConst::Int(field_idx));
+                // Uniform 8-byte slot convention for aggregates (see slot_access_ty).
                 let ptr_t = self.fresh_temp();
                 self.emit(IRInstr::GetPtr {
                     dst: ptr_t.clone(),
                     ptr: obj_val,
                     idx,
-                    ty: ty.clone(),
+                    ty: IRType::I64,
                 });
                 let dst = self.fresh_temp();
                 self.emit(IRInstr::Load {
                     dst: dst.clone(),
                     ptr: IRValue::Temp(ptr_t),
-                    ty,
+                    ty: slot_access_ty(&ty),
                 });
                 IRValue::Temp(dst)
             }
@@ -587,17 +663,20 @@ impl IRLowerer {
                 for (i, elem) in elems.iter().enumerate() {
                     let val = self.lower_expr(elem);
                     let idx_val = IRValue::Const(IRConst::Int(i as i64));
+                    // Array-typed elements (nested arrays) are stored as
+                    // pointers, one 8-byte slot each.
+                    let elem_access = array_value_ty(&IRType::from_mani(&elem.ty));
                     let ptr_t = self.fresh_temp();
                     self.emit(IRInstr::GetPtr {
                         dst: ptr_t.clone(),
                         ptr: IRValue::Temp(alloca_t.clone()),
                         idx: idx_val,
-                        ty: IRType::from_mani(&elem.ty),
+                        ty: elem_access.clone(),
                     });
                     self.emit(IRInstr::Store {
                         ptr: IRValue::Temp(ptr_t),
                         val,
-                        ty: IRType::from_mani(&elem.ty),
+                        ty: elem_access,
                     });
                 }
                 IRValue::Temp(alloca_t)
@@ -609,17 +688,18 @@ impl IRLowerer {
                 for (i, elem) in elems.iter().enumerate() {
                     let val = self.lower_expr(elem);
                     let idx_val = IRValue::Const(IRConst::Int(i as i64));
+                    // Uniform 8-byte slot convention for aggregates (see slot_access_ty).
                     let ptr_t = self.fresh_temp();
                     self.emit(IRInstr::GetPtr {
                         dst: ptr_t.clone(),
                         ptr: IRValue::Temp(alloca_t.clone()),
                         idx: idx_val,
-                        ty: IRType::from_mani(&elem.ty),
+                        ty: IRType::I64,
                     });
                     self.emit(IRInstr::Store {
                         ptr: IRValue::Temp(ptr_t),
                         val,
-                        ty: IRType::from_mani(&elem.ty),
+                        ty: slot_access_ty(&IRType::from_mani(&elem.ty)),
                     });
                 }
                 IRValue::Temp(alloca_t)
@@ -631,28 +711,37 @@ impl IRLowerer {
                     dst: alloca_t.clone(),
                     ty: IRType::Struct(name.clone()),
                 });
+                let field_manitys = self.struct_field_manitys.get(name).cloned();
                 for (i, (_, fval)) in fields.iter().enumerate() {
-                    let val = self.lower_expr(fval);
+                    let mut val = self.lower_expr(fval);
+                    if let Some(fmt) = field_manitys.as_ref().and_then(|f| f.get(i)) {
+                        let fmt = fmt.clone();
+                        val = self.coerce_value(val, &fval.ty, &fmt);
+                    }
                     let idx = IRValue::Const(IRConst::Int(i as i64));
+                    // Uniform 8-byte slot convention for aggregates (see slot_access_ty).
                     let ptr_t = self.fresh_temp();
                     self.emit(IRInstr::GetPtr {
                         dst: ptr_t.clone(),
                         ptr: IRValue::Temp(alloca_t.clone()),
                         idx,
-                        ty: IRType::from_mani(&fval.ty),
+                        ty: IRType::I64,
                     });
                     self.emit(IRInstr::Store {
                         ptr: IRValue::Temp(ptr_t),
                         val,
-                        ty: IRType::from_mani(&fval.ty),
+                        ty: slot_access_ty(&IRType::from_mani(&fval.ty)),
                     });
                 }
                 IRValue::Temp(alloca_t)
             }
 
             TypedExprKind::Range(lo, hi, _inclusive) => {
+                // Evaluate lo before hi for left-to-right side-effect order,
+                // matching the other range lowerings.
+                let lo_val = self.lower_expr(lo);
                 let _hi_val = self.lower_expr(hi);
-                self.lower_expr(lo)
+                lo_val
             }
 
             TypedExprKind::Cast(inner, target_ty) => {
@@ -796,6 +885,54 @@ impl IRLowerer {
     }
 
     /// Get a pointer (IRValue) for assignment targets.
+    /// Reading a name that is not a local: module globals load their value
+    /// through the global's address; anything else (function references,
+    /// extern symbols) stays an address value.
+    fn lower_global_read(&mut self, name: &str) -> IRValue {
+        if let Some(gty) = self.global_vars.get(name).cloned() {
+            let dst = self.fresh_temp();
+            self.emit(IRInstr::Load {
+                dst: dst.clone(),
+                ptr: IRValue::Global(name.to_string()),
+                ty: array_value_ty(&gty),
+            });
+            return IRValue::Temp(dst);
+        }
+        IRValue::Global(name.to_string())
+    }
+
+    /// Convert a fmt::format substitution argument to a string value.
+    /// Strings pass through; scalars are routed through the matching
+    /// fmt::show_* runtime conversion (both backends implement these).
+    fn fmt_arg_to_str(&mut self, val: IRValue, ty: &ManiType) -> IRValue {
+        let conv = match ty {
+            ManiType::Str => return val,
+            ManiType::Float | ManiType::Tfloat => "fmt::show_float",
+            ManiType::Bool => "fmt::show_bool",
+            // Trit/bool3 print as their numeric value: only show_int has a
+            // T3 syscall, and both backends must format identically.
+            ManiType::Int
+            | ManiType::Trit
+            | ManiType::Bool3
+            | ManiType::Tryte
+            | ManiType::T9
+            | ManiType::T27
+            | ManiType::T54
+            | ManiType::Char => "fmt::show_int",
+            // Unknown and composites: assume the caller already produced a
+            // string (the documented [fmt::show_*(..)] pattern).
+            _ => return val,
+        };
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::Call {
+            dst: Some(dst.clone()),
+            func: conv.to_string(),
+            args: vec![val],
+            ret_ty: IRType::Ptr(Box::new(IRType::I8)),
+        });
+        IRValue::Temp(dst)
+    }
+
     pub(super) fn lower_expr_as_ptr(&mut self, expr: &TypedExpr) -> IRValue {
         use crate::ast::UnOpKind;
         match &expr.kind {
@@ -831,12 +968,13 @@ impl IRLowerer {
                     .unwrap_or(0) as i64;
                 let obj_val = self.lower_expr(obj);
                 let idx = IRValue::Const(IRConst::Int(field_idx));
+                // Uniform 8-byte slot convention for aggregates (see slot_access_ty).
                 let ptr_t = self.fresh_temp();
                 self.emit(IRInstr::GetPtr {
                     dst: ptr_t.clone(),
                     ptr: obj_val,
                     idx,
-                    ty: IRType::from_mani(&expr.ty),
+                    ty: IRType::I64,
                 });
                 IRValue::Temp(ptr_t)
             }

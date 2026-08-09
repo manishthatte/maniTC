@@ -230,11 +230,22 @@ impl Default for Emulator {
 // ---------------------------------------------------------------------------
 
 pub fn run_emulator(words: Vec<i64>, string_data: HashMap<usize, String>, float_data: HashMap<usize, i64>) -> Vec<String> {
+    run_emulator_with_exit(words, string_data, float_data).0
+}
+
+/// Run the emulator and also return the program's exit code: R1 at halt,
+/// which holds main's return value (void mains clear R1 in their epilogue).
+pub fn run_emulator_with_exit(
+    words: Vec<i64>,
+    string_data: HashMap<usize, String>,
+    float_data: HashMap<usize, i64>,
+) -> (Vec<String>, i64) {
     let mut emu = Emulator::new();
     emu.load_program(words);
     emu.string_data = string_data;
     emu.float_data = float_data;
-    emu.run_with_output()
+    let out = emu.run_with_output();
+    (out, emu.regs[1])
 }
 
 /// Run emulator in interactive debug mode.

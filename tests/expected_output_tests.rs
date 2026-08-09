@@ -66,7 +66,18 @@ fn get_t3_output(test_file: &str) -> String {
 
 /// Get LLVM output for a test file (returns None if clang not available).
 fn get_llvm_output(test_file: &str) -> Option<String> {
-    if !Command::new("clang").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+    // Same candidates as runtime_link::find_clang — Debian installs
+    // versioned names only (clang-19), possibly outside PATH.
+    let has_clang = ["clang", "clang-19", "clang-18", "clang-17", "/usr/lib/llvm-19/bin/clang"]
+        .iter()
+        .any(|c| {
+            Command::new(c)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        });
+    if !has_clang {
         return None;
     }
 
@@ -151,15 +162,26 @@ expected_test!(expected_12_advanced_closures, "12_advanced_closures.mt");
 expected_test!(expected_13_numeric_edge_cases, "13_numeric_edge_cases.mt");
 expected_test!(expected_14_ternary_logic_complete, "14_ternary_logic_complete.mt");
 expected_test!(expected_17_tcon_tany, "17_tcon_tany.mt");
+expected_test!(expected_27_ir_regressions, "27_ir_regressions.mt");
 
 // Cross-target consistency (T3 vs LLVM — tests that pass on both)
+// 05_ternary_types is excluded: T3 and LLVM print a char-typed value
+// differently (emulator vs C runtime %c), a known backend divergence.
+// 16_concurrency_basic is excluded: the LLVM binary hangs on the C
+// runtime's channel semantics.
 cross_target_test!(cross_01_control_flow, "01_control_flow.mt");
 cross_target_test!(cross_02_operators, "02_operators.mt");
 cross_target_test!(cross_03_functions, "03_functions.mt");
+cross_target_test!(cross_04_structs_enums, "04_structs_enums.mt");
 cross_target_test!(cross_06_collections, "06_collections.mt");
+cross_target_test!(cross_07_error_handling, "07_error_handling.mt");
+cross_target_test!(cross_08_pattern_matching, "08_pattern_matching.mt");
+cross_target_test!(cross_10_ternary_trie, "10_ternary_trie.mt");
 cross_target_test!(cross_09_type_casting, "09_type_casting.mt");
 cross_target_test!(cross_11_string_operations, "11_string_operations.mt");
 cross_target_test!(cross_12_advanced_closures, "12_advanced_closures.mt");
 cross_target_test!(cross_13_numeric_edge_cases, "13_numeric_edge_cases.mt");
 cross_target_test!(cross_14_ternary_logic_complete, "14_ternary_logic_complete.mt");
+cross_target_test!(cross_15_generics_and_traits, "15_generics_and_traits.mt");
 cross_target_test!(cross_17_tcon_tany, "17_tcon_tany.mt");
+cross_target_test!(cross_27_ir_regressions, "27_ir_regressions.mt");

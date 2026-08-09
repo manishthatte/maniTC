@@ -170,25 +170,78 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
 
             // Resolve the runtime C source and decide how to build it — full
             // (SDL2 + libcurl) or minimal. See runtime_link.
-            let runtime_c_path = runtime_link::resolve_source(Some(&file));
+            let runtime_c_path = runtime_link::resolve_source(Some(&file)).map_err(|e| {
+                CompileError::Codegen(Diagnostic::unknown(format!(
+                    "failed to write the embedded C runtime: {}", e)))
+            })?;
             let link = runtime_link::flags();
+
+            // K8: a minimal runtime (-DMANIT_NO_GUI) has no gui_*/net_*
+            // symbols. If the program actually calls them, fail now with a
+            // diagnostic naming the missing packages instead of letting the
+            // link die with raw undefined-symbol errors.
+            let minimal_runtime = link.cflags.iter().any(|f| f == "-DMANIT_NO_GUI");
+            if minimal_runtime {
+                let uses = |prefix: &str| {
+                    ll_text.lines().any(|l| {
+                        let t = l.trim_start();
+                        !t.starts_with("declare") && !t.starts_with(';') && t.contains(prefix)
+                    })
+                };
+                let gui_used = uses("@gui_");
+                let net_used = uses("@net_");
+                if gui_used || net_used {
+                    let forced = std::env::var("MANIT_NO_GUI").is_ok();
+                    let mut msg = String::new();
+                    if gui_used {
+                        msg.push_str(
+                            "this program uses the `gui` module, but the runtime was built \
+                             without GUI support (-DMANIT_NO_GUI).\n  Missing packages: SDL2 and \
+                             SDL2_ttf development headers (pkg-config names: sdl2, SDL2_ttf).\n  \
+                             On Debian/Ubuntu: apt install libsdl2-dev libsdl2-ttf-dev\n");
+                    }
+                    if net_used {
+                        msg.push_str(
+                            "this program uses the `net` module, but the runtime was built \
+                             without network support (-DMANIT_NO_GUI).\n  Missing package: \
+                             libcurl development headers (pkg-config name: libcurl).\n  \
+                             On Debian/Ubuntu: apt install libcurl4-openssl-dev\n");
+                    }
+                    if forced {
+                        msg.push_str(
+                            "  (the minimal runtime was forced by MANIT_NO_GUI=1 in the \
+                             environment — unset it once the packages are installed)\n");
+                    } else {
+                        msg.push_str(
+                            "  (install the packages above so pkg-config finds them, then \
+                             recompile)\n");
+                    }
+                    return Err(CompileError::Codegen(Diagnostic::unknown(msg)));
+                }
+            }
+
+            // `clang` may only be installed under a versioned name (clang-19).
+            let clang = runtime_link::find_clang();
 
             // Compile runtime to object file
             let runtime_obj = runtime_link::object_path("compile");
-            let runtime_compiled = std::process::Command::new("clang")
-                .args([
-                    runtime_c_path.to_str().unwrap(),
-                    "-c",
-                    "-o", runtime_obj.to_str().unwrap(),
-                ])
-                .args(&link.cflags)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let runtime_compiled = clang.as_deref().map(|clang| {
+                std::process::Command::new(clang)
+                    .args([
+                        runtime_c_path.to_str().unwrap(),
+                        "-c",
+                        "-o", runtime_obj.to_str().unwrap(),
+                    ])
+                    .args(&link.cflags)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            }).unwrap_or(false);
 
             // Link .ll + runtime object into final binary
             if runtime_compiled {
-                if let Ok(status) = std::process::Command::new("clang")
+                let clang = clang.as_deref().unwrap();
+                if let Ok(out) = std::process::Command::new(clang)
                     .args([
                         ll_path.to_str().unwrap(),
                         runtime_obj.to_str().unwrap(),
@@ -196,19 +249,30 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
                         "-lm", "-lpthread",
                     ])
                     .args(&link.libs)
-                    .status()
+                    .output()
                 {
-                    if status.success() {
+                    if out.status.success() {
                         println!("[LLVM] binary: {}", output.display());
                     } else {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        eprint!("{}", stderr);
+                        // K8 backstop: explain undefined gui_/net_ symbols.
+                        if stderr.contains("gui_") || stderr.contains("net_") {
+                            eprintln!(
+                                "[LLVM] hint: undefined gui_/net_ symbols mean the runtime was \
+                                 built without SDL2/libcurl support; install libsdl2-dev, \
+                                 libsdl2-ttf-dev and libcurl4-openssl-dev and recompile");
+                        }
                         println!("[LLVM] clang link failed (see .ll file)");
+                        return Err(CompileError::Codegen(Diagnostic::unknown(
+                            format!("clang failed to link {}", ll_path.display()))));
                     }
                 } else {
                     println!("[LLVM] clang not found — LLVM IR written to {}", ll_path.display());
                 }
-            } else {
-                // No runtime or clang unavailable — try simple link without runtime
-                if let Ok(status) = std::process::Command::new("clang")
+            } else if let Some(clang) = clang.as_deref() {
+                // Runtime failed to compile — try simple link without runtime
+                if let Ok(status) = std::process::Command::new(clang)
                     .args([ll_path.to_str().unwrap(), "-o", output.to_str().unwrap(), "-lm", "-lpthread"])
                     .status()
                 {
@@ -217,11 +281,11 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
                     } else {
                         println!("[LLVM] clang compilation failed (see .ll file)");
                     }
-                } else {
-                    println!("[LLVM] clang not found — LLVM IR written to {}", ll_path.display());
-                    println!("[LLVM] to compile: clang {} {} -o {} -lm -lpthread",
-                        ll_path.display(), runtime_obj.display(), output.display());
                 }
+            } else {
+                println!("[LLVM] clang not found — LLVM IR written to {}", ll_path.display());
+                println!("[LLVM] to compile: clang {} {} -o {} -lm -lpthread",
+                    ll_path.display(), runtime_obj.display(), output.display());
             }
         }
         "t3" => {
@@ -339,51 +403,118 @@ fn run_parse(file: &PathBuf) -> CompileResult<()> {
     Ok(())
 }
 
+/// Write to stdout, exiting quietly when the reader has gone away
+/// (e.g. `manitc run-t3 prog.t3b | head`) instead of panicking on SIGPIPE.
+fn pipe_safe_print(s: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    if let Err(e) = out.write_all(s.as_bytes()).and_then(|_| out.flush()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Compile a .mt source file to T3ISA in memory (no output files), returning
+/// (program words, string data, float data) ready for the emulator.
+fn compile_t3_in_memory(file: &PathBuf) -> CompileResult<(
+    Vec<i64>,
+    std::collections::HashMap<usize, String>,
+    std::collections::HashMap<usize, i64>,
+)> {
+    let source = read_source(file).map_err(|e| CompileError::Lex(
+        Diagnostic::unknown(e),
+    ))?;
+    let file_str = file.to_string_lossy().to_string();
+
+    let mut lexer = Lexer::with_file(&source, &file_str);
+    let tokens = lexer.tokenize()?;
+
+    let mut parser = ManiParser::with_file(tokens, &file_str);
+    let program = parser.parse()?;
+
+    let mut analyzer = SemanticAnalyzer::with_file(&file_str);
+    let typed_program = analyzer.analyze(&program)?;
+    analyzer.warnings.emit_all_rich(&source);
+    analyzer.warnings.check_error()?;
+
+    manitc::borrow::check_borrows(&typed_program)?;
+
+    let mut ir_module = IRLowerer::lower(&typed_program);
+    ir::optimize::run_passes(&mut ir_module);
+
+    let asm_text = codegen_t3::emit_t3_asm(&ir_module);
+    codegen_t3::assemble(&asm_text).map_err(|e| CompileError::Codegen(
+        Diagnostic::unknown(format!("T3ISA assembler error: {}", e))))
+}
+
 fn run_t3(file: &PathBuf, debug: bool) -> CompileResult<()> {
-    let words = codegen_t3::read_t3_binary(file.to_str().unwrap())
-        .map_err(|e| crate::error::CompileError::Codegen(
-            crate::error::Diagnostic::unknown(e.to_string())))?;
-    // Load string sidecar (.t3d) if present
-    let str_data: std::collections::HashMap<usize, String> = {
-        let d_path = file.with_extension("t3d");
-        if let Ok(text) = std::fs::read_to_string(&d_path) {
-            text.lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(2, ':');
-                    let addr: usize = parts.next()?.parse().ok()?;
-                    let s = parts.next()?.replace("\\n", "\n");
-                    Some((addr, s))
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        }
-    };
-    let float_data: std::collections::HashMap<usize, i64> = {
-        let f_path = file.with_extension("t3f");
-        if let Ok(text) = std::fs::read_to_string(&f_path) {
-            text.lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(2, ':');
-                    let addr: usize = parts.next()?.parse().ok()?;
-                    let v: i64 = parts.next()?.parse().ok()?;
-                    Some((addr, v))
-                })
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        }
-    };
-    println!("[T3ISA] running {} ({} words)", file.display(), words.len());
-    let output_lines = if debug {
-        codegen_t3::run_emulator_debug(words, str_data, float_data)
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    let (words, str_data, float_data) = if ext == "mt" {
+        // A maniT SOURCE file: auto-compile it and run the result, instead of
+        // executing the raw source bytes as machine words.
+        compile_t3_in_memory(file)?
     } else {
-        codegen_t3::run_emulator(words, str_data, float_data)
+        let (words, has_magic) = codegen_t3::read_t3_binary_with_magic(file.to_str().unwrap())
+            .map_err(|e| crate::error::CompileError::Codegen(
+                crate::error::Diagnostic::unknown(e.to_string())))?;
+        // Legacy .t3b binaries (written before the magic header) are still
+        // accepted; anything else without the magic is not a T3 binary.
+        if !has_magic && ext != "t3b" {
+            return Err(crate::error::CompileError::Codegen(
+                crate::error::Diagnostic::unknown(format!(
+                    "{} is not a T3ISA binary (missing .t3b magic header); \
+                     pass a .t3b produced by `manitc compile --target t3`, or a .mt source file",
+                    file.display()))));
+        }
+        // Load string sidecar (.t3d) if present
+        let str_data: std::collections::HashMap<usize, String> = {
+            let d_path = file.with_extension("t3d");
+            if let Ok(text) = std::fs::read_to_string(&d_path) {
+                text.lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(2, ':');
+                        let addr: usize = parts.next()?.parse().ok()?;
+                        let s = parts.next()?.replace("\\n", "\n");
+                        Some((addr, s))
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            }
+        };
+        let float_data: std::collections::HashMap<usize, i64> = {
+            let f_path = file.with_extension("t3f");
+            if let Ok(text) = std::fs::read_to_string(&f_path) {
+                text.lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(2, ':');
+                        let addr: usize = parts.next()?.parse().ok()?;
+                        let v: i64 = parts.next()?.parse().ok()?;
+                        Some((addr, v))
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            }
+        };
+        (words, str_data, float_data)
+    };
+
+    pipe_safe_print(&format!("[T3ISA] running {} ({} words)\n", file.display(), words.len()));
+    let (output_lines, exit_code) = if debug {
+        (codegen_t3::run_emulator_debug(words, str_data, float_data), 0)
+    } else {
+        codegen_t3::run_emulator_with_exit(words, str_data, float_data)
     };
     for piece in &output_lines {
-        print!("{}", piece);
+        pipe_safe_print(piece);
     }
-    println!();
+    // main's return value becomes the process exit status (low 8 bits).
+    if exit_code != 0 {
+        std::process::exit((exit_code as i32) & 0xff);
+    }
     Ok(())
 }
 

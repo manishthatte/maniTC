@@ -25,13 +25,34 @@ int64_t fs_is_dir(const char* path) {
 char* fs_read_file(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return strdup("");
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char* buf = malloc((size_t)sz + 1);
+    long sz = -1;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        sz = ftell(f);
+        if (fseek(f, 0, SEEK_SET) != 0) sz = -1;
+    }
+    if (sz > 0) {
+        char* buf = malloc((size_t)sz + 1);
+        if (!buf) { fclose(f); return strdup(""); }
+        size_t rd = fread(buf, 1, (size_t)sz, f);
+        buf[rd] = '\0';
+        fclose(f);
+        return buf;
+    }
+    size_t cap = 8192, len = 0;
+    char* buf = malloc(cap);
     if (!buf) { fclose(f); return strdup(""); }
-    size_t rd = fread(buf, 1, (size_t)sz, f);
-    buf[rd] = '\0';
+    for (;;) {
+        size_t rd = fread(buf + len, 1, cap - len - 1, f);
+        len += rd;
+        if (rd == 0) break;
+        if (len + 1 >= cap) {
+            char* nb = realloc(buf, cap * 2);
+            if (!nb) break;
+            buf = nb;
+            cap *= 2;
+        }
+    }
+    buf[len] = '\0';
     fclose(f);
     return buf;
 }
@@ -125,7 +146,7 @@ ManitFile* fs_open(const char* path, const char* mode) {
 }
 
 char* fs_read(ManitFile* f, int64_t n) {
-    if (!f || !f->fp) return strdup("");
+    if (!f || !f->fp || n < 0) return strdup("");
     char* buf = malloc((size_t)n + 1);
     if (!buf) return strdup("");
     size_t rd = fread(buf, 1, (size_t)n, f->fp);
@@ -352,6 +373,12 @@ char* path_parent(const char* p) {
 /* Channel aliases (LLVM uses Channel_send, C has channel_send) */
 void Channel_send(ManitChan* c, int64_t v) { channel_send(c, v); }
 int64_t Channel_recv(ManitChan* c) { return channel_recv(c); }
+ManitChan* Channel_new(void) { return channel_new(); }
+ManitChan* Channel_bounded(int64_t capacity) { return channel_bounded(capacity); }
+int64_t Channel_len(ManitChan* c) { return channel_len(c); }
+int Channel_is_empty(ManitChan* c) { return channel_is_empty(c); }
+void Channel_close(ManitChan* c) { channel_close(c); }
+int Channel_is_closed(ManitChan* c) { return channel_is_closed(c); }
 ManitChan* channel(void) { return channel_new(); }
 
 /* Result aliases (LLVM uses Ok/Err/Unknown, C has Ok_new/Err_new/Unknown_new) */
@@ -444,13 +471,14 @@ int64_t fs_list_dir_open(const char* path) {
     }
     rewinddir(dir);
 
-    g_dir_entries = (char**)malloc(count * sizeof(char*));
+    g_dir_entries = (char**)malloc((size_t)count * sizeof(char*));
     if (!g_dir_entries) { closedir(dir); return 0; }
 
     int64_t idx = 0;
     while ((e = readdir(dir)) != NULL && idx < count) {
         if (e->d_name[0] == '.') continue;
-        g_dir_entries[idx++] = strdup(e->d_name);
+        char* name = strdup(e->d_name);
+        if (name) g_dir_entries[idx++] = name;
     }
     closedir(dir);
     g_dir_count = idx;
@@ -515,8 +543,15 @@ int64_t fs_copy(const char* src, const char* dst) {
     if (!out) { fclose(in); return 0; }
     char buf[65536];
     size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
-    fclose(in); fclose(out);
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in); fclose(out);
+            return 0;
+        }
+    }
+    int read_err = ferror(in);
+    fclose(in);
+    if (fclose(out) != 0 || read_err) return 0;
     return 1;
 }
 
@@ -531,25 +566,31 @@ int64_t fs_move(const char* src, const char* dst) {
 
 char* env_timestamp(void) {
     time_t t = time(NULL);
-    struct tm* tm = localtime(&t);
+    struct tm tm;
+    localtime_r(&t, &tm);
     char* buf = (char*)malloc(32);
-    strftime(buf, 32, "%Y-%m-%d %H:%M:%S", tm);
+    if (!buf) return strdup("");
+    strftime(buf, 32, "%Y-%m-%d %H:%M:%S", &tm);
     return buf;
 }
 
 char* env_date(void) {
     time_t t = time(NULL);
-    struct tm* tm = localtime(&t);
+    struct tm tm;
+    localtime_r(&t, &tm);
     char* buf = (char*)malloc(16);
-    strftime(buf, 16, "%Y-%m-%d", tm);
+    if (!buf) return strdup("");
+    strftime(buf, 16, "%Y-%m-%d", &tm);
     return buf;
 }
 
 char* env_time(void) {
     time_t t = time(NULL);
-    struct tm* tm = localtime(&t);
+    struct tm tm;
+    localtime_r(&t, &tm);
     char* buf = (char*)malloc(12);
-    strftime(buf, 12, "%H:%M:%S", tm);
+    if (!buf) return strdup("");
+    strftime(buf, 12, "%H:%M:%S", &tm);
     return buf;
 }
 
@@ -686,7 +727,9 @@ int64_t io_move_cursor(int64_t row, int64_t col) {
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "\033[%lld;%lldH",
                        (long long)row, (long long)col);
-    write(STDOUT_FILENO, buf, len);
+    if (len < 0) return 0;
+    if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
+    write(STDOUT_FILENO, buf, (size_t)len);
     return 0;
 }
 

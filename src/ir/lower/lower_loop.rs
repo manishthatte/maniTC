@@ -6,9 +6,21 @@ use crate::semantic::{ManiType, TypedBlock, TypedExprKind, TypedForExpr, TypedWh
 
 impl IRLowerer {
     pub(super) fn lower_for(&mut self, fe: &TypedForExpr) {
-        // Check if iterating over a fixed-size array
+        // Array iteration: prefer the sized IR type recorded for a
+        // let-bound local (or an outer loop variable) — it preserves the
+        // nested sizes that the ManiType may have erased.
+        if matches!(fe.iter.ty, ManiType::Array(_, _)) {
+            if let TypedExprKind::Ident(name) = &fe.iter.kind {
+                if let Some((_, IRType::Array(elem_ir, n))) = self.locals.get(name).cloned() {
+                    self.lower_for_array(fe, (*elem_ir).clone(), IRValue::Const(IRConst::Int(n as i64)));
+                    return;
+                }
+            }
+        }
+        // Fixed-size array type
         if let ManiType::Array(ref elem_mty, Some(n)) = fe.iter.ty {
-            self.lower_for_array(fe, elem_mty, n);
+            let elem_ty = IRType::from_mani(elem_mty);
+            self.lower_for_array(fe, elem_ty, IRValue::Const(IRConst::Int(n as i64)));
             return;
         }
         // Check if iterating over a Vec<T>
@@ -18,6 +30,14 @@ impl IRLowerer {
                 self.lower_for_vec(fe, &elem_mty);
                 return;
             }
+        }
+        // Unsized array `[T]` — recover the length from the hidden length
+        // param or the local's statically-sized IR type. Must NOT fall into
+        // the plain-length fallback below, which would use the array POINTER
+        // as the loop bound and bind the index instead of the element.
+        if let ManiType::Array(ref elem_mty, None) = fe.iter.ty {
+            self.lower_for_unsized_array(fe, &elem_mty.clone());
+            return;
         }
 
         // Extract start/end from range, or treat iter as a plain length
@@ -51,7 +71,9 @@ impl IRLowerer {
             val: start_val,
             ty: var_ty.clone(),
         });
-        self.locals.insert(fe.var.clone(), (var_alloca.clone(), var_ty.clone()));
+        // The loop variable only shadows a same-named outer local for the
+        // duration of the loop — remember it so it can be restored on exit.
+        let shadowed = self.locals.insert(fe.var.clone(), (var_alloca.clone(), var_ty.clone()));
 
         // Alloca for the end value so it's stable across iterations
         let end_alloca = self.fresh_temp();
@@ -132,18 +154,61 @@ impl IRLowerer {
         self.patch_break_labels(body_idx, &exit_label);
         self.patch_continue_labels(body_idx, &inc_label_str);
         self.switch_to(exit_idx);
+        self.restore_loop_var(&fe.var, shadowed);
         let _ = (inc_idx,);
     }
 
-    /// For-loop over a fixed-size array: `for v in arr { ... }`
+    /// For-loop over an unsized array `[T]`: `for v in arr { ... }`.
+    /// The length is not part of the runtime value, so recover it from
+    /// what the lowerer knows statically; if nothing is available, fail
+    /// loudly at runtime instead of miscompiling.
+    fn lower_for_unsized_array(&mut self, fe: &TypedForExpr, elem_mty: &ManiType) {
+        if let TypedExprKind::Ident(name) = &fe.iter.kind {
+            // Let-bound local whose initializer had a static size (the IR
+            // type recorded for it is a sized array).
+            if let Some((_, IRType::Array(elem_ir, n))) = self.locals.get(name).cloned() {
+                self.lower_for_array(fe, (*elem_ir).clone(), IRValue::Const(IRConst::Int(n as i64)));
+                return;
+            }
+            // Unsized array parameter — its hidden `__len_` param was
+            // registered under the reserved "#len:<name>" key.
+            if let Some((len_alloca, _)) = self.locals.get(&Self::unsized_len_key(name)).cloned() {
+                let len_t = self.fresh_temp();
+                self.emit(IRInstr::Load {
+                    dst: len_t.clone(),
+                    ptr: IRValue::Temp(len_alloca),
+                    ty: IRType::I64,
+                });
+                self.lower_for_array(fe, IRType::from_mani(elem_mty), IRValue::Temp(len_t));
+                return;
+            }
+        }
+        // No length recoverable: report and halt (defined behaviour rather
+        // than the old pointer-as-length miscompile).
+        let msg = self.intern_string(
+            "runtime error: cannot iterate over an array of unknown size\n",
+        );
+        self.emit(IRInstr::PrintStr(IRValue::Const(IRConst::Str(msg))));
+        self.set_term(IRTerminator::Unreachable);
+        let after = self.fresh_label("for_unsized_err");
+        let idx = self.new_block(after);
+        self.switch_to(idx);
+    }
+
+    /// For-loop over an array with a known bound: `for v in arr { ... }`.
+    /// `bound` is the element count — a constant for fixed-size arrays, or
+    /// a loaded hidden-length value for unsized array parameters.
     pub(super) fn lower_for_array(
         &mut self,
         fe: &TypedForExpr,
-        elem_mty: &ManiType,
-        n: usize,
+        elem_ty: IRType,
+        bound: IRValue,
     ) {
-        let elem_ty = IRType::from_mani(elem_mty);
         let idx_ty = IRType::I64;
+        // Nested-array elements are pointers at runtime: access them as such,
+        // while `locals` keeps the sized `elem_ty` so an inner loop over the
+        // element can recover its own bound.
+        let elem_access = super::helpers::array_value_ty(&elem_ty);
 
         let arr_ptr = self.lower_expr(&fe.iter);
 
@@ -156,10 +221,21 @@ impl IRLowerer {
             ty: idx_ty.clone(),
         });
 
+        // Alloca for the bound so it stays stable across iterations.
+        let bound_alloca = self.fresh_temp();
+        self.emit(IRInstr::Alloca { dst: bound_alloca.clone(), ty: idx_ty.clone() });
+        self.emit(IRInstr::Store {
+            ptr: IRValue::Temp(bound_alloca.clone()),
+            val: bound,
+            ty: idx_ty.clone(),
+        });
+
         // Alloca for loop variable (element value)
         let var_alloca = self.fresh_temp();
-        self.emit(IRInstr::Alloca { dst: var_alloca.clone(), ty: elem_ty.clone() });
-        self.locals.insert(fe.var.clone(), (var_alloca.clone(), elem_ty.clone()));
+        self.emit(IRInstr::Alloca { dst: var_alloca.clone(), ty: elem_access.clone() });
+        // The loop variable only shadows a same-named outer local for the
+        // duration of the loop — remember it so it can be restored on exit.
+        let shadowed = self.locals.insert(fe.var.clone(), (var_alloca.clone(), elem_ty.clone()));
 
         let cond_label = self.fresh_label("for_cond");
         let body_label = self.fresh_label("for_body");
@@ -168,7 +244,7 @@ impl IRLowerer {
 
         self.set_term(IRTerminator::Jump(cond_label.clone()));
 
-        // Condition block: __idx < n
+        // Condition block: __idx < bound
         let cond_idx = self.new_block(cond_label.clone());
         self.switch_to(cond_idx);
         let cur_idx_t = self.fresh_temp();
@@ -177,12 +253,18 @@ impl IRLowerer {
             ptr: IRValue::Temp(idx_alloca.clone()),
             ty: idx_ty.clone(),
         });
+        let bound_t = self.fresh_temp();
+        self.emit(IRInstr::Load {
+            dst: bound_t.clone(),
+            ptr: IRValue::Temp(bound_alloca.clone()),
+            ty: idx_ty.clone(),
+        });
         let cond_t = self.fresh_temp();
         self.emit(IRInstr::BinOp {
             dst: cond_t.clone(),
             op: IRBinOp::ILt,
             lhs: IRValue::Temp(cur_idx_t.clone()),
-            rhs: IRValue::Const(IRConst::Int(n as i64)),
+            rhs: IRValue::Temp(bound_t),
             ty: IRType::Bool,
         });
         self.set_term(IRTerminator::BinBranch {
@@ -205,18 +287,18 @@ impl IRLowerer {
             dst: elem_ptr_t.clone(),
             ptr: arr_ptr.clone(),
             idx: IRValue::Temp(idx_t),
-            ty: elem_ty.clone(),
+            ty: elem_access.clone(),
         });
         let elem_val_t = self.fresh_temp();
         self.emit(IRInstr::Load {
             dst: elem_val_t.clone(),
             ptr: IRValue::Temp(elem_ptr_t),
-            ty: elem_ty.clone(),
+            ty: elem_access.clone(),
         });
         self.emit(IRInstr::Store {
             ptr: IRValue::Temp(var_alloca.clone()),
             val: IRValue::Temp(elem_val_t),
-            ty: elem_ty.clone(),
+            ty: elem_access.clone(),
         });
         self.lower_block(&fe.body);
         if matches!(self.blocks[self.current_block].term, IRTerminator::Unreachable) {
@@ -253,6 +335,7 @@ impl IRLowerer {
         self.patch_break_labels(body_blk, &exit_label);
         self.patch_continue_labels(body_blk, &inc_label_str);
         self.switch_to(exit_blk);
+        self.restore_loop_var(&fe.var, shadowed);
         let _ = (inc_blk,);
     }
 
@@ -299,7 +382,9 @@ impl IRLowerer {
         // Loop variable alloca
         let var_alloca = self.fresh_temp();
         self.emit(IRInstr::Alloca { dst: var_alloca.clone(), ty: elem_ty.clone() });
-        self.locals.insert(fe.var.clone(), (var_alloca.clone(), elem_ty.clone()));
+        // The loop variable only shadows a same-named outer local for the
+        // duration of the loop — remember it so it can be restored on exit.
+        let shadowed = self.locals.insert(fe.var.clone(), (var_alloca.clone(), elem_ty.clone()));
 
         let cond_label = self.fresh_label("for_cond");
         let body_label = self.fresh_label("for_body");
@@ -378,8 +463,21 @@ impl IRLowerer {
         let exit_blk = self.new_block(exit_label.clone());
         self.patch_break_labels(body_blk, &exit_label);
         self.switch_to(exit_blk);
-        self.locals.remove(&fe.var);
+        self.restore_loop_var(&fe.var, shadowed);
         let _ = (cond_blk, body_blk, inc_blk, exit_blk);
+    }
+
+    /// Remove the loop-variable binding after the loop, restoring any outer
+    /// local of the same name that it shadowed.
+    fn restore_loop_var(&mut self, var: &str, shadowed: Option<(IRTemp, IRType)>) {
+        match shadowed {
+            Some(prev) => {
+                self.locals.insert(var.to_string(), prev);
+            }
+            None => {
+                self.locals.remove(var);
+            }
+        }
     }
 
     /// Replace all `Jump("__break__")` terminators in blocks [body_start..)

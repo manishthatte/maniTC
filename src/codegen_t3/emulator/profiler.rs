@@ -31,8 +31,8 @@ pub(crate) enum DebugAction {
 pub struct ExecProfile {
     /// Total instructions executed.
     pub total_instructions: usize,
-    /// Per-opcode instruction counts (indexed by Opcode discriminant).
-    pub opcode_counts: [usize; 34],
+    /// Per-opcode instruction counts (indexed by Opcode discriminant, 0..=35).
+    pub opcode_counts: [usize; 36],
     /// Maximum call depth reached.
     pub max_call_depth: usize,
     /// Maximum heap pointer (bytes allocated).
@@ -53,7 +53,7 @@ impl ExecProfile {
     pub fn new() -> Self {
         ExecProfile {
             total_instructions: 0,
-            opcode_counts: [0; 34],
+            opcode_counts: [0; 36],
             max_call_depth: 0,
             max_heap_ptr: 0,
             program_words: 0,
@@ -68,7 +68,7 @@ impl ExecProfile {
     pub(crate) fn record(&mut self, op: Opcode) {
         self.total_instructions += 1;
         let idx = op as usize;
-        if idx < 34 {
+        if idx < self.opcode_counts.len() {
             self.opcode_counts[idx] += 1;
         }
         match op {
@@ -85,7 +85,7 @@ impl ExecProfile {
             Opcode::TbrPos | Opcode::TbrZero | Opcode::TbrNeg => {
                 self.control_flow_ops += 1;
             }
-            Opcode::Load | Opcode::Store => {
+            Opcode::Load | Opcode::Store | Opcode::Loadt | Opcode::Storet => {
                 self.memory_ops += 1;
             }
             _ => {}
@@ -121,7 +121,7 @@ impl ExecProfile {
             "TAND","TOR","TNOT","TSHI","TSHR","TMIN","TMAX",
             "TCMP","LOAD","STORE","TLIT","MOV","TBRANCH","JUMP",
             "CALL","RET","HALT","SYSCALL","TBRPOS","TBRZERO","TBRNEG",
-            "CALLR","BAND","BOR","BXOR","BSHL","BSHR",
+            "CALLR","BAND","BOR","BXOR","BSHL","BSHR","LOADT","STORET",
         ];
         for (i, &count) in self.opcode_counts.iter().enumerate() {
             if count > 0 && i < names.len() {

@@ -68,7 +68,7 @@ static void gui_process_event(SDL_Event* ev) {
 }
 
 /* Return the text-input string from the last SDL_TEXTINPUT event */
-char* gui_event_text_str(void) { return g_gui_text_buf; }
+char* gui_event_text_str(void) { return strdup(g_gui_text_buf); }
 int64_t gui_wheel_dy(void)     { return g_gui_wheel_dy; }
 
 int64_t gui_init(int64_t width, int64_t height, const char* title) {
@@ -100,14 +100,17 @@ int64_t gui_init(int64_t width, int64_t height, const char* title) {
         NULL
     };
     for (int i = 0; font_paths[i]; i++) {
-        g_sdl_font    = TTF_OpenFont(font_paths[i], 15);
-        g_sdl_font_lg = TTF_OpenFont(font_paths[i], 18);
-        if (g_sdl_font) break;
+        g_sdl_font = TTF_OpenFont(font_paths[i], 15);
+        if (g_sdl_font) {
+            g_sdl_font_lg = TTF_OpenFont(font_paths[i], 18);
+            break;
+        }
     }
     if (!g_sdl_font) {
         /* fallback: try any system font */
-        g_sdl_font    = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15);
-        g_sdl_font_lg = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18);
+        g_sdl_font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 15);
+        if (g_sdl_font)
+            g_sdl_font_lg = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18);
     }
 
     SDL_StartTextInput();
@@ -258,6 +261,9 @@ int64_t gui_key_home(void)      { return SDLK_HOME; }
 int64_t gui_key_end(void)       { return SDLK_END; }
 int64_t gui_key_pageup(void)    { return SDLK_PAGEUP; }
 int64_t gui_key_pagedown(void)  { return SDLK_PAGEDOWN; }
+int64_t gui_key_enter(void)     { return SDLK_RETURN; }
+int64_t gui_key_pgup(void)      { return SDLK_PAGEUP; }
+int64_t gui_key_pgdn(void)      { return SDLK_PAGEDOWN; }
 int64_t gui_key_f1(void)        { return SDLK_F1; }
 int64_t gui_key_f2(void)        { return SDLK_F2; }
 int64_t gui_key_f3(void)        { return SDLK_F3; }
@@ -333,7 +339,7 @@ int64_t gui_poll_event(void)    { return 0; }
 int64_t gui_wait_event(int64_t ms) { (void)ms; return 0; }
 int64_t gui_event_type(void)    { return 1; }
 int64_t gui_event_key(void)     { return 0; }
-char*   gui_event_text_str(void) { return ""; }
+char*   gui_event_text_str(void) { return strdup(""); }
 int64_t gui_mouse_x(void)       { return 0; }
 int64_t gui_mouse_y(void)       { return 0; }
 int64_t gui_mouse_btn(void)     { return 0; }
@@ -349,10 +355,24 @@ int64_t gui_key_backspace(void) { return 8; }
 int64_t gui_key_delete(void)    { return 127; }
 int64_t gui_key_escape(void)    { return 27; }
 int64_t gui_key_f1(void)        { return 282; }
+int64_t gui_key_f2(void)        { return 283; }
+int64_t gui_key_f3(void)        { return 284; }
+int64_t gui_key_f4(void)        { return 285; }
+int64_t gui_key_f5(void)        { return 286; }
+int64_t gui_key_f6(void)        { return 287; }
+int64_t gui_key_f7(void)        { return 288; }
+int64_t gui_key_f8(void)        { return 289; }
+int64_t gui_key_f9(void)        { return 290; }
+int64_t gui_key_f10(void)       { return 291; }
+int64_t gui_key_f11(void)       { return 292; }
+int64_t gui_key_f12(void)       { return 293; }
 int64_t gui_key_home(void)      { return 278; }
 int64_t gui_key_end(void)       { return 279; }
 int64_t gui_key_pgup(void)      { return 280; }
 int64_t gui_key_pgdn(void)      { return 281; }
+int64_t gui_key_pageup(void)    { return 280; }
+int64_t gui_key_pagedown(void)  { return 281; }
+int64_t gui_key_return(void)    { return 13; }
 int64_t gui_key_tab(void)       { return 9; }
 int64_t gui_key_space(void)     { return 32; }
 int64_t gui_key_a(void) { return 97; }

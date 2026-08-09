@@ -6,6 +6,21 @@ use std::net::{TcpListener, TcpStream};
 use super::*;
 
 impl Emulator {
+    /// Maximum buffer length a program may request for a read/write/net syscall.
+    const MAX_BUF_LEN: i64 = 1 << 20;
+
+    /// Validate a buffer-length syscall argument.  Negative or absurdly large
+    /// lengths trap (with R1 = -1) instead of aborting the emulator with a
+    /// capacity overflow / OOM.
+    fn checked_buf_len(&mut self, num: i64, len: i64) -> Option<usize> {
+        if !(0..=Self::MAX_BUF_LEN).contains(&len) {
+            self.output.push(format!("TRAP: syscall #{}: invalid buffer length {}", num, len));
+            self.regs[1] = -1;
+            return None;
+        }
+        Some(len as usize)
+    }
+
     pub(super) fn do_syscall_fs(&mut self, num: i64) {
         match num {
             // ----------------------------------------------------------------
@@ -106,7 +121,7 @@ impl Emulator {
                 // fs_read(fd: R1, buf_addr: R2, max_len: R3) -> R1 (bytes read)
                 let fd = self.regs[1] as usize;
                 let buf_addr = self.regs[2] as usize;
-                let max_len = self.regs[3] as usize;
+                let Some(max_len) = self.checked_buf_len(num, self.regs[3]) else { return; };
                 if let Some(file) = self.files.get_mut(&fd) {
                     let mut buf = vec![0u8; max_len];
                     let n = file.read(&mut buf).unwrap_or(0);
@@ -125,7 +140,7 @@ impl Emulator {
                 // fs_write(fd: R1, buf_addr: R2, len: R3) -> R1 (bytes written)
                 let fd = self.regs[1] as usize;
                 let buf_addr = self.regs[2] as usize;
-                let len = self.regs[3] as usize;
+                let Some(len) = self.checked_buf_len(num, self.regs[3]) else { return; };
                 let bytes: Vec<u8> = (0..len)
                     .map(|i| self.memory.get(buf_addr + i).copied().unwrap_or(0) as u8)
                     .collect();
@@ -296,7 +311,7 @@ impl Emulator {
                 // net_send(fd: R1, data_addr: R2, len: R3) -> R1 (bytes sent)
                 let fd = self.regs[1] as usize;
                 let data_addr = self.regs[2] as usize;
-                let len = self.regs[3] as usize;
+                let Some(len) = self.checked_buf_len(num, self.regs[3]) else { return; };
                 let bytes: Vec<u8> = (0..len)
                     .map(|i| self.memory.get(data_addr + i).copied().unwrap_or(0) as u8)
                     .collect();
@@ -310,7 +325,7 @@ impl Emulator {
                 // net_recv(fd: R1, buf_addr: R2, max_len: R3) -> R1 (bytes received)
                 let fd = self.regs[1] as usize;
                 let buf_addr = self.regs[2] as usize;
-                let max_len = self.regs[3] as usize;
+                let Some(max_len) = self.checked_buf_len(num, self.regs[3]) else { return; };
                 if let Some(stream) = self.tcp_streams.get_mut(&fd) {
                     let mut buf = vec![0u8; max_len];
                     let n = stream.read(&mut buf).unwrap_or(0);
@@ -332,7 +347,9 @@ impl Emulator {
                 self.tcp_listeners.remove(&fd);
             }
 
-            _ => unreachable!("do_syscall_fs: unexpected num={}", num),
+            // Unassigned numbers inside the claimed ranges (513-519) take the
+            // graceful TRAP path, not a panic.
+            _ => self.trap_unknown_syscall(num),
         }
     }
 }

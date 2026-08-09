@@ -124,6 +124,40 @@ impl Colors {
     }
 }
 
+/// True for characters that terminals render two columns wide (CJK, wide
+/// forms, most emoji). Approximation of Unicode East Asian Width = Wide.
+fn char_is_wide(ch: char) -> bool {
+    matches!(ch as u32,
+        0x1100..=0x115F          // Hangul Jamo
+        | 0x2E80..=0xA4CF        // CJK radicals … Yi
+        | 0xAC00..=0xD7A3        // Hangul syllables
+        | 0xF900..=0xFAFF        // CJK compatibility ideographs
+        | 0xFE30..=0xFE4F        // CJK compatibility forms
+        | 0xFF00..=0xFF60        // fullwidth forms
+        | 0xFFE0..=0xFFE6        // fullwidth signs
+        | 0x1F300..=0x1FAFF      // emoji & pictographs
+        | 0x20000..=0x3FFFD      // CJK extension planes
+    )
+}
+
+/// Build the whitespace prefix that visually aligns a caret under column
+/// `col` (1-based, counted in characters) of `line_text`. Tabs are copied
+/// through so they expand identically to the source line, and wide
+/// characters count as two columns.
+fn caret_padding(line_text: &str, col: usize) -> String {
+    let mut pad = String::new();
+    for ch in line_text.chars().take(col.saturating_sub(1)) {
+        if ch == '\t' {
+            pad.push('\t');
+        } else if char_is_wide(ch) {
+            pad.push_str("  ");
+        } else {
+            pad.push(' ');
+        }
+    }
+    pad
+}
+
 /// Render a compile error with source-line context, caret underline, and color.
 pub fn render_error(err: &CompileError, source: Option<&str>) -> String {
     let c = Colors::for_stderr();
@@ -156,7 +190,7 @@ pub fn render_error(err: &CompileError, source: Option<&str>) -> String {
                     out.push_str(&format!(
                         " {} {}|{} {}{}\n",
                         padding, c.cyan, c.reset,
-                        " ".repeat(d.col - 1), carets
+                        caret_padding(line_text, d.col), carets
                     ));
                 }
             }
@@ -189,7 +223,7 @@ pub fn render_warning(warn: &CompileWarning, source: Option<&str>) -> String {
                     out.push_str(&format!(
                         " {} {}|{} {}{}\n",
                         padding, c.cyan, c.reset,
-                        " ".repeat(d.col - 1), carets
+                        caret_padding(line_text, d.col), carets
                     ));
                 }
             }

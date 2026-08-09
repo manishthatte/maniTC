@@ -43,10 +43,10 @@ fn main() {
     print("  Recovered[0..2]:  ", recovered[0], " ", recovered[1], " ", recovered[2]);
 
     // Verify round-trip
-    let match_count: int = 0;
-    let i: int = 0;
+    let mut match_count: int = 0;
+    let mut i: int = 0;
     while i < 27 {
-        tif plaintext[i] == recovered[i] {
+        if plaintext[i] == recovered[i] {
             match_count = match_count + 1;
         }
         i = i + 1;

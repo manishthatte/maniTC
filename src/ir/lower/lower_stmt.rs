@@ -7,6 +7,23 @@ use crate::ast::LetPat;
 use crate::semantic::{ManiType, TypedStmt, TypedExprKind};
 
 impl IRLowerer {
+    /// The most precise sized IR type recoverable from an array-literal
+    /// initializer. Semantic sizes every array literal, but a nested
+    /// annotation like `[[int]]` erases the INNER sizes from the outer
+    /// type — recover them from the literal's element expressions so
+    /// nested iteration can find its bounds.
+    pub(super) fn sized_array_irtype(expr: &crate::semantic::TypedExpr) -> IRType {
+        if let TypedExprKind::Array(elems) = &expr.kind {
+            if let ManiType::Array(_, Some(n)) = &expr.ty {
+                let elem_ir = elems.first()
+                    .map(Self::sized_array_irtype)
+                    .unwrap_or(IRType::I64);
+                return IRType::Array(Box::new(elem_ir), *n);
+            }
+        }
+        IRType::from_mani(&expr.ty)
+    }
+
     pub(super) fn lower_stmt(&mut self, stmt: &TypedStmt) -> IRValue {
         match stmt {
             TypedStmt::Let(ls) => {
@@ -103,7 +120,18 @@ impl IRLowerer {
                     }
                 }
                 // Regular Let
-                let ty = IRType::from_mani(&ls.ty);
+                let mut ty = IRType::from_mani(&ls.ty);
+                // Array locals initialized from a literal keep the deep
+                // sized IR type, so later iteration and length queries can
+                // recover the bounds — the declared ManiType erases inner
+                // sizes for nested cases like `let p: [[int]] = [[..], ..];`.
+                if let (ManiType::Array(_, _), Some(init)) = (&ls.ty, &ls.init) {
+                    if matches!(&init.kind, TypedExprKind::Array(_))
+                        && matches!(&init.ty, ManiType::Array(_, Some(_)))
+                    {
+                        ty = Self::sized_array_irtype(init);
+                    }
+                }
 
                 // For real struct types: the init expression returns the struct alloca
                 // directly (a StructLit alloca or a sret alloca from a Call).
@@ -111,6 +139,24 @@ impl IRLowerer {
                 if let IRType::Struct(ref sname) = ty {
                     if self.is_real_struct(sname) {
                         if let Some(init) = &ls.init {
+                            // Value semantics: `let b = a;` where `a` is an existing
+                            // struct local must copy the struct (like struct-returning
+                            // calls do via lower_struct_call), not alias a's storage.
+                            if let TypedExprKind::Ident(src_name) = &init.kind {
+                                if self.locals.contains_key(src_name) {
+                                    let sname = sname.clone();
+                                    let src_val = self.lower_expr(init);
+                                    let n = self.struct_nfields(&sname);
+                                    let copy_alloca = self.fresh_temp();
+                                    self.emit(IRInstr::Alloca {
+                                        dst: copy_alloca.clone(),
+                                        ty: ty.clone(),
+                                    });
+                                    self.emit_struct_copy(src_val, copy_alloca.clone(), n);
+                                    self.locals.insert(ls.name.clone(), (copy_alloca, ty));
+                                    return IRValue::Void;
+                                }
+                            }
                             let val = self.lower_expr(init);
                             if let IRValue::Temp(struct_alloca) = val {
                                 self.locals.insert(ls.name.clone(), (struct_alloca, ty));
@@ -130,6 +176,7 @@ impl IRLowerer {
                 self.emit(IRInstr::Alloca { dst: alloca_t.clone(), ty: ty.clone() });
                 if let Some(init) = &ls.init {
                     let val = self.lower_expr(init);
+                    let val = self.coerce_value(val, &init.ty, &ls.ty);
                     self.emit(IRInstr::Store {
                         ptr: IRValue::Temp(alloca_t.clone()),
                         val,
@@ -141,8 +188,15 @@ impl IRLowerer {
             }
             TypedStmt::Assign(a) => {
                 let val = self.lower_expr(&a.value);
+                let val = self.coerce_value(val, &a.value.ty, &a.target.ty);
                 let ptr = self.lower_expr_as_ptr(&a.target);
-                let ty = IRType::from_mani(&a.value.ty);
+                // Struct/tuple fields use the uniform 8-byte slot convention,
+                // so field stores/loads must use the slot access width.
+                let ty = if matches!(&a.target.kind, TypedExprKind::Field(_, _)) {
+                    super::helpers::slot_access_ty(&IRType::from_mani(&a.value.ty))
+                } else {
+                    IRType::from_mani(&a.value.ty)
+                };
                 if let Some(op) = &a.op {
                     // Compound assignment: load + op + store
                     let load_t = self.fresh_temp();
@@ -172,7 +226,11 @@ impl IRLowerer {
             }
             TypedStmt::Expr(e) => self.lower_expr(e),
             TypedStmt::Return(e) => {
-                let val = e.as_ref().map(|expr| self.lower_expr(expr));
+                let ret_mani = self.current_fn_ret.clone();
+                let val = e.as_ref().map(|expr| {
+                    let v = self.lower_expr(expr);
+                    self.coerce_value(v, &expr.ty, &ret_mani)
+                });
                 self.set_term(IRTerminator::Return(val));
                 // Start a new unreachable block for any instructions after return
                 let after = self.fresh_label("after_return");

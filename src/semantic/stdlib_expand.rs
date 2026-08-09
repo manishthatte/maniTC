@@ -1,0 +1,829 @@
+//! Expansion of ManiT-source standard library modules.
+//!
+//! Most stdlib modules (io, math, sync, …) are *native*: their `.mt` files
+//! carry only documented signatures, and the implementations live in the C
+//! runtime (LLVM backend) or in emulator syscalls / emitter intrinsics (T3
+//! backend). Three modules, however, are implemented *in ManiT itself*:
+//!
+//!   * `std::bridge` — binary/ternary conversion (Claim 17)
+//!   * `std::crypto` — ternary hash / HMAC / TRNG / cipher (Thatte5)
+//!   * `std::t27f`   — balanced ternary floating point
+//!
+//! Neither backend has native implementations for these, so their function
+//! bodies must be compiled into the program that uses them. This pass runs
+//! on the AST before semantic analysis and, for every `use std::<m>` of a
+//! source-implemented module:
+//!
+//!   1. parses the embedded module source,
+//!   2. renames its functions to their qualified form (`m::f`) and rewrites
+//!      intra-module calls to match,
+//!   3. inlines module-level constants at every use site (module bodies use
+//!      the bare name, the host program the qualified `m::NAME`) — globals
+//!      that the module itself assigns are kept as real globals under their
+//!      qualified name instead,
+//!   4. registers the module's structs/enums under their bare names and
+//!      rewrites qualified type references (`m::T`) to match, and
+//!   5. appends the transformed items to the program.
+//!
+//! Call sites in the host program already use qualified names
+//! (`bridge::bits_to_trit(...)`), so after the rename they resolve to the
+//! merged definitions with no further changes. The IR lowerer and both
+//! backends then treat the module functions as ordinary user functions.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::ast::*;
+use crate::error::CompileResult;
+
+/// The stdlib modules whose implementations are ManiT source.
+const SOURCE_MODULES: &[(&str, &str)] = &[
+    ("bridge", include_str!("../../stdlib/bridge.mt")),
+    ("crypto", include_str!("../../stdlib/crypto.mt")),
+    ("t27f", include_str!("../../stdlib/t27f.mt")),
+];
+
+/// Expand any used source-implemented stdlib modules into `program`.
+/// Returns `None` when the program uses none of them (the common case).
+pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
+    // Which source modules does the program import?
+    let mut used: Vec<&str> = Vec::new();
+    for item in &program.items {
+        if let Item::UseDecl(u) = item {
+            if u.path.len() >= 2 && u.path[0] == "std" {
+                if let Some((name, _)) =
+                    SOURCE_MODULES.iter().find(|(n, _)| *n == u.path[1])
+                {
+                    if !used.contains(name) {
+                        used.push(name);
+                    }
+                }
+            }
+        }
+    }
+    if used.is_empty() {
+        return Ok(None);
+    }
+
+    // Parse each used module (plus transitive source-module uses).
+    let mut parsed: Vec<(String, Program)> = Vec::new();
+    let mut queue: Vec<String> = used.iter().map(|s| s.to_string()).collect();
+    let mut seen: HashSet<String> = queue.iter().cloned().collect();
+    while let Some(name) = queue.pop() {
+        let src = SOURCE_MODULES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, s)| *s)
+            .expect("queued module is always in SOURCE_MODULES");
+        let file = format!("<std::{}>", name);
+        let mut lexer = crate::lexer::Lexer::with_file(src, &file);
+        let tokens = lexer.tokenize()?;
+        let mut parser = crate::parser::Parser::with_file(tokens, &file);
+        let module = parser.parse()?;
+        for item in &module.items {
+            if let Item::UseDecl(u) = item {
+                if u.path.len() >= 2 && u.path[0] == "std" {
+                    let dep = u.path[1].clone();
+                    if SOURCE_MODULES.iter().any(|(n, _)| *n == dep)
+                        && seen.insert(dep.clone())
+                    {
+                        queue.push(dep);
+                    }
+                }
+            }
+        }
+        parsed.push((name, module));
+    }
+
+    // Build the combined rewrite context and transform each module.
+    let mut merged_items: Vec<Item> = Vec::new();
+    // Host-program rewrites: qualified const name -> inlined initializer,
+    // qualified type name -> bare type name.
+    let mut host_consts: HashMap<String, Expr> = HashMap::new();
+    let mut host_types: HashMap<String, String> = HashMap::new();
+
+    for (mod_name, module) in &parsed {
+        let mut fn_names: HashSet<String> = HashSet::new();
+        let mut type_names: HashSet<String> = HashSet::new();
+        let mut const_inits: HashMap<String, Expr> = HashMap::new();
+        let mut mutable_globals: HashSet<String> = HashSet::new();
+
+        for item in &module.items {
+            match item {
+                Item::FnDef(f) => {
+                    fn_names.insert(f.name.clone());
+                }
+                Item::StructDef(s) => {
+                    type_names.insert(s.name.clone());
+                }
+                Item::EnumDef(e) => {
+                    type_names.insert(e.name.clone());
+                }
+                Item::GlobalVar(g) => {
+                    if let Some(init) = &g.val {
+                        const_inits.insert(g.name.clone(), init.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A "constant" the module itself assigns is really mutable state and
+        // must stay a global; find assignments to module-level names.
+        for item in &module.items {
+            if let Item::FnDef(f) = item {
+                if let Some(body) = &f.body {
+                    collect_assigned_globals(body, &const_inits, &mut mutable_globals);
+                }
+            }
+        }
+        for name in &mutable_globals {
+            const_inits.remove(name);
+        }
+
+        let ctx = Rewrite {
+            prefix: mod_name.clone(),
+            fn_names,
+            type_names: type_names.clone(),
+            const_inits,
+            mutable_globals,
+        };
+
+        // Constant initializers may reference other module constants (or,
+        // in principle, module functions) — rewrite them through the same
+        // context before they are inlined anywhere.
+        let mut rewritten_consts: HashMap<String, Expr> = HashMap::new();
+        for (name, init) in &ctx.const_inits {
+            let mut e = init.clone();
+            ctx.rewrite_expr(&mut e);
+            rewritten_consts.insert(name.clone(), e);
+        }
+        let ctx = Rewrite {
+            const_inits: rewritten_consts,
+            ..ctx
+        };
+
+        for item in &module.items {
+            match item {
+                Item::FnDef(f) => {
+                    let mut f = f.clone();
+                    f.name = format!("{}::{}", mod_name, f.name);
+                    if let Some(body) = &mut f.body {
+                        ctx.rewrite_block(body);
+                    }
+                    for p in &mut f.params {
+                        ctx.rewrite_type(&mut p.ty);
+                    }
+                    if let Some(rt) = &mut f.ret_ty {
+                        ctx.rewrite_type(rt);
+                    }
+                    merged_items.push(Item::FnDef(f));
+                }
+                Item::StructDef(s) => {
+                    let mut s = s.clone();
+                    for fd in &mut s.fields {
+                        ctx.rewrite_type(&mut fd.ty);
+                    }
+                    merged_items.push(Item::StructDef(s));
+                }
+                Item::EnumDef(e) => {
+                    merged_items.push(Item::EnumDef(e.clone()));
+                }
+                Item::GlobalVar(g) if ctx.mutable_globals.contains(&g.name) => {
+                    let mut g = g.clone();
+                    g.name = format!("{}::{}", mod_name, g.name);
+                    if let Some(init) = &mut g.val {
+                        ctx.rewrite_expr(init);
+                    }
+                    merged_items.push(Item::GlobalVar(g));
+                }
+                // Inlined constants and use-decls produce no merged item.
+                _ => {}
+            }
+        }
+
+        for (name, init) in &ctx.const_inits {
+            host_consts.insert(format!("{}::{}", mod_name, name), init.clone());
+        }
+        for ty in &type_names {
+            host_types.insert(format!("{}::{}", mod_name, ty), ty.clone());
+        }
+    }
+
+    // Rewrite the host program: inline qualified constants and un-qualify
+    // module type references.
+    let host_ctx = Rewrite {
+        prefix: String::new(),
+        fn_names: HashSet::new(),
+        type_names: HashSet::new(),
+        const_inits: host_consts,
+        mutable_globals: HashSet::new(),
+    };
+    let mut items = merged_items;
+    for item in &program.items {
+        let mut item = item.clone();
+        match &mut item {
+            Item::FnDef(f) => {
+                if let Some(body) = &mut f.body {
+                    host_ctx.rewrite_block(body);
+                }
+                for p in &mut f.params {
+                    rewrite_host_type(&mut p.ty, &host_types);
+                }
+                if let Some(rt) = &mut f.ret_ty {
+                    rewrite_host_type(rt, &host_types);
+                }
+            }
+            Item::ImplBlock(imp) => {
+                for m in &mut imp.methods {
+                    if let Some(body) = &mut m.body {
+                        host_ctx.rewrite_block(body);
+                    }
+                    for p in &mut m.params {
+                        rewrite_host_type(&mut p.ty, &host_types);
+                    }
+                    if let Some(rt) = &mut m.ret_ty {
+                        rewrite_host_type(rt, &host_types);
+                    }
+                }
+            }
+            Item::TraitDef(t) => {
+                for m in &mut t.methods {
+                    if let Some(body) = &mut m.body {
+                        host_ctx.rewrite_block(body);
+                    }
+                }
+            }
+            Item::GlobalVar(g) => {
+                rewrite_host_type(&mut g.ty, &host_types);
+                if let Some(init) = &mut g.val {
+                    host_ctx.rewrite_expr(init);
+                }
+            }
+            _ => {}
+        }
+        // Host let-annotations and casts inside bodies are handled by
+        // rewrite_block via rewrite_type below (the host context carries the
+        // type map through host_types applied separately). Types inside
+        // bodies still need the qualified->bare mapping:
+        if let Item::FnDef(f) = &mut item {
+            if let Some(body) = &mut f.body {
+                rewrite_types_in_block(body, &host_types);
+            }
+        }
+        if let Item::ImplBlock(imp) = &mut item {
+            for m in &mut imp.methods {
+                if let Some(body) = &mut m.body {
+                    rewrite_types_in_block(body, &host_types);
+                }
+            }
+        }
+        items.push(item);
+    }
+
+    Ok(Some(Program { items }))
+}
+
+// ---------------------------------------------------------------------------
+// Rewrite context for one module (or, with empty prefix, the host program)
+// ---------------------------------------------------------------------------
+
+struct Rewrite {
+    prefix: String,
+    /// Module function names — call callees are renamed to `prefix::name`.
+    fn_names: HashSet<String>,
+    /// Module struct/enum names — `prefix::T` type refs become bare `T`.
+    type_names: HashSet<String>,
+    /// Constants to inline: identifier -> initializer expression.
+    const_inits: HashMap<String, Expr>,
+    /// Module globals kept as real globals: identifier renamed to
+    /// `prefix::identifier` (reads and assignment targets alike).
+    mutable_globals: HashSet<String>,
+}
+
+impl Rewrite {
+    fn rewrite_block(&self, block: &mut Block) {
+        for stmt in &mut block.stmts {
+            self.rewrite_stmt(stmt);
+        }
+    }
+
+    fn rewrite_stmt(&self, stmt: &mut Stmt) {
+        match stmt {
+            Stmt::Let(ls) => {
+                if let Some(ty) = &mut ls.ty {
+                    self.rewrite_type(ty);
+                }
+                if let Some(init) = &mut ls.init {
+                    self.rewrite_expr(init);
+                }
+            }
+            Stmt::Assign(a) => {
+                self.rewrite_expr(&mut a.target);
+                self.rewrite_expr(&mut a.value);
+            }
+            Stmt::Expr(e) => self.rewrite_expr(e),
+            Stmt::Return(Some(e), _) => self.rewrite_expr(e),
+            Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::LocalStructDef(_) => {}
+        }
+    }
+
+    fn rewrite_expr(&self, expr: &mut Expr) {
+        match expr {
+            Expr::Ident(name, span) => {
+                if let Some(init) = self.const_inits.get(name.as_str()) {
+                    let mut inlined = init.clone();
+                    reassign_spans(&mut inlined, *span);
+                    *expr = inlined;
+                } else if self.mutable_globals.contains(name.as_str()) {
+                    *name = format!("{}::{}", self.prefix, name);
+                }
+            }
+            Expr::Call(callee, args, _) => {
+                // Rename direct calls to module-local functions.
+                if let Expr::Ident(name, _) = callee.as_mut() {
+                    if self.fn_names.contains(name.as_str()) {
+                        *name = format!("{}::{}", self.prefix, name);
+                    } else {
+                        self.rewrite_expr(callee);
+                    }
+                } else {
+                    self.rewrite_expr(callee);
+                }
+                for a in args {
+                    self.rewrite_expr(a);
+                }
+            }
+            Expr::BinOp(l, _, r, _) => {
+                self.rewrite_expr(l);
+                self.rewrite_expr(r);
+            }
+            Expr::UnOp(_, e, _)
+            | Expr::Await(e, _)
+            | Expr::Return(e, _)
+            | Expr::Question(e, _) => self.rewrite_expr(e),
+            Expr::Cast(e, ty, _) => {
+                self.rewrite_expr(e);
+                self.rewrite_type(ty);
+            }
+            Expr::MethodCall(recv, _, args, _) => {
+                self.rewrite_expr(recv);
+                for a in args {
+                    self.rewrite_expr(a);
+                }
+            }
+            Expr::Index(base, idx, _) => {
+                self.rewrite_expr(base);
+                self.rewrite_expr(idx);
+            }
+            Expr::Field(base, _, _) => self.rewrite_expr(base),
+            Expr::Block(b) => self.rewrite_block(b),
+            Expr::If(i) => {
+                self.rewrite_expr(&mut i.cond);
+                self.rewrite_block(&mut i.then_block);
+                for (c, b) in &mut i.elif_branches {
+                    self.rewrite_expr(c);
+                    self.rewrite_block(b);
+                }
+                if let Some(e) = &mut i.else_block {
+                    self.rewrite_block(e);
+                }
+            }
+            Expr::Tif(t) => {
+                self.rewrite_expr(&mut t.cond);
+                self.rewrite_block(&mut t.pos_block);
+                self.rewrite_block(&mut t.zero_block);
+                self.rewrite_block(&mut t.neg_block);
+            }
+            Expr::Tresult(t) => {
+                self.rewrite_expr(&mut t.expr);
+                self.rewrite_block(&mut t.ok_block);
+                self.rewrite_block(&mut t.unknown_block);
+                self.rewrite_block(&mut t.err_block);
+            }
+            Expr::Match(m) => {
+                self.rewrite_expr(&mut m.scrutinee);
+                for arm in &mut m.arms {
+                    if let Some(g) = &mut arm.guard {
+                        self.rewrite_expr(g);
+                    }
+                    self.rewrite_expr(&mut arm.body);
+                }
+            }
+            Expr::For(f) => {
+                self.rewrite_expr(&mut f.iter);
+                self.rewrite_block(&mut f.body);
+            }
+            Expr::While(w) => {
+                self.rewrite_expr(&mut w.cond);
+                self.rewrite_block(&mut w.body);
+            }
+            Expr::Loop(b, _) | Expr::Spawn(b, _) => self.rewrite_block(b),
+            Expr::Array(elems, _) | Expr::Tuple(elems, _) => {
+                for e in elems {
+                    self.rewrite_expr(e);
+                }
+            }
+            Expr::StructLit(name, fields, _) => {
+                if let Some(bare) = name.strip_prefix(&format!("{}::", self.prefix)) {
+                    if self.type_names.contains(bare) {
+                        *name = bare.to_string();
+                    }
+                }
+                for (_, e) in fields {
+                    self.rewrite_expr(e);
+                }
+            }
+            Expr::Range(lo, hi, _, _) => {
+                self.rewrite_expr(lo);
+                self.rewrite_expr(hi);
+            }
+            Expr::Lambda(params, ret, body, _) => {
+                for (_, ty) in params {
+                    self.rewrite_type(ty);
+                }
+                if let Some(rt) = ret {
+                    self.rewrite_type(rt);
+                }
+                self.rewrite_expr(body);
+            }
+            Expr::Lit(_, _) | Expr::Break(_) | Expr::Continue(_) => {}
+        }
+    }
+
+    fn rewrite_type(&self, ty: &mut Type) {
+        match ty {
+            Type::Named(name, _) => {
+                if let Some(bare) = name
+                    .strip_prefix(&format!("{}::", self.prefix))
+                    .filter(|b| self.type_names.contains(*b))
+                {
+                    *name = bare.to_string();
+                }
+            }
+            Type::Path(parts, span) => {
+                if parts.len() == 2
+                    && parts[0] == self.prefix
+                    && self.type_names.contains(&parts[1])
+                {
+                    *ty = Type::Named(parts[1].clone(), *span);
+                }
+            }
+            Type::Ref(inner, _, _) | Type::Ptr(inner, _, _) => self.rewrite_type(inner),
+            Type::Array(inner, _, _) => self.rewrite_type(inner),
+            Type::Tuple(tys, _) => {
+                for t in tys {
+                    self.rewrite_type(t);
+                }
+            }
+            Type::Fn(params, ret, _) => {
+                for t in params {
+                    self.rewrite_type(t);
+                }
+                self.rewrite_type(ret);
+            }
+            Type::Generic(_, args, _) => {
+                for t in args {
+                    self.rewrite_type(t);
+                }
+            }
+            Type::Infer(_) => {}
+        }
+    }
+}
+
+/// Find module-level names that function bodies assign to (making them
+/// mutable state rather than inlinable constants).
+fn collect_assigned_globals(
+    block: &Block,
+    candidates: &HashMap<String, Expr>,
+    out: &mut HashSet<String>,
+) {
+    struct Walker<'a> {
+        candidates: &'a HashMap<String, Expr>,
+        out: &'a mut HashSet<String>,
+    }
+    impl Walker<'_> {
+        fn block(&mut self, b: &Block) {
+            for s in &b.stmts {
+                self.stmt(s);
+            }
+        }
+        fn stmt(&mut self, s: &Stmt) {
+            match s {
+                Stmt::Assign(a) => {
+                    if let Expr::Ident(name, _) = &a.target {
+                        if self.candidates.contains_key(name) {
+                            self.out.insert(name.clone());
+                        }
+                    }
+                    self.expr(&a.target);
+                    self.expr(&a.value);
+                }
+                Stmt::Let(ls) => {
+                    if let Some(e) = &ls.init {
+                        self.expr(e);
+                    }
+                }
+                Stmt::Expr(e) | Stmt::Return(Some(e), _) => self.expr(e),
+                _ => {}
+            }
+        }
+        fn expr(&mut self, e: &Expr) {
+            match e {
+                Expr::Block(b) => self.block(b),
+                Expr::Loop(b, _) | Expr::Spawn(b, _) => self.block(b),
+                Expr::If(i) => {
+                    self.expr(&i.cond);
+                    self.block(&i.then_block);
+                    for (c, b) in &i.elif_branches {
+                        self.expr(c);
+                        self.block(b);
+                    }
+                    if let Some(b) = &i.else_block {
+                        self.block(b);
+                    }
+                }
+                Expr::Tif(t) => {
+                    self.expr(&t.cond);
+                    self.block(&t.pos_block);
+                    self.block(&t.zero_block);
+                    self.block(&t.neg_block);
+                }
+                Expr::Tresult(t) => {
+                    self.expr(&t.expr);
+                    self.block(&t.ok_block);
+                    self.block(&t.unknown_block);
+                    self.block(&t.err_block);
+                }
+                Expr::Match(m) => {
+                    self.expr(&m.scrutinee);
+                    for arm in &m.arms {
+                        if let Some(g) = &arm.guard {
+                            self.expr(g);
+                        }
+                        self.expr(&arm.body);
+                    }
+                }
+                Expr::For(f) => {
+                    self.expr(&f.iter);
+                    self.block(&f.body);
+                }
+                Expr::While(w) => {
+                    self.expr(&w.cond);
+                    self.block(&w.body);
+                }
+                Expr::BinOp(l, _, r, _) => {
+                    self.expr(l);
+                    self.expr(r);
+                }
+                Expr::UnOp(_, x, _)
+                | Expr::Await(x, _)
+                | Expr::Return(x, _)
+                | Expr::Question(x, _)
+                | Expr::Cast(x, _, _)
+                | Expr::Field(x, _, _)
+                | Expr::Lambda(_, _, x, _) => self.expr(x),
+                Expr::Call(c, args, _) => {
+                    self.expr(c);
+                    for a in args {
+                        self.expr(a);
+                    }
+                }
+                Expr::MethodCall(r, _, args, _) => {
+                    self.expr(r);
+                    for a in args {
+                        self.expr(a);
+                    }
+                }
+                Expr::Index(b, i, _) => {
+                    self.expr(b);
+                    self.expr(i);
+                }
+                Expr::Array(es, _) | Expr::Tuple(es, _) => {
+                    for x in es {
+                        self.expr(x);
+                    }
+                }
+                Expr::StructLit(_, fs, _) => {
+                    for (_, x) in fs {
+                        self.expr(x);
+                    }
+                }
+                Expr::Range(l, h, _, _) => {
+                    self.expr(l);
+                    self.expr(h);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut w = Walker { candidates, out };
+    w.block(block);
+}
+
+/// Give every span in an inlined constant expression the span of the use
+/// site, so diagnostics point at the program being compiled rather than at
+/// stdlib source the user cannot see.
+fn reassign_spans(expr: &mut Expr, span: Span) {
+    match expr {
+        Expr::Lit(_, s) | Expr::Ident(_, s) => *s = span,
+        Expr::BinOp(l, _, r, s) => {
+            *s = span;
+            reassign_spans(l, span);
+            reassign_spans(r, span);
+        }
+        Expr::UnOp(_, e, s) | Expr::Cast(e, _, s) => {
+            *s = span;
+            reassign_spans(e, span);
+        }
+        Expr::StructLit(_, fields, s) => {
+            *s = span;
+            for (_, e) in fields {
+                reassign_spans(e, span);
+            }
+        }
+        Expr::Array(es, s) | Expr::Tuple(es, s) => {
+            *s = span;
+            for e in es {
+                reassign_spans(e, span);
+            }
+        }
+        Expr::Call(c, args, s) => {
+            *s = span;
+            reassign_spans(c, span);
+            for a in args {
+                reassign_spans(a, span);
+            }
+        }
+        // Constants are simple value expressions; anything more exotic keeps
+        // its stdlib spans (still compiles, only diagnostics point away).
+        _ => {}
+    }
+}
+
+/// Host-program type rewriting: `m::T` -> `T` for merged module types.
+fn rewrite_host_type(ty: &mut Type, map: &HashMap<String, String>) {
+    match ty {
+        Type::Named(name, _) => {
+            if let Some(bare) = map.get(name.as_str()) {
+                *name = bare.clone();
+            }
+        }
+        Type::Path(parts, span) => {
+            let joined = parts.join("::");
+            if let Some(bare) = map.get(&joined) {
+                *ty = Type::Named(bare.clone(), *span);
+            }
+        }
+        Type::Ref(inner, _, _) | Type::Ptr(inner, _, _) => rewrite_host_type(inner, map),
+        Type::Array(inner, _, _) => rewrite_host_type(inner, map),
+        Type::Tuple(tys, _) => {
+            for t in tys {
+                rewrite_host_type(t, map);
+            }
+        }
+        Type::Fn(params, ret, _) => {
+            for t in params {
+                rewrite_host_type(t, map);
+            }
+            rewrite_host_type(ret, map);
+        }
+        Type::Generic(_, args, _) => {
+            for t in args {
+                rewrite_host_type(t, map);
+            }
+        }
+        Type::Infer(_) => {}
+    }
+}
+
+/// Walk a block rewriting the types that appear inside statements and
+/// expressions (let annotations, casts, lambda signatures).
+fn rewrite_types_in_block(block: &mut Block, map: &HashMap<String, String>) {
+    for stmt in &mut block.stmts {
+        rewrite_types_in_stmt(stmt, map);
+    }
+}
+
+fn rewrite_types_in_stmt(stmt: &mut Stmt, map: &HashMap<String, String>) {
+    match stmt {
+        Stmt::Let(ls) => {
+            if let Some(ty) = &mut ls.ty {
+                rewrite_host_type(ty, map);
+            }
+            if let Some(e) = &mut ls.init {
+                rewrite_types_in_expr(e, map);
+            }
+        }
+        Stmt::Assign(a) => {
+            rewrite_types_in_expr(&mut a.target, map);
+            rewrite_types_in_expr(&mut a.value, map);
+        }
+        Stmt::Expr(e) | Stmt::Return(Some(e), _) => rewrite_types_in_expr(e, map),
+        _ => {}
+    }
+}
+
+fn rewrite_types_in_expr(expr: &mut Expr, map: &HashMap<String, String>) {
+    match expr {
+        Expr::Cast(e, ty, _) => {
+            rewrite_types_in_expr(e, map);
+            rewrite_host_type(ty, map);
+        }
+        Expr::Lambda(params, ret, body, _) => {
+            for (_, ty) in params {
+                rewrite_host_type(ty, map);
+            }
+            if let Some(rt) = ret {
+                rewrite_host_type(rt, map);
+            }
+            rewrite_types_in_expr(body, map);
+        }
+        Expr::Block(b) => rewrite_types_in_block(b, map),
+        Expr::Loop(b, _) | Expr::Spawn(b, _) => rewrite_types_in_block(b, map),
+        Expr::If(i) => {
+            rewrite_types_in_expr(&mut i.cond, map);
+            rewrite_types_in_block(&mut i.then_block, map);
+            for (c, b) in &mut i.elif_branches {
+                rewrite_types_in_expr(c, map);
+                rewrite_types_in_block(b, map);
+            }
+            if let Some(b) = &mut i.else_block {
+                rewrite_types_in_block(b, map);
+            }
+        }
+        Expr::Tif(t) => {
+            rewrite_types_in_expr(&mut t.cond, map);
+            rewrite_types_in_block(&mut t.pos_block, map);
+            rewrite_types_in_block(&mut t.zero_block, map);
+            rewrite_types_in_block(&mut t.neg_block, map);
+        }
+        Expr::Tresult(t) => {
+            rewrite_types_in_expr(&mut t.expr, map);
+            rewrite_types_in_block(&mut t.ok_block, map);
+            rewrite_types_in_block(&mut t.unknown_block, map);
+            rewrite_types_in_block(&mut t.err_block, map);
+        }
+        Expr::Match(m) => {
+            rewrite_types_in_expr(&mut m.scrutinee, map);
+            for arm in &mut m.arms {
+                if let Some(g) = &mut arm.guard {
+                    rewrite_types_in_expr(g, map);
+                }
+                rewrite_types_in_expr(&mut arm.body, map);
+            }
+        }
+        Expr::For(f) => {
+            rewrite_types_in_expr(&mut f.iter, map);
+            rewrite_types_in_block(&mut f.body, map);
+        }
+        Expr::While(w) => {
+            rewrite_types_in_expr(&mut w.cond, map);
+            rewrite_types_in_block(&mut w.body, map);
+        }
+        Expr::BinOp(l, _, r, _) => {
+            rewrite_types_in_expr(l, map);
+            rewrite_types_in_expr(r, map);
+        }
+        Expr::UnOp(_, e, _)
+        | Expr::Await(e, _)
+        | Expr::Return(e, _)
+        | Expr::Question(e, _)
+        | Expr::Field(e, _, _) => rewrite_types_in_expr(e, map),
+        Expr::Call(c, args, _) => {
+            rewrite_types_in_expr(c, map);
+            for a in args {
+                rewrite_types_in_expr(a, map);
+            }
+        }
+        Expr::MethodCall(r, _, args, _) => {
+            rewrite_types_in_expr(r, map);
+            for a in args {
+                rewrite_types_in_expr(a, map);
+            }
+        }
+        Expr::Index(b, i, _) => {
+            rewrite_types_in_expr(b, map);
+            rewrite_types_in_expr(i, map);
+        }
+        Expr::Array(es, _) | Expr::Tuple(es, _) => {
+            for e in es {
+                rewrite_types_in_expr(e, map);
+            }
+        }
+        Expr::StructLit(name, fs, _) => {
+            if let Some(bare) = map.get(name.as_str()) {
+                *name = bare.clone();
+            }
+            for (_, e) in fs {
+                rewrite_types_in_expr(e, map);
+            }
+        }
+        Expr::Range(l, h, _, _) => {
+            rewrite_types_in_expr(l, map);
+            rewrite_types_in_expr(h, map);
+        }
+        Expr::Lit(_, _) | Expr::Ident(_, _) | Expr::Break(_) | Expr::Continue(_) => {}
+    }
+}

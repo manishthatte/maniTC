@@ -10,13 +10,28 @@ impl Parser {
     pub(super) fn parse_block(&mut self) -> CompileResult<Block> {
         let span = self.span();
         self.expect(&TokenKind::LBrace)?;
+        // Statements inside a block are a fresh expression context — the
+        // no-struct-literal restriction of an enclosing condition ends here.
+        let saved = self.no_struct_lit;
+        self.no_struct_lit = false;
         let mut stmts = Vec::new();
         while self.peek() != &TokenKind::RBrace && !self.is_at_end() {
             let stmt = self.parse_stmt()?;
             stmts.push(stmt);
         }
         self.expect(&TokenKind::RBrace)?;
+        self.no_struct_lit = saved;
         Ok(Block { stmts, span })
+    }
+
+    /// Block-like expressions may stand as statements without a trailing `;`.
+    fn expr_is_block_like(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Block(_) | Expr::If(_) | Expr::Tif(_) | Expr::Match(_)
+                | Expr::For(_) | Expr::While(_) | Expr::Loop(..)
+                | Expr::Spawn(..) | Expr::Tresult(_)
+        )
     }
 
     pub(super) fn parse_stmt(&mut self) -> CompileResult<Stmt> {
@@ -38,7 +53,7 @@ impl Parser {
                 } else {
                     None
                 };
-                self.eat(&TokenKind::Semi);
+                self.expect_stmt_semi("variable declaration")?;
                 Ok(Stmt::Let(LetStmt {
                     pat: LetPat::Ident(name.clone()),
                     name,
@@ -60,18 +75,18 @@ impl Parser {
                     Ok(Stmt::Return(None, span))
                 } else {
                     let e = self.parse_expr()?;
-                    self.eat(&TokenKind::Semi);
+                    self.expect_stmt_semi("return statement")?;
                     Ok(Stmt::Return(Some(e), span))
                 }
             }
             TokenKind::Break => {
                 self.advance();
-                self.eat(&TokenKind::Semi);
+                self.expect_stmt_semi("break")?;
                 Ok(Stmt::Break(span))
             }
             TokenKind::Continue => {
                 self.advance();
-                self.eat(&TokenKind::Semi);
+                self.expect_stmt_semi("continue")?;
                 Ok(Stmt::Continue(span))
             }
             _ => {
@@ -124,12 +139,20 @@ impl Parser {
                         Some(BinOpKind::RShift)
                     }
                     _ => {
-                        self.eat(&TokenKind::Semi);
+                        if !self.eat(&TokenKind::Semi) && !Self::expr_is_block_like(&expr) {
+                            // No `;` — only allowed for the block tail expression.
+                            if self.peek() != &TokenKind::RBrace && !self.is_at_end() {
+                                return Err(self.err(format!(
+                                    "expected `;` after expression, found {:?}",
+                                    self.peek()
+                                )));
+                            }
+                        }
                         return Ok(Stmt::Expr(expr));
                     }
                 };
                 let value = self.parse_expr()?;
-                self.eat(&TokenKind::Semi);
+                self.expect_stmt_semi("assignment")?;
                 Ok(Stmt::Assign(AssignStmt { target: expr, value, op, span }))
             }
         }
@@ -170,7 +193,7 @@ impl Parser {
         } else {
             None
         };
-        self.eat(&TokenKind::Semi);
+        self.expect_stmt_semi("let declaration")?;
         Ok(Stmt::Let(LetStmt { pat, name, ty, init, mutable, span }))
     }
 }

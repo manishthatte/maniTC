@@ -53,7 +53,9 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
         }
 
         if in_float {
-            if let Some(cp) = line.find(':') {
+            // Use find_label_colon so labels containing '::' (e.g. monomorphized
+            // float literals like float_Point::zero_0) parse correctly.
+            if let Some(cp) = find_label_colon(&line) {
                 let lbl = line[..cp].trim().to_string();
                 let rest = line[cp+1..].trim();
                 if let Some(s) = rest.strip_prefix(".float64") {
@@ -67,7 +69,8 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
 
         if in_data {
             // Expect:  label: .string "content"
-            if let Some(cp) = line.find(':') {
+            // find_label_colon skips ':' inside '::' path separators.
+            if let Some(cp) = find_label_colon(&line) {
                 let lbl  = line[..cp].trim().to_string();
                 let rest = line[cp+1..].trim();
                 if let Some(s) = rest.strip_prefix(".string") {
@@ -96,7 +99,16 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
                 label_map.insert(maybe_lbl.to_string(), raw_instrs.len());
                 let after = line[cp+1..].trim();
                 if !after.is_empty() {
-                    raw_instrs.push(parse_raw_instr(after)?);
+                    let raw = parse_raw_instr(after)?;
+                    // Labeled instructions must reserve TBRANCH placeholder words
+                    // exactly like the bare-instruction path below, or every later
+                    // label address shifts by 2.
+                    let is_tbranch = raw.mnemonic == "TBRANCH";
+                    raw_instrs.push(raw);
+                    if is_tbranch {
+                        raw_instrs.push(RawInstr { mnemonic: "__TBRANCH_W1".to_string(), operands: vec![] });
+                        raw_instrs.push(RawInstr { mnemonic: "__TBRANCH_W2".to_string(), operands: vec![] });
+                    }
                 }
                 continue;
             }
@@ -323,10 +335,27 @@ fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> 
             let s = ops[$ri].trim();
             if s.starts_with('#') || s.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '-') {
                 let imm_val = parse_imm(s, label_map)?;
+                if !(IMM_MIN..=IMM_MAX).contains(&imm_val) {
+                    return Err(format!(
+                        "Immediate out of range for {} at pc={}: {} (3-trit field holds {}..={}; use TLIT + register form)",
+                        raw.mnemonic, pc, imm_val, IMM_MIN, IMM_MAX));
+                }
                 (0i64, imm_val)  // register 0, immediate = n
             } else {
                 (parse_reg(s)? as i64, 0i64)
             }
+        }};
+    }
+    // mem offset validation: the balanced 3-trit imm field holds [-13, +13]
+    macro_rules! check_off {
+        ($off:expr) => {{
+            let off: i64 = $off;
+            if !(IMM_MIN..=IMM_MAX).contains(&off) {
+                return Err(format!(
+                    "Memory offset out of range for {} at pc={}: {} (3-trit field holds {}..={}; compute the address in a register)",
+                    raw.mnemonic, pc, off, IMM_MIN, IMM_MAX));
+            }
+            off
         }};
     }
     macro_rules! imm {
@@ -369,12 +398,13 @@ fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> 
         "MOV"  => encode(Opcode::Mov,  reg!(0), reg!(1), 0, 0),
 
         "TSHI" => {
-            let shift = if n >= 3 { imm!(2) } else { 0 };
-            encode(Opcode::Tshi, reg!(0), reg!(1), 0, shift)
+            // Shift amount: immediate (imm field) or register (r3 field).
+            let (r3, shift) = if n >= 3 { reg_or_imm_pair!(2, 2) } else { (0, 0) };
+            encode(Opcode::Tshi, reg!(0), reg!(1), r3, shift)
         }
         "TSHR" => {
-            let shift = if n >= 3 { imm!(2) } else { 0 };
-            encode(Opcode::Tshr, reg!(0), reg!(1), 0, shift)
+            let (r3, shift) = if n >= 3 { reg_or_imm_pair!(2, 2) } else { (0, 0) };
+            encode(Opcode::Tshr, reg!(0), reg!(1), r3, shift)
         }
 
         "BAND" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Band, reg!(0), reg!(1), r2, imv) }
@@ -386,38 +416,49 @@ fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> 
         "TLIT" => {
             let r = reg!(0);
             let imm_val = imm!(1);
+            if imm_val.abs() > WIDE_IMM_MAX {
+                return Err(format!(
+                    "TLIT immediate out of range at pc={}: {} (13-trit wide field holds ±{})",
+                    pc, imm_val, WIDE_IMM_MAX));
+            }
             encode_wide(Opcode::Tlit, r, imm_val)
         }
 
         "LOAD" => {
             let r1 = reg!(0);
             let (r2, off) = mem!(1);
-            encode(Opcode::Load, r1, r2 as i64, 0, off)
+            encode(Opcode::Load, r1, r2 as i64, 0, check_off!(off))
         }
         "STORE" => {
             let r1 = reg!(0);
             let (r2, off) = mem!(1);
-            encode(Opcode::Store, r1, r2 as i64, 0, off)
+            encode(Opcode::Store, r1, r2 as i64, 0, check_off!(off))
         }
         "LOADT" => {
             // LOADT Rd, [Ra+imm] — load single trit (clamped -1/0/+1)
             let r1 = reg!(0);
             let (r2, off) = mem!(1);
-            encode(Opcode::Loadt, r1, r2 as i64, 0, off)
+            encode(Opcode::Loadt, r1, r2 as i64, 0, check_off!(off))
         }
         "STORET" => {
             // STORET Rs, [Ra+imm] — store single trit (clamped -1/0/+1)
             let r1 = reg!(0);
             let (r2, off) = mem!(1);
-            encode(Opcode::Storet, r1, r2 as i64, 0, off)
+            encode(Opcode::Storet, r1, r2 as i64, 0, check_off!(off))
         }
 
         "JUMP" => {
             let addr = lbl!(0);
+            if !(0..P13).contains(&addr) {
+                return Err(format!("JUMP target out of range at pc={}: {}", pc, addr));
+            }
             encode_wide(Opcode::Jump, 0, addr)
         }
         "CALL" => {
             let addr = lbl!(0);
+            if !(0..P13).contains(&addr) {
+                return Err(format!("CALL target out of range at pc={}: {}", pc, addr));
+            }
             encode_wide(Opcode::Call, 0, addr)
         }
         "CALLR" => {
@@ -431,6 +472,9 @@ fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> 
 
         "SYSCALL" => {
             let sc = imm!(0);
+            if !(0..P13).contains(&sc) {
+                return Err(format!("SYSCALL number out of range at pc={}: {}", pc, sc));
+            }
             encode_wide(Opcode::Syscall, 0, sc)
         }
 
@@ -444,16 +488,25 @@ fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> 
 // Binary I/O
 // ---------------------------------------------------------------------------
 
+/// Magic header word written as the first 8 bytes of every .t3b binary
+/// ("T3BMAGIC" little-endian).  It is far outside the valid instruction
+/// range, so it can never be confused with a real T3ISA word.
+pub const T3B_MAGIC: i64 = i64::from_le_bytes(*b"T3BMAGIC");
+
 pub fn write_t3_binary(words: &[i64], path: &str) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
+    f.write_all(&T3B_MAGIC.to_le_bytes())?;
     for &w in words {
         f.write_all(&w.to_le_bytes())?;
     }
     Ok(())
 }
 
-pub fn read_t3_binary(path: &str) -> std::io::Result<Vec<i64>> {
+/// Read a .t3b binary, returning the program words and whether the file
+/// carried the T3B_MAGIC header (pre-magic binaries are still accepted for
+/// backward compatibility; callers can use the flag to reject non-binaries).
+pub fn read_t3_binary_with_magic(path: &str) -> std::io::Result<(Vec<i64>, bool)> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut buf = Vec::new();
@@ -463,5 +516,13 @@ pub fn read_t3_binary(path: &str) -> std::io::Result<Vec<i64>> {
         let arr: [u8; 8] = chunk.try_into().unwrap();
         words.push(i64::from_le_bytes(arr));
     }
-    Ok(words)
+    let has_magic = words.first() == Some(&T3B_MAGIC);
+    if has_magic {
+        words.remove(0);
+    }
+    Ok((words, has_magic))
+}
+
+pub fn read_t3_binary(path: &str) -> std::io::Result<Vec<i64>> {
+    read_t3_binary_with_magic(path).map(|(words, _)| words)
 }

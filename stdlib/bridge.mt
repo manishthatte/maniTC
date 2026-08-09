@@ -41,7 +41,17 @@
 //
 // The returned tuple (b1, b0) uses trit values 0 and +1 to represent
 // binary 0 and 1 respectively, since maniT has no native bit type.
-fn trit_to_bits(t: trit) -> (trit, trit) { /* native */ }
+fn trit_to_bits(t: trit) -> (trit, trit) {
+    let one: trit = +1;
+    let zero: trit = 0;
+    if t > 0 {
+        return (one, zero);
+    }
+    if t < 0 {
+        return (zero, one);
+    }
+    return (zero, zero);
+}
 
 // Decode a two-bit pair back to a single trit.
 //
@@ -53,7 +63,21 @@ fn trit_to_bits(t: trit) -> (trit, trit) { /* native */ }
 //
 // Use is_valid_encoding() to check for the invalid (1,1) pattern before
 // calling this function if error detection is required.
-fn bits_to_trit(b1: trit, b0: trit) -> trit { /* native */ }
+fn bits_to_trit(b1: trit, b0: trit) -> trit {
+    let zero: trit = 0;
+    if b1 > 0 && b0 > 0 {
+        return zero;
+    }
+    if b1 > 0 {
+        let pos: trit = +1;
+        return pos;
+    }
+    if b0 > 0 {
+        let neg: trit = -1;
+        return neg;
+    }
+    return zero;
+}
 
 // Check whether a two-bit pattern is a valid trit encoding.
 //
@@ -63,7 +87,12 @@ fn bits_to_trit(b1: trit, b0: trit) -> trit { /* native */ }
 // In the two-bit-per-trit scheme, (1,1) has no corresponding trit value.
 // This function allows callers to detect corruption or encoding errors
 // at the binary-ternary boundary before conversion.
-fn is_valid_encoding(b1: trit, b0: trit) -> bool3 { /* native */ }
+fn is_valid_encoding(b1: trit, b0: trit) -> bool3 {
+    if b1 > 0 && b0 > 0 {
+        return false;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Tryte (3 trits) ↔ binary encoding
@@ -80,14 +109,60 @@ fn is_valid_encoding(b1: trit, b0: trit) -> bool3 { /* native */ }
 //   t9 positions [1..0] = bits for trit 0 (LST of tryte)
 //
 // Remaining t9 positions [8..6] are zero-filled.
-fn tryte_to_byte(ty: tryte) -> t9 { /* native */ }
+//
+// Within each pair, the lower position holds b0 and the upper holds b1
+// (so position 2k = b0 of trit k, position 2k+1 = b1 of trit k).
+fn tryte_to_byte(ty: tryte) -> t9 {
+    let mut n: int = ty as int;
+    let mut packed: int = 0;
+    let mut place: int = 1;
+    let mut k: int = 0;
+    while k < 3 {
+        // Peel off the least significant balanced-ternary digit.
+        let mut d: int = n % 3;
+        if d == 2 {
+            d = -1;
+        }
+        if d == -2 {
+            d = 1;
+        }
+        n = (n - d) / 3;
+        // Encode: +1 → b1 set (position 2k+1), -1 → b0 set (position 2k).
+        if d == 1 {
+            packed = packed + place * 3;
+        }
+        if d == -1 {
+            packed = packed + place;
+        }
+        place = place * 9;
+        k = k + 1;
+    }
+    return packed as t9;
+}
 
 // Decode 6 binary bits (stored in a t9) back to a 3-trit tryte.
 //
 // Reads the lowest 6 trit positions of the t9, interpreting each
 // consecutive pair as a trit encoding per bits_to_trit().
 // Positions [8..6] are ignored.
-fn byte_to_tryte(b: t9) -> tryte { /* native */ }
+fn byte_to_tryte(b: t9) -> tryte {
+    let mut n: int = b as int;
+    let mut value: int = 0;
+    let mut place: int = 1;
+    let mut k: int = 0;
+    while k < 3 {
+        // Positions hold only 0/+1 digits, so plain base-3 peeling works.
+        let b0: int = n % 3;
+        n = n / 3;
+        let b1: int = n % 3;
+        n = n / 3;
+        // (1,0) → +1, (0,1) → -1, (0,0) and invalid (1,1) → 0.
+        value = value + (b1 - b0) * place;
+        place = place * 3;
+        k = k + 1;
+    }
+    return value as tryte;
+}
 
 // ---------------------------------------------------------------------------
 // Word (27 trits) ↔ 54-bit binary encoding
@@ -107,7 +182,30 @@ fn byte_to_tryte(b: t9) -> tryte { /* native */ }
 //
 // This is the format expected by binary DMA, PCIe, or USB bridges
 // described in Claim 17.
-fn word_to_binary(w: word) -> [trit; 54] { /* native */ }
+fn word_to_binary(w: t27) -> [trit; 54] {
+    let bits: [trit; 54] = [0; 54];
+    let one: trit = +1;
+    let mut n: int = w as int;
+    let mut k: int = 0;
+    while k < 27 {
+        let mut d: int = n % 3;
+        if d == 2 {
+            d = -1;
+        }
+        if d == -2 {
+            d = 1;
+        }
+        n = (n - d) / 3;
+        if d == 1 {
+            bits[2 * k + 1] = one;
+        }
+        if d == -1 {
+            bits[2 * k] = one;
+        }
+        k = k + 1;
+    }
+    return bits;
+}
 
 // Decode 54 binary bits back to a 27-trit word (t27).
 //
@@ -117,7 +215,25 @@ fn word_to_binary(w: word) -> [trit; 54] { /* native */ }
 // If any two-bit pair is the invalid (1,1) pattern, the corresponding
 // trit position is set to 0 (safe fallback).  For strict validation,
 // check each pair with is_valid_encoding() before calling this function.
-fn binary_to_word(bits: [trit; 54]) -> word { /* native */ }
+fn binary_to_word(bits: [trit; 54]) -> t27 {
+    let mut value: int = 0;
+    let mut place: int = 1;
+    let mut k: int = 0;
+    while k < 27 {
+        let mut b0: int = 0;
+        let mut b1: int = 0;
+        if bits[2 * k] > 0 {
+            b0 = 1;
+        }
+        if bits[2 * k + 1] > 0 {
+            b1 = 1;
+        }
+        value = value + (b1 - b0) * place;
+        place = place * 3;
+        k = k + 1;
+    }
+    return value as t27;
+}
 
 // ---------------------------------------------------------------------------
 // Bulk validation
@@ -131,7 +247,16 @@ fn binary_to_word(bits: [trit; 54]) -> word { /* native */ }
 //
 // This is the fast-path check for incoming binary data at the
 // binary-ternary bridge boundary.
-fn validate_binary_buffer(bits: [trit; 54]) -> bool3 { /* native */ }
+fn validate_binary_buffer(bits: [trit; 54]) -> bool3 {
+    let mut k: int = 0;
+    while k < 27 {
+        if bits[2 * k] > 0 && bits[2 * k + 1] > 0 {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Convenience: integer ↔ binary round-trip
@@ -143,7 +268,42 @@ fn validate_binary_buffer(bits: [trit; 54]) -> bool3 { /* native */ }
 
 // Pack a 54-bit binary array into a pair of t27 values (high 27 bits, low 27 bits).
 // This enables storing a binary-encoded word in two native ternary registers.
-fn binary_to_t27_pair(bits: [trit; 54]) -> (t27, t27) { /* native */ }
+// Each bit occupies one trit position (digit 0 or +1) of its t27.
+fn binary_to_t27_pair(bits: [trit; 54]) -> (t27, t27) {
+    let mut lo: int = 0;
+    let mut hi: int = 0;
+    let mut place: int = 1;
+    let mut k: int = 0;
+    while k < 27 {
+        if bits[k] > 0 {
+            lo = lo + place;
+        }
+        if bits[k + 27] > 0 {
+            hi = hi + place;
+        }
+        place = place * 3;
+        k = k + 1;
+    }
+    return (hi as t27, lo as t27);
+}
 
 // Unpack a pair of t27 values (high, low) back into a 54-bit binary array.
-fn t27_pair_to_binary(hi: t27, lo: t27) -> [trit; 54] { /* native */ }
+fn t27_pair_to_binary(hi: t27, lo: t27) -> [trit; 54] {
+    let bits: [trit; 54] = [0; 54];
+    let one: trit = +1;
+    let mut lo_n: int = lo as int;
+    let mut hi_n: int = hi as int;
+    let mut k: int = 0;
+    while k < 27 {
+        if lo_n % 3 == 1 {
+            bits[k] = one;
+        }
+        if hi_n % 3 == 1 {
+            bits[k + 27] = one;
+        }
+        lo_n = lo_n / 3;
+        hi_n = hi_n / 3;
+        k = k + 1;
+    }
+    return bits;
+}

@@ -14,7 +14,14 @@ impl Emulator {
         self.pc += 1;
 
         let (raw_op, r1, r2, r3, imm) = decode(word);
-        let Some(op) = Opcode::from_i64(raw_op) else { return; };
+        let Some(op) = Opcode::from_i64(raw_op) else {
+            // Silently skipping unknown opcodes let garbage (e.g. a source file
+            // read as a binary) "run" to a clean exit — trap loudly instead.
+            self.output.push(format!(
+                "TRAP: unknown opcode {} at PC={} (word {})", raw_op, self.pc - 1, word));
+            self.halted = true;
+            return;
+        };
 
         // Record instruction in profile
         self.profile.record(op);
@@ -94,16 +101,20 @@ impl Emulator {
                 wreg!(r1, v);
             }
             Opcode::Tshi => {
-                // multiply by 3^imm
-                let n = imm.clamp(0, 26) as u32;
+                // multiply by 3^n; shift amount from register (r3) or immediate
+                let n = rhs_eff.clamp(0, 26) as u32;
                 let v = clamp27(self.regs[sr2].saturating_mul(3i64.pow(n)));
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
             Opcode::Tshr => {
-                // divide by 3^imm (balanced ternary shift right)
-                let n = imm.clamp(0, 26) as u32;
-                let v = clamp27(self.regs[sr2] / 3i64.pow(n));
+                // Balanced ternary shift right: drop the n low trits.  Because
+                // balanced digits are -1/0/+1, dropping k trits is ROUND-TO-
+                // NEAREST division by 3^k (ties impossible: 3^k is odd), not
+                // truncation: 5 >> 1 = 2, -5 >> 1 = -2.
+                let n = rhs_eff.clamp(0, 26) as u32;
+                let p = 3i64.pow(n);
+                let v = clamp27((self.regs[sr2] + (p - 1) / 2).div_euclid(p));
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }

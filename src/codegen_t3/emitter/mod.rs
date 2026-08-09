@@ -40,6 +40,12 @@ struct AsmEmitter {
     float_literals: Vec<(String, i64)>,
     /// Set of block labels that have already been emitted (for loop back-edge detection).
     emitted_blocks: std::collections::HashSet<String>,
+    /// Module global variables: name → absolute memory address (GLOBALS_BASE..).
+    global_addrs: HashMap<String, i64>,
+    /// Temps relocated by rescue moves since function start. Back-edge jumps
+    /// consult this to restore only genuinely displaced temps to the target
+    /// block's canonical registers (see emit_term's Jump reconciliation).
+    rescued_temps: std::collections::HashSet<String>,
 }
 
 impl AsmEmitter {
@@ -60,6 +66,8 @@ impl AsmEmitter {
             current_block_label: String::new(),
             float_literals: Vec::new(),
             emitted_blocks: std::collections::HashSet::new(),
+            global_addrs: HashMap::new(),
+            rescued_temps: std::collections::HashSet::new(),
         }
     }
 
@@ -97,10 +105,14 @@ impl AsmEmitter {
             .map(|(n, _)| n.clone());
 
         if let Some(name) = victim {
-            let free_r = self.reg_alloc.free_regs.iter().copied().find(|&r| r != reg);
+            // Never rescue INTO R1-R3: they are the syscall argument/return
+            // registers this rescue is protecting against, and a value parked
+            // there would be clobbered by the very sequence that follows.
+            let free_r = self.reg_alloc.free_regs.iter().copied().find(|&r| r != reg && r > 3);
             if let Some(fr) = free_r {
                 self.reg_alloc.free_regs.remove(&fr);
                 self.reg_alloc.temp_to_reg.insert(name.clone(), fr);
+                self.rescued_temps.insert(name.clone());
                 self.emit(format!(
                     "    MOV   R{}, R{}  ; rescue-inc {} from R{}",
                     fr, reg, name, reg
@@ -110,6 +122,7 @@ impl AsmEmitter {
                 self.reg_alloc.spill_slots.insert(name.clone(), slot);
                 self.reg_alloc.temp_to_reg.remove(&name);
                 self.reg_alloc.spill_count += 1;
+                self.rescued_temps.insert(name.clone());
                 self.emit(format!("    TSUB  R26, R26, #1  ; rescue-inc-spill {} from R{}", name, reg));
                 self.emit(format!("    STORE R{}, [R26+#0]  ; rescue-inc-spill {}", reg, name));
                 self.reg_alloc.sp_depth += 1;
@@ -133,11 +146,14 @@ impl AsmEmitter {
             .map(|(n, _)| n.clone());
 
         if let Some(name) = victim {
-            // Try to find a free register different from `reg`.
-            let free_r = self.reg_alloc.free_regs.iter().copied().find(|&r| r != reg);
+            // Try to find a free register different from `reg`.  R1-R3 are
+            // excluded: they are syscall argument/return registers, so parking
+            // a rescued value there would defeat the rescue (see rescue_reg_inclusive).
+            let free_r = self.reg_alloc.free_regs.iter().copied().find(|&r| r != reg && r > 3);
             if let Some(fr) = free_r {
                 self.reg_alloc.free_regs.remove(&fr);
                 self.reg_alloc.temp_to_reg.insert(name.clone(), fr);
+                self.rescued_temps.insert(name.clone());
                 self.emit(format!(
                     "    MOV   R{}, R{}  ; rescue {} from R{} (syscall clobber)",
                     fr, reg, name, reg
@@ -148,11 +164,49 @@ impl AsmEmitter {
                 self.reg_alloc.spill_slots.insert(name.clone(), slot);
                 self.reg_alloc.temp_to_reg.remove(&name);
                 self.reg_alloc.spill_count += 1;
+                self.rescued_temps.insert(name.clone());
                 self.emit(format!("    TSUB  R26, R26, #1  ; rescue-spill {} from R{}", name, reg));
                 self.emit(format!("    STORE R{}, [R26+#0]  ; rescue-spill {}", reg, name));
                 self.reg_alloc.sp_depth += 1;
             }
         }
+    }
+
+    /// Save each register in `regs` to the stack IF it currently holds a temp
+    /// that is live past this instruction.  Returns the list of saved registers;
+    /// pass it to `emit_reg_restore` after the clobbering sequence.
+    ///
+    /// Unlike rescue_reg, the allocator mapping is left untouched — the values
+    /// come back into the SAME registers, so cross-block register conventions
+    /// (e.g. phi-copy destinations fixed by an earlier predecessor) survive.
+    /// Used by inline syscall expansions (StrEq/StrNe) that clobber R1/R2
+    /// without going through the caller-save path.
+    fn emit_reg_save(&mut self, regs: &[usize], note: &str) -> Vec<usize> {
+        let cur = self.reg_alloc.current_instr;
+        let to_save: Vec<usize> = regs.iter().copied().filter(|&r| {
+            self.reg_alloc.temp_to_reg.iter().any(|(name, &tr)| {
+                tr == r
+                    && self.reg_alloc.last_use
+                        .get(name)
+                        .map_or(false, |&lu| lu > cur)
+            })
+        }).collect();
+        if !to_save.is_empty() {
+            self.emit(format!("    TSUB  R26, R26, #{}  ; save live regs ({})", to_save.len(), note));
+            for (i, &r) in to_save.iter().enumerate() {
+                self.emit(format!("    STORE R{}, [R26+#{}]  ; save R{} ({})", r, i, r, note));
+            }
+        }
+        to_save
+    }
+
+    /// Restore registers saved by `emit_reg_save` (same order) and pop the slots.
+    fn emit_reg_restore(&mut self, saved: &[usize], note: &str) {
+        if saved.is_empty() { return; }
+        for (i, &r) in saved.iter().enumerate() {
+            self.emit(format!("    LOAD  R{}, [R26+#{}]  ; restore R{} ({})", r, i, r, note));
+        }
+        self.emit(format!("    TADD  R26, R26, #{}  ; pop saved regs ({})", saved.len(), note));
     }
 
     /// Commit current instruction: move cur_instr + pending_post to lines.
@@ -173,21 +227,25 @@ impl AsmEmitter {
     }
 
     /// Emit instructions to `self.lines` that load `imm` into register `r`.
-    /// Single TLIT when |imm| ≤ 797161 (fits in the 13-trit wide-imm field).
-    /// For larger values: decompose as hi*1000 + lo using TLIT+TMUL+TLIT+TADD
-    /// (all register forms — the TADD 3-trit imm field can only hold [-13,13]).
+    /// Single TLIT when |imm| ≤ 797161 (the balanced 13-trit wide-imm bound).
+    /// Larger values are decomposed recursively as hi*1000 + lo using
+    /// TLIT+TMUL+TLIT+TADD (all register forms — the TADD 3-trit imm field
+    /// can only hold [-13,13]), so the full i64 range is handled.  Note the
+    /// machine clamps arithmetic to the 27-trit range at runtime.
     fn emit_lit(&mut self, r: usize, imm: i64) {
-        const MAX_LIT: i64 = 797_161; // = P13 / 2
+        const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX; // 797_161 = (3^13 − 1)/2
         if imm.abs() <= MAX_LIT {
             self.lines.push(format!("    TLIT  {}, #{}", Self::rn(r), imm));
         } else {
             let hi = imm / 1000;
             let lo = imm - hi * 1000;
             let tmp = self.scratch();
+            // Materialize hi first (recursively — hi may itself exceed the
+            // TLIT range for |imm| > ~797 billion), then scale and add lo.
+            self.emit_lit(tmp, hi);
             let (rn_r, rn_t) = (Self::rn(r), Self::rn(tmp));
-            self.lines.push(format!("    TLIT  {}, #{}  ; large-lit hi", rn_t, hi));
             self.lines.push(format!("    TLIT  {}, #1000  ; large-lit scale", rn_r));
-            self.lines.push(format!("    TMUL  {0}, {0}, {1}  ; large-lit r=hi*1000", rn_r, rn_t));
+            self.lines.push(format!("    TMUL  {0}, {1}, {0}  ; large-lit r=hi*1000", rn_r, rn_t));
             if lo != 0 {
                 self.lines.push(format!("    TLIT  {}, #{}  ; large-lit lo", rn_t, lo));
                 self.lines.push(format!("    TADD  {0}, {0}, {1}  ; large-lit r+=lo", rn_r, rn_t));
@@ -196,11 +254,11 @@ impl AsmEmitter {
     }
 
     /// Emit a SP adjustment of `delta` words (positive = TADD = pop, negative = TSUB = push).
-    /// The 3-trit immediate field safely holds -26..26; for larger values uses R21 as scratch.
+    /// The balanced 3-trit immediate field holds -13..13; for larger values uses R21 as scratch.
     fn emit_sp_adj(&mut self, delta: i64) {
         if delta == 0 { return; }
         if delta > 0 {
-            if delta <= 26 {
+            if delta <= 13 {
                 self.emit(format!("    TADD  R26, R26, #{}  ; sp pop {}", delta, delta));
             } else {
                 self.emit(format!("    TLIT  R21, #{}  ; sp-adj large", delta));
@@ -208,7 +266,7 @@ impl AsmEmitter {
             }
         } else {
             let n = -delta;
-            if n <= 26 {
+            if n <= 13 {
                 self.emit(format!("    TSUB  R26, R26, #{}  ; sp push {}", n, n));
             } else {
                 self.emit(format!("    TLIT  R21, #{}  ; sp-adj large", n));
@@ -321,7 +379,14 @@ impl AsmEmitter {
             }
             IRValue::Global(name) => {
                 let r = self.scratch();
-                self.lines.push(format!("    TLIT  {}, #{}", Self::rn(r), name));
+                if let Some(addr) = self.global_addrs.get(name) {
+                    self.lines
+                        .push(format!("    TLIT  {}, #{}  ; &{}", Self::rn(r), addr, name));
+                } else {
+                    // Unknown global: keep the symbolic form so the assembler
+                    // fails loudly instead of silently reading address 0.
+                    self.lines.push(format!("    TLIT  {}, #{}", Self::rn(r), name));
+                }
                 r
             }
             IRValue::Void => 0,
@@ -349,26 +414,59 @@ pub fn emit_t3_asm(module: &IRModule) -> String {
     out.push_str("; T3ISA assembly — generated by maniT compiler\n");
     out.push_str("; 27-trit balanced ternary word machine\n\n");
 
-    // Globals
+    // Globals live in a fixed memory window between the stack top (SP starts
+    // at 60_000 and grows down) and the emulator's reserved areas (62_000+):
+    // one word per global, initialized by a preamble emitted before main.
+    const GLOBALS_BASE: i64 = 61_000;
+    let mut global_addrs: HashMap<String, i64> = HashMap::new();
+    for (i, g) in module.globals.iter().enumerate() {
+        global_addrs.insert(g.name.clone(), GLOBALS_BASE + i as i64);
+    }
+
+    /// Materialize `imm` into `reg` (clobbering `tmp` for the large split),
+    /// mirroring AsmEmitter::emit_lit's TLIT range handling.
+    fn lit_into(out: &mut String, reg: &str, tmp: &str, imm: i64) {
+        let max = crate::codegen_t3::isa::WIDE_IMM_MAX;
+        if imm.abs() <= max {
+            out.push_str(&format!("    TLIT  {}, #{}\n", reg, imm));
+        } else {
+            let hi = imm / 1000;
+            let lo = imm - hi * 1000;
+            lit_into(out, reg, tmp, hi);
+            out.push_str(&format!("    TLIT  {}, #1000\n", tmp));
+            out.push_str(&format!("    TMUL  {0}, {0}, {1}\n", reg, tmp));
+            if lo != 0 {
+                out.push_str(&format!("    TLIT  {}, #{}\n", tmp, lo));
+                out.push_str(&format!("    TADD  {0}, {0}, {1}\n", reg, tmp));
+            }
+        }
+    }
+
+    let has_main = module.functions.iter().any(|f| f.name == "main" && !f.is_extern);
+    let first_is_main = module.functions.iter()
+        .find(|f| !f.is_extern)
+        .map_or(false, |f| f.name == "main");
+
     if !module.globals.is_empty() {
-        out.push_str(".globals:\n");
+        out.push_str("; globals init\n");
         for g in &module.globals {
             let init = match &g.init {
                 Some(IRValue::Const(c)) => irconst_to_i64(c),
                 _ => 0,
             };
-            out.push_str(&format!("    {} = #{}\n", g.name, init));
+            let addr = global_addrs[&g.name];
+            lit_into(&mut out, "R1", "R3", init);
+            out.push_str(&format!("    TLIT  R2, #{}  ; &{}\n", addr, g.name));
+            out.push_str("    STORE R1, [R2+#0]\n");
         }
-        out.push('\n');
-    }
-
-    // Emit a JUMP to main as the very first instruction so that helper
-    // functions defined before main don't get executed as the program entry.
-    let has_main = module.functions.iter().any(|f| f.name == "main" && !f.is_extern);
-    let first_is_main = module.functions.iter()
-        .find(|f| !f.is_extern)
-        .map_or(false, |f| f.name == "main");
-    if has_main && !first_is_main {
+        // With an init preamble the program can no longer fall through into
+        // the first function; always jump to main explicitly.
+        if has_main {
+            out.push_str("    JUMP  main  ; program entry point\n\n");
+        }
+    } else if has_main && !first_is_main {
+        // Emit a JUMP to main as the very first instruction so that helper
+        // functions defined before main don't get executed as the program entry.
         out.push_str("    JUMP  main  ; program entry point\n\n");
     }
 
@@ -379,7 +477,8 @@ pub fn emit_t3_asm(module: &IRModule) -> String {
             out.push_str(&format!("; extern fn {}\n\n", func.name));
             continue;
         }
-        let (fn_asm, fn_floats) = emit_function(func, module.struct_sizes.clone());
+        let (fn_asm, fn_floats) =
+            emit_function(func, module.struct_sizes.clone(), global_addrs.clone());
         out.push_str(&fn_asm);
         out.push('\n');
         all_float_literals.extend(fn_floats);
@@ -415,10 +514,15 @@ pub fn emit_t3_asm(module: &IRModule) -> String {
     out
 }
 
-fn emit_function(func: &IRFunction, struct_sizes: HashMap<String, usize>) -> (String, Vec<(String, i64)>) {
+fn emit_function(
+    func: &IRFunction,
+    struct_sizes: HashMap<String, usize>,
+    global_addrs: HashMap<String, i64>,
+) -> (String, Vec<(String, i64)>) {
     let last_use = compute_last_use(&func.blocks);
     let mut em = AsmEmitter::new(last_use, struct_sizes);
     em.fn_name = func.name.clone();
+    em.global_addrs = global_addrs;
 
     // Pre-allocate param registers: first param → R1, second → R2, …, max R8.
     for (i, (pname, _)) in func.params.iter().enumerate() {

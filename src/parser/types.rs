@@ -200,6 +200,14 @@ impl Parser {
                 self.advance();
                 Ok(Pattern::Lit(Lit::Str(s), span))
             }
+            TokenKind::Char(c) => {
+                self.advance();
+                Ok(Pattern::Lit(Lit::Char(c), span))
+            }
+            TokenKind::TernaryInt(n) => {
+                self.advance();
+                Ok(Pattern::Lit(Lit::TernaryInt(n), span))
+            }
             TokenKind::True => {
                 self.advance();
                 Ok(Pattern::Lit(Lit::Bool(true), span))
@@ -226,16 +234,41 @@ impl Parser {
             }
             TokenKind::Minus => {
                 self.advance();
-                if let TokenKind::Int(n) = self.peek().clone() {
-                    self.advance();
-                    Ok(Pattern::Lit(Lit::Int(-n), span))
-                } else {
-                    Ok(Pattern::Lit(Lit::Trit(-1), span))
+                match self.peek().clone() {
+                    TokenKind::Int(n) => {
+                        self.advance();
+                        Ok(Pattern::Lit(Lit::Int(-n), span))
+                    }
+                    TokenKind::Float(f) => {
+                        self.advance();
+                        Ok(Pattern::Lit(Lit::Float(-f), span))
+                    }
+                    TokenKind::TernaryInt(n) => {
+                        self.advance();
+                        Ok(Pattern::Lit(Lit::TernaryInt(-n), span))
+                    }
+                    // Bare `-` is the trit literal -1
+                    _ => Ok(Pattern::Lit(Lit::Trit(-1), span)),
                 }
             }
             TokenKind::Plus => {
                 self.advance();
-                Ok(Pattern::Lit(Lit::Trit(1), span))
+                match self.peek().clone() {
+                    TokenKind::Int(n) => {
+                        self.advance();
+                        Ok(Pattern::Lit(Lit::Int(n), span))
+                    }
+                    TokenKind::Float(f) => {
+                        self.advance();
+                        Ok(Pattern::Lit(Lit::Float(f), span))
+                    }
+                    TokenKind::TernaryInt(n) => {
+                        self.advance();
+                        Ok(Pattern::Lit(Lit::TernaryInt(n), span))
+                    }
+                    // Bare `+` is the trit literal +1
+                    _ => Ok(Pattern::Lit(Lit::Trit(1), span)),
+                }
             }
             // Tuple pattern
             TokenKind::LParen => {

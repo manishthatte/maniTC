@@ -35,7 +35,7 @@
 // Trits 0-8 (low 9): exponent
 // Trits 9-26 (high 18): mantissa
 struct T27F {
-    raw: word,
+    pub raw: word,
 }
 
 // Maximum mantissa value: (3^18 - 1) / 2 = 193,710,244
@@ -75,13 +75,13 @@ fn mantissa(x: T27F) -> word {
 
 // Approximate conversion from host float to T27F.
 fn from_float(f: float) -> T27F {
-    tif f == 0.0 {
+    if f == 0.0 {
         return ZERO;
     }
     // Find exponent: largest e such that |f| >= 3^e
-    let e: t9 = 0;
-    let scale: float = 1.0;
-    let abs_f: float = tif f > 0.0 { f } else { 0.0 - f };
+    let mut e: t9 = 0;
+    let mut scale: float = 1.0;
+    let abs_f: float = if f > 0.0 { f } else { 0.0 - f };
     while scale * 3.0 <= abs_f {
         scale = scale * 3.0;
         e = e + 1;
@@ -90,8 +90,9 @@ fn from_float(f: float) -> T27F {
         scale = scale / 3.0;
         e = e - 1;
     }
-    // Mantissa = f / 3^e, rounded to integer
-    let man: word = float_to_int(f / pow3(e));
+    // Mantissa = f / 3^e, rounded to integer. pow3_float also handles
+    // negative exponents (integer pow3 would return 0 and divide by zero).
+    let man: word = float_to_int(f / pow3_float(e));
     from_parts(e, man)
 }
 
@@ -115,7 +116,7 @@ fn add(a: T27F, b: T27F) -> T27F {
     let mb = mantissa(b);
 
     // Align to the smaller exponent
-    tif ea > eb {
+    if ea > eb {
         // Scale a's mantissa up by 3^(ea-eb)
         let shift = ea - eb;
         let ma_scaled = ma * pow3(shift);
@@ -156,7 +157,7 @@ fn neg(x: T27F) -> T27F {
 // Absolute value.
 fn abs(x: T27F) -> T27F {
     let m = mantissa(x);
-    tif m < 0 {
+    if m < 0 {
         neg(x)
     } else {
         x
@@ -168,7 +169,7 @@ fn abs(x: T27F) -> T27F {
 fn compare(a: T27F, b: T27F) -> trit {
     let diff = sub(a, b);
     let m = mantissa(diff);
-    tif m > 0 { +1 } elif m == 0 { 0 } else { -1 }
+    if m > 0 { +1 } elif m == 0 { 0 } else { -1 }
 }
 
 // Check if a T27F is zero.
@@ -187,20 +188,20 @@ fn normalize(x: T27F) -> T27F {
     let e = exponent(x);
     let m = mantissa(x);
 
-    tif m == 0 {
+    if m == 0 {
         return ZERO;
     }
 
     // Shift mantissa up (multiply by 3, decrease exponent) while it fits
-    let m_norm = m;
-    let e_norm = e;
-    while m_norm * 3 <= MANTISSA_MAX tand m_norm * 3 >= 0 - MANTISSA_MAX {
+    let mut m_norm = m;
+    let mut e_norm = e;
+    while m_norm * 3 <= MANTISSA_MAX && m_norm * 3 >= 0 - MANTISSA_MAX {
         m_norm = m_norm * 3;
         e_norm = e_norm - 1;
     }
 
     // Shift mantissa down if it overflows
-    while m_norm > MANTISSA_MAX tor m_norm < 0 - MANTISSA_MAX {
+    while m_norm > MANTISSA_MAX || m_norm < 0 - MANTISSA_MAX {
         m_norm = tdiv(m_norm, 3);
         e_norm = e_norm + 1;
     }
@@ -214,13 +215,13 @@ fn normalize(x: T27F) -> T27F {
 
 // Integer power of 3.
 fn pow3(n: t9) -> word {
-    tif n == 0 { return 1; }
-    tif n < 0 {
+    if n == 0 { return 1; }
+    if n < 0 {
         // 3^(-n) for negative exponent — returns 0 for integer division
         return 0;
     }
-    let result: word = 1;
-    let i: t9 = 0;
+    let mut result: word = 1;
+    let mut i: t9 = 0;
     while i < n {
         result = result * 3;
         i = i + 1;
@@ -230,10 +231,10 @@ fn pow3(n: t9) -> word {
 
 // Float power of 3 (handles negative exponents).
 fn pow3_float(n: t9) -> float {
-    tif n == 0 { return 1.0; }
-    let result: float = 1.0;
-    let i: t9 = 0;
-    tif n > 0 {
+    if n == 0 { return 1.0; }
+    let mut result: float = 1.0;
+    let mut i: t9 = 0;
+    if n > 0 {
         while i < n {
             result = result * 3.0;
             i = i + 1;
@@ -250,7 +251,7 @@ fn pow3_float(n: t9) -> float {
 
 // Clamp a value to a range.
 fn tclamp(x: word, lo: word, hi: word) -> word {
-    tif x < lo { lo } elif x > hi { hi } else { x }
+    if x < lo { lo } elif x > hi { hi } else { x }
 }
 
 // Balanced ternary modulo (trit extraction).
@@ -258,11 +259,32 @@ fn tmod(x: word, base: word) -> t9 {
     x - tdiv(x, base) * base
 }
 
-// Balanced ternary integer division (round toward zero).
-fn tdiv(a: word, b: word) -> word { /* native */ }
+// Balanced ternary integer division (round to nearest; ties cannot occur
+// for the odd divisors used in this module). Dropping low trits of a
+// balanced ternary number IS round-to-nearest division, and the
+// from_parts/exponent/mantissa packing relies on exactly that.
+// Requires b > 0 (this module divides only by 3 and 19683).
+fn tdiv(a: word, b: word) -> word {
+    let ai: int = a as int;
+    let bi: int = b as int;
+    let mut q: int = ai / bi;
+    let r: int = ai - q * bi;
+    let half: int = (bi - 1) / 2;
+    if r > half {
+        q = q + 1;
+    }
+    if 0 - r > half {
+        q = q - 1;
+    }
+    return q as word;
+}
 
 // Convert float to integer (truncate toward zero).
-fn float_to_int(f: float) -> word { /* native */ }
+fn float_to_int(f: float) -> word {
+    return (f as int) as word;
+}
 
 // Convert integer to float.
-fn int_to_float(n: word) -> float { /* native */ }
+fn int_to_float(n: word) -> float {
+    return (n as int) as float;
+}

@@ -103,7 +103,7 @@ impl Emulator {
             31 => {
                 // Map::insert(handle=R1, key=R2, value=R3)
                 let h = self.regs[1] as usize;
-                let k = self.regs[2];
+                let k = self.intern_key(self.regs[2]);
                 let v = self.regs[3];
                 if let Some(HeapObj::Map(map)) = self.heap_objs.get_mut(&h) {
                     map.insert(k, v);
@@ -112,7 +112,7 @@ impl Emulator {
             32 => {
                 // Map::get(handle=R1, key=R2) → R1 = value or 0
                 let h = self.regs[1] as usize;
-                let k = self.regs[2];
+                let k = self.intern_key(self.regs[2]);
                 let val = if let Some(HeapObj::Map(map)) = self.heap_objs.get(&h) {
                     map.get(&k).copied().unwrap_or(0)
                 } else { 0 };
@@ -121,7 +121,7 @@ impl Emulator {
             33 => {
                 // Map::contains_key(handle=R1, key=R2) → R1 = bool
                 let h = self.regs[1] as usize;
-                let k = self.regs[2];
+                let k = self.intern_key(self.regs[2]);
                 let found = if let Some(HeapObj::Map(map)) = self.heap_objs.get(&h) {
                     map.contains_key(&k)
                 } else { false };
@@ -130,7 +130,7 @@ impl Emulator {
             34 => {
                 // Map::remove(handle=R1, key=R2)
                 let h = self.regs[1] as usize;
-                let k = self.regs[2];
+                let k = self.intern_key(self.regs[2]);
                 if let Some(HeapObj::Map(map)) = self.heap_objs.get_mut(&h) {
                     map.remove(&k);
                 }
@@ -163,7 +163,7 @@ impl Emulator {
             41 => {
                 // Set::insert(handle=R1, value=R2)
                 let h = self.regs[1] as usize;
-                let v = self.regs[2];
+                let v = self.intern_key(self.regs[2]);
                 if let Some(HeapObj::Set(set)) = self.heap_objs.get_mut(&h) {
                     set.insert(v);
                 }
@@ -171,7 +171,7 @@ impl Emulator {
             42 => {
                 // Set::contains(handle=R1, value=R2) → R1 = bool
                 let h = self.regs[1] as usize;
-                let v = self.regs[2];
+                let v = self.intern_key(self.regs[2]);
                 let found = if let Some(HeapObj::Set(set)) = self.heap_objs.get(&h) {
                     set.contains(&v)
                 } else { false };
@@ -180,7 +180,7 @@ impl Emulator {
             43 => {
                 // Set::remove(handle=R1, value=R2)
                 let h = self.regs[1] as usize;
-                let v = self.regs[2];
+                let v = self.intern_key(self.regs[2]);
                 if let Some(HeapObj::Set(set)) = self.heap_objs.get_mut(&h) {
                     set.remove(&v);
                 }
@@ -388,7 +388,7 @@ impl Emulator {
             87 => {
                 // Map::get_or(handle, key, default) → value
                 let h = self.regs[1] as usize;
-                let key = self.regs[2];
+                let key = self.intern_key(self.regs[2]);
                 let default = self.regs[3];
                 self.regs[1] = if let Some(HeapObj::Map(map)) = self.heap_objs.get(&h) {
                     map.get(&key).copied().unwrap_or(default)
@@ -699,7 +699,13 @@ impl Emulator {
                 let h = self.regs[1] as usize;
                 let is_leader = if let Some(HeapObj::Barrier(needed, arrived)) = self.heap_objs.get_mut(&h) {
                     *arrived += 1;
-                    *arrived >= *needed
+                    if *arrived >= *needed {
+                        // Cycle complete: reset so the barrier is reusable.
+                        *arrived = 0;
+                        true
+                    } else {
+                        false
+                    }
                 } else { false };
                 self.regs[1] = if is_leader { 1 } else { 0 };
             }
@@ -764,7 +770,9 @@ impl Emulator {
                 }
             }
 
-            _ => unreachable!("do_syscall_proc: unexpected num={}", num),
+            // Unassigned numbers inside the claimed ranges (27-29, 37-39,
+            // 45-49, 127-130) take the graceful TRAP path, not a panic.
+            _ => self.trap_unknown_syscall(num),
         }
     }
 }

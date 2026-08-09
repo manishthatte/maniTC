@@ -42,6 +42,12 @@ impl ManiType {
         self.is_numeric() || matches!(self, ManiType::Bool | ManiType::Bool3 | ManiType::Char)
     }
 
+    /// Permissive-on-Unknown check: `true` when the type is fully known
+    /// (contains no `Unknown` placeholder at the top level).
+    pub fn is_known(&self) -> bool {
+        !matches!(self, ManiType::Unknown)
+    }
+
     pub fn display(&self) -> String {
         match self {
             ManiType::Int => "int".to_string(),
@@ -66,6 +72,48 @@ impl ManiType {
             ManiType::Fn(ps, r) => format!("fn({}) -> {}", ps.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "), r.display()),
             ManiType::Generic(n, args) => format!("{}<{}>", n, args.iter().map(|t| t.display()).collect::<Vec<_>>().join(", ")),
         }
+    }
+}
+
+/// Whether a value of type `b` may be used where type `a` is expected
+/// (and vice versa — the relation is symmetric).
+///
+/// Design rule of the crate: `Unknown` is a permissive placeholder, so any
+/// pairing that involves `Unknown` is compatible. All numeric types are
+/// mutually coercible (int literals flow into trit/tryte/t9/t27/t54/float
+/// contexts — a coercion the language reference blesses); `bool`/`bool3` and
+/// `trit`/`bool3` share literal forms and are likewise interchangeable.
+pub fn types_compatible(a: &ManiType, b: &ManiType) -> bool {
+    use ManiType::*;
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (Unknown, _) | (_, Unknown) => true,
+        _ if a.is_numeric() && b.is_numeric() => true,
+        (Bool, Bool3) | (Bool3, Bool) => true,
+        (Trit, Bool3) | (Bool3, Trit) => true,
+        (Array(ea, na), Array(eb, nb)) => {
+            types_compatible(ea, eb) && (na.is_none() || nb.is_none() || na == nb)
+        }
+        (Tuple(ta), Tuple(tb)) => {
+            ta.len() == tb.len() && ta.iter().zip(tb).all(|(x, y)| types_compatible(x, y))
+        }
+        // Generic args are frequently `Unknown` (e.g. `Vec::new()`), so only the
+        // constructor name is compared strictly.
+        (Generic(na, aa), Generic(nb, ab)) => {
+            na == nb && aa.iter().zip(ab.iter()).all(|(x, y)| types_compatible(x, y))
+        }
+        (Fn(pa, ra), Fn(pb, rb)) => {
+            pa.len() == pb.len()
+                && pa.iter().zip(pb).all(|(x, y)| types_compatible(x, y))
+                && types_compatible(ra, rb)
+        }
+        // A module-qualified struct/enum name matches its unqualified form.
+        (Struct(x), Struct(y)) | (Enum(x), Enum(y)) => {
+            x.ends_with(&format!("::{}", y)) || y.ends_with(&format!("::{}", x))
+        }
+        _ => false,
     }
 }
 

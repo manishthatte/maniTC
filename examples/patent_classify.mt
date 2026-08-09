@@ -6,7 +6,9 @@ use std::io;
 //   Input  -1  →  tryte -1  (negative)
 
 fn classify(x: t27) -> tryte {
-    tif x {
+    // tif branches on a trit/bool3; `as trit` clamps a t27 to its sign
+    // (docs/language-reference.md, "Type cast" and "tif").
+    tif (x as trit) {
         + => { return 1 as tryte }
         0 => { return 0 as tryte }
         - => { return -1 as tryte }

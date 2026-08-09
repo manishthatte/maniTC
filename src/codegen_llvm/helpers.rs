@@ -20,6 +20,17 @@ pub(crate) fn llvm_type(ty: &IRType) -> String {
     }
 }
 
+/// The type a value of `ty` has when passed or returned by value in our
+/// ABI: aggregates (structs and fixed-size arrays) travel as pointers.
+pub(crate) fn llvm_abi_type(ty: &IRType) -> String {
+    let s = llvm_type(ty);
+    if s.starts_with("%struct.") || s.starts_with('[') {
+        "ptr".to_string()
+    } else {
+        s
+    }
+}
+
 /// Natural alignment in bytes (as a decimal string literal).
 pub(crate) fn llvm_align(ty: &IRType) -> &'static str {
     match ty {
@@ -51,14 +62,23 @@ pub(crate) fn llvm_zero_init(ty: &IRType) -> String {
 
 pub(crate) fn irconst_to_string(c: &IRConst, hint_ty: &IRType) -> String {
     match c {
-        IRConst::Int(n) => format!("{}", n),
+        IRConst::Int(n) => match hint_ty {
+            // An int constant used in a double context must be spelled as a
+            // float constant (hex form preserves the exact bit pattern).
+            IRType::F64 => format!("0x{:016X}", (*n as f64).to_bits()),
+            _ => format!("{}", n),
+        },
         IRConst::Float(f) => {
             // Emit as LLVM hex double (0x...) to preserve exact bit pattern.
             format!("0x{:016X}", f.to_bits())
         }
-        IRConst::Bool(b) => {
-            if *b { "true".to_string() } else { "false".to_string() }
-        }
+        IRConst::Bool(b) => match hint_ty {
+            // `true`/`false` are only valid spellings for i1 — in a wider
+            // integer context the constant must be numeric.
+            IRType::Bool => if *b { "true".to_string() } else { "false".to_string() },
+            IRType::F64 => if *b { "1.0".to_string() } else { "0.0".to_string() },
+            _ => if *b { "1".to_string() } else { "0".to_string() },
+        },
         IRConst::Trit(t) => format!("{}", t),
         IRConst::Str(label) => {
             // The operand for a string literal is the pointer to the global.
@@ -79,7 +99,7 @@ pub(crate) fn irvalue_to_operand(val: &IRValue, ty: &IRType) -> String {
     match val {
         IRValue::Temp(t) => format!("%{}", t.0),
         IRValue::Const(c) => irconst_to_string(c, ty),
-        IRValue::Global(name) => format!("@{}", name),
+        IRValue::Global(name) => format!("@{}", mangle_func_name(name)),
         IRValue::Void => llvm_zero_init(ty),
     }
 }
@@ -156,11 +176,13 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
         | (IRType::Trit, IRType::I32)
         | (IRType::Trit, IRType::I64) => "sext",
 
-        // Bool (i1) → integer: zero-extend (true=1, false=0)
+        // Bool (i1) → integer: zero-extend (true=1, false=0).
+        // Bool → Trit is also zext: true → +1, false → 0.
         (IRType::Bool, IRType::I8)
         | (IRType::Bool, IRType::I16)
         | (IRType::Bool, IRType::I32)
-        | (IRType::Bool, IRType::I64) => "zext",
+        | (IRType::Bool, IRType::I64)
+        | (IRType::Bool, IRType::Trit) => "zext",
 
         // Truncation / narrowing
         (IRType::I64, IRType::I32)
@@ -168,17 +190,17 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
         | (IRType::I64, IRType::I8)
         | (IRType::I32, IRType::I16)
         | (IRType::I32, IRType::I8)
-        | (IRType::I16, IRType::I8)
-        | (IRType::I64, IRType::Bool)
-        | (IRType::I32, IRType::Bool)
-        | (IRType::I16, IRType::Bool)
-        | (IRType::I8, IRType::Bool) => "trunc",
+        | (IRType::I16, IRType::I8) => "trunc",
 
-        // Integer → float
+        // Integer → float (Trit is i8 holding -1/0/+1 — signed)
         (IRType::I64, IRType::F64)
         | (IRType::I32, IRType::F64)
         | (IRType::I16, IRType::F64)
-        | (IRType::I8, IRType::F64) => "sitofp",
+        | (IRType::I8, IRType::F64)
+        | (IRType::Trit, IRType::F64) => "sitofp",
+
+        // Bool → float: false → 0.0, true → 1.0
+        (IRType::Bool, IRType::F64) => "uitofp",
 
         // Float → integer
         (IRType::F64, IRType::I64)
@@ -186,19 +208,141 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
         | (IRType::F64, IRType::I16)
         | (IRType::F64, IRType::I8) => "fptosi",
 
-        // Pointer ↔ integer
-        (IRType::Ptr(_), IRType::I64) | (IRType::Ptr(_), IRType::I32) => "ptrtoint",
-        (IRType::I64, IRType::Ptr(_)) | (IRType::I32, IRType::Ptr(_)) => "inttoptr",
+        // Pointer ↔ integer (both ops accept any integer width)
+        (IRType::Ptr(_), IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8) => "ptrtoint",
+        (IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8 | IRType::Trit, IRType::Ptr(_)) => {
+            "inttoptr"
+        }
 
         // Pointer ↔ pointer (same under opaque ptrs, but bitcast is still valid)
         (IRType::Ptr(_), IRType::Ptr(_)) => "bitcast",
 
-        // Trit narrowing (Trit widening already handled above)
-        (IRType::I64, IRType::Trit) | (IRType::I32, IRType::Trit) => "trunc",
-
-        // Default: bitcast (catches any remaining same-size reinterpretations)
+        // Default: bitcast. Only correct for same-size reinterpretations;
+        // every size-changing pair MUST have an arm above or a multi-
+        // instruction lowering in cast_sequence (int→Bool, int→Trit, …).
         _ => "bitcast",
     }
+}
+
+/// Full text of the instruction sequence for `%dst = cast %src : from → to`.
+/// Multi-line sequences use the emit_block continuation indent ("\n  ").
+///
+/// This covers the conversions a single LLVM cast opcode cannot express
+/// legally or per the language semantics (docs/language-reference.md):
+///   * int/trit → bool     — i8→i1 bitcast is illegal; the language meaning
+///                           is "nonzero is true", so emit `icmp ne .., 0`.
+///   * float → bool        — `fcmp one .., 0.0` (0.0 and NaN are false).
+///   * int/float → trit    — `as trit` clamps to {-1, 0, +1} (docs §expr,
+///                           "Type cast"), so emit compare + two selects.
+///   * everything else     — a single opcode from pick_cast_op.
+pub(crate) fn cast_sequence(dst: &str, src: &str, from: &IRType, to: &IRType) -> String {
+    let from_s = llvm_type(from);
+    let to_s = llvm_type(to);
+
+    // Identity at the LLVM level (e.g. Trit → I8 for `trit as bool3`, both
+    // i8 with the same {-1,0,+1} encoding — but int-like i8 → Trit clamps).
+    if from_s == to_s {
+        if matches!(from, IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64)
+            && matches!(to, IRType::Trit)
+        {
+            return clamp_to_trit(dst, src, &from_s);
+        }
+        return match to_s.as_str() {
+            "double" => format!("%{} = fadd double {}, 0.0", dst, src),
+            "ptr" => format!("%{} = bitcast ptr {} to ptr", dst, src),
+            _ => format!("%{} = add {} {}, 0", dst, to_s, src),
+        };
+    }
+
+    match (from, to) {
+        // Anything integer-like → Bool: nonzero is true.
+        (IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 | IRType::Trit, IRType::Bool) => {
+            format!("%{} = icmp ne {} {}, 0", dst, from_s, src)
+        }
+        // Float → Bool: 0.0 (and NaN) → false.
+        (IRType::F64, IRType::Bool) => {
+            format!("%{} = fcmp one double {}, 0.0", dst, src)
+        }
+        // Integer → Trit: clamp to {-1, 0, +1} per the language reference.
+        (IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64, IRType::Trit) => {
+            clamp_to_trit(dst, src, &from_s)
+        }
+        // Float → Trit: truncate to int, then clamp.
+        (IRType::F64, IRType::Trit) => {
+            let itmp = format!("%{}__ftoi", dst);
+            format!(
+                "{} = fptosi double {} to i64\n  {}",
+                itmp,
+                src,
+                clamp_to_trit(dst, &itmp, "i64")
+            )
+        }
+        // Ptr ↔ Bool (rare; keep it legal): nonnull test / select.
+        (IRType::Ptr(_), IRType::Bool) => {
+            format!("%{} = icmp ne ptr {}, null", dst, src)
+        }
+        (IRType::Bool, IRType::Ptr(_)) => {
+            let itmp = format!("%{}__zext", dst);
+            format!(
+                "{} = zext i1 {} to i64\n  %{} = inttoptr i64 {} to ptr",
+                itmp, src, dst, itmp
+            )
+        }
+        // Ptr ↔ trit / float (nonsense conversions, but must stay legal):
+        // go through i64.
+        (IRType::Ptr(_), IRType::Trit) => {
+            let itmp = format!("%{}__p2i", dst);
+            format!(
+                "{} = ptrtoint ptr {} to i64\n  {}",
+                itmp,
+                src,
+                clamp_to_trit(dst, &itmp, "i64")
+            )
+        }
+        (IRType::Ptr(_), IRType::F64) => {
+            let itmp = format!("%{}__p2i", dst);
+            format!(
+                "{} = ptrtoint ptr {} to i64\n  %{} = sitofp i64 {} to double",
+                itmp, src, dst, itmp
+            )
+        }
+        (IRType::F64, IRType::Ptr(_)) => {
+            let itmp = format!("%{}__f2i", dst);
+            format!(
+                "{} = fptosi double {} to i64\n  %{} = inttoptr i64 {} to ptr",
+                itmp, src, dst, itmp
+            )
+        }
+        // Single-opcode conversions.
+        _ => format!(
+            "%{} = {} {} {} to {}",
+            dst,
+            pick_cast_op(from, to),
+            from_s,
+            src,
+            to_s
+        ),
+    }
+}
+
+/// Clamp an integer value of type `src_ty` into a trit (i8 in {-1, 0, +1}):
+///   pos → +1, neg → -1, zero → 0.
+fn clamp_to_trit(dst: &str, src: &str, src_ty: &str) -> String {
+    let isp = format!("%{}__isp", dst);
+    let isn = format!("%{}__isn", dst);
+    let neg = format!("%{}__neg", dst);
+    format!(
+        "{isp} = icmp sgt {ty} {src}, 0\n  \
+         {isn} = icmp slt {ty} {src}, 0\n  \
+         {neg} = select i1 {isn}, i8 -1, i8 0\n  \
+         %{dst} = select i1 {isp}, i8 1, i8 {neg}",
+        isp = isp,
+        isn = isn,
+        neg = neg,
+        dst = dst,
+        ty = src_ty,
+        src = src
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +351,16 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
 
 /// Mangle a maniT function name to a valid LLVM identifier.
 /// Replaces `::`, `<`, `>`, `,` and spaces with `_`.
+///
+/// The user's `main` is renamed to `__manit_main`: the C ABI requires
+/// `main` to return i32, but a maniT main is void- or i64-returning, which
+/// left the process exit status as whatever happened to be in the return
+/// register. emit_module emits a `define i32 @main()` wrapper that calls
+/// `__manit_main` and returns a proper status.
 pub(crate) fn mangle_func_name(name: &str) -> String {
+    if name == "main" {
+        return "__manit_main".to_string();
+    }
     name.replace("::", "_")
         .replace('<', "_")
         .replace('>', "_")
@@ -221,6 +374,10 @@ pub(crate) fn mangle_func_name(name: &str) -> String {
 
 /// Parse LLVM `declare` lines to extract function signatures.
 /// Returns a map from function name to (param_types, return_type).
+/// A trailing `"..."` entry in param_types marks a vararg function — Call
+/// emission needs it to print the full callee type
+/// (`call ptr (ptr, ...) @fmt_format(...)`), which the x86-64 varargs ABI
+/// requires (the AL register carries the vector-register count).
 pub(crate) fn parse_declare_sigs(decl_text: &str) -> HashMap<String, (Vec<String>, String)> {
     let mut sigs = HashMap::new();
     for line in decl_text.lines() {
@@ -255,7 +412,6 @@ pub(crate) fn parse_declare_sigs(decl_text: &str) -> HashMap<String, (Vec<String
             params_str
                 .split(',')
                 .map(|p| p.trim().to_string())
-                .filter(|p| p != "...")
                 .collect()
         };
         sigs.insert(name, (params, ret_str));
@@ -402,18 +558,9 @@ declare i1 @TernaryTrie_contains(ptr, ptr)
 declare i64 @TernaryTrie_len(ptr)
 declare ptr @TernaryTrie_keys_with_prefix(ptr, ptr)
 
-; ---- Result types ----
-declare ptr @Ok_new(i64)
-declare ptr @Err_new(ptr)
-declare ptr @Unknown_new(ptr)
-declare i1 @result_is_ok(ptr)
-declare i1 @result_is_err(ptr)
-declare i1 @result_is_unknown(ptr)
-declare i64 @result_unwrap(ptr)
-
 ; ---- sync / concurrency ----
 declare ptr @Mutex_new(i64)
-declare void @Mutex_lock(ptr)
+declare ptr @Mutex_lock(ptr)
 declare void @Mutex_unlock(ptr)
 declare i64 @Mutex_get(ptr)
 declare void @Mutex_set(ptr, i64)
@@ -448,16 +595,11 @@ declare void @Semaphore_acquire(ptr)
 declare void @Semaphore_release(ptr)
 declare i1 @Semaphore_try_acquire(ptr)
 declare i64 @Semaphore_available(ptr)
-declare ptr @Barrier_new(i64)
-declare i1 @Barrier_wait(ptr)
-declare i64 @Barrier_count(ptr)
 
 ; ---- ternary utils ----
 declare i64 @ternary_trit_to_int(i8)
 declare i8 @ternary_int_to_trit(i64)
 declare ptr @ternary_t27_to_str(i64)
-declare ptr @ternary_to_balanced_ternary(i64)
-declare i64 @ternary_from_balanced_ternary(ptr)
 
 ; ---- fs (filesystem) ----
 declare i1 @fs_exists(ptr)
@@ -525,8 +667,6 @@ declare ptr @path_extension(ptr)
 declare ptr @path_parent(ptr)
 
 ; ---- alternate name aliases (IR lowerer may use module::func naming) ----
-declare i64 @math_from_balanced_ternary(ptr)
-declare ptr @math_to_balanced_ternary(i64)
 declare ptr @math_trits_to_str(i64)
 declare ptr @int_to_str(i64)
 declare ptr @float_to_str(double)
@@ -534,9 +674,6 @@ declare i64 @ternary_t27_shift_left(i64, i64)
 declare i64 @ternary_t27_shift_right(i64, i64)
 declare i64 @ternary_t27_rotate_left(i64, i64)
 declare i64 @ternary_t27_rotate_right(i64, i64)
-declare ptr @Ok(i64)
-declare ptr @Err(ptr)
-declare ptr @Unknown(ptr)
 declare ptr @str_slice(ptr, i64, i64)
 declare ptr @str_repeat(ptr, i64)
 declare i64 @str_index_of(ptr, ptr)
@@ -666,6 +803,575 @@ declare void @gui_clipboard_set(ptr)
 declare i64 @fs_delete(ptr)
 
 ";
+
+// ---------------------------------------------------------------------------
+// Internal runtime helpers (functions the T3 backend handles with dedicated
+// instructions/syscalls but the C runtime does not export). They are emitted
+// as `define internal` so they can never clash with a future C runtime
+// symbol of the same name. The signature text below is parsed into fn_sigs
+// (for call-site type coercion) but NOT printed as `declare` lines — a module
+// must not both declare and define the same symbol.
+// ---------------------------------------------------------------------------
+
+pub(crate) const INTERNAL_HELPER_SIGS: &str = "\
+declare void @io_println_bool(i1)
+declare void @io_println_bool3(i8)
+declare void @io_println_trit(i8)
+declare void @io_println_ternary(i64)
+declare i64 @ternary_int_to_t27(i64)
+declare i64 @ternary_t27_to_int(i64)
+declare i64 @ternary_int_to_t9(i64)
+declare i64 @ternary_t9_to_int(i64)
+declare i64 @ternary_int_to_tryte(i64)
+declare i64 @ternary_tryte_to_int(i64)
+declare i64 @ternary_trit_sign(i64)
+declare i64 @ternary_t27_neg(i64)
+declare i64 @ternary_trit_shift_left(i64, i64)
+declare i64 @ternary_trit_shift_right(i64, i64)
+declare i64 @ternary_tryte_from_trits(i64, i64, i64)
+declare i64 @ternary_pack_trits(ptr)
+declare ptr @ternary_unpack_trits(i64)
+declare ptr @ternary_trits_to_str(ptr)
+declare ptr @ternary_to_balanced_ternary(i64)
+declare i64 @ternary_from_balanced_ternary(ptr)
+declare ptr @math_to_balanced_ternary(i64)
+declare i64 @math_from_balanced_ternary(ptr)
+declare ptr @Ok_new(i64)
+declare ptr @Err_new(ptr)
+declare ptr @Unknown_new(ptr)
+declare ptr @Ok(i64)
+declare ptr @Err(ptr)
+declare ptr @Unknown(ptr)
+declare i1 @result_is_ok(ptr)
+declare i1 @result_is_err(ptr)
+declare i1 @result_is_unknown(ptr)
+declare i64 @result_unwrap(ptr)
+declare ptr @Channel_try_recv(ptr)
+declare void @async_sleep(i64)
+declare ptr @async_spawn_task(i64)
+declare i64 @Task_join(i64)
+declare i64 @async_select(ptr)
+declare ptr @_block_on(i64)
+declare i8 @AtomicTrit_load(ptr)
+declare void @AtomicTrit_store(ptr, i8)
+declare i64 @MutexGuard_get(i64)
+declare void @MutexGuard_unlock(i64)
+declare void @MutexGuard_update(i64, ptr)
+declare void @time_sleep(i64)
+declare ptr @Barrier_new(i64)
+declare i1 @Barrier_wait(ptr)
+declare i64 @Barrier_count(ptr)
+";
+
+/// The definitions backing INTERNAL_HELPER_SIGS.
+///
+/// Balanced-ternary array conventions mirror the T3 emulator exactly
+/// (emulator/syscall_io.rs syscalls 8, 10, 11, 12, 13) so both backends
+/// produce identical output:
+///   * a `[trit]` value is a length-prefixed i64-slot array:
+///     mem[0] = len, mem[1..=len] = trits, least-significant trit first
+///   * trits_to_str renders in array order; the empty array renders \"0\"
+///   * trit_shift_left/right multiply/round-divide by 3^k (round to
+///     nearest — dropping balanced trits is not truncation; ties cannot
+///     happen because 3^k is odd)
+pub(crate) const INTERNAL_RUNTIME_HELPERS: &str = r#"@__manit_s_true = private unnamed_addr constant [5 x i8] c"true\00", align 1
+@__manit_s_false = private unnamed_addr constant [6 x i8] c"false\00", align 1
+@__manit_s_unknown = private unnamed_addr constant [8 x i8] c"unknown\00", align 1
+@__manit_s_chempty = private unnamed_addr constant [6 x i8] c"empty\00", align 1
+@__manit_s_chclosed = private unnamed_addr constant [7 x i8] c"closed\00", align 1
+
+define internal void @io_println_bool(i1 %b) {
+entry:
+  %s = select i1 %b, ptr @__manit_s_true, ptr @__manit_s_false
+  call void @io_println(ptr %s)
+  ret void
+}
+
+define internal void @io_println_bool3(i8 %t) {
+entry:
+  %ispos = icmp sgt i8 %t, 0
+  %isneg = icmp slt i8 %t, 0
+  %nf = select i1 %isneg, ptr @__manit_s_false, ptr @__manit_s_unknown
+  %s = select i1 %ispos, ptr @__manit_s_true, ptr %nf
+  call void @io_println(ptr %s)
+  ret void
+}
+
+define internal void @io_println_trit(i8 %t) {
+entry:
+  call void @io_print_trit(i8 %t)
+  call i32 @putchar(i32 10)
+  ret void
+}
+
+define internal void @io_println_ternary(i64 %n) {
+entry:
+  %s = call ptr @ternary_t27_to_str(i64 %n)
+  call void @io_println(ptr %s)
+  ret void
+}
+
+define internal i64 @ternary_int_to_t27(i64 %n) {
+entry:
+  ret i64 %n
+}
+
+define internal i64 @ternary_t27_to_int(i64 %n) {
+entry:
+  ret i64 %n
+}
+
+define internal i64 @ternary_int_to_t9(i64 %n) {
+entry:
+  ret i64 %n
+}
+
+define internal i64 @ternary_t9_to_int(i64 %n) {
+entry:
+  ret i64 %n
+}
+
+define internal i64 @ternary_int_to_tryte(i64 %n) {
+entry:
+  ret i64 %n
+}
+
+define internal i64 @ternary_tryte_to_int(i64 %n) {
+entry:
+  ret i64 %n
+}
+
+define internal i64 @ternary_trit_sign(i64 %n) {
+entry:
+  %ispos = icmp sgt i64 %n, 0
+  %isneg = icmp slt i64 %n, 0
+  %neg = select i1 %isneg, i64 -1, i64 0
+  %r = select i1 %ispos, i64 1, i64 %neg
+  ret i64 %r
+}
+
+define internal i64 @ternary_t27_neg(i64 %n) {
+entry:
+  %r = sub i64 0, %n
+  ret i64 %r
+}
+
+; 3^k with k clamped to [0, 26] (the T3 TSHI/TSHR clamp)
+define internal i64 @__manit_pow3(i64 %k) {
+entry:
+  %kneg = icmp slt i64 %k, 0
+  %k0 = select i1 %kneg, i64 0, i64 %k
+  %kbig = icmp sgt i64 %k0, 26
+  %kc = select i1 %kbig, i64 26, i64 %k0
+  br label %cond
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %p = phi i64 [ 1, %entry ], [ %pnext, %body ]
+  %done = icmp sge i64 %i, %kc
+  br i1 %done, label %exit, label %body
+body:
+  %pnext = mul i64 %p, 3
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  ret i64 %p
+}
+
+define internal i64 @ternary_trit_shift_left(i64 %n, i64 %k) {
+entry:
+  %p = call i64 @__manit_pow3(i64 %k)
+  %r = mul i64 %n, %p
+  ret i64 %r
+}
+
+define internal i64 @ternary_trit_shift_right(i64 %n, i64 %k) {
+entry:
+  ; round-to-nearest division by 3^k: floor((n + (3^k - 1)/2) / 3^k)
+  %p = call i64 @__manit_pow3(i64 %k)
+  %pm1 = sub i64 %p, 1
+  %bias = sdiv i64 %pm1, 2
+  %t = add i64 %n, %bias
+  %q = sdiv i64 %t, %p
+  %r = srem i64 %t, %p
+  %rneg = icmp slt i64 %r, 0
+  %adj = select i1 %rneg, i64 -1, i64 0
+  %fq = add i64 %q, %adj
+  ret i64 %fq
+}
+
+define internal i64 @ternary_tryte_from_trits(i64 %a, i64 %b, i64 %c) {
+entry:
+  %a9 = mul i64 %a, 9
+  %b3 = mul i64 %b, 3
+  %s = add i64 %a9, %b3
+  %r = add i64 %s, %c
+  ret i64 %r
+}
+
+define internal i64 @ternary_pack_trits(ptr %arr) {
+entry:
+  %len = load i64, ptr %arr, align 8
+  br label %cond
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %acc = phi i64 [ 0, %entry ], [ %accnext, %body ]
+  %base = phi i64 [ 1, %entry ], [ %basenext, %body ]
+  %done = icmp sge i64 %i, %len
+  br i1 %done, label %exit, label %body
+body:
+  %idx = add i64 %i, 1
+  %ep = getelementptr i64, ptr %arr, i64 %idx
+  %t = load i64, ptr %ep, align 8
+  %tm = mul i64 %t, %base
+  %accnext = add i64 %acc, %tm
+  %basenext = mul i64 %base, 3
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  ret i64 %acc
+}
+
+; Returns a raw [trit; 27] array. Trit array elements are single i8 slots
+; in the LLVM lowering (array_value_ty), so the result is 27 bytes.
+define internal ptr @ternary_unpack_trits(i64 %v) {
+entry:
+  %buf = call ptr @malloc(i64 27)
+  br label %cond
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %val = phi i64 [ %v, %entry ], [ %valnext, %body ]
+  %done = icmp sge i64 %i, 27
+  br i1 %done, label %exit, label %body
+body:
+  %r0 = srem i64 %val, 3
+  %rneg = icmp slt i64 %r0, 0
+  %radd = select i1 %rneg, i64 3, i64 0
+  %rem = add i64 %r0, %radd
+  %istwo = icmp eq i64 %rem, 2
+  %d = select i1 %istwo, i64 -1, i64 %rem
+  %d8 = trunc i64 %d to i8
+  %ep = getelementptr i8, ptr %buf, i64 %i
+  store i8 %d8, ptr %ep, align 1
+  %sub = sub i64 %val, %d
+  %valnext = sdiv i64 %sub, 3
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  ret ptr %buf
+}
+
+define internal ptr @ternary_trits_to_str(ptr %arr) {
+entry:
+  %len = load i64, ptr %arr, align 8
+  %isempty = icmp sle i64 %len, 0
+  %n = select i1 %isempty, i64 1, i64 %len
+  %n1 = add i64 %n, 1
+  %s = call ptr @malloc(i64 %n1)
+  br i1 %isempty, label %empty, label %cond
+empty:
+  store i8 48, ptr %s, align 1
+  %e1 = getelementptr i8, ptr %s, i64 1
+  store i8 0, ptr %e1, align 1
+  ret ptr %s
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %done = icmp sge i64 %i, %len
+  br i1 %done, label %exit, label %body
+body:
+  %idx = add i64 %i, 1
+  %ep = getelementptr i64, ptr %arr, i64 %idx
+  %t = load i64, ptr %ep, align 8
+  %ispos = icmp sgt i64 %t, 0
+  %isneg = icmp slt i64 %t, 0
+  %cneg = select i1 %isneg, i8 45, i8 48
+  %ch = select i1 %ispos, i8 43, i8 %cneg
+  %sp = getelementptr i8, ptr %s, i64 %i
+  store i8 %ch, ptr %sp, align 1
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  %endp = getelementptr i8, ptr %s, i64 %len
+  store i8 0, ptr %endp, align 1
+  ret ptr %s
+}
+
+define internal ptr @math_to_balanced_ternary(i64 %n) {
+entry:
+  %buf = call ptr @malloc(i64 336)
+  %iszero = icmp eq i64 %n, 0
+  br i1 %iszero, label %zero, label %cond
+zero:
+  store i64 1, ptr %buf, align 8
+  %z1 = getelementptr i64, ptr %buf, i64 1
+  store i64 0, ptr %z1, align 8
+  ret ptr %buf
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %val = phi i64 [ %n, %entry ], [ %valnext, %body ]
+  %done = icmp eq i64 %val, 0
+  br i1 %done, label %exit, label %body
+body:
+  %r0 = srem i64 %val, 3
+  %rneg = icmp slt i64 %r0, 0
+  %radd = select i1 %rneg, i64 3, i64 0
+  %rem = add i64 %r0, %radd
+  %istwo = icmp eq i64 %rem, 2
+  %d = select i1 %istwo, i64 -1, i64 %rem
+  %idx = add i64 %i, 1
+  %ep = getelementptr i64, ptr %buf, i64 %idx
+  store i64 %d, ptr %ep, align 8
+  %sub = sub i64 %val, %d
+  %valnext = sdiv i64 %sub, 3
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  store i64 %i, ptr %buf, align 8
+  ret ptr %buf
+}
+
+define internal ptr @ternary_to_balanced_ternary(i64 %n) {
+entry:
+  %r = call ptr @math_to_balanced_ternary(i64 %n)
+  ret ptr %r
+}
+
+define internal i64 @math_from_balanced_ternary(ptr %arr) {
+entry:
+  %r = call i64 @ternary_pack_trits(ptr %arr)
+  ret i64 %r
+}
+
+define internal i64 @ternary_from_balanced_ternary(ptr %arr) {
+entry:
+  %r = call i64 @ternary_pack_trits(ptr %arr)
+  ret i64 %r
+}
+
+; --- Result<T, E> ---------------------------------------------------------
+; The IR lowers `match` on Result to direct word access: word 0 = tag
+; (1 = Ok, 0 = Unknown, -1 = Err), word 1 = payload (Ok value, or the
+; Err/Unknown message pointer). The C runtime's ManitResult keeps the
+; message in a THIRD field with val = 0, which made every Err/Unknown
+; payload print as (null) on LLVM. These internal constructors build the
+; two-word layout the IR actually reads.
+
+define internal ptr @Ok_new(i64 %v) {
+entry:
+  %r = call ptr @malloc(i64 16)
+  store i64 1, ptr %r, align 8
+  %p1 = getelementptr i64, ptr %r, i64 1
+  store i64 %v, ptr %p1, align 8
+  ret ptr %r
+}
+
+define internal ptr @Err_new(ptr %m) {
+entry:
+  %r = call ptr @malloc(i64 16)
+  store i64 -1, ptr %r, align 8
+  %mi = ptrtoint ptr %m to i64
+  %p1 = getelementptr i64, ptr %r, i64 1
+  store i64 %mi, ptr %p1, align 8
+  ret ptr %r
+}
+
+define internal ptr @Unknown_new(ptr %m) {
+entry:
+  %r = call ptr @malloc(i64 16)
+  store i64 0, ptr %r, align 8
+  %mi = ptrtoint ptr %m to i64
+  %p1 = getelementptr i64, ptr %r, i64 1
+  store i64 %mi, ptr %p1, align 8
+  ret ptr %r
+}
+
+define internal ptr @Ok(i64 %v) {
+entry:
+  %r = call ptr @Ok_new(i64 %v)
+  ret ptr %r
+}
+
+define internal ptr @Err(ptr %m) {
+entry:
+  %r = call ptr @Err_new(ptr %m)
+  ret ptr %r
+}
+
+; Sequential counting barrier, mirroring T3 emulator syscalls 117/118.
+; Spawn blocks execute inline, so a real pthread barrier would block the
+; single thread forever; instead each wait counts an arrival and the last
+; arrival (the leader) resets the cycle. Layout: [0]=needed, [1]=arrived.
+define internal ptr @Barrier_new(i64 %n) {
+entry:
+  %b = call ptr @malloc(i64 16)
+  store i64 %n, ptr %b, align 8
+  %p1 = getelementptr i64, ptr %b, i64 1
+  store i64 0, ptr %p1, align 8
+  ret ptr %b
+}
+
+define internal i1 @Barrier_wait(ptr %b) {
+entry:
+  %pn = getelementptr i64, ptr %b, i64 0
+  %needed = load i64, ptr %pn, align 8
+  %pa = getelementptr i64, ptr %b, i64 1
+  %arrived = load i64, ptr %pa, align 8
+  %next = add i64 %arrived, 1
+  %done = icmp sge i64 %next, %needed
+  %reset = select i1 %done, i64 0, i64 %next
+  store i64 %reset, ptr %pa, align 8
+  ret i1 %done
+}
+
+define internal i64 @Barrier_count(ptr %b) {
+entry:
+  %n = load i64, ptr %b, align 8
+  ret i64 %n
+}
+
+; Method-name aliases: the language spells these .load()/.store(), the C
+; runtime exports AtomicTrit_get/AtomicTrit_set.
+define internal i8 @AtomicTrit_load(ptr %a) {
+entry:
+  %v = call i8 @AtomicTrit_get(ptr %a)
+  ret i8 %v
+}
+
+define internal void @AtomicTrit_store(ptr %a, i8 %v) {
+entry:
+  call void @AtomicTrit_set(ptr %a, i8 %v)
+  ret void
+}
+
+; A MutexGuard is the mutex handle itself (the T3 emulator model: lock is a
+; no-op returning the handle in the sequential world; here the mutex was
+; already locked by Mutex_lock at the `.lock()` call site).
+define internal i64 @MutexGuard_get(i64 %g) {
+entry:
+  %m = inttoptr i64 %g to ptr
+  %v = call i64 @Mutex_get(ptr %m)
+  ret i64 %v
+}
+
+define internal void @MutexGuard_unlock(i64 %g) {
+entry:
+  %m = inttoptr i64 %g to ptr
+  call void @Mutex_unlock(ptr %m)
+  ret void
+}
+
+define internal void @MutexGuard_update(i64 %g, ptr %f) {
+entry:
+  %m = inttoptr i64 %g to ptr
+  %v = call i64 @Mutex_get(ptr %m)
+  %nv = call i64 %f(i64 %v)
+  call void @Mutex_set(ptr %m, i64 %nv)
+  ret void
+}
+
+define internal void @time_sleep(i64 %ms) {
+entry:
+  call void @time_sleep_ms(i64 %ms)
+  ret void
+}
+
+; Eager async model, mirroring the T3 emulator (syscalls 122-126): async fn
+; bodies run at the call site, async_spawn_task boxes the finished result,
+; Task_join/await unboxes it, and select resolves to the first future in the
+; vector (index 0) since everything has already completed.
+define internal void @async_sleep(i64 %ms) {
+entry:
+  %us = mul i64 %ms, 1000
+  %us32 = trunc i64 %us to i32
+  call i32 @usleep(i32 %us32)
+  ret void
+}
+
+define internal ptr @async_spawn_task(i64 %result) {
+entry:
+  %box = call ptr @malloc(i64 8)
+  store i64 %result, ptr %box, align 8
+  ret ptr %box
+}
+
+define internal i64 @Task_join(i64 %handle) {
+entry:
+  %p = inttoptr i64 %handle to ptr
+  %v = load i64, ptr %p, align 8
+  ret i64 %v
+}
+
+define internal i64 @async_select(ptr %futs) {
+entry:
+  %val = call i64 @Vec_get(ptr %futs, i64 0)
+  %sel = call ptr @malloc(i64 16)
+  store i64 0, ptr %sel, align 8
+  %p1 = getelementptr i64, ptr %sel, i64 1
+  store i64 %val, ptr %p1, align 8
+  %r = ptrtoint ptr %sel to i64
+  ret i64 %r
+}
+
+; select-result .block_on(): the select tuple (winner_idx, winner_val) was
+; fully resolved by async_select; just hand the tuple pointer back.
+define internal ptr @_block_on(i64 %sel) {
+entry:
+  %p = inttoptr i64 %sel to ptr
+  ret ptr %p
+}
+
+; Non-blocking channel receive, mirroring T3 syscall 108: Ok(value) if an
+; item is queued, otherwise Err("closed") for a closed channel and
+; Err("empty") for an open one. Check emptiness first so a queued item on
+; a closed channel is still drained, exactly like the emulator.
+define internal ptr @Channel_try_recv(ptr %c) {
+entry:
+  %empty = call i1 @Channel_is_empty(ptr %c)
+  br i1 %empty, label %no_item, label %have_item
+have_item:
+  %v = call i64 @Channel_recv(ptr %c)
+  %ok = call ptr @Ok_new(i64 %v)
+  ret ptr %ok
+no_item:
+  %closed = call i1 @Channel_is_closed(ptr %c)
+  %msg = select i1 %closed, ptr @__manit_s_chclosed, ptr @__manit_s_chempty
+  %err = call ptr @Err_new(ptr %msg)
+  ret ptr %err
+}
+
+define internal ptr @Unknown(ptr %m) {
+entry:
+  %r = call ptr @Unknown_new(ptr %m)
+  ret ptr %r
+}
+
+define internal i1 @result_is_ok(ptr %r) {
+entry:
+  %tag = load i64, ptr %r, align 8
+  %b = icmp eq i64 %tag, 1
+  ret i1 %b
+}
+
+define internal i1 @result_is_err(ptr %r) {
+entry:
+  %tag = load i64, ptr %r, align 8
+  %b = icmp eq i64 %tag, -1
+  ret i1 %b
+}
+
+define internal i1 @result_is_unknown(ptr %r) {
+entry:
+  %tag = load i64, ptr %r, align 8
+  %b = icmp eq i64 %tag, 0
+  ret i1 %b
+}
+
+define internal i64 @result_unwrap(ptr %r) {
+entry:
+  %p1 = getelementptr i64, ptr %r, i64 1
+  %v = load i64, ptr %p1, align 8
+  ret i64 %v
+}
+"#;
 
 // ---------------------------------------------------------------------------
 // String escaping for LLVM IR constant strings

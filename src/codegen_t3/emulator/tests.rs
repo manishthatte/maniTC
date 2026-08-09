@@ -516,3 +516,513 @@ fn test_emu_flags() {
     assert_eq!(emu.flags, 0);
     assert_eq!(emu.regs[3], 0);
 }
+
+// ---------------------------------------------------------------------------
+// Encode/decode field-range regression tests (B1/B2/B4/B14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_encode_decode_roundtrip_full_field_ranges() {
+    // Every legal (r1, r2, r3, imm) combination must round-trip exactly,
+    // including the balanced negative immediates that used to corrupt
+    // adjacent fields.
+    for r1 in 0..=26i64 {
+        for r2 in (0..=26i64).step_by(5) {
+            for r3 in (0..=26i64).step_by(5) {
+                for imm in IMM_MIN..=IMM_MAX {
+                    let word = encode(Opcode::Tadd, r1, r2, r3, imm);
+                    let (op, d1, d2, d3, dimm) = decode(word);
+                    assert_eq!(
+                        (op, d1, d2, d3, dimm),
+                        (Opcode::Tadd as i64, r1, r2, r3, imm),
+                        "roundtrip failed for r1={} r2={} r3={} imm={}", r1, r2, r3, imm
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_encode_wide_tlit_roundtrip_full_range_boundaries() {
+    // The balanced 13-trit wide immediate holds exactly ±(3^13 − 1)/2.
+    for &imm in &[0, 1, -1, 1000, -1000, 796_161, -796_161, 796_162, -796_162,
+                  WIDE_IMM_MAX, -WIDE_IMM_MAX] {
+        let word = encode_wide(Opcode::Tlit, 1, imm);
+        assert_eq!(decode_tlit_imm(word), imm, "TLIT roundtrip failed for {}", imm);
+    }
+    // Strided sweep across the whole legal range.
+    let mut imm = -WIDE_IMM_MAX;
+    while imm <= WIDE_IMM_MAX {
+        let word = encode_wide(Opcode::Tlit, 3, imm);
+        assert_eq!(decode_tlit_imm(word), imm);
+        imm += 997; // prime stride
+    }
+}
+
+#[test]
+#[should_panic(expected = "imm out of range")]
+fn test_encode_rejects_imm_too_large() {
+    let _ = encode(Opcode::Tadd, 1, 2, 0, 14);
+}
+
+#[test]
+#[should_panic(expected = "imm out of range")]
+fn test_encode_rejects_imm_too_small() {
+    let _ = encode(Opcode::Tadd, 1, 2, 0, -14);
+}
+
+#[test]
+#[should_panic(expected = "r1 out of range")]
+fn test_encode_rejects_register_out_of_range() {
+    let _ = encode(Opcode::Tadd, 27, 0, 0, 0);
+}
+
+#[test]
+#[should_panic(expected = "wide_imm out of range")]
+fn test_encode_wide_rejects_out_of_range() {
+    let _ = encode_wide(Opcode::Tlit, 1, P13);
+}
+
+#[test]
+fn test_assembler_rejects_out_of_range_immediates() {
+    // 3-trit imm field holds -13..13: larger constants must be a clean error,
+    // not silent field corruption.
+    assert!(assemble("TADD R1, R2, #20").is_err());
+    assert!(assemble("TSUB R1, R2, #-20").is_err());
+    assert!(assemble("LOAD R1, [R2+#20]").is_err());
+    assert!(assemble("STORE R1, [R2-20]").is_err());
+    assert!(assemble("TLIT R1, #797162").is_err());
+    assert!(assemble("TLIT R1, #-797162").is_err());
+    assert!(assemble("SYSCALL #-1").is_err());
+    // Legal boundary values still assemble.
+    assert!(assemble("TADD R1, R2, #13").is_ok());
+    assert!(assemble("TADD R1, R2, #-13").is_ok());
+    assert!(assemble("TLIT R1, #797161").is_ok());
+    assert!(assemble("TLIT R1, #-797161").is_ok());
+}
+
+#[test]
+fn test_negative_immediates_execute_correctly() {
+    // TADD R3, R2, #-5 — used to decode as garbage (B1).
+    let asm = r#"
+TLIT R2, #100
+TADD R3, R2, #-5
+HALT
+"#;
+    let (words, _, _) = assemble(asm).expect("assemble failed");
+    let mut emu = Emulator::new();
+    emu.load_program(words);
+    emu.run();
+    assert_eq!(emu.regs[3], 95);
+}
+
+#[test]
+fn test_negative_load_store_offsets() {
+    // LOAD/STORE with negative offsets (explicitly supported by parse_mem).
+    let asm = r#"
+TLIT R2, #1000
+TLIT R1, #42
+STORE R1, [R2-3]
+LOAD R4, [R2+#-3]
+HALT
+"#;
+    let (words, _, _) = assemble(asm).expect("assemble failed");
+    let mut emu = Emulator::new();
+    emu.load_program(words);
+    emu.run();
+    assert_eq!(emu.memory[997], 42);
+    assert_eq!(emu.regs[4], 42);
+}
+
+// ---------------------------------------------------------------------------
+// Labeled-instruction TBRANCH placeholders (B8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_labeled_tbranch_same_encoding_as_bare() {
+    // A `label: TBRANCH ...` line must reserve the same 3 words as a bare
+    // TBRANCH, or every later label shifts by 2.
+    let bare = r#"
+start:
+TBRANCH R1, pos, zero, neg
+pos:
+TLIT R2, #1
+HALT
+zero:
+TLIT R2, #2
+HALT
+neg:
+TLIT R2, #3
+HALT
+"#;
+    let labeled = r#"
+start: TBRANCH R1, pos, zero, neg
+pos: TLIT R2, #1
+HALT
+zero: TLIT R2, #2
+HALT
+neg: TLIT R2, #3
+HALT
+"#;
+    let (w1, _, _) = assemble(bare).expect("bare assemble failed");
+    let (w2, _, _) = assemble(labeled).expect("labeled assemble failed");
+    assert_eq!(w1, w2, "labeled TBRANCH must encode identically to bare TBRANCH");
+
+    // And the branch targets must actually be correct at runtime.
+    let (words, _, _) = assemble(labeled).unwrap();
+    for (cond, expect) in [(1i64, 1i64), (0, 2), (-1, 3)] {
+        let mut emu = Emulator::new();
+        emu.load_program(words.clone());
+        emu.regs[1] = cond;
+        emu.run();
+        assert_eq!(emu.regs[2], expect, "TBRANCH cond={} took wrong arm", cond);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TSHR round-to-nearest semantics (B13) + register shift amounts (B14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tshr_round_to_nearest() {
+    // Dropping k low balanced trits is round-to-nearest division by 3^k.
+    for (val, shift, expect) in [
+        (5i64, 1i64, 2i64), (-5, 1, -2), (7, 1, 2), (-7, 1, -2),
+        (4, 1, 1), (-4, 1, -1), (27, 1, 9), (9, 2, 1), (13, 0, 13),
+    ] {
+        let asm = format!("TLIT R1, #{}\nTSHR R2, R1, #{}\nHALT\n", val, shift);
+        let (words, _, _) = assemble(&asm).unwrap();
+        let mut emu = Emulator::new();
+        emu.load_program(words);
+        emu.run();
+        assert_eq!(emu.regs[2], expect, "TSHR {} >> {} should be {}", val, shift, expect);
+    }
+}
+
+#[test]
+fn test_tshr_syscall_202_matches_instruction() {
+    // Syscall 202 (t27_shift_right) must agree with the TSHR instruction.
+    for (val, shift, expect) in [(5i64, 1i64, 2i64), (-5, 1, -2), (42, 1, 14), (9, 2, 1)] {
+        let mut emu = Emulator::new();
+        emu.regs[1] = val;
+        emu.regs[2] = shift;
+        emu.do_syscall(202);
+        assert_eq!(emu.regs[1], expect, "syscall 202: {} >> {} should be {}", val, shift, expect);
+    }
+}
+
+#[test]
+fn test_shift_amount_in_register() {
+    // TSHI/TSHR with a register shift amount (needed for constants > 13).
+    let asm = r#"
+TLIT R1, #2
+TLIT R2, #14
+TSHI R3, R1, R2
+TLIT R4, #5
+TLIT R5, #1
+TSHR R6, R4, R5
+HALT
+"#;
+    let (words, _, _) = assemble(asm).unwrap();
+    let mut emu = Emulator::new();
+    emu.load_program(words);
+    emu.run();
+    assert_eq!(emu.regs[3], 2 * 3i64.pow(14));
+    assert_eq!(emu.regs[6], 2); // 5 >> 1 rounds to 2
+}
+
+// ---------------------------------------------------------------------------
+// Syscall router totality (B3/B6): every claimed number dispatches without
+// panicking — real handler or the graceful "TRAP: unknown syscall" path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_syscall_router_totality() {
+    let claimed: Vec<i64> = (0..=16)
+        .chain(17..=59)
+        .chain(60..=69)
+        .chain(70..=74)
+        .chain(75..=79)
+        .chain(80..=131)
+        .chain([132])
+        .chain(200..=202)
+        .chain(210..=220)
+        .chain(500..=525)
+        .chain([540, 550, 551])
+        .collect();
+    for num in claimed {
+        let mut emu = Emulator::new();
+        emu.input_queue.push_back(0); // syscall 5 (read int) must not block
+        emu.do_syscall(num); // must not panic
+    }
+    // A number outside every claimed range takes the graceful TRAP path.
+    let mut emu = Emulator::new();
+    emu.do_syscall(9999);
+    assert!(emu.output.iter().any(|l| l.contains("TRAP: unknown syscall #9999")));
+}
+
+#[test]
+fn test_syscall_131_routes_to_mutex_set_value() {
+    let mut emu = Emulator::new();
+    emu.regs[1] = 7;
+    emu.do_syscall(109); // mutex_new(7)
+    let handle = emu.regs[1];
+    emu.regs[1] = handle;
+    emu.regs[2] = 99;
+    emu.do_syscall(131); // mutex_set_value(handle, 99) — used to panic (B3)
+    emu.regs[1] = handle;
+    emu.do_syscall(111); // mutex_get(handle)
+    assert_eq!(emu.regs[1], 99);
+}
+
+#[test]
+fn test_unclaimed_syscalls_in_ranges_trap_gracefully() {
+    // Numbers inside claimed router ranges but without a handler arm used to
+    // hit unreachable!() and panic the emulator (B6).
+    for num in [27, 28, 29, 37, 38, 39, 45, 46, 47, 48, 49, 217, 218, 513, 519] {
+        let mut emu = Emulator::new();
+        emu.do_syscall(num);
+        // 217 now has a real handler (print_bool3); everything else traps.
+        if num != 217 {
+            assert!(
+                emu.output.iter().any(|l| l.contains("TRAP: unknown syscall")),
+                "syscall {} should trap gracefully", num
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// print_bool3 (B11), print_float routing (B7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_syscall_217_print_bool3_llvm_format() {
+    for (val, expect) in [(1i64, "true"), (0, "unknown"), (-1, "false")] {
+        let mut emu = Emulator::new();
+        emu.regs[1] = val;
+        emu.do_syscall(217);
+        assert_eq!(emu.output, vec![expect.to_string()]);
+    }
+}
+
+#[test]
+fn test_syscall_2_prints_float() {
+    let mut emu = Emulator::new();
+    emu.regs[1] = 2.5f64.to_bits() as i64;
+    emu.do_syscall(2);
+    assert_eq!(emu.output, vec!["2.5".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Barrier reuse (B16)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_barrier_resets_after_each_cycle() {
+    let mut emu = Emulator::new();
+    emu.regs[1] = 2;
+    emu.do_syscall(117); // barrier_new(2)
+    let handle = emu.regs[1];
+    let mut results = Vec::new();
+    for _ in 0..4 {
+        emu.regs[1] = handle;
+        emu.do_syscall(118); // barrier_wait
+        results.push(emu.regs[1]);
+    }
+    // Two full cycles: waiter, leader, waiter, leader.
+    assert_eq!(results, vec![0, 1, 0, 1], "barrier must reset after each cycle");
+}
+
+// ---------------------------------------------------------------------------
+// Buffer length validation (B15)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_syscall_501_rejects_bad_buffer_lengths() {
+    for bad_len in [-1i64, i64::MIN, 1 << 40] {
+        let mut emu = Emulator::new();
+        emu.regs[1] = 3;       // fd (nonexistent is fine)
+        emu.regs[2] = 100;     // buf addr
+        emu.regs[3] = bad_len; // used to abort with capacity overflow / OOM
+        emu.do_syscall(501);
+        assert_eq!(emu.regs[1], -1);
+        assert!(emu.output.iter().any(|l| l.contains("invalid buffer length")));
+    }
+}
+
+#[test]
+fn test_syscall_524_rejects_bad_buffer_lengths() {
+    let mut emu = Emulator::new();
+    emu.regs[1] = 100;
+    emu.regs[2] = 100;
+    emu.regs[3] = -5;
+    emu.do_syscall(524);
+    assert_eq!(emu.regs[1], -1);
+}
+
+// ---------------------------------------------------------------------------
+// align_right lp-string fallback (B17)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_align_right_reads_lp_string_from_memory() {
+    let mut emu = Emulator::new();
+    // Write "ab" as a length-prefixed string at address 2000.
+    emu.memory[2000] = 2;
+    emu.memory[2001] = 'a' as i64;
+    emu.memory[2002] = 'b' as i64;
+    emu.regs[1] = 2000;
+    emu.regs[21] = 5;             // width
+    emu.regs[22] = '.' as i64;    // fill
+    emu.do_syscall(15);
+    let addr = emu.regs[1] as usize;
+    assert_eq!(emu.string_data.get(&addr).map(|s| s.as_str()), Some("...ab"));
+}
+
+// ---------------------------------------------------------------------------
+// Unknown opcodes trap (B22) and binary magic header
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_unknown_opcode_traps_instead_of_silent_skip() {
+    let mut emu = Emulator::new();
+    // 99 is not a valid opcode; the word decodes to raw_op = 99.
+    emu.load_program(vec![99 * P18]);
+    emu.run();
+    assert!(emu.halted);
+    assert!(
+        emu.output.iter().any(|l| l.contains("TRAP: unknown opcode")),
+        "invalid opcodes must trap, got: {:?}", emu.output
+    );
+}
+
+#[test]
+fn test_t3_binary_magic_header() {
+    let words = vec![
+        encode_wide(Opcode::Tlit, 1, 5),
+        encode(Opcode::Halt, 0, 0, 0, 0),
+    ];
+    let path = "/tmp/test_t3_magic.bin";
+    write_t3_binary(&words, path).unwrap();
+    // The raw file must start with the magic word...
+    let raw = std::fs::read(path).unwrap();
+    assert_eq!(&raw[0..8], &crate::codegen_t3::assembler::T3B_MAGIC.to_le_bytes());
+    // ...and read_t3_binary_with_magic strips it and reports it.
+    let (loaded, has_magic) = crate::codegen_t3::assembler::read_t3_binary_with_magic(path).unwrap();
+    assert!(has_magic);
+    assert_eq!(loaded, words);
+    // Legacy magic-less binaries are still readable (backward compat).
+    use std::io::Write;
+    let legacy_path = "/tmp/test_t3_legacy.bin";
+    let mut f = std::fs::File::create(legacy_path).unwrap();
+    for w in &words { f.write_all(&w.to_le_bytes()).unwrap(); }
+    drop(f);
+    let (legacy, legacy_magic) = crate::codegen_t3::assembler::read_t3_binary_with_magic(legacy_path).unwrap();
+    assert!(!legacy_magic);
+    assert_eq!(legacy, words);
+}
+
+// ---------------------------------------------------------------------------
+// call_fn_ptr depth balance (B12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_call_fn_ptr_balances_call_depth() {
+    // fn at addr 3: R1 = R1 + 1; RET.  Vec::map over [10, 20] calls it twice.
+    let asm = r#"
+JUMP setup
+fnadd:
+TADD R1, R1, #1
+RET
+setup:
+HALT
+"#;
+    let (words, _, _) = assemble(asm).unwrap();
+    let mut emu = Emulator::new();
+    emu.load_program(words);
+    // Build a Vec [10, 20]
+    emu.do_syscall(17);
+    let handle = emu.regs[1];
+    for v in [10, 20] {
+        emu.regs[1] = handle;
+        emu.regs[2] = v;
+        emu.do_syscall(18);
+    }
+    let depth_before = emu.call_depth;
+    emu.regs[1] = handle;
+    emu.regs[2] = 1; // fnadd label address (after the JUMP word)
+    emu.do_syscall(84); // Vec::map
+    assert_eq!(emu.call_depth, depth_before,
+        "call_fn_ptr must leave call_depth balanced (Ret decrements it)");
+    let mapped = emu.regs[1] as usize;
+    if let Some(HeapObj::Vec(v)) = emu.heap_objs.get(&mapped) {
+        assert_eq!(v, &vec![11, 21]);
+    } else {
+        panic!("Vec::map did not produce a Vec");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Profiler covers Loadt/Storet (B18)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_profiler_counts_loadt_storet() {
+    let mut emu = Emulator::new();
+    emu.load_program(vec![
+        encode_wide(Opcode::Tlit, 1, 1),
+        encode_wide(Opcode::Tlit, 2, 5000),
+        encode(Opcode::Storet, 1, 2, 0, 0),
+        encode(Opcode::Loadt, 3, 2, 0, 0),
+        encode(Opcode::Halt, 0, 0, 0, 0),
+    ]);
+    emu.run();
+    assert_eq!(emu.regs[3], 1);
+    assert_eq!(emu.profile.opcode_counts[Opcode::Loadt as usize], 1);
+    assert_eq!(emu.profile.opcode_counts[Opcode::Storet as usize], 1);
+    assert_eq!(emu.profile.memory_ops, 2);
+    let summary = emu.profile.summary();
+    assert!(summary.contains("LOADT"));
+    assert!(summary.contains("STORET"));
+}
+
+// ---------------------------------------------------------------------------
+// env::exit halts with code instead of killing the host process
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_env_exit_halts_with_code() {
+    let mut emu = Emulator::new();
+    emu.regs[1] = 3;
+    emu.do_syscall(550);
+    assert!(emu.halted);
+    assert_eq!(emu.regs[1], 3);
+}
+
+// ---------------------------------------------------------------------------
+// Assembler .float/.data sections with '::' labels (K4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_float_section_labels_with_path_separator() {
+    // Monomorphized labels like float_Point::zero_0 must resolve (K4).
+    let asm = r#"
+main:
+TLIT R1, #float_Point::zero_0
+HALT
+.float:
+    float_Point::zero_0: .float64 4614256656552045848
+"#;
+    let (words, _strings, floats) = assemble(asm).expect("assemble failed");
+    assert_eq!(words.len(), 2);
+    assert_eq!(floats.len(), 1);
+    let (&addr, &bits) = floats.iter().next().unwrap();
+    assert_eq!(bits, 4614256656552045848);
+    // The TLIT must load the float label's address.
+    let mut emu = Emulator::new();
+    emu.load_program(words);
+    emu.run();
+    assert_eq!(emu.regs[1] as usize, addr);
+}

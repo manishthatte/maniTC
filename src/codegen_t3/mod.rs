@@ -11,6 +11,6 @@ pub mod emulator;
 pub mod emitter;
 
 pub use isa::*;
-pub use assembler::{assemble, write_t3_binary, read_t3_binary};
-pub use emulator::{run_emulator, run_emulator_debug, run_emulator_profiled, Emulator, ExecProfile};
+pub use assembler::{assemble, write_t3_binary, read_t3_binary, read_t3_binary_with_magic, T3B_MAGIC};
+pub use emulator::{run_emulator, run_emulator_debug, run_emulator_profiled, run_emulator_with_exit, Emulator, ExecProfile};
 pub use emitter::emit_t3_asm;

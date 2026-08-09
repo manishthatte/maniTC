@@ -668,36 +668,56 @@ fn strength_reduce(func: &mut IRFunction) {
 // Pass 7: Dead Block Elimination
 // ---------------------------------------------------------------------------
 
-/// Remove functions with no blocks (extern stubs) and unreachable blocks
-/// (blocks with no predecessors except the entry block).
+/// Remove unreachable blocks. Liveness is a fixpoint computed from the entry
+/// block, so dead cycles (blocks that only reference each other) go too.
+/// A block is live if:
+///   - the entry block reaches it through terminator edges, or
+///   - a live block contains a PHI naming it as a predecessor (such blocks
+///     must be kept — removing them would leave the PHI referring to a
+///     deleted predecessor, which the LLVM backend rejects).
 fn dead_block_eliminate(module: &mut IRModule) {
     for func in &mut module.functions {
         if func.is_extern || func.blocks.len() <= 1 {
             continue;
         }
 
-        // Collect all jump targets
-        let mut reachable: HashSet<String> = HashSet::new();
-        reachable.insert(func.blocks[0].label.clone()); // entry is always reachable
+        let index: HashMap<&str, usize> = func.blocks.iter().enumerate()
+            .map(|(i, b)| (b.label.as_str(), i))
+            .collect();
 
-        for block in &func.blocks {
+        let mut live: HashSet<String> = HashSet::new();
+        let mut worklist: Vec<String> = vec![func.blocks[0].label.clone()];
+
+        while let Some(label) = worklist.pop() {
+            if !live.insert(label.clone()) {
+                continue;
+            }
+            let Some(&i) = index.get(label.as_str()) else { continue };
+            let block = &func.blocks[i];
             match &block.term {
                 IRTerminator::Jump(target) => {
-                    reachable.insert(target.clone());
+                    worklist.push(target.clone());
                 }
                 IRTerminator::BinBranch { true_label, false_label, .. } => {
-                    reachable.insert(true_label.clone());
-                    reachable.insert(false_label.clone());
+                    worklist.push(true_label.clone());
+                    worklist.push(false_label.clone());
                 }
                 IRTerminator::TritBranch { pos_label, zero_label, neg_label, .. } => {
-                    reachable.insert(pos_label.clone());
-                    reachable.insert(zero_label.clone());
-                    reachable.insert(neg_label.clone());
+                    worklist.push(pos_label.clone());
+                    worklist.push(zero_label.clone());
+                    worklist.push(neg_label.clone());
                 }
                 _ => {}
             }
+            for instr in &block.instrs {
+                if let IRInstr::Phi { incoming, .. } = instr {
+                    for (_, pred_label) in incoming {
+                        worklist.push(pred_label.clone());
+                    }
+                }
+            }
         }
 
-        func.blocks.retain(|block| reachable.contains(&block.label));
+        func.blocks.retain(|block| live.contains(&block.label));
     }
 }

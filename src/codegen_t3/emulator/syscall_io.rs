@@ -163,7 +163,10 @@ impl Emulator {
                 let fill = char::from_u32(self.regs[22] as u32).unwrap_or(' ');
                 let s = if let Some(content) = self.string_data.get(&str_addr) {
                     content.clone()
-                } else { String::new() };
+                } else {
+                    // Same fallback as align_left (132): in-memory lp-string.
+                    self.read_lp_string(str_addr)
+                };
                 let padded = if s.len() < width {
                     let pad: String = std::iter::repeat(fill).take(width - s.len()).collect();
                     format!("{}{}", pad, s)
@@ -293,18 +296,17 @@ impl Emulator {
             201 => {
                 // t27_shift_left(R1=n, R2=k) → R1 = n * 3^k
                 let n = self.regs[1];
-                let k = self.regs[2];
-                let mut factor = 1i64;
-                for _ in 0..k { factor *= 3; }
-                self.regs[1] = n * factor;
+                let k = self.regs[2].clamp(0, 26) as u32;
+                self.regs[1] = clamp27(n.saturating_mul(3i64.pow(k)));
             }
             202 => {
-                // t27_shift_right(R1=n, R2=k) → R1 = n / 3^k  (truncating)
+                // t27_shift_right(R1=n, R2=k) → R1: drop the k low trits.
+                // Round-to-nearest division by 3^k — same semantics as the
+                // TSHR instruction (balanced digits make ties impossible).
                 let n = self.regs[1];
-                let k = self.regs[2];
-                let mut factor = 1i64;
-                for _ in 0..k { factor *= 3; }
-                self.regs[1] = if factor == 0 { 0 } else { n / factor };
+                let k = self.regs[2].clamp(0, 26) as u32;
+                let p = 3i64.pow(k);
+                self.regs[1] = (n + (p - 1) / 2).div_euclid(p);
             }
 
             // ----------------------------------------------------------------
@@ -358,6 +360,13 @@ impl Emulator {
                 } else {
                     self.regs[1] = 0;
                 }
+            }
+            217 => {
+                // print_bool3: R1 = bool3 value → "true"/"false"/"unknown"
+                // (same wording as the LLVM backend's __manit_print_bool3).
+                let t = self.regs[1];
+                let s = if t > 0 { "true" } else if t < 0 { "false" } else { "unknown" };
+                self.output.push(s.to_string());
             }
             220 => {
                 // fneg: R1 = -R1 (flip IEEE 754 sign bit, bit 63)
@@ -448,9 +457,11 @@ impl Emulator {
                 self.regs[1] = ms;
             }
             550 => {
-                // env_exit(code: R1) — exit the process immediately
-                let code = self.regs[1] as i32;
-                std::process::exit(code);
+                // env_exit(code: R1) — halt the machine with R1 as the exit
+                // code.  (Halting instead of std::process::exit keeps buffered
+                // output and lets the embedding process decide how to exit;
+                // run-t3 propagates R1 as the process status.)
+                self.halted = true;
             }
             #[allow(unreachable_patterns)]
             551 => {
@@ -459,7 +470,9 @@ impl Emulator {
                 self.regs[1] = h as i64;
             }
 
-            _ => unreachable!("do_syscall_io: unexpected num={}", num),
+            // Unassigned numbers inside the claimed ranges (e.g. 218) take the
+            // graceful TRAP path, not a panic.
+            _ => self.trap_unknown_syscall(num),
         }
     }
 }

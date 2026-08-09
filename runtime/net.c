@@ -18,9 +18,11 @@ static size_t curl_write_cb(void* ptr, size_t size, size_t nmemb, void* ud) {
     struct curl_resp_buf* b = (struct curl_resp_buf*)ud;
     size_t bytes = size * nmemb;
     while (b->len + bytes + 1 > b->cap) {
-        b->cap = b->cap ? b->cap * 2 : 65536;
-        b->data = (char*)realloc(b->data, b->cap);
-        if (!b->data) return 0;
+        size_t ncap = b->cap ? b->cap * 2 : 65536;
+        char* nd = (char*)realloc(b->data, ncap);
+        if (!nd) return 0;
+        b->data = nd;
+        b->cap = ncap;
     }
     memcpy(b->data + b->len, ptr, bytes);
     b->len += bytes;
@@ -34,6 +36,7 @@ char* net_http_get(const char* url) {
 
     struct curl_resp_buf buf = {0};
     buf.data = (char*)malloc(65536);
+    if (!buf.data) { curl_easy_cleanup(curl); return strdup("(out of memory)"); }
     buf.cap  = 65536;
     buf.data[0] = '\0';
 
@@ -51,6 +54,7 @@ char* net_http_get(const char* url) {
     if (res != CURLE_OK) {
         free(buf.data);
         char* err = (char*)malloc(128);
+        if (!err) return strdup("(curl error)");
         snprintf(err, 128, "(curl error: %s)", curl_easy_strerror(res));
         return err;
     }

@@ -6,7 +6,7 @@ pub use profiler::ExecProfile;
 pub(crate) use profiler::{Task, DebugAction};
 
 pub mod debugger;
-pub use debugger::{run_emulator, run_emulator_debug, run_emulator_profiled};
+pub use debugger::{run_emulator, run_emulator_debug, run_emulator_profiled, run_emulator_with_exit};
 
 mod execute;
 mod syscalls;
@@ -64,6 +64,10 @@ pub struct Emulator {
     heap_ptr: usize,
     /// Heap objects (Vecs, Maps, Sets, Deques, Channels) keyed by handle.
     heap_objs: HashMap<usize, HeapObj>,
+    /// Canonical address per string CONTENT, for Map/Set keys: two string
+    /// values with equal text must hash/compare as the same key even though
+    /// they live at different addresses.
+    string_intern: HashMap<String, i64>,
     /// Open file handles.
     files: HashMap<usize, std::fs::File>,
     /// Next file descriptor counter (starts at 3 to avoid stdin/stdout/stderr).
@@ -107,6 +111,7 @@ impl Emulator {
             call_stack: Vec::new(),
             heap_ptr: 64_000,
             heap_objs: HashMap::new(),
+            string_intern: HashMap::new(),
             files: HashMap::new(),
             next_fd: 3,
             tcp_streams: HashMap::new(),
@@ -134,8 +139,11 @@ impl Emulator {
     fn call_fn_ptr(&mut self, fn_ptr: usize, arg: i64) -> i64 {
         let saved_pc = self.pc;
         let depth = self.call_stack.len();
-        // Simulate the CALL instruction
+        let saved_call_depth = self.call_depth;
+        // Simulate the CALL instruction (Ret decrements call_depth, so it must
+        // be incremented here to stay balanced)
         self.call_stack.push(saved_pc);
+        self.call_depth += 1;
         self.regs[26] -= 1;
         self.regs[1] = arg;
         self.pc = fn_ptr;
@@ -146,8 +154,13 @@ impl Emulator {
             steps += 1;
         }
         let ret = self.regs[1];
-        // Ensure PC is correctly restored even if we timed out
-        if self.call_stack.len() <= depth {
+        // On a normal return, Ret already popped our frame and set pc=saved_pc.
+        // On step-limit timeout the stale frame(s) are still on the stack:
+        // drop them and restore the PC so execution resumes at the call site.
+        if self.call_stack.len() > depth {
+            self.call_stack.truncate(depth);
+            self.call_depth = saved_call_depth;
+            self.regs[26] = clamp27(self.regs[26] + 1);
             self.pc = saved_pc;
         }
         ret
@@ -185,7 +198,9 @@ impl Emulator {
     fn call_fn_ptr_2arg(&mut self, fn_ptr: usize, a: i64, b: i64) -> i64 {
         let saved_pc = self.pc;
         let depth = self.call_stack.len();
+        let saved_call_depth = self.call_depth;
         self.call_stack.push(saved_pc);
+        self.call_depth += 1;
         self.regs[26] -= 1;
         self.regs[1] = a;
         self.regs[2] = b;
@@ -196,7 +211,11 @@ impl Emulator {
             steps += 1;
         }
         let ret = self.regs[1];
-        if self.call_stack.len() <= depth {
+        // Same timeout recovery as call_fn_ptr: pop stale frames, restore PC.
+        if self.call_stack.len() > depth {
+            self.call_stack.truncate(depth);
+            self.call_depth = saved_call_depth;
+            self.regs[26] = clamp27(self.regs[26] + 1);
             self.pc = saved_pc;
         }
         ret
@@ -251,6 +270,18 @@ impl Emulator {
         addr
     }
 
+    /// Canonicalize a Map/Set key: values that are string addresses map to
+    /// one canonical address per distinct CONTENT (first address seen), so
+    /// key comparison behaves like string comparison. Non-string values
+    /// pass through unchanged.
+    pub(crate) fn intern_key(&mut self, k: i64) -> i64 {
+        if let Some(s) = self.string_data.get(&(k as usize)) {
+            let s = s.clone();
+            return *self.string_intern.entry(s).or_insert(k);
+        }
+        k
+    }
+
     /// Allocate `len` words of memory at the heap, write `values`, and return the address.
     fn heap_alloc_array(&mut self, values: &[i64]) -> usize {
         let addr = self.heap_ptr;
@@ -285,13 +316,8 @@ impl Emulator {
         }
     }
 
-    /// Register string content at sequential high-memory addresses.
-    /// Assembler resolves symbolic string labels to those addresses.
-    pub fn load_strings(&mut self, strings: Vec<(String, String)>) {
-        let base: usize = 63_000;
-        for (i, (_label, content)) in strings.iter().enumerate() {
-            self.string_data.insert(base + i, content.clone());
-        }
-    }
-
+    // NOTE: a former `load_strings` helper registered strings at base 63_000,
+    // which disagreed with the assembler's placement (code_size + 1024).  It
+    // was dead code with no callers and has been removed; string data flows
+    // in through `string_data` (see run_emulator).
 }

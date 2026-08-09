@@ -54,9 +54,19 @@ impl SemanticAnalyzer {
                 } else {
                     None
                 };
-                let init = if let Some(e) = &ls.init {
+                let (init, stmt_ty) = if let Some(e) = &ls.init {
                     let te = self.check_expr(e, hint.as_ref())?;
                     let inferred_ty = te.ty.clone();
+                    // S4: a KNOWN annotation must be compatible with a KNOWN
+                    // initialiser type (Unknown on either side stays permissive).
+                    if let Some(h) = &hint {
+                        if h.is_known() && inferred_ty.is_known() && !types_compatible(h, &inferred_ty) {
+                            return Err(self.err(ls.span, format!(
+                                "type mismatch: '{}' is declared as `{}` but its initialiser has type `{}`",
+                                ls.name, h.display(), inferred_ty.display()
+                            )));
+                        }
+                    }
                     // If hint is an unsized array but init provides a size, use the sized type.
                     let final_ty = match (hint, &inferred_ty) {
                         (Some(ManiType::Array(ref elem_h, None)), ManiType::Array(ref elem_i, Some(n)))
@@ -95,31 +105,73 @@ impl SemanticAnalyzer {
                                 let ety = elem_tys.get(i).cloned().unwrap_or(ManiType::Unknown);
                                 self.symbols.define(n, ety, ls.mutable);
                             }
-                            // Also define the primary name for backward compat
-                            self.symbols.define(&ls.name, final_ty.clone(), ls.mutable);
+                            // S17: element names only — the first element must
+                            // NOT be redefined with the whole tuple type.
                         }
                         ast::LetPat::Ident(_) => {
                             self.symbols.define(&ls.name, final_ty.clone(), ls.mutable);
                         }
                     }
-                    Some(te)
+                    (Some(te), final_ty)
                 } else {
                     let ty = hint.unwrap_or(ManiType::Unknown);
-                    self.symbols.define(&ls.name, ty, ls.mutable);
-                    None
+                    // An uninitialised `let` accepts its first assignment even
+                    // without `mut` ("left uninitialised until first assignment").
+                    self.symbols.define(&ls.name, ty.clone(), true);
+                    (None, ty)
                 };
-                let ty = self.symbols.lookup(&ls.name).map(|s| s.ty.clone()).unwrap_or(ManiType::Unknown);
                 Ok(TypedStmt::Let(TypedLetStmt {
                     name: ls.name.clone(),
                     pat: ls.pat.clone(),
-                    ty,
+                    ty: stmt_ty,
                     init,
                     mutable: ls.mutable,
                 }))
             }
             Stmt::Assign(a) => {
+                // S5: lvalue validity — only variables, index and field
+                // expressions (or a deref) can be assigned to.
+                match &a.target {
+                    Expr::Ident(_, _) | Expr::Index(_, _, _) | Expr::Field(_, _, _) => {}
+                    Expr::UnOp(ast::UnOpKind::Deref, _, _) => {}
+                    other => {
+                        return Err(self.err(
+                            other.span(),
+                            "invalid assignment target — expected a variable, index, or field",
+                        ));
+                    }
+                }
                 let target = self.check_expr(&a.target, None)?;
+                // S5: mutability of direct variable assignments. Module-level
+                // globals (scope depth 0) are exempt: the parser does not
+                // record `mut` for globals.
+                if let Expr::Ident(name, ispan) = &a.target {
+                    let binding = self.symbols
+                        .lookup_with_depth(name)
+                        .map(|(depth, info)| (depth, info.mutable));
+                    if let Some((depth, mutable)) = binding {
+                        if depth >= 1 && !mutable {
+                            return Err(self.err(*ispan, format!(
+                                "cannot assign to immutable variable '{}' — declare it with `let mut`",
+                                name
+                            )));
+                        }
+                    }
+                }
                 let value = self.check_expr(&a.value, Some(&target.ty))?;
+                // S5: assigned value must be type-compatible with the target;
+                // compound assignments additionally obey the binop rules.
+                if let Some(op) = &a.op {
+                    self.binop_type(op, &target.ty, &value.ty, a.span)?;
+                } else if target.ty.is_known()
+                    && value.ty.is_known()
+                    && !types_compatible(&target.ty, &value.ty)
+                {
+                    return Err(self.err(a.span, format!(
+                        "type mismatch: cannot assign `{}` to a target of type `{}`",
+                        value.ty.display(), target.ty.display()
+                    )));
+                }
                 Ok(TypedStmt::Assign(TypedAssignStmt {
                     target,
                     value,

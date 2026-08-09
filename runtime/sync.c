@@ -13,13 +13,23 @@ typedef struct {
 ManitMutex* Mutex_new(int64_t v) {
     ManitMutex* m = malloc(sizeof(*m));
     if (!m) return NULL;
-    pthread_mutex_init(&m->lock, NULL);
+    /* Recursive: the guard pattern (`let g = m.lock(); g.get(); ...`)
+     * calls Mutex_get/Mutex_set while the lock is already held by the
+     * same thread; a default mutex would self-deadlock there. */
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&m->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
     m->value = v;
     return m;
 }
 
-void Mutex_lock(ManitMutex* m) {
+/* Returns the mutex itself: `let guard = m.lock()` binds the handle as the
+ * guard, matching the T3 emulator (syscall 110 returns R1 unchanged). */
+ManitMutex* Mutex_lock(ManitMutex* m) {
     if (m) pthread_mutex_lock(&m->lock);
+    return m;
 }
 
 void Mutex_unlock(ManitMutex* m) {
@@ -55,22 +65,35 @@ ManitAtomicTrit* AtomicTrit_new(int8_t v) {
 
 int8_t AtomicTrit_get(ManitAtomicTrit* a) {
     if (!a) return 0;
-    return __atomic_load_n(&a->val, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&a->lock);
+    int8_t v = a->val;
+    pthread_mutex_unlock(&a->lock);
+    return v;
 }
 
 void AtomicTrit_set(ManitAtomicTrit* a, int8_t v) {
-    if (a) __atomic_store_n(&a->val, v, __ATOMIC_SEQ_CST);
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    a->val = v;
+    pthread_mutex_unlock(&a->lock);
 }
 
 int8_t AtomicTrit_swap(ManitAtomicTrit* a, int8_t v) {
     if (!a) return 0;
-    return __atomic_exchange_n(&a->val, v, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&a->lock);
+    int8_t old = a->val;
+    a->val = v;
+    pthread_mutex_unlock(&a->lock);
+    return old;
 }
 
 int AtomicTrit_compare_exchange(ManitAtomicTrit* a, int8_t expected, int8_t new_val) {
     if (!a) return 0;
-    return __atomic_compare_exchange_n(&a->val, &expected, new_val,
-                                        0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    pthread_mutex_lock(&a->lock);
+    int ok = a->val == expected;
+    if (ok) a->val = new_val;
+    pthread_mutex_unlock(&a->lock);
+    return ok;
 }
 
 int8_t AtomicTrit_fetch_and(ManitAtomicTrit* a, int8_t v) {
@@ -118,26 +141,20 @@ typedef struct {
     int closed;
 } ManitChan;
 
+ManitChan* channel_bounded(int64_t capacity);
+
 ManitChan* channel_new(void) {
-    ManitChan* c = malloc(sizeof(ManitChan));
-    if (!c) return NULL;
-    c->capacity = CHAN_DEFAULT_CAP;
-    c->buffer = malloc(sizeof(int64_t) * (size_t)c->capacity);
-    c->count = 0;
-    c->head = 0;
-    c->tail = 0;
-    c->closed = 0;
-    pthread_mutex_init(&c->lock, NULL);
-    pthread_cond_init(&c->not_empty, NULL);
-    pthread_cond_init(&c->not_full, NULL);
-    return c;
+    return channel_bounded(CHAN_DEFAULT_CAP);
 }
 
 ManitChan* channel_bounded(int64_t capacity) {
     ManitChan* c = malloc(sizeof(ManitChan));
     if (!c) return NULL;
-    c->capacity = capacity > 0 ? (int)capacity : 1;
+    if (capacity < 1) capacity = 1;
+    if (capacity > (int64_t)1 << 30) capacity = (int64_t)1 << 30;
+    c->capacity = (int)capacity;
     c->buffer = malloc(sizeof(int64_t) * (size_t)c->capacity);
+    if (!c->buffer) { free(c); return NULL; }
     c->count = 0;
     c->head = 0;
     c->tail = 0;
@@ -156,6 +173,7 @@ void channel_send(ManitChan* c, int64_t v) {
     }
     if (c->closed) {
         pthread_mutex_unlock(&c->lock);
+        fprintf(stderr, "manit: send on closed channel\n");
         return;
     }
     c->buffer[c->tail] = v;
@@ -242,9 +260,9 @@ char* ternary_t27_to_str(int64_t n) {
     int idx = 63;
     buf[idx] = '\0';
     int negative = n < 0;
-    int64_t v = negative ? -n : n;
+    uint64_t v = negative ? 0 - (uint64_t)n : (uint64_t)n;
     while (v && idx > 0) {
-        int64_t rem = v % 3;
+        uint64_t rem = v % 3;
         v /= 3;
         if (rem == 0) {
             buf[--idx] = '0';
@@ -279,7 +297,10 @@ ManitTask* manit_spawn(int64_t (*fn_ptr)(int64_t), int64_t arg) {
     task->fn_ptr = fn_ptr;
     task->arg = arg;
     task->result = 0;
-    pthread_create(&task->thread, NULL, _manit_task_runner, task);
+    if (pthread_create(&task->thread, NULL, _manit_task_runner, task) != 0) {
+        free(task);
+        return NULL;
+    }
     return task;
 }
 
@@ -350,10 +371,14 @@ typedef struct {
 } ManitBarrier;
 
 ManitBarrier* Barrier_new(int64_t n) {
+    if (n < 1 || n > 0x7fffffff) return NULL;
     ManitBarrier* b = malloc(sizeof(*b));
     if (!b) return NULL;
     b->count = (int)n;
-    pthread_barrier_init(&b->barrier, NULL, (unsigned)n);
+    if (pthread_barrier_init(&b->barrier, NULL, (unsigned)n) != 0) {
+        free(b);
+        return NULL;
+    }
     return b;
 }
 

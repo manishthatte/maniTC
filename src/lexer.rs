@@ -13,7 +13,7 @@ pub enum TokenKind {
     Str(String),
     Char(char),
     Bool(bool),
-    TernaryInt(i64), // 0t+0-+1 balanced ternary literal
+    TernaryInt(i64), // 0t+0- balanced ternary literal
 
     // --- Identifiers / keywords ---
     Ident(String),
@@ -284,9 +284,16 @@ impl Lexer {
         CompileError::lex(&self.file, self.line, self.col, msg)
     }
 
+    /// Build a lexer error pointing at an explicit span (the start of the
+    /// offending token) rather than at the current cursor position, which
+    /// has usually advanced past the token by the time the error is built.
+    fn err_at(&self, span: Span, msg: impl Into<String>) -> CompileError {
+        CompileError::lex(&self.file, span.line, span.col, msg)
+    }
+
     // --- skip whitespace & comments ---
 
-    fn skip_whitespace_and_comments(&mut self) {
+    fn skip_whitespace_and_comments(&mut self) -> CompileResult<()> {
         loop {
             // whitespace
             while self.peek().map_or(false, |c| c.is_ascii_whitespace()) {
@@ -306,6 +313,7 @@ impl Lexer {
             }
             // block comment /* ... */
             if self.peek() == Some('/') && self.peek2() == Some('*') {
+                let start = self.current_span();
                 self.advance();
                 self.advance();
                 let mut depth = 1usize;
@@ -321,7 +329,12 @@ impl Lexer {
                             self.advance();
                             depth -= 1;
                         }
-                        (None, _) => break,
+                        (None, _) => {
+                            return Err(self.err_at(
+                                start,
+                                "unterminated block comment: missing closing `*/`",
+                            ));
+                        }
                         _ => {
                             self.advance();
                         }
@@ -331,6 +344,7 @@ impl Lexer {
             }
             break;
         }
+        Ok(())
     }
 
     // --- number lexing ---
@@ -341,21 +355,59 @@ impl Lexer {
             match self.peek2() {
                 Some('t') => {
                     // Balanced ternary literal: 0t followed by +, 0, -
+                    //
+                    // Lexing rule for the sign characters: a `+` or `-` is
+                    // consumed as a trit digit only when the character after
+                    // it could NOT begin a new operand. If the sign is
+                    // immediately followed by an operand start (an ASCII
+                    // digit, letter, `_`, `.`, `(`, `"` or `'`), the literal
+                    // ends before the sign and the sign is lexed as an
+                    // ordinary binary/unary operator. This makes
+                    // `0t+0-1` lex as `0t+0` `-` `1` (= 3 - 1 = 2) while
+                    // keeping multi-trit literals like `0t+-0+` intact.
                     self.advance(); // '0'
                     self.advance(); // 't'
                     let mut digits: Vec<char> = Vec::new();
                     while let Some(c) = self.peek() {
-                        if c == '+' || c == '-' || c == '0' {
-                            digits.push(c);
-                            self.advance();
-                        } else {
-                            break;
+                        match c {
+                            '0' => {
+                                digits.push(c);
+                                self.advance();
+                            }
+                            '+' | '-' => {
+                                // `0` is excluded from the operand-start set:
+                                // it is itself a trit digit, so `0t+0-0`
+                                // stays one literal (longest match).
+                                let starts_operand = self.peek2().map_or(false, |n| {
+                                    (n.is_ascii_digit() && n != '0')
+                                        || n.is_alphabetic()
+                                        || n == '_'
+                                        || n == '.'
+                                        || n == '('
+                                        || n == '"'
+                                        || n == '\''
+                                });
+                                if starts_operand {
+                                    break;
+                                }
+                                digits.push(c);
+                                self.advance();
+                            }
+                            _ => break,
                         }
                     }
                     if digits.is_empty() {
-                        return Err(self.err("empty balanced ternary literal after '0t'"));
+                        return Err(self.err_at(span, "empty balanced ternary literal after '0t'"));
                     }
-                    let value = balanced_ternary_to_i64(&digits);
+                    let value = balanced_ternary_to_i64(&digits).ok_or_else(|| {
+                        self.err_at(
+                            span,
+                            format!(
+                                "balanced ternary literal 0t{} is out of range for a 64-bit integer",
+                                digits.iter().collect::<String>()
+                            ),
+                        )
+                    })?;
                     return Ok(Token::new(TokenKind::TernaryInt(value), span));
                 }
                 Some('x') | Some('X') => {
@@ -369,7 +421,7 @@ impl Lexer {
                         }
                     }
                     let v = i64::from_str_radix(&s, 16)
-                        .map_err(|_| self.err(format!("invalid hex literal: 0x{}", s)))?;
+                        .map_err(|_| self.err_at(span, format!("invalid hex literal: 0x{}", s)))?;
                     return Ok(Token::new(TokenKind::Int(v), span));
                 }
                 Some('b') | Some('B') => {
@@ -383,7 +435,7 @@ impl Lexer {
                         }
                     }
                     let v = i64::from_str_radix(&s, 2)
-                        .map_err(|_| self.err(format!("invalid binary literal: 0b{}", s)))?;
+                        .map_err(|_| self.err_at(span, format!("invalid binary literal: 0b{}", s)))?;
                     return Ok(Token::new(TokenKind::Int(v), span));
                 }
                 Some('o') | Some('O') => {
@@ -397,7 +449,7 @@ impl Lexer {
                         }
                     }
                     let v = i64::from_str_radix(&s, 8)
-                        .map_err(|_| self.err(format!("invalid octal literal: 0o{}", s)))?;
+                        .map_err(|_| self.err_at(span, format!("invalid octal literal: 0o{}", s)))?;
                     return Ok(Token::new(TokenKind::Int(v), span));
                 }
                 _ => {}
@@ -440,10 +492,10 @@ impl Lexer {
                     s.push(self.advance().unwrap());
                 }
             }
-            let v: f64 = s.parse().map_err(|_| self.err(format!("invalid float literal: {}", s)))?;
+            let v: f64 = s.parse().map_err(|_| self.err_at(span, format!("invalid float literal: {}", s)))?;
             Ok(Token::new(TokenKind::Float(v), span))
         } else {
-            let v: i64 = s.parse().map_err(|_| self.err(format!("invalid integer literal: {}", s)))?;
+            let v: i64 = s.parse().map_err(|_| self.err_at(span, format!("invalid integer literal: {}", s)))?;
             Ok(Token::new(TokenKind::Int(v), span))
         }
     }
@@ -481,8 +533,17 @@ impl Lexer {
 
     fn lex_char(&mut self, span: Span) -> CompileResult<Token> {
         // opening ' already consumed
+        // `''` (including the first two quotes of `'''`) is an empty char
+        // literal — report it here, before consuming any following token.
+        if self.peek() == Some('\'') {
+            self.advance(); // consume the closing '
+            return Err(self.err_at(
+                span,
+                "empty character literal — write '\\'' for a quote character",
+            ));
+        }
         let ch = match self.advance() {
-            None => return Err(self.err("unterminated character literal")),
+            None => return Err(self.err_at(span, "unterminated character literal")),
             Some('\\') => match self.advance() {
                 Some('n') => '\n',
                 Some('t') => '\t',
@@ -490,14 +551,16 @@ impl Lexer {
                 Some('\\') => '\\',
                 Some('\'') => '\'',
                 Some('0') => '\0',
-                Some(c) => return Err(self.err(format!("unknown escape in char: \\{}", c))),
-                None => return Err(self.err("unterminated char escape")),
+                Some(c) => return Err(self.err_at(span, format!("unknown escape in char: \\{}", c))),
+                None => return Err(self.err_at(span, "unterminated char escape")),
             },
             Some(c) => c,
         };
-        match self.advance() {
-            Some('\'') => {}
-            _ => return Err(self.err("char literal must contain exactly one character")),
+        match self.peek() {
+            Some('\'') => {
+                self.advance();
+            }
+            _ => return Err(self.err_at(span, "char literal must contain exactly one character")),
         }
         Ok(Token::new(TokenKind::Char(ch), span))
     }
@@ -507,7 +570,7 @@ impl Lexer {
     pub fn tokenize(&mut self) -> CompileResult<Vec<Token>> {
         let mut tokens: Vec<Token> = Vec::new();
         loop {
-            self.skip_whitespace_and_comments();
+            self.skip_whitespace_and_comments()?;
             let span = self.current_span();
             let ch = match self.peek() {
                 None => {
@@ -723,7 +786,7 @@ impl Lexer {
 
                 c => {
                     self.advance();
-                    return Err(self.err(format!("unexpected character: '{}'", c)));
+                    return Err(self.err_at(span, format!("unexpected character: '{}'", c)));
                 }
             };
             tokens.push(tok);
@@ -736,7 +799,8 @@ impl Lexer {
 // Balanced ternary digit string → i64
 // ---------------------------------------------------------------------------
 
-fn balanced_ternary_to_i64(digits: &[char]) -> i64 {
+/// Returns `None` when the literal does not fit in an i64.
+fn balanced_ternary_to_i64(digits: &[char]) -> Option<i64> {
     let mut value: i64 = 0;
     for &d in digits {
         let trit: i64 = match d {
@@ -745,9 +809,9 @@ fn balanced_ternary_to_i64(digits: &[char]) -> i64 {
             '0' => 0,
             _ => 0,
         };
-        value = value * 3 + trit;
+        value = value.checked_mul(3)?.checked_add(trit)?;
     }
-    value
+    Some(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -807,6 +871,75 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn test_ternary_int_stops_before_operand() {
+        // F3 regression: a sign followed by an operand start terminates the
+        // literal, so `0t+0-1` is `0t+0` `-` `1` (3 - 1 = 2), not 0t"+0-"
+        // with a stray `1`.
+        let toks = lex("0t+0-1");
+        assert_eq!(
+            toks,
+            vec![
+                TokenKind::TernaryInt(3),
+                TokenKind::Minus,
+                TokenKind::Int(1),
+                TokenKind::Eof,
+            ]
+        );
+        // Multi-trit literals keep working, including trailing signs and
+        // interior zeros.
+        assert_eq!(lex("0t+-0+"), vec![TokenKind::TernaryInt(19), TokenKind::Eof]);
+        assert_eq!(lex("0t+0-0"), vec![TokenKind::TernaryInt(24), TokenKind::Eof]);
+        // A sign before an identifier is a binary operator, not a digit.
+        assert_eq!(
+            lex("0t0-x"),
+            vec![
+                TokenKind::TernaryInt(0),
+                TokenKind::Minus,
+                TokenKind::Ident("x".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ternary_int_overflow_is_error() {
+        // F1 regression: a 41-trit literal must report an error instead of
+        // panicking (debug) or wrapping (release).
+        let src = format!("0t{}0", "+".repeat(40));
+        let err = Lexer::new(&src).tokenize().unwrap_err();
+        assert!(err.to_string().contains("out of range"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_unterminated_block_comment_is_error() {
+        // F10 regression: an unterminated /* must not silently swallow the
+        // rest of the file.
+        let err = Lexer::new("let x = 1; /* never closed").tokenize().unwrap_err();
+        assert!(err.to_string().contains("unterminated block comment"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_bad_char_literals() {
+        // F11 regression: `'''` must not lex as Char('\'') and `''` must not
+        // consume the token after it before erroring.
+        let err = Lexer::new("'''").tokenize().unwrap_err();
+        assert!(err.to_string().contains("empty character literal"), "got: {}", err);
+        let err = Lexer::new("'' x").tokenize().unwrap_err();
+        assert!(err.to_string().contains("empty character literal"), "got: {}", err);
+        // The escaped form still works.
+        assert_eq!(lex("'\\''"), vec![TokenKind::Char('\''), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn test_error_column_points_at_offending_char() {
+        // F12 regression: the reported column is the character's own column,
+        // not one past it.
+        let err = Lexer::new("let romba<3 @").tokenize().unwrap_err();
+        let d = err.diagnostic();
+        assert_eq!((d.line, d.col), (1, 13), "got {}:{}", d.line, d.col);
     }
 
     #[test]

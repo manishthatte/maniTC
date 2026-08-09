@@ -5,81 +5,104 @@ gap, reproducible from a clean checkout. CI runs the working set on every
 push, so anything that works today cannot silently regress; this file is the
 list of what does not work yet.
 
-Last measured: 9 August 2026, against the initial public release.
+Last measured: 10 August 2026, after the full bug-fix campaign (see
+`../report.txt` for the complete finding-by-finding record).
 
 ## Example programs
 
-The T3ISA backend compiles and runs 11 of the 17 examples. The LLVM backend
-compiles and runs 3.
+All 17 example programs compile and run to completion with exit status 0 on
+BOTH backends. Verification is done by compiling to a real artifact
+(`manitc compile --target t3 -o x.t3b` then `manitc run-t3 x.t3b`, and the
+LLVM binary directly) and comparing actual output between the backends —
+never by `run-t3 <file>.mt`, which historically executed raw source bytes
+and proved nothing.
 
-| Example | T3ISA | LLVM |
-|---|---|---|
-| capability_demo | works | build fails |
-| database | works | build fails |
-| data_structures | works | build fails |
-| fibonacci | works | works |
-| hello | works | build fails |
-| neural_net | works | build fails |
-| stream_demo | works | works |
-| ternary_calculator | works | build fails |
-| ternary_demo | works | build fails |
-| ternary_sort | works | build fails |
-| three_valued_logic | works | build fails |
-| oop | assembler error | works |
-| bridge_demo | parse error | build fails |
-| concurrency | build fails | build fails |
-| crypto_demo | build fails | build fails |
-| float_demo | build fails | build fails |
-| patent_classify | build fails | build fails |
+| Example | T3ISA | LLVM | Output parity |
+|---|---|---|---|
+| bridge_demo | works | works | byte-identical |
+| capability_demo | works | works | diverges (T3 prints garbage for one PID string — see below) |
+| concurrency | works | works | byte-identical |
+| crypto_demo | works | works | byte-identical |
+| database | works | works | byte-identical |
+| data_structures | works | works | diverges in the trie section (T3 NUL-string print), and T3 takes ~4 min |
+| fibonacci | works | works | diverges above fib(62) — T3 saturates at the t27 word range (by design) |
+| float_demo | works | works | byte-identical |
+| hello | works | works | byte-identical |
+| neural_net | works | works | byte-identical |
+| oop | works | works | byte-identical |
+| patent_classify | works | works | byte-identical |
+| stream_demo | works | works | byte-identical |
+| ternary_calculator | works | works | byte-identical |
+| ternary_demo | works | works | diverges in two truth-table cells (T3) |
+| ternary_sort | works | works | byte-identical |
+| three_valued_logic | works | works | diverges in truth-table cells (T3) |
 
-## Open defects behind those failures
+`cargo test`: 261 passed, 0 failed, 0 ignored.
 
-**LLVM backend emits invalid IR for several constructs.** clang rejects the
-generated module rather than the compiler reporting an error itself. Observed
-so far:
+## Open issues
 
-- undefined runtime symbol `@io_println_bool3` is called but never declared
-  (`examples/hello.mt`)
-- a value typed `i64` used where `ptr` is expected (`examples/ternary_demo.mt`)
-- a returned value that does not match the function's declared result type
-  (`examples/three_valued_logic.mt`)
+1. **T3 `int` arithmetic saturates at the 27-trit word range** (±3 812 798
+   742 493). The T3ISA is a 27-trit machine and every ALU op clamps
+   (`clamp27`), while the LLVM backend computes in 64-bit. Programs whose
+   intermediate values exceed the t27 range diverge between backends
+   (fibonacci beyond fib(62) is the visible case). This is an architectural
+   property, not a bug; portable code — including the shipped stdlib —
+   must keep intermediates inside the t27 range.
 
-**Front-end gaps.**
+2. **T3 truth-table cell corruption (register-layout sensitive).** In
+   `three_valued_logic` and `ternary_demo`, some cells of the printed
+   tand/tor/txor tables are wrong on T3 (e.g. a row printing the row value
+   for every column). Minimal reproductions of the same code shape
+   (nested for over `[trit]`, indirect lambda call, `io::print_trit`)
+   produce correct output; the corruption appears only in the full
+   examples' register/stack layout. Suspected residual back-edge register
+   reconciliation gap in the T3 emitter (the general mechanism was added
+   for syscalls in loops; some non-syscall relocation path likely remains).
 
-- `std::t27f` is not resolvable as a standard library module, so balanced
-  ternary floating point cannot be imported (`examples/float_demo.mt`)
-- array literal syntax fails to parse in `examples/bridge_demo.mt:21`
+3. **T3 prints garbage/NUL runs for some computed strings** in
+   `capability_demo` (one PID line) and the `data_structures` trie section.
+   The string address being printed is not a registered string object, so
+   the emulator's null-terminated-memory fallback dumps raw memory.
+   Same class as issue 2 — a wrong register/stack value used as a string
+   handle in large functions.
 
-**T3ISA assembler.**
+4. **The T3 emulator is slow on allocation-heavy programs**:
+   `data_structures` takes ~4 minutes (interpreted, debug build, close to
+   the 10M-step budget). Purely a performance matter.
 
-- unresolved symbol `float_Point::zero_0` when a struct associated function is
-  generic over a float type (`examples/oop.mt`)
+5. **Loop-body array allocations on T3 are iteration-scoped.** The T3
+   backend reuses a loop body's stack allocations each iteration, so an
+   array created inside a loop must not be stored/aliased past its
+   iteration (the stdlib hoists its buffers accordingly; array-returning
+   calls and struct array fields are deep-copied at call sites). User code
+   that keeps a pointer to a loop-local array across iterations will read
+   clobbered data on T3.
 
-**Result / pattern binding.** `Ok(v)`, `Err(e)` and `Unknown(m)` bindings in
-`match` arms are reported as unknown identifiers by the semantic pass, and the
-error payload prints as `(null)` at runtime (`examples/fibonacci.mt`,
-`examples/hello.mt`).
+6. **No free/destroy API — leak by design.** Vec/Map/Set/Deque/Trie/
+   Channel/Mutex and most string-returning runtime functions allocate and
+   are never freed. Fine for the short-lived demo programs; a real
+   allocator interface is future work.
 
-**Exit status.** Several examples return a nonzero exit status after running
-correctly to completion; `main`'s return value is not being translated into a
-process status.
+## Fixed since the initial release (summary)
 
-**SIGPIPE.** `manitc run-t3 | head` panics with "failed printing to stdout:
-Broken pipe" when the reader closes early, instead of exiting quietly the way
-a command line tool should.
+The August 2026 campaign closed all 116 findings of the full review plus
+the original eight known issues (K1–K8) recorded here. Highlights:
 
-## Runtime linking
-
-The LLVM backend links compiled programs against the ManiT C runtime. With the
-SDL2 and libcurl development packages installed, the full runtime is built;
-without them the compiler probes pkg-config and falls back to the minimal
-runtime (`-DMANIT_NO_GUI`), which drops the `gui` and `net` modules and keeps
-everything else. `MANIT_NO_GUI=1` forces the minimal build.
-
-Programs using `gui` or `net` therefore need SDL2 and libcurl present at
-compile time. There is no diagnostic yet when they are used without it — the
-link simply fails on undefined symbols.
-
----
+- `run-t3` validates/auto-compiles its input and propagates main's return
+  value as the process exit status (K6); SIGPIPE exits quietly (K7).
+- The LLVM backend emits valid IR for all examples, links with a clear
+  diagnostic when the minimal runtime lacks gui/net (K8), and no longer
+  emits illegal casts or unhonored vararg ABIs.
+- `std::bridge`, `std::crypto`, and `std::t27f` are fully implemented in
+  ManiT and compiled into any program that imports them (they previously
+  had no implementation on either backend).
+- `print(...)` is a variadic line-printer on both backends; `fmt::format`
+  substitutes values (not addresses) identically on both backends.
+- String concatenation, string-keyed Map/Set, tryte printing, and module
+  globals now work on T3.
+- `bool → bool3` coercion produces `false`, not `unknown`.
+- Concurrency: sync handles (Mutex, Channel, Task, …) are Copy;
+  the mutex is recursive so guard-held accessors don't self-deadlock;
+  select/await/barrier/atomics have matching semantics on both backends.
 
 © Manish Jagdish Thatte

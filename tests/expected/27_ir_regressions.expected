@@ -1,0 +1,38 @@
+-- struct trit field --
+PASS struct-trit: int field intact
+PASS struct-trit: trit field reads
+PASS struct-trit: after field assign, int intact
+PASS struct-trit: after field assign, trit reads
+-- struct copy semantics --
+PASS struct-copy: copy sees fields
+PASS struct-copy: a.x unchanged
+PASS struct-copy: a.y unchanged
+-- for-loop shadowing --
+PASS for-shadow: range loop ran
+PASS for-shadow: outer i restored
+PASS for-shadow: array loop ran
+PASS for-shadow: outer v restored
+PASS for-shadow: vec loop ran
+PASS for-shadow: outer e restored
+-- string match --
+PASS match-str: concat hits arm 1
+PASS match-str: concat hits arm 2
+PASS match-str: wildcard still ok
+-- tfloat compare --
+PASS tfloat: -2.5 < 1.5
+PASS tfloat: 1.5 > -2.5
+PASS tfloat: -2.5 <= -2.5
+-- if with return arm --
+PASS if-ret: else path
+PASS if-ret: return path
+-- or-pattern binding --
+PASS or-bind: first alt uses y
+PASS or-bind: second alt uses x
+-- unsized array params --
+PASS unsized: sum of 4 ints
+PASS unsized: sum of 2 ints
+PASS unsized: forwarded param
+PASS unsized: trit elements
+PASS unsized: nested rows
+all ir regression tests done
+

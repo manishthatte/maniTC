@@ -40,7 +40,7 @@ pub struct LinkFlags {
 ///   3. next to the manitc executable (`../runtime/`) — this is the layout
 ///      the release tarball ships, `bin/manitc` alongside `runtime/`
 ///   4. failing all that, write the embedded copy to a temporary directory
-pub fn resolve_source(source_file: Option<&Path>) -> PathBuf {
+pub fn resolve_source(source_file: Option<&Path>) -> std::io::Result<PathBuf> {
     let candidates = [
         source_file
             .and_then(|f| f.parent())
@@ -54,20 +54,58 @@ pub fn resolve_source(source_file: Option<&Path>) -> PathBuf {
     ];
 
     if let Some(found) = candidates.iter().find(|p| p.exists()) {
-        return found.clone();
+        return Ok(found.clone());
     }
     write_embedded()
 }
 
 /// Write the embedded runtime — all seven files — into a temporary directory
-/// and return the path to the aggregator.
-fn write_embedded() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("manit_runtime_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+/// and return the path to the aggregator. Write errors propagate to the
+/// caller: silently returning a path to files that were never written would
+/// surface later as a baffling clang error.
+///
+/// The directory name carries a monotonic nanosecond timestamp in addition to
+/// the PID: a recycled PID must not silently reuse a stale directory left by
+/// an earlier process (whose runtime files may be from a different manitc
+/// version).
+fn write_embedded() -> std::io::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "manit_runtime_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir)?;
     for (name, contents) in RUNTIME_FILES {
-        let _ = std::fs::write(dir.join(name), contents);
+        std::fs::write(dir.join(name), contents)?;
     }
-    dir.join("manit_runtime.c")
+    Ok(dir.join("manit_runtime.c"))
+}
+
+/// Locate a usable clang executable. `clang` on PATH is preferred; Debian
+/// installs versioned names only (`clang-19`), and an LLVM prefix install may
+/// not be on PATH at all.
+pub fn find_clang() -> Option<String> {
+    let candidates = [
+        "clang",
+        "clang-19",
+        "clang-18",
+        "clang-17",
+        "/usr/lib/llvm-19/bin/clang",
+    ];
+    candidates
+        .iter()
+        .find(|c| {
+            Command::new(c)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .map(|c| c.to_string())
 }
 
 /// Where to put the compiled runtime object. Keyed by process id so that

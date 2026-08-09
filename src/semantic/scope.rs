@@ -8,7 +8,6 @@ use super::types::ManiType;
 #[derive(Debug, Clone)]
 pub(crate) struct SymbolInfo {
     pub ty: ManiType,
-    #[allow(dead_code)]
     pub mutable: bool,
 }
 
@@ -52,6 +51,17 @@ impl SymbolTable {
         for scope in self.scopes.iter().rev() {
             if let Some(info) = scope.symbols.get(name) {
                 return Some(info);
+            }
+        }
+        None
+    }
+
+    /// Like `lookup`, but also returns the scope depth of the binding
+    /// (0 = module-level globals, >= 1 = function-local scopes).
+    pub(crate) fn lookup_with_depth(&self, name: &str) -> Option<(usize, &SymbolInfo)> {
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
+            if let Some(info) = scope.symbols.get(name) {
+                return Some((depth, info));
             }
         }
         None

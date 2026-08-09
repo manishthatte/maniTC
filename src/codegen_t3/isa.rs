@@ -131,14 +131,38 @@ pub const P13: i64 = 1_594_323;   // 3^13
 pub const P8:  i64 = 6_561;       // 3^8
 pub const P3:  i64 = 27;           // 3^3
 
+/// Balanced 3-trit immediate field range: [-13, +13].
+pub const IMM_MIN: i64 = -13;
+pub const IMM_MAX: i64 = 13;
+/// Balanced 13-trit wide-immediate range for TLIT: ±(3^13 − 1)/2.
+pub const WIDE_IMM_MAX: i64 = (P13 - 1) / 2; // 797_161
+
+/// Encode a standard 5-field instruction word.
+///
+/// Field ranges are validated at encode time (out-of-range values used to
+/// silently corrupt adjacent fields): r1/r2/r3 must be register indices
+/// 0..=26, imm must fit the balanced 3-trit field [-13, +13].  Negative
+/// immediates are stored as balanced digits (rem_euclid 27) and decoded
+/// symmetrically by `decode`.
 pub fn encode(opcode: Opcode, r1: i64, r2: i64, r3: i64, imm: i64) -> i64 {
-    (opcode as i64) * P18 + r1 * P13 + r2 * P8 + r3 * P3 + imm
+    assert!((0..=26).contains(&r1), "T3ISA internal error: encode {:?}: r1 out of range (0..=26): {}", opcode, r1);
+    assert!((0..=26).contains(&r2), "T3ISA internal error: encode {:?}: r2 out of range (0..=26): {}", opcode, r2);
+    assert!((0..=26).contains(&r3), "T3ISA internal error: encode {:?}: r3 out of range (0..=26): {}", opcode, r3);
+    assert!((IMM_MIN..=IMM_MAX).contains(&imm),
+        "T3ISA internal error: encode {:?}: imm out of range ({}..={}): {}", opcode, IMM_MIN, IMM_MAX, imm);
+    (opcode as i64) * P18 + r1 * P13 + r2 * P8 + r3 * P3 + imm.rem_euclid(P3)
 }
 
 /// Encode an instruction with a wide immediate occupying the low P13 trits
 /// (after the opcode field).  r1 sits in the top 5 trits of that field.
 /// Uses rem_euclid so negative wide_imm values don't corrupt the r1 field.
+/// Accepted range: balanced [-WIDE_IMM_MAX, +WIDE_IMM_MAX] for signed users
+/// (TLIT) or unsigned [0, P13) for address users (JUMP/CALL/TBR_*/SYSCALL);
+/// the union is validated here, per-mnemonic bounds live in the assembler.
 pub fn encode_wide(opcode: Opcode, r1: i64, wide_imm: i64) -> i64 {
+    assert!((0..=26).contains(&r1), "T3ISA internal error: encode_wide {:?}: r1 out of range (0..=26): {}", opcode, r1);
+    assert!(wide_imm >= -WIDE_IMM_MAX && wide_imm < P13,
+        "T3ISA internal error: encode_wide {:?}: wide_imm out of range ({}..{}): {}", opcode, -WIDE_IMM_MAX, P13, wide_imm);
     let adj = wide_imm.rem_euclid(P13);
     (opcode as i64) * P18 + r1 * P13 + adj
 }
@@ -151,7 +175,9 @@ pub fn decode(word: i64) -> (i64, i64, i64, i64, i64) {
     let r2   = rest / P8;
     let rest = rest - r2 * P8;
     let r3   = rest / P3;
-    let imm  = rest - r3 * P3;
+    let raw  = rest - r3 * P3;
+    // The 3-trit imm field is balanced: stored digits 14..=26 represent -13..=-1.
+    let imm  = if raw > IMM_MAX { raw - P3 } else { raw };
     (op, r1, r2, r3, imm)
 }
 

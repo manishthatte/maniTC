@@ -79,6 +79,119 @@ pub struct SemanticAnalyzer {
     pub(crate) read_vars: std::collections::HashSet<String>,
     /// Names registered by register_builtins (user functions may shadow these)
     pub(crate) builtin_names: std::collections::HashSet<String>,
+    /// Prefixes ("foo" / "foo::bar") of successfully loaded user modules
+    pub(crate) loaded_module_prefixes: std::collections::HashSet<String>,
+    /// Non-`pub` items of loaded user modules: full item name → module prefix
+    pub(crate) module_private_items: HashMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// Standard library module membership (for `::`-path diagnostics)
+// ---------------------------------------------------------------------------
+
+/// Embedded stdlib sources, scanned (textually, so files with known parse
+/// gaps still contribute) for their top-level item names.
+const STDLIB_SOURCES: &[(&str, &str)] = &[
+    ("async",       include_str!("../../../stdlib/async.mt")),
+    ("bridge",      include_str!("../../../stdlib/bridge.mt")),
+    ("collections", include_str!("../../../stdlib/collections.mt")),
+    ("crypto",      include_str!("../../../stdlib/crypto.mt")),
+    ("env",         include_str!("../../../stdlib/env.mt")),
+    ("fmt",         include_str!("../../../stdlib/fmt.mt")),
+    ("fs",          include_str!("../../../stdlib/fs.mt")),
+    ("io",          include_str!("../../../stdlib/io.mt")),
+    ("math",        include_str!("../../../stdlib/math.mt")),
+    ("net",         include_str!("../../../stdlib/net.mt")),
+    ("str",         include_str!("../../../stdlib/str.mt")),
+    ("sync",        include_str!("../../../stdlib/sync.mt")),
+    ("t27f",        include_str!("../../../stdlib/t27f.mt")),
+    ("ternary",     include_str!("../../../stdlib/ternary.mt")),
+    ("time",        include_str!("../../../stdlib/time.mt")),
+    ("tritfs",      include_str!("../../../stdlib/tritfs.mt")),
+];
+
+/// Extract top-level (column-0) declaration names from a stdlib module source.
+fn scan_module_members(src: &str) -> std::collections::HashSet<String> {
+    fn leading_ident(s: &str) -> Option<String> {
+        let end = s
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(s.len());
+        if end == 0 { None } else { Some(s[..end].to_string()) }
+    }
+    let mut out = std::collections::HashSet::new();
+    for line in src.lines() {
+        if line.is_empty() || line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let l = line.strip_prefix("pub ").unwrap_or(line);
+        let ident = if let Some(rest) = l.strip_prefix("fn ") {
+            leading_ident(rest)
+        } else if let Some(rest) = l.strip_prefix("struct ") {
+            leading_ident(rest)
+        } else if let Some(rest) = l.strip_prefix("enum ") {
+            leading_ident(rest)
+        } else if let Some(rest) = l.strip_prefix("trait ") {
+            leading_ident(rest)
+        } else if let Some(rest) = l.strip_prefix("let ") {
+            leading_ident(rest.strip_prefix("mut ").unwrap_or(rest))
+        } else {
+            None
+        };
+        if let Some(id) = ident {
+            out.insert(id);
+        }
+    }
+    out
+}
+
+/// Backend-intrinsic module functions that the code generators support but
+/// that are not (yet) declared in the corresponding stdlib .mt source.
+/// Extracted from the T3 emitter / IR lowering intrinsic tables.
+const STDLIB_EXTRA_MEMBERS: &[(&str, &[&str])] = &[
+    ("io", &[
+        "newline", "print_int", "println_int", "print_float",
+        "print_ternary", "println_ternary", "print_tryte", "println_tryte",
+    ]),
+    ("ternary", &[
+        "t27_shift_left", "t27_shift_right", "t27_and", "t27_or", "t27_neg",
+        "t27_explain", "t27_to_int", "t27_to_str", "t27_to_str_padded",
+        "int_to_t27", "int_to_t9", "int_to_trit", "int_to_tryte",
+        "t9_to_int", "trit_to_int", "tryte_to_int", "tryte_from_trits",
+        "trits_to_str", "from_balanced_ternary",
+    ]),
+    ("math", &["from_balanced_ternary", "to_balanced_ternary", "trit_count"]),
+    ("fmt", &["int_to_str", "align_left", "align_right", "pad_left", "pad_right"]),
+    ("fs", &[
+        "open", "open2", "close", "read", "write", "exists2",
+        "read_bytes", "write_bytes", "remove", "close_file", "open_file",
+    ]),
+    ("async", &["spawn", "yield_"]),
+    ("str", &["to_int"]),
+];
+
+/// Top-level item names of a stdlib module, or `None` for unknown modules.
+pub(crate) fn std_module_members(
+    module: &str,
+) -> Option<&'static std::collections::HashSet<String>> {
+    use std::sync::OnceLock;
+    static MEMBERS: OnceLock<HashMap<&'static str, std::collections::HashSet<String>>> =
+        OnceLock::new();
+    MEMBERS
+        .get_or_init(|| {
+            let mut map: HashMap<&'static str, std::collections::HashSet<String>> =
+                STDLIB_SOURCES
+                    .iter()
+                    .map(|(name, src)| (*name, scan_module_members(src)))
+                    .collect();
+            for (module, extras) in STDLIB_EXTRA_MEMBERS {
+                let entry = map.entry(module).or_default();
+                for e in *extras {
+                    entry.insert((*e).to_string());
+                }
+            }
+            map
+        })
+        .get(module)
 }
 
 impl SemanticAnalyzer {
@@ -103,6 +216,8 @@ impl SemanticAnalyzer {
             warnings: WarningCollector::new(),
             read_vars: std::collections::HashSet::new(),
             builtin_names: std::collections::HashSet::new(),
+            loaded_module_prefixes: std::collections::HashSet::new(),
+            module_private_items: HashMap::new(),
         };
         analyzer.register_builtins();
         analyzer
@@ -399,6 +514,18 @@ impl SemanticAnalyzer {
     // ---------------------------------------------------------------------------
 
     pub fn analyze(&mut self, program: &Program) -> CompileResult<TypedProgram> {
+        // Source-implemented stdlib modules (std::bridge / std::crypto /
+        // std::t27f) have no native backend implementations; merge their
+        // parsed items into the program so they compile with it.
+        let expanded;
+        let program = match super::stdlib_expand::expand(program)? {
+            Some(p) => {
+                expanded = p;
+                &expanded
+            }
+            None => program,
+        };
+
         // First pass: collect type definitions and function signatures
         self.collect_declarations(program)?;
 
@@ -463,7 +590,15 @@ impl SemanticAnalyzer {
                 Item::GlobalVar(gv) => {
                     let ty = self.resolve_type(&gv.ty)?;
                     let init = if let Some(e) = &gv.val {
-                        Some(self.check_expr(e, Some(&ty))?)
+                        let te = self.check_expr(e, Some(&ty))?;
+                        // S4: global initialiser must match the declared type.
+                        if ty.is_known() && te.ty.is_known() && !types_compatible(&ty, &te.ty) {
+                            return Err(self.err(gv.span, format!(
+                                "type mismatch: global '{}' is declared as `{}` but its initialiser has type `{}`",
+                                gv.name, ty.display(), te.ty.display()
+                            )));
+                        }
+                        Some(te)
                     } else {
                         None
                     };
@@ -549,7 +684,9 @@ impl SemanticAnalyzer {
                 }
                 Item::GlobalVar(gv) => {
                     let ty = self.resolve_type(&gv.ty)?;
-                    self.symbols.define(&gv.name, ty, false);
+                    // The parser does not record `mut` for globals, so they are
+                    // conservatively treated as mutable.
+                    self.symbols.define(&gv.name, ty, true);
                 }
                 Item::UseDecl(u) => {
                     self.resolve_use(u)?;
@@ -613,9 +750,10 @@ impl SemanticAnalyzer {
     // ---------------------------------------------------------------------------
 
     /// Known standard library module names (matching stdlib/ directory)
-    const STDLIB_MODULES: &'static [&'static str] = &[
+    pub(crate) const STDLIB_MODULES: &'static [&'static str] = &[
         "io", "math", "ternary", "collections", "fmt", "str",
         "sync", "async", "env", "time", "fs", "net",
+        "t27f", "crypto", "bridge", "tritfs",
     ];
 
     fn resolve_use(&mut self, decl: &UseDecl) -> CompileResult<()> {
@@ -679,12 +817,19 @@ impl SemanticAnalyzer {
 
         // Build module prefix from path: foo::bar → "foo::bar"
         let prefix = decl.path.join("::");
+        self.loaded_module_prefixes.insert(prefix.clone());
 
-        // Register all public definitions from the module with prefixed names
+        // Register all PUBLIC definitions from the module with prefixed names.
+        // Non-`pub` items are recorded so that referencing them produces a
+        // privacy error instead of a generic unknown-path diagnostic (S11).
         for item in &program.items {
             match item {
                 Item::FnDef(f) => {
                     let full_name = format!("{}::{}", prefix, f.name);
+                    if !f.is_pub {
+                        self.module_private_items.insert(full_name, prefix.clone());
+                        continue;
+                    }
                     let param_types: Vec<ManiType> = f
                         .params
                         .iter()
@@ -699,6 +844,10 @@ impl SemanticAnalyzer {
                 }
                 Item::StructDef(s) => {
                     let full_name = format!("{}::{}", prefix, s.name);
+                    if !s.is_pub {
+                        self.module_private_items.insert(full_name, prefix.clone());
+                        continue;
+                    }
                     let fields: Vec<(String, ManiType)> = s
                         .fields
                         .iter()
@@ -713,6 +862,10 @@ impl SemanticAnalyzer {
                 }
                 Item::EnumDef(e) => {
                     let full_name = format!("{}::{}", prefix, e.name);
+                    if !e.is_pub {
+                        self.module_private_items.insert(full_name, prefix.clone());
+                        continue;
+                    }
                     let variants: Vec<(String, Vec<ManiType>)> = e
                         .variants
                         .iter()
@@ -727,7 +880,13 @@ impl SemanticAnalyzer {
                         .collect();
                     self.enums.insert(full_name, variants);
                 }
-                _ => {} // Ignore use decls, impl blocks, etc. in imported modules
+                Item::UseDecl(u) => {
+                    // S11: transitive imports — modules used by the loaded
+                    // module are loaded too (the loaded_modules set guards
+                    // against cycles).
+                    self.resolve_use(u)?;
+                }
+                _ => {} // Ignore impl blocks, globals, etc. in imported modules
             }
         }
 

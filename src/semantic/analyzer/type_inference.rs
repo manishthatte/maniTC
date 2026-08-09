@@ -33,24 +33,94 @@ impl SemanticAnalyzer {
         }
     }
 
-    pub(super) fn binop_type(&self, op: &BinOpKind, lhs: &ManiType, rhs: &ManiType, _span: Span) -> CompileResult<ManiType> {
+    /// Render a binary operator for diagnostics.
+    fn binop_symbol(op: &BinOpKind) -> &'static str {
+        match op {
+            BinOpKind::Add => "+", BinOpKind::Sub => "-", BinOpKind::Mul => "*",
+            BinOpKind::Div => "/", BinOpKind::Rem => "%",
+            BinOpKind::Eq => "==", BinOpKind::Ne => "!=",
+            BinOpKind::Lt => "<", BinOpKind::Gt => ">",
+            BinOpKind::Le => "<=", BinOpKind::Ge => ">=",
+            BinOpKind::And => "&&", BinOpKind::Or => "||",
+            BinOpKind::BitAnd => "&", BinOpKind::BitOr => "|", BinOpKind::BitXor => "^",
+            BinOpKind::LShift => "<<", BinOpKind::RShift => ">>",
+            BinOpKind::Tand => "tand", BinOpKind::Tor => "tor", BinOpKind::Txor => "txor",
+            BinOpKind::Tcon => "tcon", BinOpKind::Tany => "tany",
+            BinOpKind::Range => "..", BinOpKind::RangeInclusive => "..=",
+        }
+    }
+
+    fn binop_operand_err(&self, op: &BinOpKind, lhs: &ManiType, rhs: &ManiType, span: Span) -> CompileError {
+        self.err(span, format!(
+            "invalid operands: operator `{}` cannot be applied to `{}` and `{}`",
+            Self::binop_symbol(op), lhs.display(), rhs.display()
+        ))
+    }
+
+    /// Infer (and, for KNOWN operand types, enforce) the result type of a
+    /// binary operation. Operands of type `Unknown` are always accepted —
+    /// permissive-on-Unknown is the crate's design rule.
+    pub(super) fn binop_type(&self, op: &BinOpKind, lhs: &ManiType, rhs: &ManiType, span: Span) -> CompileResult<ManiType> {
+        use ManiType::Unknown;
+        let both_known = lhs.is_known() && rhs.is_known();
         match op {
             BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div | BinOpKind::Rem => {
+                // String concatenation: `str + str`.
+                if matches!(op, BinOpKind::Add)
+                    && *lhs == ManiType::Str && *rhs == ManiType::Str
+                {
+                    return Ok(ManiType::Str);
+                }
+                // Arithmetic requires numeric operands.
+                if (lhs.is_known() && !lhs.is_numeric()) || (rhs.is_known() && !rhs.is_numeric()) {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
                 // Numeric result
                 match (lhs, rhs) {
                     (ManiType::Float, _) | (_, ManiType::Float) => Ok(ManiType::Float),
                     (ManiType::Trit, ManiType::Trit) => Ok(ManiType::Trit),
-                    (ManiType::Unknown, other) | (other, ManiType::Unknown) => Ok(other.clone()),
+                    (Unknown, other) | (other, Unknown) => Ok(other.clone()),
                     _ => Ok(lhs.clone()),
                 }
             }
-            BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Gt
-            | BinOpKind::Le | BinOpKind::Ge => Ok(ManiType::Bool),
-            BinOpKind::And | BinOpKind::Or => Ok(ManiType::Bool),
-            BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor => Ok(lhs.clone()),
-            BinOpKind::LShift | BinOpKind::RShift => Ok(lhs.clone()),
+            BinOpKind::Lt | BinOpKind::Gt | BinOpKind::Le | BinOpKind::Ge => {
+                if (lhs.is_known() && !lhs.is_comparable())
+                    || (rhs.is_known() && !rhs.is_comparable())
+                    || (both_known && !types_compatible(lhs, rhs))
+                {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
+                Ok(ManiType::Bool)
+            }
+            BinOpKind::Eq | BinOpKind::Ne => {
+                if both_known && !types_compatible(lhs, rhs) {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
+                Ok(ManiType::Bool)
+            }
+            BinOpKind::And | BinOpKind::Or => {
+                let ok = |t: &ManiType| matches!(t, ManiType::Bool | Unknown);
+                if !ok(lhs) || !ok(rhs) {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
+                Ok(ManiType::Bool)
+            }
+            BinOpKind::BitAnd | BinOpKind::BitOr | BinOpKind::BitXor
+            | BinOpKind::LShift | BinOpKind::RShift => {
+                // Integer (binary or balanced-ternary) operands only.
+                let ok = |t: &ManiType| !t.is_known() || (t.is_numeric() && *t != ManiType::Float);
+                if !ok(lhs) || !ok(rhs) {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
+                Ok(lhs.clone())
+            }
             BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Txor
             | BinOpKind::Tcon | BinOpKind::Tany => {
+                // Ternary logic operates on ternary-valued types.
+                let ok = |t: &ManiType| !t.is_known() || t.is_ternary();
+                if !ok(lhs) || !ok(rhs) {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
                 // Preserve bool3 if both operands are bool3; otherwise trit
                 match (lhs, rhs) {
                     (ManiType::Bool3, ManiType::Bool3) => Ok(ManiType::Bool3),
@@ -58,6 +128,10 @@ impl SemanticAnalyzer {
                 }
             }
             BinOpKind::Range | BinOpKind::RangeInclusive => {
+                let ok = |t: &ManiType| !t.is_known() || t.is_numeric();
+                if !ok(lhs) || !ok(rhs) {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
                 Ok(ManiType::Generic("Range".to_string(), vec![lhs.clone()]))
             }
         }
@@ -92,7 +166,7 @@ impl SemanticAnalyzer {
         ManiType::Unknown
     }
 
-    pub(super) fn resolve_method_type(&self, obj_ty: &ManiType, method: &str) -> ManiType {
+    pub(super) fn resolve_method_type(&mut self, obj_ty: &ManiType, method: &str, span: Span) -> ManiType {
         // Check user-defined impl methods first (before built-in fallbacks)
         let type_name_str = match obj_ty {
             ManiType::Struct(n) | ManiType::Enum(n) => Some(n.as_str()),
@@ -138,6 +212,9 @@ impl SemanticAnalyzer {
                 args.first().cloned().unwrap_or(ManiType::Unknown)
             }
             (ManiType::Generic(name, _), "set") if name == "Vec" => ManiType::Void,
+            (ManiType::Generic(name, args), "remove") if name == "Vec" => {
+                args.first().cloned().unwrap_or(ManiType::Unknown)
+            }
             (ManiType::Generic(name, _), "is_empty") if name == "Vec" => ManiType::Bool,
             (ManiType::Generic(name, _), "clear") if name == "Vec" => ManiType::Void,
             (ManiType::Generic(name, _), "contains") if name == "Vec" => ManiType::Bool,
@@ -226,6 +303,9 @@ impl SemanticAnalyzer {
                 ManiType::Generic("MutexGuard".to_string(), args.clone())
             }
             (ManiType::Generic(name, _), "unlock") if name == "Mutex" => ManiType::Void,
+            (ManiType::Generic(name, _), "set") if name == "Mutex" || name == "MutexGuard" => {
+                ManiType::Void
+            }
             (ManiType::Generic(name, args), "get") if name == "Mutex" || name == "MutexGuard" => {
                 args.first().cloned().unwrap_or(ManiType::Unknown)
             }
@@ -269,10 +349,125 @@ impl SemanticAnalyzer {
                 ManiType::Generic("Vec".to_string(), vec![ManiType::Unknown])
             }
 
-            // Catch-all for unknown method calls on Generic (collection) types — permissive
-            (ManiType::Generic(_, _), _) => ManiType::Int,
+            // Catch-all for unknown method calls on Generic (collection) types —
+            // permissive (type Unknown), but flag the likely typo.
+            (ManiType::Generic(gname, _), _) => {
+                let known: Vec<&str> = vec![
+                    "len", "is_empty", "push", "pop", "get", "set", "insert", "remove",
+                    "contains", "contains_key", "keys", "clear", "sort", "reverse",
+                    "map", "filter", "for_each", "slice", "index_of", "fold",
+                    "push_front", "push_back", "pop_front", "pop_back", "front", "back",
+                    "send", "recv", "try_recv", "close", "lock", "unlock", "update",
+                    "join", "block_on", "unwrap", "keys_with_prefix",
+                    "is_subset", "is_superset", "is_disjoint",
+                    "intersection", "union", "difference", "get_or",
+                ];
+                let hint = did_you_mean(method, known.iter().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                self.warnings.push(CompileWarning::new(
+                    WarningKind::UnknownType,
+                    &self.file, span.line, span.col,
+                    format!(
+                        "unknown method '{}' on '{}'{} — type inferred as Unknown",
+                        method, gname, hint
+                    ),
+                ));
+                ManiType::Unknown
+            }
 
             _ => ManiType::Unknown,
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Match pattern bindings
+    // ---------------------------------------------------------------------------
+
+    /// Define every variable bound by a match pattern in the current scope,
+    /// deriving payload types from the scrutinee type where possible
+    /// (Result/Option payloads, user enum variant fields, tuple elements,
+    /// struct fields). Unknown payloads fall back to `ManiType::Unknown`.
+    pub(super) fn define_pattern_bindings(&mut self, pat: &Pattern, scrut_ty: &ManiType) {
+        match pat {
+            Pattern::Wildcard(_) | Pattern::Lit(_, _) => {}
+            Pattern::Ident(name, _) => {
+                self.symbols.define(name, scrut_ty.clone(), false);
+            }
+            Pattern::Tuple(pats, _) => {
+                let elem_tys: Vec<ManiType> = match scrut_ty {
+                    ManiType::Tuple(ts) => ts.clone(),
+                    _ => vec![ManiType::Unknown; pats.len()],
+                };
+                for (i, p) in pats.iter().enumerate() {
+                    let ety = elem_tys.get(i).cloned().unwrap_or(ManiType::Unknown);
+                    self.define_pattern_bindings(p, &ety);
+                }
+            }
+            Pattern::Struct(sname, field_pats, _) => {
+                let struct_name = match scrut_ty {
+                    ManiType::Struct(n) => n.clone(),
+                    _ => sname.clone(),
+                };
+                let fields = self.structs.get(&struct_name).cloned().unwrap_or_default();
+                for (fname, fpat) in field_pats {
+                    let fty = fields
+                        .iter()
+                        .find(|(n, _)| n == fname)
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or(ManiType::Unknown);
+                    self.define_pattern_bindings(fpat, &fty);
+                }
+            }
+            Pattern::Enum(variant, enum_name, subpats, _) => {
+                // The parser encodes the bare `Unknown(msg)` result pattern as
+                // Enum("Result", Some("Unknown"), ...): normalise the variant name.
+                let variant_name: &str =
+                    if variant == "Result" && enum_name.as_deref() == Some("Unknown") {
+                        "Unknown"
+                    } else {
+                        variant.as_str()
+                    };
+                let payload_tys: Vec<ManiType> = match scrut_ty {
+                    // Result<T, E>: Ok(T) / Err(E) / Unknown(str)
+                    ManiType::Generic(g, args) if g == "Result" => match variant_name {
+                        "Ok" => vec![args.first().cloned().unwrap_or(ManiType::Unknown)],
+                        "Err" => vec![args.get(1).cloned().unwrap_or(ManiType::Unknown)],
+                        "Unknown" => vec![ManiType::Str],
+                        _ => vec![ManiType::Unknown; subpats.len()],
+                    },
+                    // Option<T>: Some(T) / None
+                    ManiType::Generic(g, args) if g == "Option" => match variant_name {
+                        "Some" => vec![args.first().cloned().unwrap_or(ManiType::Unknown)],
+                        _ => vec![],
+                    },
+                    _ => {
+                        // User enum: field types from the variant declaration.
+                        let ename = match (enum_name, scrut_ty) {
+                            (Some(en), _) => Some(en.clone()),
+                            (None, ManiType::Enum(n)) => Some(n.clone()),
+                            _ => None,
+                        };
+                        ename
+                            .and_then(|en| self.enums.get(&en).cloned())
+                            .and_then(|variants| {
+                                variants
+                                    .iter()
+                                    .find(|(v, _)| v == variant_name)
+                                    .map(|(_, tys)| tys.clone())
+                            })
+                            .unwrap_or_else(|| vec![ManiType::Unknown; subpats.len()])
+                    }
+                };
+                for (i, p) in subpats.iter().enumerate() {
+                    let pty = payload_tys.get(i).cloned().unwrap_or(ManiType::Unknown);
+                    self.define_pattern_bindings(p, &pty);
+                }
+            }
+            Pattern::Or(pats, _) => {
+                for p in pats {
+                    self.define_pattern_bindings(p, scrut_ty);
+                }
+            }
         }
     }
 
@@ -304,6 +499,10 @@ impl SemanticAnalyzer {
         arms: &[TypedMatchArm],
         span: Span,
     ) -> CompileResult<()> {
+        // A guarded arm can fail at runtime, so it never counts toward
+        // exhaustiveness — only unguarded arms are considered below.
+        let arms: Vec<&TypedMatchArm> = arms.iter().filter(|a| a.guard.is_none()).collect();
+
         // Wildcard or variable binding arm = always exhaustive
         let has_catch_all = arms.iter().any(|arm| {
             matches!(&arm.pattern, Pattern::Wildcard(_) | Pattern::Ident(_, _))

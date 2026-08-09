@@ -24,7 +24,7 @@ fn main() {
 
     // Encode to binary
     print("Encoding to binary (2 bits per trit):");
-    let i: int = 0;
+    let mut i: int = 0;
     while i < 5 {
         let (b1, b0) = bridge::trit_to_bits(value[i]);
         let valid = bridge::is_valid_encoding(b1, b0);
@@ -45,10 +45,10 @@ fn main() {
     decoded[3] = bridge::bits_to_trit(1, 0);
     decoded[4] = bridge::bits_to_trit(0, 1);
 
-    let match_count: int = 0;
+    let mut match_count: int = 0;
     i = 0;
     while i < 5 {
-        tif value[i] == decoded[i] {
+        if value[i] == decoded[i] {
             match_count = match_count + 1;
         }
         i = i + 1;

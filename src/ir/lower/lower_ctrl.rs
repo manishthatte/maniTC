@@ -1,6 +1,7 @@
 // ir/lower/lower_ctrl.rs — Control flow lowering: if/tif/match/pattern/bindings.
 
 use super::IRLowerer;
+use super::helpers::sanitize_phi_incoming;
 use crate::ir::types::*;
 use crate::semantic::{ManiType, TypedIfExpr, TypedMatchExpr, TypedTifExpr, TypedTresultExpr};
 
@@ -73,10 +74,13 @@ impl IRLowerer {
         let merge_idx = self.new_block(merge_label);
         self.switch_to(merge_idx);
 
-        if ir_result_ty == IRType::Void || incoming.is_empty() {
+        // An if without else is a statement (semantic types it as void); a
+        // merge PHI would be missing the fall-through edge and yield undef.
+        if ir_result_ty == IRType::Void || ie.else_block.is_none() || incoming.is_empty() {
             IRValue::Void
         } else {
             let phi_dst = self.fresh_temp();
+            let incoming = sanitize_phi_incoming(incoming, &ir_result_ty);
             self.emit(IRInstr::Phi {
                 dst: phi_dst.clone(),
                 ty: ir_result_ty,
@@ -132,14 +136,18 @@ impl IRLowerer {
             IRValue::Void
         } else {
             let phi_dst = self.fresh_temp();
-            self.emit(IRInstr::Phi {
-                dst: phi_dst.clone(),
-                ty: ir_result_ty,
-                incoming: vec![
+            let incoming = sanitize_phi_incoming(
+                vec![
                     (pos_val, pos_end_label),
                     (zero_val, zero_end_label),
                     (neg_val, neg_end_label),
                 ],
+                &ir_result_ty,
+            );
+            self.emit(IRInstr::Phi {
+                dst: phi_dst.clone(),
+                ty: ir_result_ty,
+                incoming,
             });
             IRValue::Temp(phi_dst)
         }
@@ -213,21 +221,42 @@ impl IRLowerer {
             IRValue::Void
         } else {
             let phi_dst = self.fresh_temp();
-            self.emit(IRInstr::Phi {
-                dst: phi_dst.clone(),
-                ty: ir_result_ty,
-                incoming: vec![
+            let incoming = sanitize_phi_incoming(
+                vec![
                     (ok_val, ok_end_label),
                     (unk_val, unk_end_label),
                     (err_val, err_end_label),
                 ],
+                &ir_result_ty,
+            );
+            self.emit(IRInstr::Phi {
+                dst: phi_dst.clone(),
+                ty: ir_result_ty,
+                incoming,
             });
             IRValue::Temp(phi_dst)
         }
     }
 
     pub(super) fn lower_match(&mut self, me: &TypedMatchExpr, result_ty: &ManiType) -> IRValue {
-        let scrutinee_val = self.lower_expr(&me.scrutinee);
+        let raw_scrutinee = self.lower_expr(&me.scrutinee);
+        // String scrutinees are compared with the str_eq runtime call, which
+        // (on the T3 backend) clobbers the scrutinee's register. Keep the
+        // scrutinee in a stack slot and reload a fresh temp wherever an arm
+        // needs it, so every compare sees the original pointer.
+        let scrutinee_slot = if matches!(&me.scrutinee.ty, ManiType::Str) {
+            let slot = self.fresh_temp();
+            let sty = IRType::Ptr(Box::new(IRType::I8));
+            self.emit(IRInstr::Alloca { dst: slot.clone(), ty: sty.clone() });
+            self.emit(IRInstr::Store {
+                ptr: IRValue::Temp(slot.clone()),
+                val: raw_scrutinee.clone(),
+                ty: sty,
+            });
+            Some(slot)
+        } else {
+            None
+        };
         let ir_result_ty = IRType::from_mani(result_ty);
         let merge_label = self.fresh_label("match_merge");
         let mut incoming = Vec::new();
@@ -237,6 +266,7 @@ impl IRLowerer {
             let next_label = self.fresh_label("match_next");
 
             // Emit comparison for pattern
+            let scrutinee_val = self.reload_scrutinee(&scrutinee_slot, &raw_scrutinee);
             let matches_cond = self.lower_pattern_match(&arm.pattern, &scrutinee_val, &me.scrutinee.ty);
 
             // If there is a guard we need pattern bindings to be in scope BEFORE
@@ -254,7 +284,8 @@ impl IRLowerer {
                 let guard_idx = self.new_block(guard_label);
                 self.switch_to(guard_idx);
                 // Bind pattern variables so the guard can reference them.
-                self.bind_pattern_locals(&arm.pattern, &scrutinee_val);
+                let bind_val = self.reload_scrutinee(&scrutinee_slot, &raw_scrutinee);
+                self.bind_pattern_locals(&arm.pattern, &bind_val);
                 // Now lower the guard expression.
                 self.lower_expr(guard)
             } else {
@@ -272,7 +303,8 @@ impl IRLowerer {
             // For non-guard arms, bind pattern variables here.
             // For guard arms, variables were already bound in the guard-eval block,
             // but we re-bind to ensure they're in the locals map for the arm body.
-            self.bind_pattern_locals(&arm.pattern, &scrutinee_val);
+            let bind_val = self.reload_scrutinee(&scrutinee_slot, &raw_scrutinee);
+            self.bind_pattern_locals(&arm.pattern, &bind_val);
             let arm_val = self.lower_expr(&arm.body);
             let arm_end = self.current_block;
             incoming.push((arm_val, self.blocks[arm_end].label.clone()));
@@ -282,8 +314,16 @@ impl IRLowerer {
             self.switch_to(next_idx);
         }
 
-        // Fallthrough (no pattern matched) → jump to merge
-        self.set_term(IRTerminator::Jump(merge_label.clone()));
+        // Fallthrough (no pattern matched). A void match just continues at the
+        // merge block. A value-producing match must not reach the merge PHI
+        // through this edge (it has no incoming value and would yield undef):
+        // it is provably dead when the match is exhaustive, and traps
+        // (Unreachable) otherwise.
+        if ir_result_ty == IRType::Void || incoming.is_empty() {
+            self.set_term(IRTerminator::Jump(merge_label.clone()));
+        } else {
+            self.set_term(IRTerminator::Unreachable);
+        }
 
         let merge_idx = self.new_block(merge_label);
         self.switch_to(merge_idx);
@@ -292,12 +332,30 @@ impl IRLowerer {
             IRValue::Void
         } else {
             let phi_dst = self.fresh_temp();
+            let incoming = sanitize_phi_incoming(incoming, &ir_result_ty);
             self.emit(IRInstr::Phi {
                 dst: phi_dst.clone(),
                 ty: ir_result_ty,
                 incoming,
             });
             IRValue::Temp(phi_dst)
+        }
+    }
+
+    /// Fetch the match scrutinee for use at the current emission point.
+    /// If it was spilled to a stack slot (string scrutinees), load a fresh
+    /// temp; otherwise reuse the original value.
+    fn reload_scrutinee(&mut self, slot: &Option<IRTemp>, raw: &IRValue) -> IRValue {
+        if let Some(slot) = slot {
+            let t = self.fresh_temp();
+            self.emit(IRInstr::Load {
+                dst: t.clone(),
+                ptr: IRValue::Temp(slot.clone()),
+                ty: IRType::Ptr(Box::new(IRType::I8)),
+            });
+            IRValue::Temp(t)
+        } else {
+            raw.clone()
         }
     }
 
@@ -314,10 +372,19 @@ impl IRLowerer {
             }
             crate::ast::Pattern::Lit(lit, _) => {
                 let lit_val = self.lower_lit(lit);
+                // String literals need runtime string equality (pointer compare
+                // never matches runtime-built strings), floats need FEq
+                // (bitwise i64 compare mishandles -0.0 vs 0.0). This mirrors
+                // how `==` is lowered for BinOp (see binop_to_ir).
+                let op = match lit {
+                    crate::ast::Lit::Str(_) => IRBinOp::StrEq,
+                    crate::ast::Lit::Float(_) => IRBinOp::FEq,
+                    _ => IRBinOp::IEq,
+                };
                 let dst = self.fresh_temp();
                 self.emit(IRInstr::BinOp {
                     dst: dst.clone(),
-                    op: IRBinOp::IEq,
+                    op,
                     lhs: scrutinee.clone(),
                     rhs: lit_val,
                     ty: IRType::Bool,
@@ -548,8 +615,179 @@ impl IRLowerer {
                 }
             }
             Pattern::Or(alts, _) => {
+                if alts.len() == 1 {
+                    if let Some(first) = alts.first() {
+                        self.bind_pattern_locals(first, scrutinee);
+                    }
+                    return;
+                }
+                // Each alternative may bind the same name from a different
+                // extraction position, so test the alternatives in order and
+                // bind from the first one that matches. All alternatives share
+                // one alloca slot per bound name.
+                let mut names: Vec<String> = Vec::new();
+                for alt in alts {
+                    for n in Self::pattern_bound_names(alt) {
+                        if !names.contains(&n) {
+                            names.push(n);
+                        }
+                    }
+                }
+                if names.is_empty() {
+                    return;
+                }
+                let mut slots: std::collections::HashMap<String, IRTemp> =
+                    std::collections::HashMap::new();
+                for name in &names {
+                    let alloca = self.fresh_temp();
+                    self.emit(IRInstr::Alloca { dst: alloca.clone(), ty: IRType::I64 });
+                    self.locals.insert(name.clone(), (alloca.clone(), IRType::I64));
+                    slots.insert(name.clone(), alloca);
+                }
+                let end_label = self.fresh_label("orbind_end");
+                for (i, alt) in alts.iter().enumerate() {
+                    if i + 1 == alts.len() {
+                        // Last alternative: we are only here because the whole
+                        // or-pattern matched, so bind unconditionally.
+                        self.bind_pattern_into(alt, scrutinee, &slots);
+                        self.set_term(IRTerminator::Jump(end_label.clone()));
+                    } else {
+                        let cond =
+                            self.lower_pattern_match(alt, scrutinee, &ManiType::Unknown);
+                        let bind_label = self.fresh_label("orbind_alt");
+                        let next_label = self.fresh_label("orbind_next");
+                        self.set_term(IRTerminator::BinBranch {
+                            cond,
+                            true_label: bind_label.clone(),
+                            false_label: next_label.clone(),
+                        });
+                        let bind_idx = self.new_block(bind_label);
+                        self.switch_to(bind_idx);
+                        self.bind_pattern_into(alt, scrutinee, &slots);
+                        self.set_term(IRTerminator::Jump(end_label.clone()));
+                        let next_idx = self.new_block(next_label);
+                        self.switch_to(next_idx);
+                    }
+                }
+                let end_idx = self.new_block(end_label);
+                self.switch_to(end_idx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Collect the names bound by a pattern (in order of appearance).
+    fn pattern_bound_names(pattern: &crate::ast::Pattern) -> Vec<String> {
+        use crate::ast::Pattern;
+        let mut out = Vec::new();
+        match pattern {
+            Pattern::Ident(name, _) => out.push(name.clone()),
+            Pattern::Enum(_, _, fields, _) => {
+                for f in fields {
+                    out.extend(Self::pattern_bound_names(f));
+                }
+            }
+            Pattern::Struct(_, field_pats, _) => {
+                for (_, p) in field_pats {
+                    out.extend(Self::pattern_bound_names(p));
+                }
+            }
+            Pattern::Or(alts, _) => {
+                for a in alts {
+                    out.extend(Self::pattern_bound_names(a));
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Like `bind_pattern_locals`, but store each bound value into the
+    /// pre-allocated slot for its name instead of allocating fresh slots.
+    /// Used for or-patterns, where every alternative must write to the same
+    /// slot while extracting from its own positions.
+    fn bind_pattern_into(
+        &mut self,
+        pattern: &crate::ast::Pattern,
+        scrutinee: &IRValue,
+        slots: &std::collections::HashMap<String, IRTemp>,
+    ) {
+        use crate::ast::Pattern;
+        match pattern {
+            Pattern::Ident(name, _) => {
+                if let Some(slot) = slots.get(name) {
+                    self.emit(IRInstr::Store {
+                        ptr: IRValue::Temp(slot.clone()),
+                        val: scrutinee.clone(),
+                        ty: IRType::I64,
+                    });
+                }
+            }
+            Pattern::Enum(_, _, fields, _) => {
+                // scrutinee is a pointer to [tag, value]; payload lives at offset 1.
+                for field in fields {
+                    if let Pattern::Ident(name, _) = field {
+                        if let Some(slot) = slots.get(name) {
+                            let val_ptr_t = self.fresh_temp();
+                            self.emit(IRInstr::GetPtr {
+                                dst: val_ptr_t.clone(),
+                                ptr: scrutinee.clone(),
+                                idx: IRValue::Const(IRConst::Int(1)),
+                                ty: IRType::I64,
+                            });
+                            let val_t = self.fresh_temp();
+                            self.emit(IRInstr::Load {
+                                dst: val_t.clone(),
+                                ptr: IRValue::Temp(val_ptr_t),
+                                ty: IRType::I64,
+                            });
+                            self.emit(IRInstr::Store {
+                                ptr: IRValue::Temp(slot.clone()),
+                                val: IRValue::Temp(val_t),
+                                ty: IRType::I64,
+                            });
+                        }
+                    } else {
+                        self.bind_pattern_into(field, scrutinee, slots);
+                    }
+                }
+            }
+            Pattern::Struct(struct_name, field_pats, _) => {
+                let field_defs: Vec<String> = self.structs.get(struct_name)
+                    .map(|fs| fs.iter().map(|(n, _)| n.clone()).collect())
+                    .unwrap_or_default();
+                for (field_name, sub_pat) in field_pats {
+                    if let Pattern::Ident(var_name, _) = sub_pat {
+                        if let Some(slot) = slots.get(var_name) {
+                            let idx = field_defs.iter().position(|n| n == field_name)
+                                .unwrap_or(0) as i64;
+                            let ptr_t = self.fresh_temp();
+                            self.emit(IRInstr::GetPtr {
+                                dst: ptr_t.clone(),
+                                ptr: scrutinee.clone(),
+                                idx: IRValue::Const(IRConst::Int(idx)),
+                                ty: IRType::I64,
+                            });
+                            let val_t = self.fresh_temp();
+                            self.emit(IRInstr::Load {
+                                dst: val_t.clone(),
+                                ptr: IRValue::Temp(ptr_t),
+                                ty: IRType::I64,
+                            });
+                            self.emit(IRInstr::Store {
+                                ptr: IRValue::Temp(slot.clone()),
+                                val: IRValue::Temp(val_t),
+                                ty: IRType::I64,
+                            });
+                        }
+                    } else {
+                        self.bind_pattern_into(sub_pat, scrutinee, slots);
+                    }
+                }
+            }
+            Pattern::Or(alts, _) => {
                 if let Some(first) = alts.first() {
-                    self.bind_pattern_locals(first, scrutinee);
+                    self.bind_pattern_into(first, scrutinee, slots);
                 }
             }
             _ => {}

@@ -16,23 +16,94 @@ impl SemanticAnalyzer {
                 self.read_vars.insert(name.clone());
                 let ty = if let Some(sym) = self.symbols.lookup(name) {
                     sym.ty.clone()
-                } else if let Some((_, ret)) = self.functions.get(name) {
-                    ret.clone()
-                } else if let Some(sep) = name.find("::") {
-                    // Check if this looks like EnumName::Variant
-                    let enum_name = &name[..sep];
-                    let variant_name = &name[sep + 2..];
-                    if self.enums.contains_key(enum_name)
-                        && self.enums[enum_name].iter().any(|(v, _)| v == variant_name)
-                    {
-                        ManiType::Enum(enum_name.to_string())
+                } else if let Some((params, ret)) = self.functions.get(name) {
+                    // A bare function name in a context expecting a fn type is
+                    // a function reference; otherwise keep the legacy view
+                    // (the function's return type).
+                    if matches!(hint, Some(ManiType::Fn(_, _))) {
+                        ManiType::Fn(params.clone(), Box::new(ret.clone()))
                     } else {
-                        ManiType::Unknown
+                        ret.clone()
                     }
+                } else if let Some(enum_name) = self.enum_variant_path(name) {
+                    // EnumName::Variant
+                    ManiType::Enum(enum_name)
+                } else if let Some(pos) = name.rfind("::") {
+                    // Unresolved `::` path.
+                    // S11: referencing a private item of a loaded module is a
+                    // hard error mentioning privacy.
+                    if let Some(mod_prefix) = self.module_private_items.get(name.as_str()) {
+                        return Err(self.err(span, format!(
+                            "'{}' is private in module '{}' — mark it `pub` to make it importable",
+                            name, mod_prefix
+                        )));
+                    }
+                    // S12: warn for unknown `::` paths (still permissively
+                    // typed Unknown, matching the crate's design).
+                    let prefix = &name[..pos];
+                    let item = &name[pos + 2..];
+                    let bare_mod = prefix.strip_prefix("std::").unwrap_or(prefix);
+                    if let Some(members) = super::std_module_members(bare_mod) {
+                        if !members.contains(item) {
+                            let hint = did_you_mean(item, members.iter().cloned())
+                                .unwrap_or_default();
+                            self.warnings.push(CompileWarning::new(
+                                WarningKind::UnknownType,
+                                &self.file, span.line, span.col,
+                                format!("std module '{}' has no item '{}'{}", bare_mod, item, hint),
+                            ));
+                        }
+                    } else if self.loaded_module_prefixes.contains(prefix) {
+                        let mod_prefix = format!("{}::", prefix);
+                        let candidates = self.functions.keys()
+                            .chain(self.structs.keys())
+                            .chain(self.enums.keys())
+                            .filter(|n| n.starts_with(&mod_prefix))
+                            .map(|n| n[mod_prefix.len()..].to_string());
+                        let hint = did_you_mean(item, candidates).unwrap_or_default();
+                        self.warnings.push(CompileWarning::new(
+                            WarningKind::UnknownType,
+                            &self.file, span.line, span.col,
+                            format!("module '{}' has no item '{}'{}", prefix, item, hint),
+                        ));
+                    } else {
+                        let first = &name[..name.find("::").unwrap_or(name.len())];
+                        // Namespaces the type checker cannot enumerate (builtin
+                        // generic types, structs/enums with impls, generics).
+                        const BUILTIN_NAMESPACES: &[&str] = &[
+                            "Vec", "Map", "Set", "Deque", "TernaryTrie", "Channel",
+                            "Mutex", "MutexGuard", "AtomicTrit", "Barrier", "Semaphore",
+                            "Task", "Result", "Option", "Pair", "Range", "String", "str",
+                            "Self", "std",
+                        ];
+                        if self.enums.contains_key(first) {
+                            self.warnings.push(CompileWarning::new(
+                                WarningKind::UnknownType,
+                                &self.file, span.line, span.col,
+                                format!("enum '{}' has no variant '{}'", first, item),
+                            ));
+                        } else if !BUILTIN_NAMESPACES.contains(&first)
+                            && !self.structs.contains_key(first)
+                            && !self.user_method_types.contains_key(first)
+                            && !self.type_params.contains_key(first)
+                            && !Self::STDLIB_MODULES.contains(&first)
+                        {
+                            self.warnings.push(CompileWarning::new(
+                                WarningKind::UnknownType,
+                                &self.file, span.line, span.col,
+                                format!("unknown module or type '{}' in path '{}'", first, name),
+                            ));
+                        }
+                    }
+                    ManiType::Unknown
                 } else {
+                    // Result/Option constructors are handled structurally by
+                    // the lowering — never warn for them.
+                    const RESULT_CONSTRUCTORS: &[&str] =
+                        &["Ok", "Err", "Unknown", "Some", "None"];
                     // Allow unknown identifiers for now (stdlib etc.)
                     // Emit a warning for likely typos / genuinely unknown names
-                    if !name.contains("::") && !name.contains('<') {
+                    if !name.contains('<') && !RESULT_CONSTRUCTORS.contains(&name.as_str()) {
                         let var_names = self.symbols.all_names();
                         let fn_names = self.functions.keys().cloned();
                         let candidates = var_names.chain(fn_names);
@@ -53,8 +124,23 @@ impl SemanticAnalyzer {
             }
 
             Expr::BinOp(lhs, op, rhs, _) => {
-                let tlhs = self.check_expr(lhs, None)?;
-                let trhs = self.check_expr(rhs, Some(&tlhs.ty))?;
+                // Operand hints: ternary-logic operators expect trit operands
+                // (so bare 0/1/-1 literals coerce), logical operators expect bool.
+                let operand_hint = match op {
+                    BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Txor
+                    | BinOpKind::Tcon | BinOpKind::Tany => Some(ManiType::Trit),
+                    BinOpKind::And | BinOpKind::Or => Some(ManiType::Bool),
+                    _ => None,
+                };
+                let tlhs = self.check_expr(lhs, operand_hint.as_ref())?;
+                let rhs_hint = if operand_hint.is_some() && tlhs.ty == ManiType::Bool3 {
+                    ManiType::Bool3
+                } else if operand_hint.is_some() {
+                    operand_hint.clone().unwrap()
+                } else {
+                    tlhs.ty.clone()
+                };
+                let trhs = self.check_expr(rhs, Some(&rhs_hint))?;
                 let ty = self.binop_type(op, &tlhs.ty, &trhs.ty, span)?;
 
                 // Division by zero detection
@@ -95,12 +181,27 @@ impl SemanticAnalyzer {
 
             Expr::Call(callee, args, _) => {
                 let tcallee = self.check_expr(callee, None)?;
-                // Try to resolve function name or fn-type for type lookup
+                // Try to resolve function name or fn-type for type lookup.
+                // `enforce` is set only when the signature is trustworthy:
+                // fn-typed values and user-defined functions always are; builtin
+                // registry entries only when fully specified (no Unknown params —
+                // e.g. println / fmt::format are variadic-ish placeholders).
+                let mut enforce = false;
+                let mut display_name = String::from("<fn>");
                 let (param_tys, ret_ty) = match &tcallee.ty {
-                    ManiType::Fn(pts, rt) => (pts.clone(), *rt.clone()),
+                    ManiType::Fn(pts, rt) => {
+                        enforce = true;
+                        if let TypedExprKind::Ident(n) = &tcallee.kind {
+                            display_name = n.clone();
+                        }
+                        (pts.clone(), *rt.clone())
+                    }
                     _ => match &tcallee.kind {
                         TypedExprKind::Ident(name) => {
                             if let Some((pts, rt)) = self.functions.get(name) {
+                                display_name = name.clone();
+                                enforce = !self.builtin_names.contains(name)
+                                    || pts.iter().all(|t| t.is_known());
                                 (pts.clone(), rt.clone())
                             } else {
                                 (vec![], ManiType::Unknown)
@@ -109,10 +210,27 @@ impl SemanticAnalyzer {
                         _ => (vec![], ManiType::Unknown),
                     },
                 };
+                if enforce && args.len() != param_tys.len() {
+                    return Err(self.err(span, format!(
+                        "function '{}' expects {} argument(s), found {}",
+                        display_name, param_tys.len(), args.len()
+                    )));
+                }
                 let mut typed_args = Vec::new();
                 for (i, arg) in args.iter().enumerate() {
-                    let hint = param_tys.get(i).unwrap_or(&ManiType::Unknown);
-                    typed_args.push(self.check_expr(arg, Some(hint))?);
+                    let hint = param_tys.get(i).cloned().unwrap_or(ManiType::Unknown);
+                    let targ = self.check_expr(arg, Some(&hint))?;
+                    if enforce
+                        && hint.is_known()
+                        && targ.ty.is_known()
+                        && !types_compatible(&hint, &targ.ty)
+                    {
+                        return Err(self.err(targ.span, format!(
+                            "argument {} to '{}': expected `{}`, found `{}`",
+                            i + 1, display_name, hint.display(), targ.ty.display()
+                        )));
+                    }
+                    typed_args.push(targ);
                 }
                 Ok(TypedExpr {
                     kind: TypedExprKind::Call(Box::new(tcallee), typed_args),
@@ -128,7 +246,7 @@ impl SemanticAnalyzer {
                     typed_args.push(self.check_expr(arg, None)?);
                 }
                 // For method calls, we do basic resolution
-                let ret_ty = self.resolve_method_type(&tobj.ty, method);
+                let ret_ty = self.resolve_method_type(&tobj.ty, method, span);
                 Ok(TypedExpr {
                     kind: TypedExprKind::MethodCall(Box::new(tobj), method.clone(), typed_args),
                     ty: ret_ty,
@@ -192,10 +310,12 @@ impl SemanticAnalyzer {
 
             Expr::If(ie) => {
                 let tcond = self.check_expr(&ie.cond, Some(&ManiType::Bool))?;
+                self.check_bool_cond(&tcond, "if condition")?;
                 let tthen = self.check_block(&ie.then_block)?;
                 let mut telif = Vec::new();
                 for (econd, eblock) in &ie.elif_branches {
                     let tec = self.check_expr(econd, Some(&ManiType::Bool))?;
+                    self.check_bool_cond(&tec, "elif condition")?;
                     let teb = self.check_block(eblock)?;
                     telif.push((tec, teb));
                 }
@@ -204,6 +324,14 @@ impl SemanticAnalyzer {
                 } else {
                     None
                 };
+                // S7: when the `if` can produce a value (it has an else), all
+                // branches with known non-void types must agree.
+                if let Some(eb) = &telse {
+                    let mut parts = vec![tthen.ty.clone()];
+                    parts.extend(telif.iter().map(|(_, b)| b.ty.clone()));
+                    parts.push(eb.ty.clone());
+                    self.check_branch_agreement(&parts, "if branches", span)?;
+                }
                 let ty = telse.as_ref().map(|b| b.ty.clone()).unwrap_or(ManiType::Void);
                 Ok(TypedExpr {
                     kind: TypedExprKind::If(TypedIfExpr {
@@ -219,19 +347,29 @@ impl SemanticAnalyzer {
 
             Expr::Tif(te) => {
                 let tcond = self.check_expr(&te.cond, Some(&ManiType::Trit))?;
-                // tif condition must be trit or bool3 — enforce it explicitly
-                if tcond.ty != ManiType::Trit && tcond.ty != ManiType::Bool3 {
+                // tif condition must be trit or bool3 — enforce for KNOWN types;
+                // Unknown (the permissive placeholder, e.g. generics) is allowed.
+                if tcond.ty.is_known()
+                    && tcond.ty != ManiType::Trit
+                    && tcond.ty != ManiType::Bool3
+                {
                     return Err(self.err(
                         te.cond.span(),
                         format!(
-                            "tif condition must be `trit` or `bool3`, found `{:?}`",
-                            tcond.ty
+                            "tif condition must be `trit` or `bool3`, found `{}`",
+                            tcond.ty.display()
                         ),
                     ));
                 }
                 let tpos = self.check_block(&te.pos_block)?;
                 let tzero = self.check_block(&te.zero_block)?;
                 let tneg = self.check_block(&te.neg_block)?;
+                // S7: all three arms must agree when they produce values.
+                self.check_branch_agreement(
+                    &[tpos.ty.clone(), tzero.ty.clone(), tneg.ty.clone()],
+                    "tif arms",
+                    span,
+                )?;
                 let ty = tpos.ty.clone();
                 Ok(TypedExpr {
                     kind: TypedExprKind::Tif(TypedTifExpr {
@@ -249,20 +387,31 @@ impl SemanticAnalyzer {
                 let tscrutinee = self.check_expr(&me.scrutinee, None)?;
                 let mut typed_arms = Vec::new();
                 let mut arm_ty = ManiType::Void;
+                let mut arm_tys = Vec::new();
                 for arm in &me.arms {
+                    // Pattern bindings (e.g. `Ok(v) => ...`) live in a per-arm
+                    // scope and are visible to both the guard and the body.
+                    self.symbols.push_scope();
+                    self.define_pattern_bindings(&arm.pattern, &tscrutinee.ty);
                     let guard = if let Some(g) = &arm.guard {
-                        Some(self.check_expr(g, Some(&ManiType::Bool))?)
+                        let tg = self.check_expr(g, Some(&ManiType::Bool))?;
+                        self.check_bool_cond(&tg, "match guard")?;
+                        Some(tg)
                     } else {
                         None
                     };
                     let tbody = self.check_expr(&arm.body, hint)?;
+                    self.symbols.pop_scope();
                     arm_ty = tbody.ty.clone();
+                    arm_tys.push(tbody.ty.clone());
                     typed_arms.push(TypedMatchArm {
                         pattern: arm.pattern.clone(),
                         guard,
                         body: tbody,
                     });
                 }
+                // S7: arms with known non-void types must agree.
+                self.check_branch_agreement(&arm_tys, "match arms", span)?;
                 // Feature 1: exhaustiveness checking for enum, trit, bool3 types
                 self.check_exhaustiveness(&tscrutinee.ty, &typed_arms, span)?;
                 Ok(TypedExpr {
@@ -295,6 +444,7 @@ impl SemanticAnalyzer {
 
             Expr::While(we) => {
                 let tcond = self.check_expr(&we.cond, Some(&ManiType::Bool))?;
+                self.check_bool_cond(&tcond, "while condition")?;
                 let tbody = self.check_block(&we.body)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::While(TypedWhileExpr {
@@ -354,7 +504,15 @@ impl SemanticAnalyzer {
 
             Expr::StructLit(name, fields, _) => {
                 let mut typed_fields = Vec::new();
-                let struct_fields = self.structs.get(name).cloned().unwrap_or_default();
+                // S1: an unknown struct name is an error, not a silent guess.
+                let struct_fields = match self.structs.get(name) {
+                    Some(f) => f.clone(),
+                    None => {
+                        let hint = did_you_mean(name, self.structs.keys().cloned())
+                            .unwrap_or_default();
+                        return Err(self.err(span, format!("unknown struct '{}'{}", name, hint)));
+                    }
+                };
 
                 // --- Struct update syntax: { ..base_expr, field: val, ... } ---
                 // The parser encodes the base as a sentinel ("__spread__", base_expr).
@@ -362,11 +520,28 @@ impl SemanticAnalyzer {
                 // synthesise `base_expr.field_name` as the value.
                 let spread_expr = fields.iter().find(|(n, _)| n == "__spread__")
                     .map(|(_, e)| e.clone());
-                let _explicit_names: std::collections::HashSet<&str> = fields
-                    .iter()
-                    .filter(|(n, _)| n != "__spread__")
-                    .map(|(n, _)| n.as_str())
-                    .collect();
+
+                // S1: explicit field names must exist on the struct and be unique.
+                let mut explicit_names: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for (fname, fval) in fields.iter().filter(|(n, _)| n != "__spread__") {
+                    if !struct_fields.iter().any(|(n, _)| n == fname) {
+                        let hint = did_you_mean(
+                            fname,
+                            struct_fields.iter().map(|(n, _)| n.clone()),
+                        ).unwrap_or_default();
+                        return Err(self.err(
+                            fval.span(),
+                            format!("struct '{}' has no field '{}'{}", name, fname, hint),
+                        ));
+                    }
+                    if !explicit_names.insert(fname.as_str()) {
+                        return Err(self.err(
+                            fval.span(),
+                            format!("field '{}' specified more than once in struct literal", fname),
+                        ));
+                    }
+                }
 
                 if let Some(base_expr) = spread_expr {
                     // Type-check the base expression (must be the same struct type).
@@ -401,13 +576,41 @@ impl SemanticAnalyzer {
                     }
                 } else {
                     // Normal struct literal — no spread.
-                    for (fname, fval) in fields {
-                        let field_ty = struct_fields
+                    // S1: every declared field must be provided.
+                    let missing: Vec<&str> = struct_fields
+                        .iter()
+                        .filter(|(n, _)| !explicit_names.contains(n.as_str()))
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(self.err(span, format!(
+                            "missing field{} {} in literal of struct '{}'",
+                            if missing.len() == 1 { "" } else { "s" },
+                            missing.iter().map(|n| format!("'{}'", n))
+                                .collect::<Vec<_>>().join(", "),
+                            name,
+                        )));
+                    }
+                    // S1: emit fields IN STRUCT DECLARATION ORDER — the IR
+                    // lowering assigns by position (same contract as the
+                    // spread branch above), so source order must not leak.
+                    for (sfname, sfty) in &struct_fields {
+                        let fval = fields
                             .iter()
-                            .find(|(n, _)| n == fname)
-                            .map(|(_, t)| t.clone());
-                        let tval = self.check_expr(fval, field_ty.as_ref())?;
-                        typed_fields.push((fname.clone(), tval));
+                            .find(|(n, _)| n == sfname)
+                            .map(|(_, e)| e)
+                            .expect("field presence verified above");
+                        let tval = self.check_expr(fval, Some(sfty))?;
+                        if sfty.is_known()
+                            && tval.ty.is_known()
+                            && !types_compatible(sfty, &tval.ty)
+                        {
+                            return Err(self.err(tval.span, format!(
+                                "field '{}' of struct '{}' has type `{}`, found `{}`",
+                                sfname, name, sfty.display(), tval.ty.display()
+                            )));
+                        }
+                        typed_fields.push((sfname.clone(), tval));
                     }
                 }
 
@@ -515,14 +718,34 @@ impl SemanticAnalyzer {
                     ManiType::Unknown
                 };
 
-                // Capture the outer scope names before pushing the lambda scope.
-                // Any read of an outer-scope variable that is not a lambda param is a
-                // closure capture — not supported; emit a compile error.
-                let outer_names: std::collections::HashSet<String> =
-                    self.symbols.all_names().collect();
+                // Closure-capture detection (S2): walk the lambda body's own AST
+                // collecting free identifiers (reads not bound by the lambda's
+                // params or its local declarations). Any free name that resolves
+                // to an enclosing FUNCTION-LOCAL variable is a capture — not
+                // supported. Module-level globals (scope depth 0) are fine.
+                let mut lambda_bound: Vec<std::collections::HashSet<String>> =
+                    vec![param_names.iter().cloned().collect()];
+                let mut free_names: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                collect_free_idents(body, &mut lambda_bound, &mut free_names);
+                let mut captured: Vec<&String> = free_names
+                    .iter()
+                    .filter(|v| {
+                        matches!(self.symbols.lookup_with_depth(v), Some((depth, _)) if depth >= 1)
+                    })
+                    .collect();
+                captured.sort();
+                if let Some(v) = captured.first() {
+                    return Err(self.err(
+                        span,
+                        format!(
+                            "lambda captures outer variable '{}' — closures are not yet supported; use a parameter instead",
+                            v
+                        ),
+                    ));
+                }
 
                 // Type-check the body with a fresh scope containing only the params
-                let read_before: std::collections::HashSet<String> = self.read_vars.clone();
                 self.symbols.push_scope();
                 for tp in &typed_params {
                     self.symbols.define(&tp.name, tp.ty.clone(), false);
@@ -532,21 +755,6 @@ impl SemanticAnalyzer {
                 let tbody = self.check_expr(body, Some(&ret_mani))?;
                 self.current_fn_ret = prev_ret;
                 self.symbols.pop_scope();
-
-                // Find any variables read during body-check that are outer captures
-                let newly_read: std::collections::HashSet<String> =
-                    self.read_vars.difference(&read_before).cloned().collect();
-                for v in &newly_read {
-                    if !param_names.contains(v) && outer_names.contains(v) {
-                        return Err(self.err(
-                            span,
-                            format!(
-                                "lambda captures outer variable '{}' — closures are not yet supported; use a parameter instead",
-                                v
-                            ),
-                        ));
-                    }
-                }
 
                 // Wrap body in a block that returns the expression
                 let body_block = TypedBlock {
@@ -611,6 +819,250 @@ impl SemanticAnalyzer {
                     ty,
                     span,
                 })
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Condition / branch-type helpers
+    // -----------------------------------------------------------------------
+
+    /// If `name` is an `EnumName::Variant` path of a known enum, return the
+    /// enum's name.
+    fn enum_variant_path(&self, name: &str) -> Option<String> {
+        let sep = name.find("::")?;
+        let enum_name = &name[..sep];
+        let variant_name = &name[sep + 2..];
+        let variants = self.enums.get(enum_name)?;
+        if variants.iter().any(|(v, _)| v == variant_name) {
+            Some(enum_name.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// S8: enforce that a condition (if/elif/while, match guard) is `bool`
+    /// when its type is KNOWN; `Unknown` stays permissive by design.
+    pub(crate) fn check_bool_cond(&self, cond: &TypedExpr, what: &str) -> CompileResult<()> {
+        if cond.ty.is_known() && cond.ty != ManiType::Bool {
+            return Err(self.err(
+                cond.span,
+                format!("{} must be `bool`, found `{}`", what, cond.ty.display()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// S7: branches of a value-producing construct (if/match/tif) must agree.
+    /// Branches typed `Void` (statement position or diverging via
+    /// return/break/continue) and `Unknown` are tolerated; two KNOWN,
+    /// non-void, incompatible branch types are an error.
+    pub(crate) fn check_branch_agreement(
+        &self,
+        branch_tys: &[ManiType],
+        what: &str,
+        span: Span,
+    ) -> CompileResult<()> {
+        let mut first: Option<&ManiType> = None;
+        for ty in branch_tys {
+            if !ty.is_known() || *ty == ManiType::Void {
+                continue;
+            }
+            match first {
+                None => first = Some(ty),
+                Some(fty) => {
+                    if !types_compatible(fty, ty) {
+                        return Err(self.err(span, format!(
+                            "{} have incompatible types: `{}` vs `{}`",
+                            what, fty.display(), ty.display()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free-identifier collection for lambda capture detection (S2)
+// ---------------------------------------------------------------------------
+
+fn bind_name(bound: &mut [std::collections::HashSet<String>], name: &str) {
+    if let Some(scope) = bound.last_mut() {
+        scope.insert(name.to_string());
+    }
+}
+
+fn is_bound(bound: &[std::collections::HashSet<String>], name: &str) -> bool {
+    bound.iter().any(|s| s.contains(name))
+}
+
+fn bind_pattern_names(pat: &Pattern, bound: &mut [std::collections::HashSet<String>]) {
+    match pat {
+        Pattern::Wildcard(_) | Pattern::Lit(_, _) => {}
+        Pattern::Ident(n, _) => bind_name(bound, n),
+        Pattern::Tuple(ps, _) | Pattern::Or(ps, _) | Pattern::Enum(_, _, ps, _) => {
+            for p in ps {
+                bind_pattern_names(p, bound);
+            }
+        }
+        Pattern::Struct(_, fields, _) => {
+            for (_, p) in fields {
+                bind_pattern_names(p, bound);
+            }
+        }
+    }
+}
+
+fn collect_free_in_block(
+    block: &Block,
+    bound: &mut Vec<std::collections::HashSet<String>>,
+    free: &mut std::collections::HashSet<String>,
+) {
+    bound.push(Default::default());
+    for stmt in &block.stmts {
+        match stmt {
+            Stmt::Let(ls) => {
+                // The initialiser is evaluated BEFORE the binding exists.
+                if let Some(init) = &ls.init {
+                    collect_free_idents(init, bound, free);
+                }
+                match &ls.pat {
+                    ast::LetPat::Ident(n) => bind_name(bound, n),
+                    ast::LetPat::Tuple(names) => {
+                        for n in names {
+                            bind_name(bound, n);
+                        }
+                    }
+                }
+            }
+            Stmt::Assign(a) => {
+                collect_free_idents(&a.value, bound, free);
+                collect_free_idents(&a.target, bound, free);
+            }
+            Stmt::Expr(e) => collect_free_idents(e, bound, free),
+            Stmt::Return(Some(e), _) => collect_free_idents(e, bound, free),
+            Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::LocalStructDef(_) => {}
+        }
+    }
+    bound.pop();
+}
+
+/// Collect every identifier read by `expr` that is not bound within `expr`
+/// itself (or by an enclosing `bound` scope). Path identifiers (`a::b`) are
+/// constants/functions, never local variables — they are skipped.
+fn collect_free_idents(
+    expr: &Expr,
+    bound: &mut Vec<std::collections::HashSet<String>>,
+    free: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Expr::Lit(_, _) | Expr::Break(_) | Expr::Continue(_) => {}
+        Expr::Ident(name, _) => {
+            if !name.contains("::") && !is_bound(bound, name) {
+                free.insert(name.clone());
+            }
+        }
+        Expr::BinOp(l, _, r, _) => {
+            collect_free_idents(l, bound, free);
+            collect_free_idents(r, bound, free);
+        }
+        Expr::UnOp(_, e, _)
+        | Expr::Await(e, _)
+        | Expr::Return(e, _)
+        | Expr::Cast(e, _, _)
+        | Expr::Question(e, _) => collect_free_idents(e, bound, free),
+        Expr::Call(callee, args, _) => {
+            collect_free_idents(callee, bound, free);
+            for a in args {
+                collect_free_idents(a, bound, free);
+            }
+        }
+        Expr::MethodCall(obj, _, args, _) => {
+            collect_free_idents(obj, bound, free);
+            for a in args {
+                collect_free_idents(a, bound, free);
+            }
+        }
+        Expr::Index(a, i, _) => {
+            collect_free_idents(a, bound, free);
+            collect_free_idents(i, bound, free);
+        }
+        Expr::Field(obj, _, _) => collect_free_idents(obj, bound, free),
+        Expr::Block(b) => collect_free_in_block(b, bound, free),
+        Expr::If(ie) => {
+            collect_free_idents(&ie.cond, bound, free);
+            collect_free_in_block(&ie.then_block, bound, free);
+            for (c, b) in &ie.elif_branches {
+                collect_free_idents(c, bound, free);
+                collect_free_in_block(b, bound, free);
+            }
+            if let Some(eb) = &ie.else_block {
+                collect_free_in_block(eb, bound, free);
+            }
+        }
+        Expr::Tif(te) => {
+            collect_free_idents(&te.cond, bound, free);
+            collect_free_in_block(&te.pos_block, bound, free);
+            collect_free_in_block(&te.zero_block, bound, free);
+            collect_free_in_block(&te.neg_block, bound, free);
+        }
+        Expr::Match(me) => {
+            collect_free_idents(&me.scrutinee, bound, free);
+            for arm in &me.arms {
+                bound.push(Default::default());
+                bind_pattern_names(&arm.pattern, bound);
+                if let Some(g) = &arm.guard {
+                    collect_free_idents(g, bound, free);
+                }
+                collect_free_idents(&arm.body, bound, free);
+                bound.pop();
+            }
+        }
+        Expr::For(fe) => {
+            collect_free_idents(&fe.iter, bound, free);
+            bound.push(Default::default());
+            bind_name(bound, &fe.var);
+            collect_free_in_block(&fe.body, bound, free);
+            bound.pop();
+        }
+        Expr::While(we) => {
+            collect_free_idents(&we.cond, bound, free);
+            collect_free_in_block(&we.body, bound, free);
+        }
+        Expr::Loop(b, _) | Expr::Spawn(b, _) => collect_free_in_block(b, bound, free),
+        Expr::Array(elems, _) | Expr::Tuple(elems, _) => {
+            for e in elems {
+                collect_free_idents(e, bound, free);
+            }
+        }
+        Expr::StructLit(_, fields, _) => {
+            for (_, e) in fields {
+                collect_free_idents(e, bound, free);
+            }
+        }
+        Expr::Range(lo, hi, _, _) => {
+            collect_free_idents(lo, bound, free);
+            collect_free_idents(hi, bound, free);
+        }
+        Expr::Lambda(params, _, body, _) => {
+            bound.push(params.iter().map(|(n, _)| n.clone()).collect());
+            collect_free_idents(body, bound, free);
+            bound.pop();
+        }
+        Expr::Tresult(tr) => {
+            collect_free_idents(&tr.expr, bound, free);
+            for (var, block) in [
+                (&tr.ok_var, &tr.ok_block),
+                (&tr.unknown_var, &tr.unknown_block),
+                (&tr.err_var, &tr.err_block),
+            ] {
+                bound.push(Default::default());
+                bind_name(bound, var);
+                collect_free_in_block(block, bound, free);
+                bound.pop();
             }
         }
     }

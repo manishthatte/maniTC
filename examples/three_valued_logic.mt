@@ -300,7 +300,7 @@ fn demo_sensor_fusion() {
     io::println("  System safety: engine AND brakes must both be OK.");
     io::println("  (using tand for conservative AND — min of two sensor readings)");
     let engine = +;         // OK
-    let brakes = 0;         // Unknown (sensor offline)
+    let brakes: trit = 0;   // Unknown (sensor offline)
     let safe = engine tand brakes;
     io::print("    engine=OK, brakes=Unknown  =>  safe=");
     io::println(sensor_status_str(safe));

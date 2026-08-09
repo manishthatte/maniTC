@@ -18,15 +18,30 @@ pub struct Parser {
     /// next call to peek()/advance() sees the second `>` without consuming
     /// further tokens.
     pub(super) pending_gt: bool,
+    /// The synthesized second `>` of a split `>>`, returned by peek_tok()
+    /// and advance() while `pending_gt` is set.
+    pub(super) split_gt: Token,
+    /// While set, `ident { ... }` is NOT parsed as a struct literal. Used in
+    /// condition / iterator / scrutinee position (`if`, `while`, `for`,
+    /// `match`, `tif`, `tresult`) where the `{` belongs to the construct's
+    /// body. Cleared inside any parenthesized/bracketed subexpression.
+    pub(super) no_struct_lit: bool,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(mut tokens: Vec<Token>) -> Self {
+        // Guarantee at least one token so the cursor helpers never index an
+        // empty vector (the lexer always appends Eof, but callers may not).
+        if tokens.is_empty() {
+            tokens.push(Token::new(TokenKind::Eof, Span::zero()));
+        }
         Parser {
             tokens,
             pos: 0,
             file: String::from("<input>"),
             pending_gt: false,
+            split_gt: Token::new(TokenKind::Gt, Span::zero()),
+            no_struct_lit: false,
         }
     }
 
@@ -46,6 +61,9 @@ impl Parser {
     }
 
     pub(super) fn peek_tok(&self) -> &Token {
+        if self.pending_gt {
+            return &self.split_gt;
+        }
         &self.tokens[self.pos.min(self.tokens.len().saturating_sub(1))]
     }
 
@@ -67,7 +85,9 @@ impl Parser {
             TokenKind::Gt => { self.advance(); true }
             TokenKind::RShift => {
                 // Split >> into two >
+                let sp = self.span();
                 self.advance(); // consume >>
+                self.split_gt = Token::new(TokenKind::Gt, Span::new(sp.line, sp.col + 1));
                 self.pending_gt = true; // leave one > pending
                 true
             }
@@ -80,6 +100,12 @@ impl Parser {
     }
 
     pub(super) fn advance(&mut self) -> &Token {
+        // A pending `>` from a split `>>` must be consumed first, otherwise
+        // peek() and advance() desynchronize.
+        if self.pending_gt {
+            self.pending_gt = false;
+            return &self.split_gt;
+        }
         let tok = &self.tokens[self.pos.min(self.tokens.len() - 1)];
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
@@ -119,6 +145,24 @@ impl Parser {
     pub(super) fn err(&self, msg: impl Into<String>) -> CompileError {
         let sp = self.span();
         CompileError::parse(&self.file, sp.line, sp.col, msg)
+    }
+
+    pub(super) fn err_at(&self, sp: Span, msg: impl Into<String>) -> CompileError {
+        CompileError::parse(&self.file, sp.line, sp.col, msg)
+    }
+
+    /// Require the `;` that terminates a statement. The semicolon may only be
+    /// omitted before a closing `}` (block tail expression) or at end of
+    /// input; anywhere else, two statements running together is an error.
+    pub(super) fn expect_stmt_semi(&mut self, what: &str) -> CompileResult<()> {
+        if self.eat(&TokenKind::Semi)
+            || self.peek() == &TokenKind::RBrace
+            || self.is_at_end()
+        {
+            Ok(())
+        } else {
+            Err(self.err(format!("expected `;` after {}, found {:?}", what, self.peek())))
+        }
     }
 
     pub(super) fn is_at_end(&self) -> bool {
@@ -181,7 +225,7 @@ impl Parser {
                 } else {
                     None
                 };
-                self.eat(&TokenKind::Semi);
+                self.expect_stmt_semi("global variable declaration")?;
                 Ok(Item::GlobalVar(GlobalVar {
                     name,
                     ty,
@@ -190,6 +234,10 @@ impl Parser {
                     span,
                 }))
             }
+            TokenKind::Mod => Err(self.err(
+                "`mod` is a reserved keyword but module blocks are not supported yet — \
+                 ManiT uses one module per file; move this code into its own file",
+            )),
             _ => Err(self.err(format!("unexpected token at top level: {:?}", self.peek()))),
         }
     }
@@ -387,6 +435,9 @@ impl Parser {
             tok => {
                 // Check if this keyword could be a module name
                 let s = match &tok {
+                    TokenKind::Spawn => "spawn".to_string(),
+                    TokenKind::Await => "await".to_string(),
+                    TokenKind::Channel => "channel".to_string(),
                     TokenKind::IntKw => "int".to_string(),
                     TokenKind::FloatKw => "float".to_string(),
                     TokenKind::CharKw => "char".to_string(),
@@ -422,7 +473,25 @@ impl Parser {
             let seg = self.expect_path_segment()?;
             path.push(seg);
         }
-        self.eat(&TokenKind::Semi);
+        self.expect_stmt_semi("use declaration")?;
         Ok(UseDecl { path, span })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_token_vector_does_not_panic() {
+        // F15 regression: Parser::new used to panic (index underflow) when
+        // handed a token vector without a trailing Eof.
+        let mut p = Parser::new(Vec::new());
+        let program = p.parse().expect("empty input parses to an empty program");
+        assert!(program.items.is_empty());
     }
 }

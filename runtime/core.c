@@ -35,9 +35,13 @@ char* io_read_line(void) {
 }
 
 int64_t io_read_int(void) {
-    int64_t n = 0;
-    scanf("%ld", (long*)&n);
-    return n;
+    long long n = 0;
+    if (scanf("%lld", &n) != 1) {
+        int ch;
+        while ((ch = getchar()) != EOF && ch != '\n') {}
+        return 0;
+    }
+    return (int64_t)n;
 }
 
 /* ======================== fmt ======================== */
@@ -93,9 +97,12 @@ char* fmt_format(const char* fmt_str, ...) {
     va_start(args, fmt_str);
     while (*p && q < end) {
         if (p[0] == '{' && p[1] == '}') {
-            int64_t n = va_arg(args, int64_t);
-            int written = snprintf(q, (size_t)(end - q), "%ld", (long)n);
-            if (written > 0) q += written;
+            /* The language-level API is fmt::format(str, [str]): every
+             * substitution argument is already a string (via fmt::show_*). */
+            const char* s = va_arg(args, const char*);
+            int avail = (int)(end - q);
+            int written = snprintf(q, (size_t)avail, "%s", s ? s : "(null)");
+            if (written > 0) q += written < avail ? written : avail - 1;
             p += 2;
         } else {
             *q++ = *p++;
@@ -157,7 +164,7 @@ char* fmt_to_lower(const char* s) {
 
 /* ======================== math ======================== */
 
-int64_t math_abs(int64_t n) { return n < 0 ? -n : n; }
+int64_t math_abs(int64_t n) { return n < 0 ? (int64_t)(0 - (uint64_t)n) : n; }
 double  math_abs_float(double f) { return fabs(f); }
 double  math_sqrt(double x) { return sqrt(x); }
 double  math_pow(double x, double y) { return pow(x, y); }
@@ -180,9 +187,9 @@ int64_t math_trit_count(int64_t n) {
        Uses balanced ternary decomposition: digits are {-1, 0, +1}. */
     if (n == 0) return 1;
     int64_t count = 0;
-    int64_t v = n < 0 ? -n : n;
+    uint64_t v = n < 0 ? 0 - (uint64_t)n : (uint64_t)n;
     while (v) {
-        int64_t rem = v % 3;
+        uint64_t rem = v % 3;
         if (rem == 2) { v = v / 3 + 1; } /* carry: 2 → -1 + carry */
         else { v = v / 3; }
         count++;
@@ -193,14 +200,21 @@ int64_t math_trit_count(int64_t n) {
 /* ======================== str ======================== */
 
 int64_t str_len(const char* s) { return (int64_t)strlen(s); }
-int8_t  str_char_at(const char* s, int64_t i) { return (int8_t)s[i]; }
+int8_t  str_char_at(const char* s, int64_t i) {
+    if (!s || i < 0 || i >= (int64_t)strlen(s)) return 0;
+    return (int8_t)s[i];
+}
 char*   str_concat(const char* a, const char* b) { return fmt_concat(a, b); }
 
 char* str_substr(const char* s, int64_t start, int64_t len) {
+    int64_t slen = (int64_t)strlen(s);
+    if (start < 0) start = 0;
+    if (start > slen) start = slen;
     if (len < 0) len = 0;
+    if (len > slen - start) len = slen - start;
     char* r = malloc((size_t)len + 1);
     if (!r) return NULL;
-    strncpy(r, s + start, (size_t)len);
+    memcpy(r, s + start, (size_t)len);
     r[len] = '\0';
     return r;
 }
@@ -225,18 +239,18 @@ int64_t str_find(const char* s, const char* sub) {
 
 char* str_replace(const char* s, const char* from, const char* to) {
     size_t fl = strlen(from), tl = strlen(to);
-    size_t bufsz = 4096;
-    char* r = malloc(bufsz);
+    if (fl == 0) return strdup(s);
+    size_t count = 0;
+    for (const char* p = strstr(s, from); p; p = strstr(p + fl, from)) count++;
+    size_t sl = strlen(s);
+    char* r = malloc(sl - count * fl + count * tl + 1);
     if (!r) return NULL;
     const char* p = s;
     char* q = r;
-    char* rend = r + bufsz - 1;
-    while (*p && q < rend) {
-        if (fl > 0 && strncmp(p, from, fl) == 0) {
-            size_t space = (size_t)(rend - q);
-            size_t copy = tl < space ? tl : space;
-            memcpy(q, to, copy);
-            q += copy;
+    while (*p) {
+        if (strncmp(p, from, fl) == 0) {
+            memcpy(q, to, tl);
+            q += tl;
             p += fl;
         } else {
             *q++ = *p++;

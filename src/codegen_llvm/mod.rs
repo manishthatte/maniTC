@@ -181,6 +181,7 @@ impl LLVMEmitter {
         out.push_str("declare ptr @malloc(i64)\n");
         out.push_str("declare void @free(ptr)\n");
         out.push_str("declare i32 @strcmp(ptr, ptr)\n");
+        out.push_str("declare i32 @usleep(i32)\n");
         out.push('\n');
 
         // ---- maniT stdlib declarations -------------------------------------
@@ -199,18 +200,19 @@ impl LLVMEmitter {
         for (k, v) in parse_declare_sigs(libc_decls) {
             self.fn_sigs.insert(k, v);
         }
+        // Signatures of the internal helper definitions (emitted below as
+        // `define internal` — they must NOT also appear as declares).
+        for (k, v) in parse_declare_sigs(INTERNAL_HELPER_SIGS) {
+            self.fn_sigs.insert(k, v);
+        }
         // Add user-defined and extern function signatures from the module.
         for f in &module.functions {
             let mangled = mangle_func_name(&f.name);
             let params: Vec<String> = f.params.iter().map(|(_, ty)| {
-                let s = llvm_type(ty);
-                if s.starts_with("%struct.") { "ptr".to_string() } else { s }
+                llvm_abi_type(ty)
             }).collect();
-            let mut ret = llvm_type(&f.ret_ty);
-            // Struct returns are always pointers in our ABI.
-            if ret.starts_with("%struct.") {
-                ret = "ptr".to_string();
-            }
+            // Aggregate returns (structs and arrays) are pointers in our ABI.
+            let ret = llvm_abi_type(&f.ret_ty);
             self.fn_sigs.insert(mangled, (params, ret));
         }
 
@@ -219,6 +221,10 @@ impl LLVMEmitter {
         out.push('\n');
         self.emit_helper_print_bool3(out);
         out.push('\n');
+        // Ternary/array/IO helpers the C runtime does not export
+        // (semantics mirror the T3 emulator syscalls — see helpers.rs).
+        out.push_str(INTERNAL_RUNTIME_HELPERS);
+        out.push('\n');
 
         // ---- User-defined / external functions ------------------------------
         for f in &module.functions {
@@ -226,6 +232,15 @@ impl LLVMEmitter {
             self.temp_types.clear();
             self.alloca_stored_types.clear();
             self.emit_function(f, out);
+            out.push('\n');
+        }
+
+        // ---- C-ABI main wrapper ---------------------------------------------
+        // The user's main was emitted as @__manit_main (see mangle_func_name);
+        // emit the i32-returning @main the C runtime start code expects, so
+        // the process exit status is main's return value (or 0 for void).
+        if let Some(user_main) = module.functions.iter().find(|f| f.name == "main") {
+            self.emit_main_wrapper(user_main, out);
             out.push('\n');
         }
 
@@ -246,7 +261,75 @@ impl LLVMEmitter {
             Some(v) => irvalue_to_operand(v, &g.ty),
             None => llvm_zero_init(&g.ty),
         };
-        out.push_str(&format!("@{} = global {} {}\n", g.name, ty_str, init_str));
+        out.push_str(&format!(
+            "@{} = global {} {}\n",
+            mangle_func_name(&g.name),
+            ty_str,
+            init_str
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // C-ABI main wrapper
+    // -----------------------------------------------------------------------
+
+    fn emit_main_wrapper(&self, user_main: &IRFunction, out: &mut String) {
+        // Zero/default arguments for any parameters main declares (unused in
+        // practice, but the call must match the emitted signature).
+        let args: Vec<String> = user_main
+            .params
+            .iter()
+            .map(|(_, ty)| {
+                let ty_s = llvm_abi_type(ty);
+                match ty_s.as_str() {
+                    "ptr" => "ptr null".to_string(),
+                    "double" => "double 0.0".to_string(),
+                    other => format!("{} 0", other),
+                }
+            })
+            .collect();
+        let ret_s = llvm_abi_type(&user_main.ret_ty);
+
+        out.push_str("define i32 @main() {\nentry:\n");
+        match ret_s.as_str() {
+            "void" => {
+                out.push_str(&format!(
+                    "  call void @__manit_main({})\n  ret i32 0\n",
+                    args.join(", ")
+                ));
+            }
+            "i32" => {
+                out.push_str(&format!(
+                    "  %r = call i32 @__manit_main({})\n  ret i32 %r\n",
+                    args.join(", ")
+                ));
+            }
+            "i64" | "i16" | "i8" => {
+                let op = if ret_s == "i64" { "trunc" } else { "sext" };
+                out.push_str(&format!(
+                    "  %r = call {} @__manit_main({})\n  %s = {} {} %r to i32\n  ret i32 %s\n",
+                    ret_s,
+                    args.join(", "),
+                    op,
+                    ret_s
+                ));
+            }
+            "i1" => {
+                out.push_str(&format!(
+                    "  %r = call i1 @__manit_main({})\n  %s = zext i1 %r to i32\n  ret i32 %s\n",
+                    args.join(", ")
+                ));
+            }
+            _ => {
+                // double / ptr returning main: run it, exit 0.
+                out.push_str(&format!(
+                    "  %r = call {} @__manit_main({})\n  ret i32 0\n",
+                    ret_s,
+                    args.join(", ")
+                ));
+            }
+        }
+        out.push_str("}\n");
     }
 
     // -----------------------------------------------------------------------
@@ -308,17 +391,13 @@ impl LLVMEmitter {
 
     fn emit_function(&mut self, f: &IRFunction, out: &mut String) {
         // Struct return types are always returned as pointers in our ABI.
-        let ret_ty_str = {
-            let s = llvm_type(&f.ret_ty);
-            if s.starts_with("%struct.") { "ptr".to_string() } else { s }
-        };
+        let ret_ty_str = llvm_abi_type(&f.ret_ty);
 
         if f.is_extern {
             // Emit only a `declare` — no body.
             let params_str: Vec<String> =
                 f.params.iter().map(|(_, ty)| {
-                    let s = llvm_type(ty);
-                    if s.starts_with("%struct.") { "ptr".to_string() } else { s }
+                    llvm_abi_type(ty)
                 }).collect();
             out.push_str(&format!(
                 "declare {} @{}({})\n",
@@ -336,9 +415,7 @@ impl LLVMEmitter {
             .params
             .iter()
             .map(|(name, ty)| {
-                let ty_s = llvm_type(ty);
-                let ty_s = if ty_s.starts_with("%struct.") { "ptr".to_string() } else { ty_s };
-                format!("{} %param_{}", ty_s, name)
+                format!("{} %param_{}", llvm_abi_type(ty), name)
             })
             .collect();
 
@@ -351,32 +428,41 @@ impl LLVMEmitter {
 
         self.current_ret_ty = f.ret_ty.clone();
 
-        // Build predecessor map for PHI node fixups.
+        // Build predecessor map for PHI node fixups. The map must reflect
+        // the CFG as EMITTED, not the IR: a TritBranch lowers to two
+        // two-way branches, and its zero/neg targets are really reached
+        // from the synthesized `<label>__tneg_check` block (B20). The
+        // check-block name matches what emit_terminator generates.
         self.block_predecessors.clear();
         for block in &f.blocks {
-            let successors = match &block.term {
-                IRTerminator::Jump(lbl) => vec![lbl.clone()],
-                IRTerminator::BinBranch { true_label, false_label, .. } => {
-                    vec![true_label.clone(), false_label.clone()]
-                }
+            // (successor, emitted predecessor label)
+            let edges: Vec<(String, String)> = match &block.term {
+                IRTerminator::Jump(lbl) => vec![(lbl.clone(), block.label.clone())],
+                IRTerminator::BinBranch { true_label, false_label, .. } => vec![
+                    (true_label.clone(), block.label.clone()),
+                    (false_label.clone(), block.label.clone()),
+                ],
                 IRTerminator::TritBranch { pos_label, zero_label, neg_label, .. } => {
-                    vec![pos_label.clone(), zero_label.clone(), neg_label.clone()]
+                    let check_lbl = format!("{}__tneg_check", block.label);
+                    vec![
+                        (pos_label.clone(), block.label.clone()),
+                        (zero_label.clone(), check_lbl.clone()),
+                        (neg_label.clone(), check_lbl),
+                    ]
                 }
                 _ => vec![],
             };
-            for succ in successors {
+            for (succ, pred) in edges {
                 self.block_predecessors
                     .entry(succ)
                     .or_insert_with(Vec::new)
-                    .push(block.label.clone());
+                    .push(pred);
             }
         }
 
         // Record parameter types so downstream instructions can look them up.
         for (name, ty) in &f.params {
-            let ty_s = llvm_type(ty);
-            let ty_s = if ty_s.starts_with("%struct.") { "ptr".to_string() } else { ty_s };
-            self.record_temp_type(&format!("param_{}", name), &ty_s);
+            self.record_temp_type(&format!("param_{}", name), &llvm_abi_type(ty));
         }
 
         for block in &f.blocks {

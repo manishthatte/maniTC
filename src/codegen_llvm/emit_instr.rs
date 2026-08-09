@@ -263,6 +263,19 @@ impl LLVMEmitter {
                         bytes
                     );
                 }
+                if let IRType::Array(elem, n) = ty {
+                    // Arrays too: they can be returned by pointer, and a
+                    // stack alloca would dangle. Aggregate-typed elements
+                    // are stored as 8-byte pointers.
+                    let elem_bytes: usize = match &**elem {
+                        IRType::I8 | IRType::Bool | IRType::Trit => 1,
+                        IRType::I16 => 2,
+                        IRType::I32 => 4,
+                        _ => 8,
+                    };
+                    let bytes = (n * elem_bytes).max(1);
+                    return format!("%{} = call ptr @malloc(i64 {})", dst.0, bytes);
+                }
                 let (alloca_ty, align) = (alloca_ty, llvm_align(ty));
                 format!(
                     "%{} = alloca {}, align {}",
@@ -385,14 +398,27 @@ impl LLVMEmitter {
                 // Look up the declared signature for correct types.
                 let sig = self.fn_sigs.get(&mangled).cloned();
 
+                // Vararg callees keep a trailing "..." in their parsed
+                // signature (see parse_declare_sigs).
+                let is_vararg = sig
+                    .as_ref()
+                    .map(|(p, _)| p.last().map(|s| s == "...").unwrap_or(false))
+                    .unwrap_or(false);
+                let fixed_params = sig
+                    .as_ref()
+                    .map(|(p, _)| p.len() - if is_vararg { 1 } else { 0 })
+                    .unwrap_or(0);
+
                 let mut call_prefix = String::new();
                 let args_str: Vec<String> = args
                     .iter()
                     .enumerate()
                     .map(|(i, a)| {
                         let declared = if let Some((ref param_types, _)) = sig {
-                            if i < param_types.len() {
+                            if i < fixed_params {
                                 param_types[i].clone()
+                            } else if is_vararg {
+                                "...".to_string()
                             } else {
                                 self.actual_type_of(a)
                             }
@@ -403,8 +429,25 @@ impl LLVMEmitter {
                         let guessed = guess_value_type(a);
                         let val_s = self.resolve_val(a, &guessed);
 
+                        // Vararg slot: apply the C default argument
+                        // promotions — integers narrower than i64 widen to
+                        // i64 (the runtime reads them with va_arg(int64_t)).
+                        if declared == "..." {
+                            if matches!(actual.as_str(), "i1" | "i8" | "i16" | "i32") {
+                                let uid = self.fresh_anon("argv");
+                                let coerce_name = format!("%{}", uid);
+                                let op = if actual == "i1" { "zext" } else { "sext" };
+                                call_prefix.push_str(&format!(
+                                    "{} = {} {} {} to i64\n  ",
+                                    coerce_name, op, actual, val_s
+                                ));
+                                return format!("i64 {}", coerce_name);
+                            }
+                            return format!("{} {}", actual, val_s);
+                        }
+
                         // If declared and actual differ, insert coercion
-                        if declared != actual && declared != "..." {
+                        if declared != actual {
                             let dw = int_width(&declared);
                             let aw = int_width(&actual);
                             if dw > 0 && aw > 0 && dw != aw {
@@ -437,7 +480,7 @@ impl LLVMEmitter {
                                 return format!("{} {}", declared, coerce_name);
                             }
                         }
-                        format!("{} {}", if declared != "..." { declared } else { actual }, val_s)
+                        format!("{} {}", declared, val_s)
                     })
                     .collect();
 
@@ -453,10 +496,29 @@ impl LLVMEmitter {
                     self.record_temp_type(&d.0, &actual_ret);
                 }
 
+                // Vararg calls must spell out the full function type —
+                // `call ptr (ptr, ...) @fmt_format(...)` — for x86-64 ABI
+                // correctness (only the fixed-arg form was correct before).
+                let callee_ty = if is_vararg {
+                    let (params, _) = sig.as_ref().unwrap();
+                    format!("{} ({})", actual_ret, params.join(", "))
+                } else {
+                    actual_ret.clone()
+                };
+
                 if actual_ret == "void" {
+                    // The IR may still bind a dst temp to a void call (e.g. a
+                    // lambda whose tail expression is a void print). A `call
+                    // void` defines no SSA name, so substitute 0 for any
+                    // later reference to keep the module well-formed.
+                    if let Some(d) = dst {
+                        self.assigns.insert(d.0.clone(), "0".to_string());
+                        self.record_temp_type(&d.0, "i64");
+                    }
                     format!(
-                        "{}call void @{}({})",
+                        "{}call {} @{}({})",
                         call_prefix,
+                        callee_ty,
                         mangled,
                         args_str.join(", ")
                     )
@@ -466,14 +528,14 @@ impl LLVMEmitter {
                             "{}%{} = call {} @{}({})",
                             call_prefix,
                             d.0,
-                            actual_ret,
+                            callee_ty,
                             mangled,
                             args_str.join(", ")
                         ),
                         None => format!(
                             "{}call {} @{}({})",
                             call_prefix,
-                            actual_ret,
+                            callee_ty,
                             mangled,
                             args_str.join(", ")
                         ),
@@ -484,10 +546,25 @@ impl LLVMEmitter {
             // ---- GetPtr (getelementptr) -------------------------------------
             IRInstr::GetPtr { dst, ptr, idx, ty } => {
                 self.record_temp_type(&dst.0, "ptr");
-                let ptr_s = self.resolve_ptr_val(ptr);
-                let idx_s = self.resolve_val(idx, &IRType::I64);
+                let mut prefix = String::new();
+                let mut ptr_s = self.resolve_ptr_val(ptr);
+                // The base may be an integer temp (e.g. an address that came
+                // through an i64 slot) — getelementptr requires a ptr operand.
+                let base_actual = self.actual_type_of(ptr);
+                if matches!(base_actual.as_str(), "i8" | "i16" | "i32" | "i64") {
+                    let uid = self.fresh_anon("gepp");
+                    prefix.push_str(&format!(
+                        "%{} = inttoptr {} {} to ptr\n  ",
+                        uid, base_actual, ptr_s
+                    ));
+                    ptr_s = format!("%{}", uid);
+                }
+                let (idx_prefix, idx_s) =
+                    self.resolve_with_coerce(idx, "i64", &format!("{}_idx", dst.0));
                 format!(
-                    "%{} = getelementptr {}, ptr {}, i64 {}",
+                    "{}{}%{} = getelementptr {}, ptr {}, i64 {}",
+                    prefix,
+                    idx_prefix,
                     dst.0,
                     llvm_type(ty),
                     ptr_s,
@@ -541,8 +618,11 @@ impl LLVMEmitter {
             }
 
             IRInstr::PrintInt(val) => {
-                let s = self.resolve_val(val, &IRType::I64);
-                format!("call i32 (ptr, ...) @printf(ptr @fmt_int, i64 {})", s)
+                // The value may live in a narrower register (e.g. an i32
+                // runtime call result); widen it to the i64 printf slot.
+                let uid = self.fresh_anon("pint");
+                let (prefix, s) = self.resolve_with_coerce(val, "i64", &uid);
+                format!("{}call i32 (ptr, ...) @printf(ptr @fmt_int, i64 {})", prefix, s)
             }
 
             IRInstr::PrintFloat(val) => {
@@ -551,13 +631,15 @@ impl LLVMEmitter {
             }
 
             IRInstr::PrintTrit(val) => {
-                let s = self.resolve_val(val, &IRType::I8);
-                format!("call void @__manit_print_trit(i8 {})", s)
+                let uid = self.fresh_anon("ptrit");
+                let (prefix, s) = self.resolve_with_coerce(val, "i8", &uid);
+                format!("{}call void @__manit_print_trit(i8 {})", prefix, s)
             }
 
             IRInstr::PrintBool3(val) => {
-                let s = self.resolve_val(val, &IRType::I8);
-                format!("call void @__manit_print_bool3(i8 {})", s)
+                let uid = self.fresh_anon("pb3");
+                let (prefix, s) = self.resolve_with_coerce(val, "i8", &uid);
+                format!("{}call void @__manit_print_bool3(i8 {})", prefix, s)
             }
 
             // ---- Phi --------------------------------------------------------
@@ -579,7 +661,22 @@ impl LLVMEmitter {
                 }
                 self.record_temp_type(&dst.0, &phi_ty);
 
-                // Build the incoming edges, using undef for values.
+                // Emitted predecessors of the block this PHI lives in
+                // (self.current_block_label). block_predecessors reflects
+                // the CFG as EMITTED: for a TritBranch, the zero/neg targets
+                // are reached through the synthesized <pred>__tneg_check
+                // block, not the IR block itself (B20).
+                let preds: Vec<String> = self
+                    .current_block_label
+                    .as_ref()
+                    .and_then(|b| self.block_predecessors.get(b))
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Build the incoming edges. Incoming labels that name the
+                // IR-level TritBranch block are rewritten to the emitted
+                // __tneg_check block when that is the real predecessor.
+                let mut seen_labels: Vec<String> = Vec::new();
                 let mut pairs: Vec<String> = incoming
                     .iter()
                     .map(|(v, label)| {
@@ -589,33 +686,25 @@ impl LLVMEmitter {
                         } else {
                             self.resolve_val(v, ty)
                         };
-                        format!("[ {}, %{} ]", vs, label)
+                        let mut lbl = label.clone();
+                        if !preds.iter().any(|p| *p == lbl) {
+                            let check = format!("{}__tneg_check", lbl);
+                            if preds.iter().any(|p| *p == check) {
+                                lbl = check;
+                            }
+                        }
+                        seen_labels.push(lbl.clone());
+                        format!("[ {}, %{} ]", vs, lbl)
                     })
                     .collect();
 
                 // LLVM requires every predecessor of a block to appear in
-                // the PHI.  If the predecessor map has more predecessors
+                // the PHI. If the predecessor map has more predecessors
                 // than the IR's incoming list, add undef entries.
-                // (Also handles TritBranch intermediate blocks.)
-                let incoming_labels: std::collections::HashSet<&str> =
-                    incoming.iter().map(|(_, l)| l.as_str()).collect();
-                // We need to find which block this PHI lives in. Unfortunately
-                // we don't have direct access here. Use a workaround: store
-                // the current block label.
-                // Instead, check block_predecessors for all blocks and find
-                // which has these incoming labels as a subset.
-                // Actually, PHI's block is the current block being emitted.
-                // Let me pass it through via a field.
-                // For now, scan block_predecessors for a block whose preds
-                // include all our incoming labels.
-                if let Some(current_block) = &self.current_block_label {
-                    if let Some(preds) = self.block_predecessors.get(current_block) {
-                        for pred in preds {
-                            if !incoming_labels.contains(pred.as_str()) {
-                                let undef_val = if phi_ty == "ptr" { "null" } else { "undef" };
-                                pairs.push(format!("[ {}, %{} ]", undef_val, pred));
-                            }
-                        }
+                for pred in &preds {
+                    if !seen_labels.iter().any(|l| l == pred) {
+                        let undef_val = if phi_ty == "ptr" { "null" } else { "undef" };
+                        pairs.push(format!("[ {}, %{} ]", undef_val, pred));
                     }
                 }
 
@@ -625,15 +714,12 @@ impl LLVMEmitter {
             // ---- Cast -------------------------------------------------------
             IRInstr::Cast { dst, src, from_ty, to_ty } => {
                 self.record_temp_type(&dst.0, &llvm_type(to_ty));
-                let src_s = self.resolve_val(src, from_ty);
-                format!(
-                    "%{} = {} {} {} to {}",
-                    dst.0,
-                    pick_cast_op(from_ty, to_ty),
-                    llvm_type(from_ty),
-                    src_s,
-                    llvm_type(to_ty)
-                )
+                // If the temp's actual width differs from the declared
+                // from-type (e.g. an i64 temp cast "from" Trit), coerce it
+                // first so the cast sequence sees the type it expects.
+                let (prefix, src_s) =
+                    self.resolve_with_coerce(src, &llvm_type(from_ty), &format!("{}_cast", dst.0));
+                format!("{}{}", prefix, cast_sequence(&dst.0, &src_s, from_ty, to_ty))
             }
             // ---- CallIndirect -----------------------------------------------
             // Emits:  %dst = call <ret_ty> %fn_ptr(<typed_args>)
@@ -658,6 +744,15 @@ impl LLVMEmitter {
                 // Record return type for dst.
                 if let Some(d) = dst {
                     self.record_temp_type(&d.0, &ret_str);
+                }
+
+                // A void indirect call defines no SSA name (see Call above).
+                if ret_str == "void" {
+                    if let Some(d) = dst {
+                        self.assigns.insert(d.0.clone(), "0".to_string());
+                        self.record_temp_type(&d.0, "i64");
+                    }
+                    return format!("call void {}({})", fp_s, typed_args.join(", "));
                 }
 
                 match dst {
@@ -692,7 +787,7 @@ impl LLVMEmitter {
                 if *ret_ty == crate::ir::types::IRType::Void {
                     vec!["ret void".to_string()]
                 } else {
-                    let ty_str = llvm_type(ret_ty);
+                    let ty_str = llvm_abi_type(ret_ty);
                     let zero = if ty_str == "ptr" { "null" } else { "0" };
                     vec![format!("ret {} {}", ty_str, zero)]
                 }
@@ -702,28 +797,35 @@ impl LLVMEmitter {
                 // If the value is Void but the function returns non-void,
                 // this is a dead merge block — return zero default.
                 if matches!(val, IRValue::Void) && self.current_ret_ty != IRType::Void {
-                    let ty_str = llvm_type(&self.current_ret_ty);
+                    let ty_str = llvm_abi_type(&self.current_ret_ty);
                     let zero = if ty_str == "ptr" { "null" } else { "0" };
                     return vec![format!("ret {} {}", ty_str, zero)];
                 }
                 // Determine the return type. Use the function's declared
-                // return type (which already maps struct→ptr).
+                // return type (which already maps struct→ptr) — constants
+                // adapt to the declared width; guessing i64 for a plain `0`
+                // in an i8-returning function produced `ret i64 0` (K1).
                 let ty = match val {
                     IRValue::Temp(_) => self.current_ret_ty.clone(),
+                    _ if self.current_ret_ty != IRType::Void => self.current_ret_ty.clone(),
                     _ => guess_value_type(val),
                 };
-                let mut ty_str = llvm_type(&ty);
+                // Aggregate returns (structs and arrays) use ptr in the ABI.
+                let ty_str = llvm_abi_type(&ty);
                 let vs = self.resolve_val(val, &ty);
 
-                // Struct returns: the function signature uses ptr.
-                if ty_str.starts_with("%struct.") {
-                    ty_str = "ptr".to_string();
-                }
-
                 // Fix type mismatch: if the actual value type differs from
-                // the function return type, insert a cast.
+                // the function return type, insert a cast. Integer constants
+                // need no cast — they adapt to the declared type (but string
+                // and null constants are genuinely ptr-typed, so keep those).
                 let actual = self.actual_type_of(val);
-                if actual != ty_str && actual != "void" && ty_str != "void" {
+                let adapts = matches!(
+                    val,
+                    IRValue::Const(IRConst::Int(_))
+                        | IRValue::Const(IRConst::Bool(_))
+                        | IRValue::Const(IRConst::Trit(_))
+                );
+                if !adapts && actual != ty_str && actual != "void" && ty_str != "void" {
                     if actual == "ptr" && ty_str != "ptr" {
                         // ptr → int: ptrtoint
                         let ext_name = "%__ret_coerce";
@@ -791,18 +893,41 @@ impl LLVMEmitter {
                 //
                 // The intermediate check block is emitted as a bare label
                 // line (prefixed with '\n' so emit_block knows not to indent it).
-                let cs = self.resolve_val(cond, &IRType::I8);
-                let check_lbl = self.fresh_anon("__tneg_check");
+                // Its name is derived from the current block label so that
+                // the predecessor map built before emission (emit_function)
+                // names the same block (B20).
+                let mut cs = self.resolve_val(cond, &IRType::I8);
+                // The condition temp may actually be wider than i8 (e.g. a
+                // trit loaded through an i64 slot) — compare in its real type.
+                let mut pre = Vec::new();
+                let cond_ty = match self.actual_type_of(cond).as_str() {
+                    "i1" => {
+                        // A two-valued bool as trit condition: widen so the
+                        // signed compares below see 0 / +1 (not i1's 0 / -1).
+                        let z = self.fresh_anon("__tzext");
+                        pre.push(format!("%{} = zext i1 {} to i8", z, cs));
+                        cs = format!("%{}", z);
+                        "i8".to_string()
+                    }
+                    t @ ("i16" | "i32" | "i64") => t.to_string(),
+                    _ => "i8".to_string(),
+                };
+                let check_lbl = format!(
+                    "{}__tneg_check",
+                    self.current_block_label.clone().unwrap_or_default()
+                );
                 let tpos = self.fresh_anon("__tpos");
                 let tneg = self.fresh_anon("__tneg");
-                vec![
-                    format!("%{} = icmp sgt i8 {}, 0", tpos, cs),
+                let mut lines = pre;
+                lines.extend([
+                    format!("%{} = icmp sgt {} {}, 0", tpos, cond_ty, cs),
                     format!("br i1 %{}, label %{}, label %{}", tpos, pos_label, check_lbl),
                     // A '\n'-prefixed string is treated as a bare label by emit_block.
                     format!("\n{}:", check_lbl),
-                    format!("%{} = icmp slt i8 {}, 0", tneg, cs),
+                    format!("%{} = icmp slt {} {}, 0", tneg, cond_ty, cs),
                     format!("br i1 %{}, label %{}, label %{}", tneg, neg_label, zero_label),
-                ]
+                ]);
+                lines
             }
 
             IRTerminator::Unreachable => vec!["unreachable".to_string()],
@@ -825,7 +950,9 @@ impl LLVMEmitter {
                 }
             }
             IRValue::Const(c) => irconst_to_string(c, ty),
-            IRValue::Global(name) => format!("@{}", name),
+            // Global names may carry module paths (`t27f::ZERO`) — mangle
+            // them the same way the definition site does.
+            IRValue::Global(name) => format!("@{}", mangle_func_name(name)),
             IRValue::Void => String::new(),
         }
     }
@@ -841,7 +968,7 @@ impl LLVMEmitter {
                     format!("%{}", t.0)
                 }
             }
-            IRValue::Global(name) => format!("@{}", name),
+            IRValue::Global(name) => format!("@{}", mangle_func_name(name)),
             IRValue::Const(IRConst::Null) => "null".to_string(),
             IRValue::Const(IRConst::Str(label)) => {
                 format!("@{}", label.trim_start_matches('@'))
@@ -885,7 +1012,13 @@ impl LLVMEmitter {
         }
 
         let ext_name = format!("%__coerce_{}", suffix);
-        let op = if aw < tw { "sext" } else { "trunc" };
+        // i1 holds a logical 0/1 — widening it must zero-extend (sext would
+        // turn `true` into -1). All wider integer types are signed values.
+        let op = if aw < tw {
+            if actual == "i1" { "zext" } else { "sext" }
+        } else {
+            "trunc"
+        };
         let prefix = format!(
             "{} = {} {} {} to {}\n  ",
             ext_name, op, actual, resolved, target_ty
@@ -943,18 +1076,15 @@ impl LLVMEmitter {
             "  br i1 %ispos, label %pos, label %notpos\n",
             "pos:\n",
             "  call i32 @putchar(i32 43)\n",  // '+'
-            "  call i32 @putchar(i32 10)\n",  // '\n'
             "  ret void\n",
             "notpos:\n",
             "  %isneg = icmp slt i8 %t, 0\n",
             "  br i1 %isneg, label %neg, label %zero\n",
             "neg:\n",
             "  call i32 @putchar(i32 45)\n",  // '-'
-            "  call i32 @putchar(i32 10)\n",
             "  ret void\n",
             "zero:\n",
             "  call i32 @putchar(i32 48)\n",  // '0'
-            "  call i32 @putchar(i32 10)\n",
             "  ret void\n",
             "}\n"
         ));
@@ -973,7 +1103,6 @@ impl LLVMEmitter {
             "  call i32 @putchar(i32 114)\n",  // 'r'
             "  call i32 @putchar(i32 117)\n",  // 'u'
             "  call i32 @putchar(i32 101)\n",  // 'e'
-            "  call i32 @putchar(i32 10)\n",
             "  ret void\n",
             "notpos:\n",
             "  %isneg = icmp slt i8 %t, 0\n",
@@ -985,7 +1114,6 @@ impl LLVMEmitter {
             "  call i32 @putchar(i32 108)\n",  // 'l'
             "  call i32 @putchar(i32 115)\n",  // 's'
             "  call i32 @putchar(i32 101)\n",  // 'e'
-            "  call i32 @putchar(i32 10)\n",
             "  ret void\n",
             "unknown:\n",
             "; print \"unknown\\n\"\n",
@@ -996,7 +1124,6 @@ impl LLVMEmitter {
             "  call i32 @putchar(i32 111)\n",  // 'o'
             "  call i32 @putchar(i32 119)\n",  // 'w'
             "  call i32 @putchar(i32 110)\n",  // 'n'
-            "  call i32 @putchar(i32 10)\n",
             "  ret void\n",
             "}\n"
         ));
