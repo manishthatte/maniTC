@@ -1,5 +1,8 @@
 # manitc — the ManiT compiler
 
+[![CI](https://github.com/manishthatte/manitc/actions/workflows/ci.yml/badge.svg)](https://github.com/manishthatte/manitc/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+
 **ManiT** is a systems programming language in which balanced ternary is the
 native number system: integers are signed by construction, logic is
 three-valued (`True` / `Unknown` / `False`), and the fundamental control-flow

@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+          clang --version
+
+      # The LLVM backend links compiled programs against the ManiT C runtime.
+      # With SDL2 and libcurl present the runtime is built in full; without
+      # them it falls back to -DMANIT_NO_GUI. CI exercises the full build.
+      - name: Install runtime link dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libsdl2-dev libsdl2-ttf-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --all --locked
+
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime link dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libsdl2-dev libsdl2-ttf-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Every example that currently compiles and runs. Anything not listed
+      # is tracked in KNOWN_ISSUES.md — add it here as it starts working, so
+      # that a fix can never silently regress.
+      - name: T3ISA backend — compile and run on the emulator
+        run: |
+          set -euo pipefail
+          for ex in capability_demo database data_structures fibonacci hello \
+                    neural_net stream_demo ternary_calculator ternary_demo \
+                    ternary_sort three_valued_logic; do
+            echo "::group::$ex"
+            ./target/release/manitc compile --target t3 "examples/$ex.mt" -o "/tmp/$ex.t3b"
+            ./target/release/manitc run-t3 "/tmp/$ex.t3b" > "/tmp/$ex.t3.out"
+            test -s "/tmp/$ex.t3.out"
+            head -5 "/tmp/$ex.t3.out"
+            echo "::endgroup::"
+          done
+
+      # The LLVM backend does not yet cover the whole example set; these are
+      # the ones that build and run. See KNOWN_ISSUES.md.
+      - name: LLVM backend — compile and run natively
+        run: |
+          set -euo pipefail
+          for ex in fibonacci oop stream_demo; do
+            echo "::group::$ex"
+            ./target/release/manitc compile "examples/$ex.mt" --target llvm -o "/tmp/$ex"
+            test -x "/tmp/$ex"
+            # These examples return a nonzero exit status after running
+            # correctly (KNOWN_ISSUES.md), so the assertion is that they
+            # produce output and do not die on a signal.
+            rc=0
+            "/tmp/$ex" > "/tmp/$ex.llvm.out" 2>&1 || rc=$?
+            test "$rc" -lt 128
+            test -s "/tmp/$ex.llvm.out"
+            head -5 "/tmp/$ex.llvm.out"
+            echo "::endgroup::"
+          done
+
+      - name: Minimal runtime — no SDL2, no libcurl
+        run: |
+          set -euo pipefail
+          MANIT_NO_GUI=1 ./target/release/manitc compile examples/fibonacci.mt \
+            --target llvm -o /tmp/fib_minimal
+          rc=0
+          /tmp/fib_minimal > /tmp/fib_minimal.out 2>&1 || rc=$?
+          test "$rc" -lt 128
+          head -3 /tmp/fib_minimal.out

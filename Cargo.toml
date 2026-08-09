@@ -3,10 +3,13 @@ name = "manitc"
 version = "0.1.0"
 edition = "2021"
 description = "The maniT balanced ternary language compiler"
-license = "Apache-2.0"
+license = "AGPL-3.0-or-later"
 authors = ["Manish Jagdish Thatte <manish@manitlab.org>"]
-repository = "https://github.com/manishthatte/THATTE"
+repository = "https://github.com/manishthatte/manitc"
 homepage = "https://www.manitlab.org"
+readme = "README.md"
+keywords = ["ternary", "balanced-ternary", "compiler", "language", "t3isa"]
+categories = ["compilers", "development-tools"]
 
 [lib]
 name = "manitc"

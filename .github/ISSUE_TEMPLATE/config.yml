@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and language design discussion
+    url: https://github.com/manishthatte/manitc/discussions
+    about: Ask how something works, or float a design idea before filing an issue.
+  - name: Getting started
+    url: https://github.com/manishthatte/manitc/blob/main/GETTING_STARTED.md
+    about: Install, first program, first boot of THATTEOS.
+  - name: Commercial licensing
+    url: https://www.manitlab.org
+    about: manitc is AGPL-3.0. Contact the author for commercial licensing terms.

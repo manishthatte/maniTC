@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install runtime link dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libsdl2-dev libsdl2-ttf-dev
+
+      # A release that fails its own test suite is not a release.
+      - name: Test
+        run: cargo test --all --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          DIR="manitc-${VERSION}-x86_64-linux"
+
+          mkdir -p "$DIR/bin"
+          cp target/release/manitc "$DIR/bin/"
+          strip "$DIR/bin/manitc"
+
+          # The compiler looks for the C runtime next to its own executable
+          # (bin/../runtime), so the runtime must travel with the binary for
+          # the LLVM backend to link anything.
+          cp -r runtime stdlib examples "$DIR/"
+          cp LICENSE NOTICE COPYING.RUNTIME-EXCEPTION README.md GETTING_STARTED.md "$DIR/"
+
+          tar czf "${DIR}.tar.gz" "$DIR"
+          sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "archive=${DIR}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # Prove the packaged artefact works when unpacked somewhere else, with
+      # the source tree nowhere in sight.
+      - name: Verify package
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/verify && tar xzf "${{ steps.package.outputs.archive }}" -C /tmp/verify
+          PREFIX="/tmp/verify/$(basename "${{ steps.package.outputs.archive }}" .tar.gz)"
+          cd /tmp
+
+          # Output goes to files, never through a pipe: closing a pipe early
+          # makes the emulator die on SIGPIPE and would fail the release.
+          "$PREFIX/bin/manitc" compile --target t3 "$PREFIX/examples/ternary_demo.mt" -o /tmp/verify.t3b
+          "$PREFIX/bin/manitc" run-t3 /tmp/verify.t3b > /tmp/verify_t3.out
+          test -s /tmp/verify_t3.out
+          head -3 /tmp/verify_t3.out
+
+          # Links against runtime/ found next to the binary — the reason the
+          # runtime directory ships inside the archive.
+          "$PREFIX/bin/manitc" compile "$PREFIX/examples/fibonacci.mt" --target llvm -o /tmp/verify_fib
+          test -x /tmp/verify_fib
+          rc=0
+          /tmp/verify_fib > /tmp/verify_fib.out 2>&1 || rc=$?
+          test "$rc" -lt 128
+          test -s /tmp/verify_fib.out
+          head -3 /tmp/verify_fib.out
+
+      - name: Compose release notes
+        run: |
+          set -euo pipefail
+          ARCHIVE="${{ steps.package.outputs.archive }}"
+          SUM=$(cut -d' ' -f1 < "${ARCHIVE}.sha256")
+          cat > /tmp/notes.md <<EOF
+          ## Install
+
+          \`\`\`sh
+          tar xzf ${ARCHIVE}
+          cd $(basename "$ARCHIVE" .tar.gz)
+          ./bin/manitc --help
+          \`\`\`
+
+          Built on Ubuntu (x86-64, glibc). Keep \`bin/manitc\` and the
+          \`runtime/\` directory together — the LLVM backend links compiled
+          programs against the C runtime it finds next to the executable.
+
+          Linking with the full runtime needs SDL2 and libcurl development
+          packages; without them the compiler falls back to the minimal
+          runtime automatically (or set \`MANIT_NO_GUI=1\` to force it).
+
+          ## Backend coverage
+
+          The T3ISA backend and its emulator run the example set. The LLVM
+          backend covers the test suite and part of the example set — current
+          status and the open gaps are in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+          ## Checksum
+
+          \`\`\`
+          $SUM  $ARCHIVE
+          \`\`\`
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.package.outputs.tag }}"
+          gh release create "$TAG" \
+            --title "manitc $TAG" \
+            --notes-file /tmp/notes.md \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.archive }}.sha256"

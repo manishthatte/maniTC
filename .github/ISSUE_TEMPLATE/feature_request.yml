@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a language or compiler change
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Language design questions are often better started as a
+        [Discussion](../../discussions) — open an issue once the shape of the
+        change is clear.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What is hard or impossible to express today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you would like instead. ManiT is balanced ternary from first principles — proposals that assume a binary machine underneath are unlikely to fit.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

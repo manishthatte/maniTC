@@ -1,0 +1,47 @@
+name: Bug report
+description: Something the compiler gets wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check [KNOWN_ISSUES.md](../blob/main/KNOWN_ISSUES.md) —
+        the current backend gaps are already listed there.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: The smallest ManiT program that shows the problem, and the exact manitc command you ran.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - T3ISA (--target t3)
+        - LLVM (--target llvm)
+        - Both
+        - Not backend specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: version
+    attributes:
+      label: Version and platform
+      description: Output of `manitc --version`, your OS, and whether you built from source or used a release archive.
+      render: shell
+    validations:
+      required: true

@@ -24,8 +24,11 @@ bug reports, fixes, stdlib modules, examples, docs, ports.
    (three-valued logic, signed arithmetic, no binary idioms bolted on) and
    early alignment saves everyone time.
 
-4. **Style.** Match the surrounding code. Rust code: `cargo fmt` clean.
-   ManiT code: follow the stdlib's conventions.
+4. **Style.** Match the surrounding code. New Rust code should be
+   `cargo fmt` clean, but please do not reformat existing files as part of
+   a feature or fix — the tree is not uniformly formatted yet, and a
+   whole-file reformat buried in a PR is impossible to review. ManiT code:
+   follow the stdlib's conventions.
 
 5. **Tests.** New behavior needs a test under `tests/`. Run the suite
    before submitting.

@@ -1,4 +1,5 @@
 mod bench;
+mod runtime_link;
 use bench::{read_source, run_bench};
 
 use clap::{Parser, Subcommand};
@@ -12,10 +13,6 @@ use manitc::ir::{self, IRLowerer};
 use manitc::codegen_llvm;
 use manitc::codegen_t3;
 use manitc::lsp;
-
-/// Embedded copy of the maniT C runtime library.
-/// Written to /tmp/manit_runtime.c when the file cannot be found on disk.
-const RUNTIME_C_SOURCE: &str = include_str!("../runtime/manit_runtime.c");
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -171,43 +168,20 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
             })?;
             println!("[LLVM] wrote {}", ll_path.display());
 
-            // Resolve the runtime C source path. Try:
-            //   1. Relative to the source file's directory.
-            //   2. Relative to the current working directory.
-            //   3. Relative to the executable's directory.
-            //   4. Fall back to /tmp/manit_runtime.c (write embedded copy).
-            let runtime_c_path: std::path::PathBuf = {
-                let candidates = [
-                    // next to source file
-                    file.parent()
-                        .map(|p| p.join("../runtime/manit_runtime.c"))
-                        .unwrap_or_default(),
-                    std::path::PathBuf::from("runtime/manit_runtime.c"),
-                    std::env::current_exe()
-                        .ok()
-                        .and_then(|e| e.parent().map(|p| p.join("../runtime/manit_runtime.c")))
-                        .unwrap_or_default(),
-                ];
-                let found = candidates.iter().find(|p| p.exists()).cloned();
-                match found {
-                    Some(p) => p,
-                    None => {
-                        // Write embedded runtime to /tmp
-                        let tmp = std::path::PathBuf::from("/tmp/manit_runtime.c");
-                        std::fs::write(&tmp, RUNTIME_C_SOURCE).ok();
-                        tmp
-                    }
-                }
-            };
+            // Resolve the runtime C source and decide how to build it — full
+            // (SDL2 + libcurl) or minimal. See runtime_link.
+            let runtime_c_path = runtime_link::resolve_source(Some(&file));
+            let link = runtime_link::flags();
 
             // Compile runtime to object file
-            let runtime_obj = std::path::PathBuf::from("/tmp/manit_runtime.o");
+            let runtime_obj = runtime_link::object_path("compile");
             let runtime_compiled = std::process::Command::new("clang")
                 .args([
                     runtime_c_path.to_str().unwrap(),
                     "-c",
                     "-o", runtime_obj.to_str().unwrap(),
                 ])
+                .args(&link.cflags)
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
@@ -221,6 +195,7 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
                         "-o", output.to_str().unwrap(),
                         "-lm", "-lpthread",
                     ])
+                    .args(&link.libs)
                     .status()
                 {
                     if status.success() {
@@ -244,8 +219,8 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
                     }
                 } else {
                     println!("[LLVM] clang not found — LLVM IR written to {}", ll_path.display());
-                    println!("[LLVM] to compile: clang {} /tmp/manit_runtime.o -o {} -lm -lpthread",
-                        ll_path.display(), output.display());
+                    println!("[LLVM] to compile: clang {} {} -o {} -lm -lpthread",
+                        ll_path.display(), runtime_obj.display(), output.display());
                 }
             }
         }

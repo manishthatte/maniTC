@@ -1,6 +1,6 @@
 // bench.rs — Benchmarking command implementation for the maniT compiler.
 use std::path::PathBuf;
-use crate::RUNTIME_C_SOURCE;
+
 use manitc::error::{CompileError, CompileResult, Diagnostic};
 use manitc::lexer::Lexer;
 use manitc::parser::Parser as ManiParser;
@@ -79,34 +79,21 @@ pub fn run_bench(file: &PathBuf, iterations: usize) -> CompileResult<()> {
     std::fs::write(&ll_path, &ll_text).ok();
 
     // Resolve runtime
-    let runtime_c_path: std::path::PathBuf = {
-        let candidates = [
-            file.parent()
-                .map(|p| p.join("../runtime/manit_runtime.c"))
-                .unwrap_or_default(),
-            std::path::PathBuf::from("runtime/manit_runtime.c"),
-        ];
-        let found = candidates.iter().find(|p| p.exists()).cloned();
-        match found {
-            Some(p) => p,
-            None => {
-                let tmp = std::path::PathBuf::from("/tmp/manit_runtime.c");
-                std::fs::write(&tmp, RUNTIME_C_SOURCE).ok();
-                tmp
-            }
-        }
-    };
+    let runtime_c_path = crate::runtime_link::resolve_source(Some(file));
+    let link = crate::runtime_link::flags();
 
     // Compile LLVM binary
-    let runtime_obj = std::path::PathBuf::from("/tmp/manit_runtime_bench.o");
+    let runtime_obj = crate::runtime_link::object_path("bench");
     let _ = std::process::Command::new("clang")
         .args([runtime_c_path.to_str().unwrap(), "-c", "-O2",
                "-o", runtime_obj.to_str().unwrap()])
+        .args(&link.cflags)
         .status();
 
     let llvm_compiled = std::process::Command::new("clang")
         .args([ll_path.to_str().unwrap(), runtime_obj.to_str().unwrap(),
                "-O2", "-o", bin_path.to_str().unwrap(), "-lm", "-lpthread"])
+        .args(&link.libs)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
