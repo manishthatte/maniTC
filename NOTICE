@@ -1,5 +1,5 @@
 ManiT Compiler (manitc)
-Copyright 2026 Manish Jagdish Thatte
+© 2026 Manish Jagdish Thatte
 
 This product includes software developed by
 Manish Jagdish Thatte (manish@manitlab.org)
@@ -14,3 +14,27 @@ produces both LLVM IR (for binary host execution) and T3ISA
 Patent applications covering the underlying hardware have been
 filed with the Indian Patent Office (Application Nos.
 202621045270–202621045342, filed 9 April 2026).
+
+----------------------------------------------------------------------
+
+T3ISA — specification and independent implementations
+
+The T3ISA instruction set architecture is designed and specified
+solely by Manish Jagdish Thatte. The normative specification is
+docs/t3isa-reference.md (© Manish Jagdish Thatte); versioned
+releases are tagged t3isa-spec-vX.Y in this repository.
+
+Independent SOFTWARE implementations of T3ISA — compilers,
+assemblers, emulators, and tooling — written from the published
+specification without use of manitc source code are welcome and
+encouraged. The author does not regard such spec-conformant
+software implementations as derivative works of manitc, and does
+not intend to assert the patent applications listed above against
+them. This permission covers software only: hardware
+implementations of balanced-ternary or photonic-ternary computing
+devices, including the THATTE Device, remain subject to the patent
+applications listed above and require a separate license
+(manish@manitlab.org).
+
+Implementations are asked to carry the attribution:
+"T3ISA designed and specified by Manish Jagdish Thatte".

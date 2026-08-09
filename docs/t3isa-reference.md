@@ -5,6 +5,11 @@ used as the backend for maniT's balanced ternary compilation target. This docume
 specifies the architecture, instruction set, encoding, assembly syntax, and emulator
 behaviour.
 
+**Specification version 1.0** — tagged `t3isa-spec-v1.0` in this repository.
+This document is the normative definition of T3ISA; independent implementations
+should cite the tagged version they were written against. Where this document
+and the manitc emulator disagree, that is a specification bug — please report it.
+
 ---
 
 ## Table of contents
@@ -142,7 +147,7 @@ Wide immediate fits ±(3^13−1)/2 = ±797,161.
 | `TOR` | Rd, Ra, Rb | Rd = max(Ra, Rb) — Łukasiewicz disjunction |
 | `TNOT` | Rd, Ra | Rd = −Ra — Łukasiewicz negation |
 | `TSHI` | Rd, Ra, Rb | Rd = Ra × 3^Rb (ternary shift left) |
-| `TSHR` | Rd, Ra, Rb | Rd = Ra ÷ 3^Rb (ternary shift right, truncating) |
+| `TSHR` | Rd, Ra, Rb | Rd = Ra ÷ 3^Rb (ternary shift right, round to nearest — drops the low Rb trits) |
 | `TMIN` | Rd, Ra, Rb | Rd = min(Ra, Rb) |
 | `TMAX` | Rd, Ra, Rb | Rd = max(Ra, Rb) |
 

@@ -69,6 +69,11 @@ inventor Manish Jagdish Thatte — see [NOTICE](NOTICE). The AGPL's patent
 grant (§11) applies to this software as released; hardware implementations
 require a separate license.
 
+Independent **software** implementations of T3ISA written from the published
+specification ([docs/t3isa-reference.md](docs/t3isa-reference.md)) are welcome
+and encouraged — see [NOTICE](NOTICE) for the explicit permission and
+attribution request. Versioned spec releases are tagged `t3isa-spec-vX.Y`.
+
 ---
 
 Authored by **Manish Jagdish Thatte** · manish@manitlab.org · [manitlab.org](https://www.manitlab.org)
