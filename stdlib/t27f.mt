@@ -17,8 +17,9 @@
 //   - Negation is exact trit-flip (no special cases)
 //   - Rounding by truncation is unbiased (balanced ternary truncation rounds to nearest)
 //
-// Precision: ~8.6 balanced ternary digits (~5.4 decimal digits)
-// Range: approximately ±1.6 × 10^4700 (vastly exceeds IEEE 754 double)
+// Precision: 18 balanced ternary digits of mantissa (~8.6 decimal digits).
+//            Sits between IEEE 754 single (~7.2) and double (~15.9).
+// Range:     up to ~4.3 × 10^4703 (IEEE 754 double tops out near 1.8 × 10^308).
 //
 // Usage:
 //   use std::t27f;
