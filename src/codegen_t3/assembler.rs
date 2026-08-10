@@ -28,6 +28,12 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
     let mut label_map: HashMap<String, usize> = HashMap::new();
     let mut string_data: HashMap<String, String> = HashMap::new();
     let mut float_data_src: HashMap<String, i64> = HashMap::new();
+    // Declaration order of the .data and .float labels. A HashMap has no order
+    // of its own, and sorting the label NAMES puts str10 before str2, so the
+    // address a literal receives depended on how its label spelled its index.
+    // Keep the order the assembly listing declares them in.
+    let mut string_order: Vec<String> = Vec::new();
+    let mut float_order: Vec<String> = Vec::new();
     let mut in_data = false;
     let mut in_float = false;
 
@@ -60,7 +66,9 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
                 let rest = line[cp+1..].trim();
                 if let Some(s) = rest.strip_prefix(".float64") {
                     if let Ok(bits) = s.trim().parse::<i64>() {
-                        float_data_src.insert(lbl, bits);
+                        if float_data_src.insert(lbl.clone(), bits).is_none() {
+                            float_order.push(lbl);
+                        }
                     }
                 }
             }
@@ -75,7 +83,9 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
                 let rest = line[cp+1..].trim();
                 if let Some(s) = rest.strip_prefix(".string") {
                     let content = parse_string_literal(s.trim());
-                    string_data.insert(lbl, content);
+                    if string_data.insert(lbl.clone(), content).is_none() {
+                        string_order.push(lbl);
+                    }
                 }
             }
             continue;
@@ -128,8 +138,7 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
     // Assign string labels to addresses past the code
     let code_size = raw_instrs.len();
     let str_base = code_size + 1024;
-    let mut str_keys: Vec<String> = string_data.keys().cloned().collect();
-    str_keys.sort();
+    let str_keys: Vec<String> = string_order;
     for (i, key) in str_keys.iter().enumerate() {
         label_map.insert(key.clone(), str_base + i);
     }
@@ -144,8 +153,7 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
 
     // Assign float labels to addresses past the string addresses
     let float_base = str_base + str_keys.len();
-    let mut float_keys: Vec<String> = float_data_src.keys().cloned().collect();
-    float_keys.sort();
+    let float_keys: Vec<String> = float_order;
     for (i, key) in float_keys.iter().enumerate() {
         label_map.insert(key.clone(), float_base + i);
     }

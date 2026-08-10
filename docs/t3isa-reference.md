@@ -5,7 +5,7 @@ used as the backend for maniT's balanced ternary compilation target. This docume
 specifies the architecture, instruction set, encoding, assembly syntax, and emulator
 behaviour.
 
-**Specification version 1.1** — tagged `t3isa-spec-v1.1` in this repository.
+**Specification version 1.2** — tagged `t3isa-spec-v1.2` in this repository.
 This document is the normative definition of T3ISA; independent implementations
 should cite the tagged version they were written against. Where this document
 and the manitc emulator disagree, that is a specification bug — please report it.
@@ -509,6 +509,15 @@ newlines when serving `print_str` syscalls.
 ```
 
 Address values correspond to entries in `label_map` for string labels.
+
+Only `\n` is escaped. A double quote and a backslash are written raw here,
+while the `.string` literal in the `.t3s` listing escapes both as `\"` and
+`\\`. An implementation reading both artifacts must unescape them differently.
+
+String literals are assigned addresses `code_size + 1024 + i`, where `i` is
+the literal's position in **declaration order** — the order its label appears
+in the `.data` section of the `.t3s` listing. Float literals follow the same
+rule from `code_size + 1024 + <number of strings>`.
 
 ---
 

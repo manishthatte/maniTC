@@ -343,7 +343,10 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
                     println!("[T3ISA] to run:  manitc run-t3 {}", bin_path.display());
                 }
                 Err(e) => {
-                    eprintln!("[T3ISA] assembler error: {}", e);
+                    // No .t3b was written, so this must not report success:
+                    // returning the error renders it and exits non-zero.
+                    return Err(CompileError::Codegen(Diagnostic::unknown(
+                        format!("[T3ISA] assembler error: {}", e))));
                 }
             }
         }

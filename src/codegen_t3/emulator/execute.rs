@@ -9,7 +9,9 @@ impl Emulator {
     /// alongside `halted`; the exit status is derived from R1, which a faulting
     /// program has no reason to have left meaningful.
     pub(crate) fn trap(&mut self, msg: impl Into<String>) {
-        self.output.push(msg.into());
+        // Output pieces are written raw and carry their own newlines, so a trap
+        // message without one runs into whatever prints next.
+        self.output.push(format!("{}\n", msg.into()));
         self.halted = true;
         self.trapped = true;
     }

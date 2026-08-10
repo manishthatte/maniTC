@@ -94,8 +94,17 @@ fn stderr_is_tty() -> bool {
     unsafe { libc_isatty(2) != 0 }
 }
 
+// The MSVC CRT exports `_isatty`, not `isatty`; linking the POSIX spelling
+// there fails with LNK2019 even though every dependency compiles.
+#[cfg(not(target_env = "msvc"))]
 extern "C" {
     #[link_name = "isatty"]
+    fn libc_isatty(fd: i32) -> i32;
+}
+
+#[cfg(target_env = "msvc")]
+extern "C" {
+    #[link_name = "_isatty"]
     fn libc_isatty(fd: i32) -> i32;
 }
 
