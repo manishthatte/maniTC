@@ -1,0 +1,24 @@
+Hello from maniT!
+Running on balanced ternary logic.
+
+--- trit demo ---
+Trit is positive (+1)
+  trit + -> positive
+  trit 0 -> zero
+  trit - -> negative
+
+--- bool3 demo ---
+  sensor_ok = true
+  sensor_unknown = unknown
+  sensor_fail = false
+
+--- balanced ternary literal ---
+  0t+0- as int = 8
+  tryte 8 = +0-
+
+--- Result demo ---
+  Ok(42)
+  Unknown("not yet computed")
+  Err("division by zero")
+
+Done.

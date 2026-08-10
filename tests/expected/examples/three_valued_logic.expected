@@ -1,0 +1,174 @@
+maniT Three-Valued Logic Demo
+=============================
+
+================================================
+  1. bool3 Literals and tif Branching
+================================================
+  bool3 values and their trit representations:
+    True    -> trit: +
+    Unknown -> trit: 0
+    False   -> trit: -
+
+  tif branching on bool3:
+    tif True => branch +  (True)
+    tif Unknown => branch 0  (Unknown)
+    tif False => branch -  (False)
+
+  Classical if/elif/else on bool3 (treating Unknown as not-True):
+    True -> definitely true
+    Unknown -> indeterminate — cannot decide
+    False -> definitely false
+
+================================================
+  2. Ternary Operator Truth Tables
+================================================
+  tnot (negation: flip sign):
+    tnot + = -   (True  -> False)
+    tnot 0 = 0   (Unknown -> Unknown)
+    tnot - = +   (False -> True)
+
+  tand  (conjunction, min(a,b)):
+       |   +      0      -  
+  -----+---------------------
+     +   |    +      +      +  
+     0   |    0      0      0  
+     -   |    -      -      -  
+
+  tor   (disjunction, max(a,b)):
+       |   +      0      -  
+  -----+---------------------
+     +   |    +      +      +  
+     0   |    +      +      +  
+     -   |    +      +      +  
+
+  txor  (exclusive-or, (a+b) mod3 balanced):
+       |   +      0      -  
+  -----+---------------------
+     +   |    +      +      +  
+     0   |    +      +      +  
+     -   |    +      +      +  
+
+  Luk implication  (max(tnot a, b)):
+       |   +      0      -  
+  -----+---------------------
+     +   |    +      +      +  
+     0   |    +      +      +  
+     -   |    +      +      +  
+
+  Luk biconditional (tnot(a txor b)):
+       |   +      0      -  
+  -----+---------------------
+     +   |    -      -      -  
+     0   |    -      -      -  
+     -   |    -      -      -  
+
+
+================================================
+  3. Three-Valued Logic Identities
+================================================
+  De Morgan (tnot(a tand b) == tnot(a) tor tnot(b)):
+    Holds for all (a,b): true
+
+  De Morgan (tnot(a tor b) == tnot(a) tand tnot(b)):
+    Holds for all (a,b): true
+
+  Double negation (tnot(tnot a) == a):
+    Holds: true
+
+  Law of excluded middle (a tor tnot(a)):
+  (Not a tautology in 3-valued logic — can be Unknown!)
+    a=+  =>  a tor tnot(a) = +
+    a=0  =>  a tor tnot(a) = 0
+    a=-  =>  a tor tnot(a) = +
+
+  Idempotence: a tand a == a, a tor a == a
+    Holds: true
+
+  Commutativity: a tand b == b tand a, a tor b == b tor a
+    Holds: false
+
+  Distributivity: a tand (b tor c) == (a tand b) tor (a tand c)
+    Holds: false
+
+================================================
+  4. Practical: Multi-Sensor Fusion with bool3
+================================================
+  Scenario 1: All sensors report OK (+)
+    A=+ B=+ C=+  =>  vote=OK      
+
+  Scenario 2: Two of three sensors report FAULT (-)
+    A=+ B=- C=-  =>  vote=FAULT   
+
+  Scenario 3: One OK, one Unknown, one Fault
+    A=+ B=0 C=-  =>  vote=UNKNOWN 
+
+  Scenario 4: All sensors return Unknown
+    A=0 B=0 C=0  =>  vote=UNKNOWN 
+
+  System safety: engine AND brakes must both be OK.
+  (using tand for conservative AND — min of two sensor readings)
+    engine=OK, brakes=Unknown  =>  safe=OK      
+
+  Emergency stop: trigger if engine OR brakes is FAULT.
+  (using tor for conservative OR — max, but we check for fault=-)
+    engine=OK, brakes=FAULT  =>  combined=FAULT   
+
+================================================
+  5. Epistemic Interpretation (Knowledge States)
+================================================
+  Assigning knowledge states to propositions:
+    "The sky is blue"  ->  true
+    "It will rain tomorrow"  ->  unknown
+    "2 + 2 = 5"  ->  false
+    "P = NP"  ->  unknown
+    "maniT uses ternary logic"  ->  true
+
+  Inference: combining knowledge claims with tand / tor
+  Claim A (True) tand Claim B (Unknown):
+    True tand Unknown = Unknown
+    (cannot assert the conjunction when one part is uncertain)
+
+  Claim C (True) tor Claim D (Unknown):
+    True tor Unknown = True
+    (can assert disjunction because one part is certainly true)
+
+  Negation of Unknown is still Unknown:
+    tnot Unknown = Unknown
+
+================================================
+  6. Triple Modular Redundancy (TMR) with trit_median
+================================================
+  Input value: 5
+
+  No faults   A=+ B=+ C=+  voted=+
+  One fault   A=+ B=- C=+  voted=+  (majority overrides fault)
+  Two faults  A=+ B=- C=-  voted=-  (majority corrupted — wrong result)
+
+  TMR can tolerate exactly 1 fault out of 3 modules.
+  trit_median(a, b, c) is the native ternary majority vote.
+
+================================================
+  7. Three-Valued vs Two-Valued Logic
+================================================
+  In classical (Boolean) logic:
+    AND truth table (2x2): 4 cells
+    OR  truth table (2x2): 4 cells
+    The law of excluded middle always holds: a OR NOT(a) = True
+
+  In Kleene 3-valued logic:
+    AND truth table (3x3): 9 cells
+    OR  truth table (3x3): 9 cells
+    The law of excluded middle does NOT always hold:
+      Unknown tor tnot(Unknown) = Unknown tor Unknown = 0
+
+  Practical differences:
+    Binary: NULL in SQL is implicitly 'unknown' but SQL has
+            three-valued semantics layered on top of binary.
+    maniT:  Unknown is a first-class value; tif handles it
+            directly without special-casing.
+
+  Classical tautologies that break in 3-valued logic:
+    a = Unknown:  a tor tnot(a) = 0   a tand tnot(a) = 0
+    (Both are Unknown, not True/False as in classical logic)
+
+Demo complete.

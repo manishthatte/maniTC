@@ -1,0 +1,29 @@
+=== T27F Balanced Ternary Float Demo ===
+
+100 = mantissa 100 × 3^0
+27  = mantissa 1 × 3^3
+
+--- Property: Exact negation (trit-flip) ---
+  +42 mantissa: 42
+  -42 mantissa: -42
+  neg(neg(42)): 42
+
+--- Property: Single zero ---
+  ZERO is zero: true
+  0×3^5 normalized is zero: true
+
+--- Property: No NaN ---
+  Every 27-trit pattern is a valid T27F number.
+  No special bit patterns, no NaN, no infinity.
+
+--- Arithmetic ---
+  100 + 200 = 159432300 × 3^-12
+  200 - 100 = 159432300 × 3^-13
+  3 × 9     = 129140163 × 3^-14
+
+--- Comparison ---
+  200 > 100: +
+  100 < 200: -
+  100 = 100: 0
+
+=== T27F demo complete ===

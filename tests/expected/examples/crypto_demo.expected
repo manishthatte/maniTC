@@ -1,0 +1,18 @@
+=== Ternary Cryptography Demo ===
+
+--- Trit Hash ---
+  Input:  27-trit word
+  Digest: 27-trit hash
+  Hash[0..2]: - - 0
+
+--- Trit HMAC ---
+  Key:  all +1
+  HMAC[0..2]: + - -
+
+--- Symmetric Cipher ---
+  Plaintext[0..2]:  + 0 -
+  Ciphertext[0..2]: + 0 -
+  Recovered[0..2]:  + 0 -
+  Round-trip: 27/27 trits match
+
+=== Crypto demo complete ===

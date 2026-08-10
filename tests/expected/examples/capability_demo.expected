@@ -1,0 +1,140 @@
+maniT Capability-Based Security Demo
+=====================================
+Authored by: Manish Jagdish Thatte
+
+================================================
+  1. Process Ring Levels — The Ternary Privilege Model
+================================================
+  THATTEOS three-ring model:
+    Ring + (Kernel):  full hardware access, memory management
+    Ring 0 (Service): device drivers, system daemons
+    Ring - (User):    application code, sandboxed
+
+  Running processes:
+    PID 0 [kernel] ring=+  =>  Kernel  (+)
+    PID 1 [disk_driver] ring=0  =>  Service (0)
+    PID 2 [netstack] ring=0  =>  Service (0)
+    PID 3 [editor] ring=-  =>  User    (-)
+    PID 4 [shell] ring=-  =>  User    (-)
+
+================================================
+  2. Capability Tokens — Trit-Encoded Permissions
+================================================
+  Permission encoding:
+    + => full access   (read/write/execute)
+    0 => partial       (read-only / check)
+    - => no access     (denied / revoked)
+
+  Allocated capabilities:
+    Cap#1  resource="/dev/mem"  R=+ W=+ X=-  min_ring=+  owner=PID 0
+    Cap#2  resource="/dev/disk"  R=+ W=+ X=-  min_ring=0  owner=PID 1
+    Cap#3  resource="/home/data"  R=+ W=+ X=-  min_ring=-  owner=PID 3
+    Cap#4  resource="/dev/net"  R=+ W=0 X=-  min_ring=0  owner=PID 2
+
+================================================
+  3. TMIN2 Gate Permission Checking
+================================================
+  TMIN2 gate: access = process_ring tand required_ring
+  If result == required_ring: GRANT.  Otherwise: DENY.
+  One gate. One cycle. Complete security check.
+
+  Access matrix (process ring vs required ring):
+
+                     Required Ring
+                     Kernel(+)  Service(0)  User(-)
+    Kernel (+):    GRANT    GRANT    GRANT
+    Service(0):    DENY     GRANT    GRANT
+    User   (-):    DENY     DENY     GRANT
+
+  Key insight: kernel (+) can access everything (TMIN2 always passes).
+  User (-) can only access user-level resources.
+  Service (0) can access service and user, but not kernel.
+  This is exactly the principle of least privilege, in one trit.
+
+================================================
+  4. Capability Attenuation — Privileges Can Only Decrease
+================================================
+  Attenuation uses tand (min) — the privilege can only go down.
+  A kernel process can give a service process a read-only view.
+  The service process CANNOT escalate it back to read-write.
+
+  Original capability (kernel, full access):
+    Cap#10  resource="/dev/mem"  R=+ W=+ X=+  min_ring=+  owner=PID 0
+  After attenuation (read-only, given to service):
+    Cap#10  resource="/dev/mem"  R=+ W=- X=-  min_ring=+  owner=PID 1
+  After further attenuation (partial read, given to user):
+    Cap#10  resource="/dev/mem"  R=0 W=- X=-  min_ring=+  owner=PID 3
+
+  Attempting to ESCALATE (user tries to grant write):
+  Result (tand prevents escalation):
+    Cap#10  resource="/dev/mem"  R=0 W=- X=-  min_ring=+  owner=PID 3
+  Write permission is still -, because tand(-, +) = -.
+  Escalation is MATHEMATICALLY IMPOSSIBLE with tand.
+
+================================================
+  5. Capability Delegation — Transferring Access
+================================================
+  A process can delegate a capability to another process.
+  The delegated capability can only have EQUAL or FEWER permissions.
+
+  Step 1: Kernel (PID 0) creates network capability:
+    Cap#20  resource="/dev/net"  R=+ W=+ X=-  min_ring=+  owner=PID 0
+  Step 2: Kernel delegates to netstack (PID 2), read-full, write-partial:
+    Cap#20  resource="/dev/net"  R=+ W=0 X=-  min_ring=+  owner=PID 2
+  Step 3: Netstack delegates to browser (PID 4), read-only:
+    Cap#20  resource="/dev/net"  R=+ W=- X=-  min_ring=+  owner=PID 4
+
+  Delegation chain:
+    Kernel (+, +, -)  --attenuate-->  Service (+, 0, -)  --attenuate-->  User (+, -, -)
+    Permissions can only decrease at each step.
+    The tand gate enforces this at the hardware level.
+
+  System capability table:
+    Cap#20  resource="/dev/net"  R=+ W=+ X=-  min_ring=+  owner=PID 0
+    Cap#20  resource="/dev/net"  R=+ W=0 X=-  min_ring=+  owner=PID 2
+    Cap#20  resource="/dev/net"  R=+ W=- X=-  min_ring=+  owner=PID 4
+
+================================================
+  6. Capability Revocation — Setting All Trits to -
+================================================
+  To revoke a capability, set all permission trits to -.
+  This is a single trit-fill operation (tnot of all-+ is all-).
+
+  Before revocation:
+    Cap#30  resource="/home/secret"  R=+ W=+ X=-  min_ring=-  owner=PID 3
+  After revocation:
+    Cap#30  resource="/home/secret"  R=- W=- X=-  min_ring=-  owner=PID 3
+
+  Verification: all access checks now fail.
+    Kernel  tries read: perm=-, effective=-  => DENIED
+    Service tries read: perm=-, effective=-  => DENIED
+    User    tries read: perm=-, effective=-  => DENIED
+
+================================================
+  7. Why Three Rings are Sufficient
+================================================
+  x86 has four rings (0, 1, 2, 3).
+  In practice, only rings 0 and 3 are used.
+  Rings 1 and 2 are wasted — complexity for nothing.
+
+  THATTEOS has three rings (+, 0, -).
+  ALL THREE are actively used:
+    + (Kernel):  memory management, interrupt handling
+    0 (Service): device drivers, file system, network stack
+    - (User):    applications, shells, user code
+
+  Three levels map directly to three operational concerns:
+    + = hardware control  (must not be accessible from outside)
+    0 = system services   (mediate between hardware and apps)
+    - = user computation  (sandboxed, least privilege)
+
+  In hardware:
+    Binary ring check:   subtract + compare (multi-cycle)
+    Ternary ring check:  one trit comparison (one TMIN2 gate)
+    The security boundary is enforced in a single clock cycle.
+
+  Capability attenuation: tand(current, desired) = min
+  Privilege can only flow downward: + -> 0 -> -
+  Escalation is impossible without a new grant from a higher ring.
+
+Demo complete.

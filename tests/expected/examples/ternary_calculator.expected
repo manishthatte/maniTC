@@ -1,0 +1,194 @@
+maniT Balanced Ternary Calculator
+=================================
+Authored by: Manish Jagdish Thatte
+
+================================================
+  1. Decimal to Balanced Ternary Conversion
+================================================
+  Balanced ternary uses digits {-, 0, +} (values -1, 0, +1).
+  Conversion from decimal: divide by 3, adjust remainders.
+
+  Converting 42 to balanced ternary:
+
+    Step  | n     | n%3  | trit | n/3 (adjusted)
+    ------|-------|------|------|---------------
+      1   |    42 |   0  |  0   | 14
+      2   |    14 |   2  |  -   | 5
+      3   |     5 |   2  |  -   | 2
+      4   |     2 |   2  |  -   | 1
+      5   |     1 |   1  |  +   | 0
+  Result (MST-first): +---0
+
+  Verification:
+    math::to_balanced_ternary(42) = 0---+
+    math::from_balanced_ternary(result) = 42
+
+================================================
+  2. Balanced Ternary Arithmetic
+================================================
+  All four operations, shown in both decimal and ternary.
+
+  --- Addition ---
+    42 (0---+) + 17 (-0-+) = 59 (--+-+)
+    -13 (---) + 8 (-0+) = -5 (++-)
+    100 (+0-++) + -100 (-0+--) = 0 (0)
+    27 (000+) + 27 (000+) = 54 (000-+)
+
+  --- Subtraction (add with tnot — same circuit!) ---
+    42 (0---+) - 17 (-0-+) = 25 (+-0+)
+    100 (+0-++) - 99 (00-++) = 1 (+)
+    13 (+++) - 40 (++++) = -27 (000-)
+    0 (0) - 1 (+) = -1 (-)
+
+  --- Multiplication ---
+    7 (+-+) * 6 (0-+) = 42 (0---+)
+    13 (+++) * -3 (0-) = -39 (0---)
+    -9 (00-) * -9 (00-) = 81 (0000+)
+    3 (0+) * 27 (000+) = 81 (0000+)
+
+  --- Division (integer, truncates toward zero) ---
+    42 (0---+) / 7 (+-+) = 6 (0-+)  remainder 0 (0)
+    100 (+0-++) / 3 (0+) = 33 (0-++)  remainder 1 (+)
+    -27 (000-) / 9 (00+) = -3 (0-)  remainder 0 (0)
+    81 (0000+) / -3 (0-) = -27 (000-)  remainder 0 (0)
+
+================================================
+  3. Carry Propagation — Trit-by-Trit Addition
+================================================
+  Balanced ternary addition truth table (single trit):
+  a + b + carry_in -> (sum, carry_out)
+
+  When a + b + c_in gives:
+    -3 => sum = 0, carry = -    (-3 = 0 + (-1)*3)
+    -2 => sum = +, carry = -    (-2 = 1 + (-1)*3)
+    -1 => sum = -, carry = 0    (-1 = -1 + 0*3)
+     0 => sum = 0, carry = 0
+    +1 => sum = +, carry = 0    (+1 = 1 + 0*3)
+    +2 => sum = -, carry = +    (+2 = -1 + 1*3)
+    +3 => sum = 0, carry = +    (+3 = 0 + 1*3)
+
+  Worked example: 42 + 17 = 59
+
+      42  =  0---+
+  +   17  =  -0-+
+          --------
+      59  =  --+-+
+
+  Note: carry is always {-, 0, +} — never larger than a single trit.
+  This makes the carry chain simpler than binary (where carry is {0, 1}).
+
+================================================
+  4. Negation — Trit-Flip Elegance
+================================================
+  Binary negation (two's complement):
+    1. Flip all bits
+    2. Add 1
+    3. Watch for overflow (MIN_INT has no positive counterpart!)
+    Binary 16-bit range: -32768 to +32767  (ASYMMETRIC)
+
+  Balanced ternary negation (trit-flip):
+    1. Flip every trit: + <-> -, 0 stays 0
+    That's it. No add-one step. No overflow. Always works.
+    3-trit (tryte) range: -13 to +13  (SYMMETRIC)
+
+    Value   | Balanced Ternary | Negated (trit-flip) | Negated Value
+    --------|------------------|---------------------|-------------
+          1 |                + |                   - |      -1
+         -1 |                - |                   + |       1
+         13 |              +++ |                 --- |     -13
+        -13 |              --- |                 +++ |      13
+         42 |            0---+ |               0+++- |     -42
+        -42 |            0+++- |               0---+ |      42
+        100 |            +0-++ |               -0+-- |    -100
+       -100 |            -0+-- |               +0-++ |     100
+          0 |                0 |                   0 |       0
+
+  Every positive number has an exact negative counterpart.
+  Zero negates to zero. The range is perfectly symmetric.
+  In hardware: negation = tnot gate on each trit. One cycle.
+
+================================================
+  5. Symmetric Ranges — No Bias, No Gotchas
+================================================
+  Balanced ternary word sizes and their ranges:
+
+    Type   | Trits | Values  | Range
+    -------|-------|---------|----------------------------
+    trit   |   1   |       3 | -1 to +1
+    tryte  |   3   |      27 | -13 to +13
+    t9     |   9   |  19,683 | -9,841 to +9,841
+    t27    |  27   |  7.6e12 | -3,812,798,742,493 to +3,812,798,742,493
+
+  Contrast with binary:
+    int8   |  8b   |     256 | -128 to +127        (OFF BY ONE!)
+    int16  | 16b   |  65,536 | -32,768 to +32,767  (OFF BY ONE!)
+    int32  | 32b   |  4.3e9  | -2,147,483,648 to +2,147,483,647
+
+  Binary's asymmetry causes real bugs:
+    -(-128) overflows in int8 (there is no +128)
+    abs(INT_MIN) is undefined behavior in C
+
+  Balanced ternary: -(-13) = +13.  Always safe.  Always symmetric.
+
+  Powers of 3 (the ternary word boundaries):
+    3^0 =        1  =>  0-trit range: -0 to +0
+    3^1 =        3  =>  1-trit range: -1 to +1
+    3^2 =        9  =>  2-trit range: -4 to +4
+    3^3 =       27  =>  3-trit range: -13 to +13
+    3^4 =       81  =>  4-trit range: -40 to +40
+    3^5 =      243  =>  5-trit range: -121 to +121
+    3^6 =      729  =>  6-trit range: -364 to +364
+    3^7 =     2187  =>  7-trit range: -1093 to +1093
+    3^8 =     6561  =>  8-trit range: -3280 to +3280
+    3^9 =    19683  =>  9-trit range: -9841 to +9841
+
+================================================
+  6. Multiply/Divide by 3 — Trivial Shift
+================================================
+  In binary, multiply by 2 = shift left by 1 bit.  Trivial.
+  In balanced ternary, multiply by 3 = shift left by 1 trit.  Trivial.
+
+  This is a FREE operation — no multiplier circuit needed.
+
+       1  (+)  * 3 =     3  (0+)  [shift left 1 trit]
+       4  (++)  * 3 =    12  (0++)  [shift left 1 trit]
+      13  (+++)  * 3 =    39  (0+++)  [shift left 1 trit]
+      -7  (-+-)  * 3 =   -21  (0-+-)  [shift left 1 trit]
+      42  (0---+)  * 3 =   126  (00---+)  [shift left 1 trit]
+
+  Similarly, divide by 3 = shift right by 1 trit.
+  Powers of 3 are what powers of 2 are to binary — the native scale.
+
+================================================
+  7. Sample Calculations
+================================================
+  A series of calculations displayed in dual notation:
+
+  (13 + 27) * 3:
+    13 + 27 = 40 (++++)
+    40 * 3  = 120 (0++++)
+
+  81 - 27 - 9 - 3 - 1  (subtracting powers of 3):
+    result = 41 (----+)
+
+  3^4 - 3^3 - 3^2 - 3^1 - 3^0:
+    result = 41 (----+)
+    This is +---- in balanced ternary (MST=+, rest=-)
+
+  Numbers that are powers of 3 (single non-zero trit):
+    3^0 = 1 (+)
+    3^1 = 3 (0+)
+    3^2 = 9 (00+)
+    3^3 = 27 (000+)
+    3^4 = 81 (0000+)
+    3^5 = 243 (00000+)
+    3^6 = 729 (000000+)
+
+  Negation symmetry: a + (-a) = 0 for every value:
+    1 + (-1) = 0  [verified]
+    13 + (-13) = 0  [verified]
+    42 + (-42) = 0  [verified]
+    100 + (-100) = 0  [verified]
+    9841 + (-9841) = 0  [verified]
+
+Demo complete.

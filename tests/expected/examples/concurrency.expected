@@ -1,0 +1,71 @@
+maniT Concurrency Demo
+======================
+
+--- 1. Basic channel + spawn ---
+  producer sends: 1
+  producer sends: 2
+  producer sends: 3
+  producer sends: 4
+  producer sends: 5
+  consumer got:  1
+  consumer got:  2
+  consumer got:  3
+  consumer got:  4
+  consumer got:  5
+  sum = 15
+
+--- 2. Producer-consumer pipeline ---
+  Sum of 1..20 = 210
+
+--- 3. Mutex<int> shared counter ---
+  Final counter value (expected 900): 900
+
+--- 4. AtomicTrit lifecycle flag ---
+  Initial status: -
+  [task] running...
+  [task] done.
+  [main] task completed.
+
+--- 5. Barrier (3-thread synchronisation) ---
+  thread 0 before barrier
+  thread 0 after barrier
+  thread 1 before barrier
+  thread 1 after barrier
+  thread 2 before barrier
+  thread 2 is the barrier leader
+  thread 2 after barrier
+  All threads passed the barrier.
+
+--- 6. async/await fan-out ---
+  processed: data-1
+  processed: data-2
+  processed: data-3
+  processed: data-4
+  processed: data-5
+  Squares: 1, 4, 9, 16, 25
+
+--- 7. Semaphore (max 3 concurrent workers) ---
+  worker 0 acquired semaphore
+  worker 0 releasing semaphore
+  worker 1 acquired semaphore
+  worker 1 releasing semaphore
+  worker 2 acquired semaphore
+  worker 2 releasing semaphore
+  worker 3 acquired semaphore
+  worker 3 releasing semaphore
+  worker 4 acquired semaphore
+  worker 4 releasing semaphore
+  worker 5 acquired semaphore
+  worker 5 releasing semaphore
+  worker 6 acquired semaphore
+  worker 6 releasing semaphore
+  worker 7 acquired semaphore
+  worker 7 releasing semaphore
+  worker 8 acquired semaphore
+  worker 8 releasing semaphore
+  All workers finished.
+
+--- 8. select (first-to-complete wins) ---
+  Winner: index=0, value="task-A (100ms)"
+
+All demos complete.

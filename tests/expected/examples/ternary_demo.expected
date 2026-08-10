@@ -1,0 +1,140 @@
+maniT Balanced Ternary Demo
+===========================
+
+=================================================
+  1. Trit Basics
+=================================================
+Trit literals:
+  +  -> int value: 1
+  0  -> int value: 0
+  -  -> int value: -1
+
+tif branching on trit values:
+  tif + => positive branch
+  tif 0 => zero branch
+  tif - => negative branch
+
+=================================================
+  2. Ternary Word Types
+=================================================
+tryte examples (3 trits, range -13..+13):
+  0t++- = 11 = 11
+  0t--+ = -11 = -11
+  0t+0- = 8 = 8
+
+t9 examples (9 trits, range -9841..+9841):
+  0t+00000000 = 6561
+  0t+-------- = 3281
+
+t27 examples (27 trits):
+  0t+0-+0-+0- ... = +0-+0-+0-
+  as integer     = 6056
+
+=================================================
+  3. Balanced Ternary Arithmetic
+=================================================
+x = 42
+y = -17
+
+x in balanced ternary (LST-first): 0---+
+y in balanced ternary (LST-first): +0+-
+
+t27 arithmetic (values as balanced ternary strings):
+  a (42)  = +---0
+  b (-17) = -+0+
+  a << 1 (x3) = +---00 = 126
+  a >> 1 (/3) = +--- = 14
+  -a (tnot)   = -+++0 = -42
+
+=================================================
+  4. Ternary Operators (tand / tor / tnot / txor)
+=================================================
+Single-trit operations:
+  tnot + = -
+  tnot 0 = 0
+  tnot - = +
+
+tand (min) truth table:
+       +    0    -
+  +    +    0    -  
+  0    +    0    -  
+  -    -    -    -  
+
+tor (max) truth table:
+       +    0    -
+  +    +    +    +  
+  0    +    0    -  
+  -    +    0    -  
+
+txor (mod-3 add, balanced) truth table:
+       +    0    -
+  +    0    +    +  
+  0    +    0    +  
+  -    +    +    0  
+
+Practical example: signal combining with tand / tor
+  enable(+) tand fault(-) = -
+
+=================================================
+  5. Packing and Unpacking Trits
+=================================================
+Packed [+,-,0,+,+,-] (LST-first) = -++0-+  (int: -137)
+Unpacked first 6 trits (LST-first): + - 0 + + - 
+tryte_from_trits(+, 0, -) = 8  = 8
+
+=================================================
+  6. Ternary vs Binary Storage Efficiency
+=================================================
+Capacity comparison:
+  Format      | Digits | Distinct values        | Bits equivalent
+  ------------|--------|------------------------|----------------
+  8-bit int   |   8    | 256                    | 8.0
+  1-tryte     |   3    | 27                     | 4.75
+  t9          |   9    | 19,683                 | 14.3
+  16-bit int  |  16    | 65,536                 | 16.0
+  t27         |  27    | 7,625,597,484,987      | 42.8
+  32-bit int  |  32    | 4,294,967,296          | 32.0
+  t54         |  54    | ~5.8e25                | 85.6
+  64-bit int  |  64    | 1.8e19                 | 64.0
+
+Information per digit:
+  Binary trit (bit): log2(2) = 1.000 bit
+  Balanced trit:     log2(3) = 1.585 bits  (+58.5% efficiency)
+
+A t27 encodes as much information as a 42.8-bit binary integer,
+using the same number of 'digits'.
+
+Ternary logarithm examples (base 3):
+  log3(1) = 0
+  log3(3) = 1
+  log3(9) = 2
+  log3(27) = 3
+  log3(81) = 4
+  log3(243) = 5
+  log3(729) = 6
+
+=================================================
+  7. Integer <-> Balanced Ternary Conversion
+=================================================
+n       | trit_count | balanced ternary (LST-first)
+--------|------------|-----------------------------
+       0  |     1      | 0
+       1  |     1      | +
+      -1  |     1      | -
+       5  |     3      | --+
+      -5  |     3      | ++-
+      13  |     3      | +++
+     -13  |     3      | ---
+      42  |     5      | 0---+
+     100  |     5      | +0-++
+    -100  |     5      | -0+--
+     255  |     6      | 0++00+
+    1000  |     7      | +00+0++
+
+Round-trip check (int -> ternary -> int):
+  42 -> 0---+ -> 42  [OK]
+  -99 -> 00+-- -> -99  [OK]
+  1234 -> +0-+0--+ -> 1234  [OK]
+  -5678 -> +0-0-++0- -> -5678  [OK]
+
+Demo complete.

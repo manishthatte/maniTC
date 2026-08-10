@@ -1,0 +1,32 @@
+maniT OOP Demo
+==============
+
+--- 1. Point struct with impl methods ---
+  p1 + p2 = (4, 6)
+  p1 * 2 = (6, 8)
+  origin  = (0, 0)
+
+--- 2. Counter with chained method calls ---
+  After 3 ticks (step=3): 9
+  After reset: 0
+
+--- 3. Traits: Describable + Scalable ---
+  Rectangle(4x3)
+  area = 12
+  perimeter = 14
+  scaled: Rectangle(8x6)
+  magnitude = 48
+  Circle(r=5)
+  scaled: Circle(r=15)
+  magnitude = 225
+
+--- 4. Generic and utility functions ---
+  identity(42) = 42
+  max(7, 3)  = 7
+  clamp(15, 0, 10) = 10
+
+--- 5. Enum with impl methods ---
+  North -> opposite -> South
+  East -> opposite -> West
+
+All demos complete.

@@ -1,0 +1,20 @@
+=== Binary-Ternary Bridge Demo ===
+
+Ternary value: +1 -1  0 +1 -1  (decimal 56)
+
+Encoding to binary (2 bits per trit):
+  trit[0] = + → bits (+,0)  valid=true
+  trit[1] = - → bits (0,+)  valid=true
+  trit[2] = 0 → bits (0,0)  valid=true
+  trit[3] = + → bits (+,0)  valid=true
+  trit[4] = - → bits (0,+)  valid=true
+
+Total: 5 trits encoded as 10 binary bits
+Binary: 10 01 00 10 01
+
+Decoding back to ternary:
+  Round-trip: 5/5 trits match
+
+Invalid encoding (1,1) → 0 (mapped to 0)
+
+=== Bridge demo complete ===

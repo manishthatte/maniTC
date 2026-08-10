@@ -1,0 +1,60 @@
+Fibonacci in maniT
+==================
+
+Recursive Fibonacci (n = 0..10):
+  fib(0) = 0
+  fib(1) = 1
+  fib(2) = 1
+  fib(3) = 2
+  fib(4) = 3
+  fib(5) = 5
+  fib(6) = 8
+  fib(7) = 13
+  fib(8) = 21
+  fib(9) = 34
+  fib(10) = 55
+
+Iterative Fibonacci (n = 0..20):
+  fib(0) = 0
+  fib(1) = 1
+  fib(2) = 1
+  fib(3) = 2
+  fib(4) = 3
+  fib(5) = 5
+  fib(6) = 8
+  fib(7) = 13
+  fib(8) = 21
+  fib(9) = 34
+  fib(10) = 55
+  fib(11) = 89
+  fib(12) = 144
+  fib(13) = 233
+  fib(14) = 377
+  fib(15) = 610
+  fib(16) = 987
+  fib(17) = 1597
+  fib(18) = 2584
+  fib(19) = 4181
+  fib(20) = 6765
+
+Safe Fibonacci with overflow detection:
+  fib_safe(30) -> Ok(832040)
+  fib_safe(50) -> Ok(12586269025)
+  fib_safe(70) -> Ok(3812798742493)
+  fib_safe(90) -> Ok(3812798742493)
+  fib_safe(92) -> Ok(3812798742493)
+  fib_safe(93) -> Err("overflow: exceeds 64-bit int range")
+  fib_safe(100) -> Err("overflow: exceeds 64-bit int range")
+
+F(n) mod 3 for n=0..15 (Pisano period 8):
+  0, 1, 1, 2, 0, 2, 2, 1, 0, 1, 1, 2, 0, 2, 2, 1
+
+F(n+1)/F(n) converging to golden ratio (phi ~ 1.618...):
+  F(6)/F(5) = 1.600000
+  F(11)/F(10) = 1.618181
+  F(16)/F(15) = 1.618032
+  F(21)/F(20) = 1.618033
+  F(26)/F(25) = 1.618033
+  F(31)/F(30) = 1.618033
+
+Done.

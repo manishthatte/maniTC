@@ -1,0 +1,34 @@
+=== Zero-Copy Trit Stream IPC Demo ===
+
+Creating SWCNT trit stream channel:
+  Sender PID:   1
+  Receiver PID: 2
+  Channel: physical SWCNT path allocated
+
+--- Zero-Copy Mechanism ---
+  Sender writes trit +1:
+    → Sets current direction to +54 µA on SWCNT
+    → Receiver reads +54 µA = trit +1
+    → SAME physical current. Zero copy.
+
+  Sender writes trit 0:
+    → No current on SWCNT (photon off)
+    → Receiver reads 0 µA = trit 0
+    → No data moved. True zero.
+
+  Sender writes trit -1:
+    → Sets current direction to -54 µA on SWCNT
+    → Receiver reads -54 µA = trit -1
+    → SAME physical current, opposite direction.
+
+--- Word Transmission (27 trits) ---
+  Sending word: 42
+  Transmitted as 27 sequential trit current pulses
+  Latency for 10µm channel: ~12.5 ps (Fermi velocity)
+
+--- Channel Revocation ---
+  Closing channel: cease photon delivery
+  Effect: instant, one clock cycle, physical disconnect
+  No buffer flush, no FIN packet, no handshake
+
+=== Stream demo complete ===

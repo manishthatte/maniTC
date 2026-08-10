@@ -1,0 +1,128 @@
+maniT Ternary Database Engine
+=============================
+Authored by: Manish Jagdish Thatte
+
+================================================
+  1. Trit-Trie Database — Basic Operations
+================================================
+  Building a city temperature database...
+  Key: 3-trit balanced ternary number (range -13..+13)
+  Value: city name + temperature
+
+  Records inserted: 10
+
+  Database contents:
+    Key(dec)  Key(ternary)  Value
+    --------  ------------  -----
+      -13       ---          Yakutsk: -25C
+       -8       -0+          Reykjavik: 5C
+       -3       0-0          London: 12C
+       -1       00-          Oslo: 14C
+        0       000          Geneva: 15C
+        3       0+0          Paris: 22C
+        5       +--          Nashik: 30C
+        7       +-+          Delhi: 38C
+       10       +0+          Dubai: 45C
+       13       +++          Death Valley: 52C
+
+================================================
+  2. Lookups and Deletes
+================================================
+  Lookups:
+    get(  1) = alpha
+    get(  4) = beta
+    get( -4) = gamma
+    get(  0) = delta
+    get(  9) = epsilon
+    get(  7) = (not found)
+
+  Deleting key 4...
+    Deleted: true
+    get(4) after delete: (not found)
+    Records remaining: 4
+
+  Deleting non-existent key 99...
+    Deleted: false
+    Records remaining: 4
+
+================================================
+  3. Prefix Queries — Find All Matching Keys
+================================================
+  Total records: 16
+
+  Query: prefix [+]  (all positive numbers, MST = +)
+    Found: 4 records
+      +000  =>  twenty-seven
+      +00+  =>  twenty-eight
+      +0+0  =>  thirty
+      ++++  =>  forty
+
+  Query: prefix [-]  (all negative numbers, MST = -)
+    Found: 1 records
+      -000  =>  minus-twenty-seven
+
+  Query: prefix [+, 0]  (numbers where 3^3 digit = +, 3^2 digit = 0)
+    Found: 3 records
+      +000  =>  twenty-seven
+      +00+  =>  twenty-eight
+      +0+0  =>  thirty
+
+================================================
+  4. Trie Depth — Ternary vs Binary
+================================================
+  For a key space of N values:
+
+    Key Space  |  Binary Trie    |  Ternary Trie   |  Depth Savings
+    (N values) |  (depth=log2N)  |  (depth=log3N)  |  (fewer levels)
+    -----------|-----------------|-----------------|---------------
+            8  |        3        |        2        |     1 fewer
+           27  |        5        |        3        |     2 fewer
+           64  |        6        |        4        |     2 fewer
+          256  |        8        |        6        |     2 fewer
+          729  |       10        |        6        |     4 fewer
+         6561  |       13        |        8        |     5 fewer
+        19683  |       15        |        9        |     6 fewer
+
+  At every level, a ternary trie has 3 branches instead of 2.
+  Fewer levels means fewer pointer chases, fewer cache misses,
+  and faster lookups.  The ternary advantage grows with key size.
+
+  For a 27-trit key (t27 address space):
+    Binary:  43 levels (27 * 1.585 = 42.8 bits)
+    Ternary: 27 levels
+    That is 16 fewer memory accesses per lookup.
+
+================================================
+  5. Trit-Trie Structure — Three-Way Branching
+================================================
+  A trit-trie node has three children, one per trit value:
+
+                    [root]
+                   /  |  \
+                  -   0   +
+                 / | \  ...  / | \
+                -  0  +     -  0  +
+
+  Each path from root to leaf is a balanced ternary number.
+  Example: path [+, -, 0] represents:
+    (+1)*9 + (-1)*3 + (0)*1 = 9 - 3 + 0 = 6
+
+  2-trit key space (9 values, -4 to +4):
+
+    Key    Ternary    Value
+    ----   -------    -----
+     -4      --       -4
+     -3      -0       -3
+     -2      -+       -2
+     -1      0-       -1
+      0      00       0
+      1      0+       1
+      2      +-       2
+      3      +0       3
+      4      ++       4
+
+  The entire key space is naturally ordered from -4 (--) to +4 (++).
+  Negative keys branch left (-), zero stays center (0), positive branch right (+).
+  This is the natural order of balanced ternary — no encoding needed.
+
+Demo complete.

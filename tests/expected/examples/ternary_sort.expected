@@ -1,0 +1,111 @@
+maniT Balanced Ternary Sorting Algorithms
+==========================================
+Authored by: Manish Jagdish Thatte
+
+================================================
+  1. Ternary Comparison: compare(a, b) -> trit
+================================================
+  In binary logic, comparison returns a bool (true/false).
+  To distinguish <, ==, > you need TWO comparisons.
+
+  In balanced ternary, comparison returns a TRIT:
+    - => less    (negative)
+    0 => equal   (zero)
+    + => greater (positive)
+
+  One comparison, three outcomes. Natural and complete.
+
+    compare(3, 7) = -  => a < b
+    compare(5, 5) = 0  => a == b
+    compare(9, 2) = +  => a > b
+
+================================================
+  2. Insertion Sort (ternary comparison, stable)
+================================================
+  Before: 7, 3, 5, 3, 9, 1, 5, 8, 2, 5
+  After:  1, 2, 3, 3, 5, 5, 5, 7, 8, 9
+
+  Note: equal elements (3,3) and (5,5,5) preserve original order.
+  The tif 0-branch ensures stability — no extra flag needed.
+
+================================================
+  3. Three-Way Partition (Dutch National Flag)
+================================================
+  Pivot = 4 (many duplicates)
+  Before: 4, 1, 7, 4, 9, 4, 2, 4, 6, 4
+  After:  4, 1, 7, 4, 4, 2, 4, 6, 4, 9
+  Region < 4:  indices 0..8
+  Region == 4: indices 9..9
+  Region > 4:  indices 10..9
+
+  Each element was classified by a single trit comparison.
+  tif routes directly to <, ==, or > — no secondary test needed.
+
+================================================
+  4. Quicksort with Three-Way Partition
+================================================
+  Input:  13, -4, 7, 0, -13, 9, -1, 4, -9, 1, 0, -7, 13, 3
+  Sorted: -13, -9, -7, -4, -1, 0, 0, 1, 3, 4, 7, 9, 13, 13
+
+  Many duplicates (ternary quicksort excels here):
+  Input:  1, 0, -1, 0, 1, -1, 0, 0, 1, -1, 0, 1, -1, 0, -1, 1, 0, 0
+  Sorted: -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1
+  All duplicates handled in a single partition pass (== region skipped).
+
+================================================
+  5. Sorting Balanced Ternary Numbers
+================================================
+  Values in tryte range (-13 to +13):
+  Before: +0-(8)  --+(-11)  ++(4)  -(-1)  +++(13)  0(0)  ---(-13)  +(1)  --(-4)  ++-(11)  -0+(-8)
+  After:  ---(-13)  --+(-11)  -0+(-8)  --(-4)  -(-1)  0(0)  +(1)  ++(4)  +0-(8)  ++-(11)  +++(13)
+
+  Balanced ternary representation of sorted values:
+     -13  =  ---
+     -11  =  +--
+      -8  =  +0-
+      -4  =  --
+      -1  =  -
+       0  =  0
+       1  =  +
+       4  =  ++
+       8  =  -0+
+      11  =  -++
+      13  =  +++
+
+  Note: balanced ternary has symmetric range (-13 to +13 for 3 trits).
+  Negation is just trit-flip (tnot). No offset, no bias, no two's complement.
+
+================================================
+  6. The Ternary Sorting Advantage
+================================================
+  Binary comparison: a < b -> bool {true, false}
+    To sort, you need:
+      if a < b   -> move left
+      else       -> move right
+    Equal elements? Need ANOTHER comparison (a == b).
+    Three-way partition? Special algorithm (Bentley-McIlroy).
+
+  Ternary comparison: compare(a, b) -> trit {-, 0, +}
+    To sort, you need:
+      tif compare(a, b) {
+        - => move left,    // less
+        0 => stay,         // equal
+        + => move right,   // greater
+      }
+    Three outcomes, one comparison, one tif branch.
+    Three-way partition is the DEFAULT, not a special case.
+
+  In hardware (Thatte2 gate library):
+    Binary CMP:  compare -> {0, 1} -> need extra gates for ==
+    Ternary CMP:  compare -> {-, 0, +} -> TMIN2 gate, one cycle
+    Three-way branch: tif reads the trit directly. Zero overhead.
+
+  Ternary comparison truth table (a vs b):
+          b=-1    b=0    b=+1
+    a=-1:     0      -      - 
+    a= 0:     +      0      - 
+    a=+1:     +      +      0 
+
+  Every cell is a single trit. Every sort decision is one gate.
+
+Demo complete.

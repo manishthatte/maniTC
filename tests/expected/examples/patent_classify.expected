@@ -1,0 +1,3 @@
+R1=+1 -> tryte=1
+R1=0  -> tryte=0
+R1=-1 -> tryte=-1
