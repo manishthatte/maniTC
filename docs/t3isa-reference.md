@@ -5,7 +5,7 @@ used as the backend for maniT's balanced ternary compilation target. This docume
 specifies the architecture, instruction set, encoding, assembly syntax, and emulator
 behaviour.
 
-**Specification version 1.0** — tagged `t3isa-spec-v1.0` in this repository.
+**Specification version 1.1** — tagged `t3isa-spec-v1.1` in this repository.
 This document is the normative definition of T3ISA; independent implementations
 should cite the tagged version they were written against. Where this document
 and the manitc emulator disagree, that is a specification bug — please report it.
@@ -58,7 +58,7 @@ All arithmetic saturates at the 27-trit boundary (values are clamped to
 | R25 | Reserved (currently unused) |
 | R26 | Stack pointer (SP). Starts at top of memory, grows down |
 
-The FLAGS register is set by `TCMP Rx, Ry`:
+The FLAGS register is set by `TCMP Rd, Rx, Ry`:
 - +1 if `Rx > Ry`
 - 0 if `Rx == Ry`
 - −1 if `Rx < Ry`
@@ -116,6 +116,67 @@ Used by: `TLIT`, `JUMP`, `CALL`, `SYSCALL`, `TBRANCH` (partial).
 
 Wide immediate fits ±(3^13−1)/2 = ±797,161.
 
+### Opcode values
+
+The `opcode` field holds one of the following 36 values. Values 36 and above
+are unassigned and decode as an invalid instruction.
+
+| # | Mnemonic | Operands | Operation |
+|---|----------|----------|-----------|
+| 0 | `NOP` | — | no operation |
+| 1 | `TADD` | Rd, Ra, Rb | Rd = clamp27(Ra + Rb) |
+| 2 | `TSUB` | Rd, Ra, Rb | Rd = clamp27(Ra − Rb) |
+| 3 | `TMUL` | Rd, Ra, Rb | Rd = clamp27(Ra × Rb) |
+| 4 | `TDIV` | Rd, Ra, Rb | Rd = Ra ÷ Rb, truncated toward zero; Rb = 0 traps |
+| 5 | `TMOD` | Rd, Ra, Rb | Rd = Ra rem Rb, truncating; Rb = 0 traps |
+| 6 | `TNEG` | Rd, Ra | Rd = −Ra |
+| 7 | `TAND` | Rd, Ra, Rb | Rd = min(Ra, Rb) — Łukasiewicz conjunction |
+| 8 | `TOR` | Rd, Ra, Rb | Rd = max(Ra, Rb) — Łukasiewicz disjunction |
+| 9 | `TNOT` | Rd, Ra | Rd = −Ra — Łukasiewicz negation |
+| 10 | `TSHI` | Rd, Ra, Rb\|#imm | Rd = Ra × 3^n, n = rhs clamped to 0..26 |
+| 11 | `TSHR` | Rd, Ra, Rb\|#imm | Rd = Ra ÷ 3^n, n = rhs clamped to 0..26 |
+| 12 | `TMIN` | Rd, Ra, Rb | Rd = min(Ra, Rb) |
+| 13 | `TMAX` | Rd, Ra, Rb | Rd = max(Ra, Rb) |
+| 14 | `TCMP` | Rd, Ra, Rb | Rd = FLAGS = sign(Ra − Rb) ∈ {−1, 0, +1} |
+| 15 | `LOAD` | Rd, [Ra+#imm] | Rd = memory[Ra + imm] |
+| 16 | `STORE` | Ra, [Rb+#imm] | memory[Rb + imm] = Ra |
+| 17 | `TLIT` | Rd, #imm | Rd = imm (wide immediate, signed) |
+| 18 | `MOV` | Rd, Ra | Rd = Ra |
+| 19 | `TBRANCH` | Rc, addr_pos, addr_zero | three-way branch; see below |
+| 20 | `JUMP` | addr | PC = addr (unconditional) |
+| 21 | `CALL` | addr | push return address, PC = addr |
+| 22 | `RET` | — | pop return address into PC |
+| 23 | `HALT` | — | stop execution |
+| 24 | `SYSCALL` | #num | invoke host service `num` (section 8) |
+| 25 | `TBR_POS` | Rc, addr | PC = addr if Rc > 0 |
+| 26 | `TBR_ZERO` | Rc, addr | PC = addr if Rc = 0 |
+| 27 | `TBR_NEG` | Rc, addr | PC = addr if Rc < 0 |
+| 28 | `CALLR` | Rx | push return address, PC = Rx |
+| 29 | `BAND` | Rd, Ra, Rb\|#imm | Rd = clamp27(Ra & rhs) — binary bitwise AND |
+| 30 | `BOR` | Rd, Ra, Rb\|#imm | Rd = clamp27(Ra \| rhs) — binary bitwise OR |
+| 31 | `BXOR` | Rd, Ra, Rb\|#imm | Rd = clamp27(Ra ^ rhs) — binary bitwise XOR |
+| 32 | `BSHL` | Rd, Ra, Rb\|#imm | Rd = clamp27(Ra << n), n = rhs clamped to 0..63 |
+| 33 | `BSHR` | Rd, Ra, Rb\|#imm | Rd = clamp27(Ra >> n), n = rhs clamped to 0..63, arithmetic |
+| 34 | `LOADT` | Rd, [Ra+#imm] | Rd = clamp(memory[Ra + imm], −1, +1) — single trit |
+| 35 | `STORET` | Rs, [Ra+#imm] | memory[Ra + imm] = clamp(Rs, −1, +1) — single trit |
+
+Opcodes 29–35 are the binary-interop and single-trit memory group: they let a
+ternary program manipulate packed binary values without leaving the machine.
+
+### The effective right-hand operand
+
+Every three-address ALU instruction resolves its right-hand side as
+
+```
+rhs = regs[r3] + imm
+```
+
+`R0` reads as zero, so `r3 = 0` with `imm = n` encodes an immediate, and
+`imm = 0` with `r3 = n` encodes a register. Both forms are legal on `TADD`,
+`TSUB`, `TMUL`, `TDIV`, `TMOD`, `TSHI`, `TSHR`, `TMIN`, `TMAX`, `TCMP`,
+`BAND`, `BOR`, `BXOR`, `BSHL` and `BSHR`. An implementation must not assume
+the immediate form is the only one.
+
 ### TBRANCH encoding
 
 `TBRANCH` is a pseudo-instruction that the assembler expands to three words:
@@ -135,8 +196,8 @@ Wide immediate fits ±(3^13−1)/2 = ±797,161.
 | `TADD` | Rd, Ra, Rb | Rd = clamp27(Ra + Rb) |
 | `TSUB` | Rd, Ra, Rb | Rd = clamp27(Ra − Rb) |
 | `TMUL` | Rd, Ra, Rb | Rd = clamp27(Ra × Rb) |
-| `TDIV` | Rd, Ra, Rb | Rd = Ra ÷ Rb (truncate toward zero; Rb=0 → 0) |
-| `TMOD` | Rd, Ra, Rb | Rd = Ra mod Rb |
+| `TDIV` | Rd, Ra, Rb | Rd = Ra ÷ Rb (truncate toward zero; Rb = 0 traps) |
+| `TMOD` | Rd, Ra, Rb | Rd = Ra rem Rb (truncating remainder, sign of the dividend; Rb = 0 traps) |
 | `TNEG` | Rd, Ra | Rd = −Ra |
 
 ### Logic
@@ -155,9 +216,11 @@ Wide immediate fits ±(3^13−1)/2 = ±797,161.
 
 | Mnemonic | Operands | Operation |
 |----------|----------|-----------|
-| `TCMP` | Ra, Rb | FLAGS = sign(Ra − Rb) ∈ {−1, 0, +1} |
+| `TCMP` | Rd, Ra, Rb | Rd = FLAGS = sign(Ra − Rb) ∈ {−1, 0, +1} |
 
-`TCMP` does not write to a register. Subsequent branch instructions read FLAGS.
+`TCMP` writes the sign into `Rd` **and** sets FLAGS; subsequent branch
+instructions read FLAGS. The three-address form is the only one the reference
+compiler emits.
 
 ### Memory
 
@@ -469,7 +532,10 @@ discarded.
 All arithmetic uses signed 64-bit integers internally. Results are clamped to
 the 27-trit range [−3,812,798,742,493, +3,812,798,742,493] by `clamp27()`.
 
-Division by zero returns 0 (emulator-defined behaviour, not a fault).
+Division or remainder by zero is a fault. `TDIV` and `TMOD` with a zero
+right-hand operand raise `TRAP: division by zero` and `TRAP: modulo by zero`
+respectively, and the machine halts. Every trap halts; a trapped program
+exits with status 70 rather than the value in R1.
 
 ### Stack overflow
 
