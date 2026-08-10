@@ -7,6 +7,11 @@ PASS struct-trit: after field assign, trit reads
 PASS struct-copy: copy sees fields
 PASS struct-copy: a.x unchanged
 PASS struct-copy: a.y unchanged
+-- for over struct array --
+PASS for-struct: int field summed
+PASS for-struct: fields match index
+PASS for-struct: bool3 field matches
+PASS for-struct: last element read
 -- for-loop shadowing --
 PASS for-shadow: range loop ran
 PASS for-shadow: outer i restored
@@ -35,4 +40,3 @@ PASS unsized: forwarded param
 PASS unsized: trit elements
 PASS unsized: nested rows
 all ir regression tests done
-

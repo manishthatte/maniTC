@@ -574,12 +574,21 @@ impl LLVMEmitter {
                 }
                 let (idx_prefix, idx_s) =
                     self.resolve_with_coerce(idx, "i64", &format!("{}_idx", dst.0));
+                // A struct value is a pointer occupying one 8-byte slot (see
+                // slot_access_ty), so an array of structs is an array of
+                // pointers. Indexing it with %struct.X would stride by
+                // sizeof(%struct.X) — 24 bytes for a three-field struct — and
+                // run off the end of a malloc sized at n * 8.
+                let gep_ty = match ty {
+                    IRType::Struct(_) => "i64".to_string(),
+                    _ => llvm_type(ty),
+                };
                 format!(
                     "{}{}%{} = getelementptr {}, ptr {}, i64 {}",
                     prefix,
                     idx_prefix,
                     dst.0,
-                    llvm_type(ty),
+                    gep_ty,
                     ptr_s,
                     idx_s
                 )

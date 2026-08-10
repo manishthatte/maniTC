@@ -63,6 +63,46 @@ fn test_struct_copy_semantics() {
 }
 
 // ---------------------------------------------------------------------------
+// `for s in <array of structs>` must bind a copy of the element, not a
+// pointer parked in a struct-typed slot. When it stored the pointer, every
+// field access read the slot itself: field 0 came back as the struct's own
+// address (printed as a string, arbitrary bytes) and field 1 as whatever
+// followed it. Indexing the array directly was unaffected, so this survived
+// every run that only checked for traps and exit codes.
+// ---------------------------------------------------------------------------
+
+struct Labelled { pub name: str, pub tag: bool3, pub n: int }
+
+fn test_for_over_struct_array() {
+    let items: [Labelled] = [
+        Labelled { name: "alpha", tag: True,    n: 1 },
+        Labelled { name: "beta",  tag: Unknown, n: 2 },
+        Labelled { name: "gamma", tag: False,   n: 3 },
+    ];
+
+    let mut n_total = 0;
+    let mut names_ok = true;
+    let mut tags_ok = true;
+    let mut i = 0;
+    for it in items {
+        n_total = n_total + it.n;
+        // Each field must match what indexing the same element yields.
+        if it.n != items[i].n { names_ok = false; }
+        if it.tag != items[i].tag { tags_ok = false; }
+        i = i + 1;
+    }
+
+    check_int("for-struct: int field summed",  n_total, 6);
+    check("for-struct: fields match index",    names_ok);
+    check("for-struct: bool3 field matches",   tags_ok);
+
+    // A trailing field must not be read out of the neighbouring slot.
+    let mut last_n = 0;
+    for it in items { last_n = it.n; }
+    check_int("for-struct: last element read", last_n, 3);
+}
+
+// ---------------------------------------------------------------------------
 // For-loop variable must not clobber a same-named outer local
 // ---------------------------------------------------------------------------
 
@@ -200,6 +240,9 @@ fn main() {
 
     io::println("-- struct copy semantics --");
     test_struct_copy_semantics();
+
+    io::println("-- for over struct array --");
+    test_for_over_struct_array();
 
     io::println("-- for-loop shadowing --");
     test_for_shadowing();

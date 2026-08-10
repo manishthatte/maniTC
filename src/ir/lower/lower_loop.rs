@@ -295,11 +295,28 @@ impl IRLowerer {
             ptr: IRValue::Temp(elem_ptr_t),
             ty: elem_access.clone(),
         });
-        self.emit(IRInstr::Store {
-            ptr: IRValue::Temp(var_alloca.clone()),
-            val: IRValue::Temp(elem_val_t),
-            ty: elem_access.clone(),
-        });
+        // A struct element is a pointer to its fields, and `locals` records a
+        // real-struct variable as storage that IS the struct (see the Ident
+        // and `let b = a;` paths). Storing the pointer into a struct-typed
+        // slot would make every field access read the slot itself: field 0
+        // would yield the struct's own address and field 1 whatever followed
+        // it. Copy the fields in, which also gives the loop variable the same
+        // value semantics a let-binding has.
+        let struct_fields = match &elem_access {
+            IRType::Struct(sname) if self.is_real_struct(sname) => {
+                Some(self.struct_nfields(sname))
+            }
+            _ => None,
+        };
+        if let Some(n) = struct_fields {
+            self.emit_struct_copy(IRValue::Temp(elem_val_t), var_alloca.clone(), n);
+        } else {
+            self.emit(IRInstr::Store {
+                ptr: IRValue::Temp(var_alloca.clone()),
+                val: IRValue::Temp(elem_val_t),
+                ty: elem_access.clone(),
+            });
+        }
         self.lower_block(&fe.body);
         if matches!(self.blocks[self.current_block].term, IRTerminator::Unreachable) {
             self.set_term(IRTerminator::Jump(inc_label.clone()));
