@@ -203,6 +203,18 @@ pub enum IRInstr {
         idx: IRValue,
         ty: IRType,
     },
+    /// Verify `0 <= idx < len` before a fixed-length array access (A2).
+    ///
+    /// Emitted only where the element count is statically known, immediately
+    /// before the corresponding GetPtr. Unchecked, an out-of-range index
+    /// segfaulted on LLVM and read adjacent emulator memory on T3 (a[-1]
+    /// returned the array's own length header). A separate instruction rather
+    /// than a field on GetPtr, which is also used for struct-field and
+    /// slot projections where no bound applies.
+    BoundsCheck {
+        idx: IRValue,
+        len: usize,
+    },
     // Ternary operations
     TritMin {
         dst: IRTemp,

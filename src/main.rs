@@ -131,6 +131,18 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
     analyzer.warnings.emit_all_rich(&source);
     analyzer.warnings.check_error()?;
 
+    // A8: `compile` produces an executable, so it needs an entry point.
+    // Without this the failure surfaced late and differently per backend: the
+    // T3 path wrote a .t3b that ran to a silent exit 1, and the LLVM path
+    // leaked the raw toolchain error ("undefined reference to `main'").
+    if !typed_program.functions.iter().any(|f| f.name == "main") {
+        return Err(CompileError::Codegen(Diagnostic::unknown(format!(
+            "{}: no `main` function found — a compiled program needs \
+             `fn main() {{ … }}` as its entry point",
+            file.display(),
+        ))));
+    }
+
     // Borrow / move checking
     manitc::borrow::check_borrows(&typed_program)?;
 
@@ -537,7 +549,34 @@ fn run_t3(file: &PathBuf, debug: bool) -> CompileResult<()> {
 // main
 // ---------------------------------------------------------------------------
 
+/// Stack reserved for the compiler thread (A3).
+///
+/// Every pass after the lexer — parser, semantic analyzer, IR lowering, both
+/// emitters — recurses over the expression tree, so deeply nested source used
+/// to abort the process with a bare "has overflowed its stack" and no
+/// file:line. The parser now refuses input nested past MAX_PARSE_DEPTH, but
+/// that limit is only enforceable if the stack is deep enough to reach it, and
+/// the default 8 MB main-thread stack is not. This is a virtual reservation:
+/// only pages actually touched are committed.
+const COMPILER_STACK_BYTES: usize = 256 * 1024 * 1024;
+
 fn main() {
+    // Run the whole CLI on a thread with a large stack (A3). `Lsp` is handled
+    // inside `run` as before; the tokio runtime it builds gets its own threads.
+    let child = std::thread::Builder::new()
+        .name("manitc".to_string())
+        .stack_size(COMPILER_STACK_BYTES)
+        .spawn(run)
+        .expect("failed to spawn the compiler thread");
+    match child.join() {
+        Ok(()) => {}
+        // The worker already reported the failure (or panicked and printed its
+        // own message); propagate a failing status without a second report.
+        Err(_) => std::process::exit(1),
+    }
+}
+
+fn run() {
     let cli = Cli::parse();
 
     let result: CompileResult<()> = match &cli.command {

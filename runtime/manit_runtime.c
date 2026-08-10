@@ -26,6 +26,7 @@
 #include <time.h>
 #include <errno.h>
 #include <termios.h>
+#include <signal.h>
 
 /* Forward declarations (used across sub-modules) */
 typedef struct ManitVec ManitVec;

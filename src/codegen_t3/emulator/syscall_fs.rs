@@ -14,7 +14,7 @@ impl Emulator {
     /// capacity overflow / OOM.
     fn checked_buf_len(&mut self, num: i64, len: i64) -> Option<usize> {
         if !(0..=Self::MAX_BUF_LEN).contains(&len) {
-            self.output.push(format!("TRAP: syscall #{}: invalid buffer length {}", num, len));
+            self.trap(format!("TRAP: syscall #{}: invalid buffer length {}", num, len));
             self.regs[1] = -1;
             return None;
         }

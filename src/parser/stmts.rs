@@ -8,6 +8,14 @@ impl Parser {
     // ---------------------------------------------------------------------------
 
     pub(super) fn parse_block(&mut self) -> CompileResult<Block> {
+        // A3: nested blocks recurse independently of expression nesting.
+        self.enter("block")?;
+        let result = self.parse_block_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_block_inner(&mut self) -> CompileResult<Block> {
         let span = self.span();
         self.expect(&TokenKind::LBrace)?;
         // Statements inside a block are a fresh expression context — the

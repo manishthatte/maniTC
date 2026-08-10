@@ -250,8 +250,14 @@ char* env_cwd(void) {
     return strdup("");
 }
 
+/* A12: chdir's result was discarded, so env::set_cwd("/nonexistent") reported
+   nothing and the program carried on in the old directory. The ABI is void
+   (declared `void @env_set_cwd(ptr)` for the LLVM backend), so report on
+   stderr; a status-returning variant would be an API change. */
 void env_set_cwd(const char* path) {
-    chdir(path);
+    if (chdir(path) != 0)
+        fprintf(stderr, "manit: env::set_cwd(\"%s\") failed: %s\n",
+                path ? path : "(null)", strerror(errno));
 }
 
 int64_t env_pid(void) { return (int64_t)getpid(); }
@@ -599,6 +605,22 @@ char* env_time(void) {
 static struct termios g_saved_termios;
 static int            g_raw_mode = 0;
 
+/* A15: a TUI that exits via env::exit, aborts, or is killed used to leave the
+   terminal in raw mode — no echo, no line editing, no Ctrl-C. Restore on every
+   ordinary exit path, and on the fatal signals, before re-raising. */
+static void terminal_restore_atexit(void) {
+    if (g_raw_mode) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_saved_termios);
+        g_raw_mode = 0;
+    }
+}
+
+static void terminal_restore_on_signal(int sig) {
+    terminal_restore_atexit();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 int64_t terminal_set_raw(void) {
     struct termios raw;
     if (tcgetattr(STDIN_FILENO, &g_saved_termios) != 0) return -1;
@@ -611,6 +633,16 @@ int64_t terminal_set_raw(void) {
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return -1;
     g_raw_mode = 1;
+    static int handlers_installed = 0;
+    if (!handlers_installed) {
+        handlers_installed = 1;
+        atexit(terminal_restore_atexit);
+        signal(SIGINT,  terminal_restore_on_signal);
+        signal(SIGTERM, terminal_restore_on_signal);
+        signal(SIGSEGV, terminal_restore_on_signal);
+        signal(SIGABRT, terminal_restore_on_signal);
+        signal(SIGFPE,  terminal_restore_on_signal);
+    }
     return 0;
 }
 
@@ -688,7 +720,7 @@ int64_t io_read_key(void) {
             FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
             tv.tv_sec = 0; tv.tv_usec = 50000;
             if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0)
-                read(STDIN_FILENO, &tilde, 1);
+                (void)!read(STDIN_FILENO, &tilde, 1);
             switch (seq[1]) {
                 case '1': return 1006; /* Home   */
                 case '2': return 1009; /* Insert */
@@ -718,7 +750,7 @@ int64_t io_read_key(void) {
 }
 
 int64_t io_clear_screen(void) {
-    write(STDOUT_FILENO, "\033[2J\033[H", 7);
+    (void)!write(STDOUT_FILENO, "\033[2J\033[H", 7);
     return 0;
 }
 
@@ -729,21 +761,21 @@ int64_t io_move_cursor(int64_t row, int64_t col) {
                        (long long)row, (long long)col);
     if (len < 0) return 0;
     if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
-    write(STDOUT_FILENO, buf, (size_t)len);
+    (void)!write(STDOUT_FILENO, buf, (size_t)len);
     return 0;
 }
 
 int64_t io_set_reverse(void) {
-    write(STDOUT_FILENO, "\033[7m", 4);
+    (void)!write(STDOUT_FILENO, "\033[7m", 4);
     return 0;
 }
 
 int64_t io_reset_attr(void) {
-    write(STDOUT_FILENO, "\033[0m", 4);
+    (void)!write(STDOUT_FILENO, "\033[0m", 4);
     return 0;
 }
 
 int64_t io_set_bold(void) {
-    write(STDOUT_FILENO, "\033[1m", 4);
+    (void)!write(STDOUT_FILENO, "\033[1m", 4);
     return 0;
 }

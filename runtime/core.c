@@ -3,6 +3,41 @@
  * Author: Manish Jagdish Thatte
  */
 
+/* ======================== runtime faults ======================== */
+/* A7/A2/E1: a single reporting path for runtime faults, so the LLVM backend
+ * fails the way the T3 emulator already does (a named TRAP and a defined exit
+ * status) instead of dying on a raw SIGFPE/SIGSEGV.
+ *
+ * stdout is flushed FIRST: it is block-buffered when redirected, so a program
+ * killed by a signal lost everything it had printed, which made these faults
+ * look like "the program produced no output at all".
+ *
+ * Exit status 70 matches T3_TRAP_EXIT on the T3 side. */
+#define MANIT_TRAP_EXIT 70
+
+void manit_fault(const char* msg) {
+    fflush(stdout);
+    fprintf(stderr, "TRAP: %s\n", msg ? msg : "runtime fault");
+    fflush(stderr);
+    exit(MANIT_TRAP_EXIT);
+}
+
+/* Divisor guard: called immediately before an integer sdiv/srem. */
+void manit_check_divisor(int64_t d) {
+    if (d == 0) manit_fault("division by zero");
+}
+
+/* Bounds guard: called before indexing a fixed-length array. */
+void manit_check_index(int64_t idx, int64_t len) {
+    if (idx < 0 || idx >= len) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "index %lld is out of bounds for an array of length %lld",
+                 (long long)idx, (long long)len);
+        manit_fault(buf);
+    }
+}
+
 /* ======================== IO ======================== */
 
 void io_println(const char* s) { printf("%s\n", s); }

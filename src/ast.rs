@@ -436,6 +436,38 @@ pub enum Type {
 }
 
 impl Type {
+    /// Render the type back in ManiT surface syntax.
+    ///
+    /// Used for user-facing output such as LSP hover, which previously leaked
+    /// Rust `{:?}` debug formatting of this enum (A9).
+    pub fn display(&self) -> String {
+        match self {
+            Type::Named(n, _) => n.clone(),
+            Type::Path(parts, _) => parts.join("::"),
+            Type::Ref(t, true, _) => format!("&mut {}", t.display()),
+            Type::Ref(t, false, _) => format!("&{}", t.display()),
+            Type::Ptr(t, true, _) => format!("*mut {}", t.display()),
+            Type::Ptr(t, false, _) => format!("*{}", t.display()),
+            Type::Array(t, Some(n), _) => format!("[{}; {}]", t.display(), n),
+            Type::Array(t, None, _) => format!("[{}]", t.display()),
+            Type::Tuple(ts, _) => format!(
+                "({})",
+                ts.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "),
+            ),
+            Type::Fn(ps, r, _) => format!(
+                "fn({}) -> {}",
+                ps.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "),
+                r.display(),
+            ),
+            Type::Generic(n, args, _) => format!(
+                "{}<{}>",
+                n,
+                args.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "),
+            ),
+            Type::Infer(_) => "_".to_string(),
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Type::Named(_, s) => *s,

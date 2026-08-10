@@ -54,6 +54,10 @@ pub struct Emulator {
     pub memory: Vec<i64>,
     pub flags: i8,
     pub halted: bool,
+    /// Set when execution stopped on a TRAP (a runtime fault) rather than a
+    /// normal HALT/RET. A5: the process exit status is taken from R1, so
+    /// without this a trapped program could still report success.
+    pub trapped: bool,
     pub output: Vec<String>,
     pub string_data: HashMap<usize, String>,
     pub float_data: HashMap<usize, i64>,
@@ -104,6 +108,7 @@ impl Emulator {
             memory: vec![0i64; 65536],
             flags: 0,
             halted: false,
+            trapped: false,
             output: Vec::new(),
             string_data: HashMap::new(),
             float_data: HashMap::new(),

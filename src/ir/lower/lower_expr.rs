@@ -587,8 +587,16 @@ impl IRLowerer {
             }
 
             TypedExprKind::Index(arr, idx) => {
+                // A2: bounds-check when the element count is statically known.
+                let arr_len = match &arr.ty {
+                    ManiType::Array(_, Some(n)) => Some(*n),
+                    _ => None,
+                };
                 let arr_val = self.lower_expr(arr);
                 let idx_val = self.lower_expr(idx);
+                if let Some(len) = arr_len {
+                    self.emit(IRInstr::BoundsCheck { idx: idx_val.clone(), len });
+                }
                 let ptr_t = self.fresh_temp();
                 self.emit(IRInstr::GetPtr {
                     dst: ptr_t.clone(),

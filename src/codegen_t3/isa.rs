@@ -109,6 +109,24 @@ impl Opcode {
             _  => None,
         }
     }
+
+    /// True when the instruction carries a wide immediate in the trits below
+    /// the r1 field, so r2 / r3 / imm hold immediate digits rather than
+    /// register indices (A5).
+    ///
+    /// These are the `encode_wide` users: TLIT (value), JUMP / CALL / SYSCALL
+    /// (r1 is 0, the whole low field is the address or syscall number) and the
+    /// single-address branches (r1 is the condition register, the low field is
+    /// the target). TBRANCH is the legacy packed 3-address form, whose fields
+    /// below r1 are likewise addresses, not registers.
+    pub fn uses_wide_immediate(self) -> bool {
+        matches!(
+            self,
+            Opcode::Tlit | Opcode::Jump | Opcode::Call | Opcode::Syscall
+                | Opcode::TbrPos | Opcode::TbrZero | Opcode::TbrNeg
+                | Opcode::Tbranch
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

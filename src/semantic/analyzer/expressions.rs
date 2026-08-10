@@ -146,10 +146,18 @@ impl SemanticAnalyzer {
                 // Division by zero detection
                 if matches!(op, BinOpKind::Div | BinOpKind::Rem) {
                     if let TypedExprKind::Lit(Lit::Int(0)) = &trhs.kind {
-                        self.warnings.push(CompileWarning::new(
-                            WarningKind::DivisionByZero,
-                            &self.file, span.line, span.col,
-                            "division by zero",
+                        // A7: integer division by a literal zero has no
+                        // meaningful result — T3 traps, LLVM raises SIGFPE.
+                        // It cannot be intentional, so reject it rather than
+                        // warn. (Float /0.0 stays a warning below: IEEE
+                        // division by zero is defined and yields inf/nan.)
+                        return Err(self.err(
+                            span,
+                            format!(
+                                "division by zero: the right operand of `{}` is the \
+                                 literal 0",
+                                if matches!(op, BinOpKind::Div) { "/" } else { "%" },
+                            ),
                         ));
                     } else if let TypedExprKind::Lit(Lit::Float(f)) = &trhs.kind {
                         if *f == 0.0 {
@@ -257,6 +265,37 @@ impl SemanticAnalyzer {
             Expr::Index(arr, idx, _) => {
                 let tarr = self.check_expr(arr, None)?;
                 let tidx = self.check_expr(idx, Some(&ManiType::Int))?;
+
+                // A2: array indexing is otherwise entirely unchecked — the
+                // LLVM backend segfaults on a far out-of-range index and the T3
+                // backend reads adjacent emulator memory (a[-1] returned the
+                // array's own length header). When both the length and the
+                // index are statically known, reject it outright.
+                // Literal `a[3]` and negated-literal `a[-1]` are both folded
+                // here; anything more involved (`a[0 - 1]`, `a[n]`) is left to
+                // the runtime guard emitted by IR lowering.
+                let const_idx = match &**idx {
+                    Expr::Lit(Lit::Int(i), _) => Some(*i),
+                    Expr::UnOp(UnOpKind::Neg, inner, _) => match &**inner {
+                        Expr::Lit(Lit::Int(i), _) => Some(-*i),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let (ManiType::Array(_, Some(len)), Some(i)) = (&tarr.ty, &const_idx) {
+                    let len = *len as i64;
+                    if *i < 0 || *i >= len {
+                        return Err(self.err(
+                            span,
+                            format!(
+                                "index {} is out of bounds for an array of length {} \
+                                 (valid indices are 0..{})",
+                                i, len, len.saturating_sub(1),
+                            ),
+                        ));
+                    }
+                }
+
                 let elem_ty = match &tarr.ty {
                     ManiType::Array(inner, _) => *inner.clone(),
                     ManiType::Generic(name, args) if name == "Vec" => {

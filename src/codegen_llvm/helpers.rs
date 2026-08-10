@@ -424,6 +424,10 @@ pub(crate) fn parse_declare_sigs(decl_text: &str) -> HashMap<String, (Vec<String
 // ---------------------------------------------------------------------------
 
 pub(crate) const STDLIB_DECLARES: &str = "\
+; ---- runtime fault guards (A7 / A2) ----
+declare void @manit_fault(ptr)
+declare void @manit_check_divisor(i64)
+declare void @manit_check_index(i64, i64)
 ; ---- io ----
 declare void @io_println(ptr)
 declare void @io_print(ptr)

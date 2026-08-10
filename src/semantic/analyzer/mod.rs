@@ -943,6 +943,44 @@ impl SemanticAnalyzer {
             typed_params.push(TypedParam { name: p.name.clone(), ty });
         }
 
+        // A1: a non-void function must supply a value on every path. Falling
+        // off the end left the return slot uninitialised — harmless-looking
+        // for `-> int` (a silent 0) but an uninitialised pointer for `-> str`,
+        // which the print path then dereferences.
+        if let Some(block) = &f.body {
+            if !matches!(ret_ty, ManiType::Void)
+                && !crate::semantic::diverges::block_diverges(block)
+                && !crate::semantic::diverges::block_has_value_tail(block)
+            {
+                return Err(self.err(
+                    f.span,
+                    format!(
+                        "function `{}` declares a return type of `{}` but can \
+                         finish without returning a value; add a `return` (or a \
+                         tail expression) on every path",
+                        f.name, ret_ty.display(),
+                    ),
+                ));
+            }
+        }
+
+        // A16: report bindings that are never read, and `mut` bindings that
+        // are never assigned. Warnings only — this catches discarded results
+        // (`let allowed = enforce(cap, ..);` with no use) without breaking any
+        // existing source.
+        for u in crate::semantic::unused::check_fn(f) {
+            let msg = match u.kind {
+                crate::semantic::unused::UnusedKind::Variable =>
+                    format!("unused variable `{}`; prefix with `_` if intentional", u.name),
+                crate::semantic::unused::UnusedKind::Mutability =>
+                    format!("variable `{}` does not need to be mutable", u.name),
+            };
+            self.warnings.push(CompileWarning::new(
+                WarningKind::UnusedVariable,
+                &self.file, u.span.line, u.span.col, msg,
+            ));
+        }
+
         let body = if let Some(block) = &f.body {
             Some(self.check_block(block)?)
         } else {

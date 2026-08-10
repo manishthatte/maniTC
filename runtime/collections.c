@@ -187,12 +187,18 @@ ManitMap* Map_new(void) {
     return m;
 }
 
+/* A13: probe at most `cap` slots. Map_insert normally holds the load factor at
+   50%, but if map_grow fails under memory pressure the table can be driven to
+   full, and an unbounded probe for an absent key would then spin forever.
+   Returns -1 when the key is absent and there is no free slot. */
 static int64_t map_slot(ManitMap* m, int64_t key) {
     int64_t mask = m->cap - 1;
     int64_t slot = (int64_t)(map_hash(key) & (uint64_t)mask);
-    while (m->entries[slot].used && m->entries[slot].key != key)
+    for (int64_t probes = 0; probes < m->cap; probes++) {
+        if (!m->entries[slot].used || m->entries[slot].key == key) return slot;
         slot = (slot + 1) & mask;
-    return slot;
+    }
+    return -1;
 }
 
 static int map_grow(ManitMap* m) {
@@ -205,6 +211,9 @@ static int map_grow(ManitMap* m) {
     for (int64_t i = 0; i < ocap; i++) {
         if (!oe[i].used) continue;
         int64_t s = map_slot(m, oe[i].key);
+        if (s < 0) { /* cannot happen: the new table is twice as large */
+            free(ne); m->entries = oe; m->cap = ocap; return 0;
+        }
         m->entries[s] = oe[i];
     }
     free(oe);
@@ -216,6 +225,7 @@ void Map_insert(ManitMap* m, int64_t k, int64_t v) {
     if (m->count * 2 >= m->cap && !map_grow(m) && m->count + 1 >= m->cap)
         return;
     int64_t s = map_slot(m, k);
+    if (s < 0) return;              /* table full and key absent (A13) */
     if (!m->entries[s].used) m->count++;
     m->entries[s].used = 1; m->entries[s].key = k; m->entries[s].val = v;
 }
@@ -223,25 +233,25 @@ void Map_insert(ManitMap* m, int64_t k, int64_t v) {
 int64_t Map_get(ManitMap* m, int64_t k) {
     if (!m) return 0;
     int64_t s = map_slot(m, k);
-    return m->entries[s].used ? m->entries[s].val : 0;
+    return (s >= 0 && m->entries[s].used) ? m->entries[s].val : 0;
 }
 
 int64_t Map_get_or(ManitMap* m, int64_t k, int64_t def) {
     if (!m) return def;
     int64_t s = map_slot(m, k);
-    return m->entries[s].used ? m->entries[s].val : def;
+    return (s >= 0 && m->entries[s].used) ? m->entries[s].val : def;
 }
 
 int Map_contains_key(ManitMap* m, int64_t k) {
     if (!m) return 0;
     int64_t s = map_slot(m, k);
-    return m->entries[s].used;
+    return s >= 0 && m->entries[s].used;
 }
 
 void Map_remove(ManitMap* m, int64_t k) {
     if (!m) return;
     int64_t s = map_slot(m, k);
-    if (!m->entries[s].used) return;
+    if (s < 0 || !m->entries[s].used) return;
     m->entries[s].used = 0;
     m->count--;
     int64_t mask = m->cap - 1;
@@ -292,12 +302,15 @@ ManitSet* Set_new(void) {
     return s;
 }
 
+/* A13: bounded probe, as for map_slot. -1 = absent and no free slot. */
 static int64_t set_slot(ManitSet* s, int64_t key) {
     int64_t mask = s->cap - 1;
     int64_t slot = (int64_t)(map_hash(key) & (uint64_t)mask);
-    while (s->entries[slot].used && s->entries[slot].key != key)
+    for (int64_t probes = 0; probes < s->cap; probes++) {
+        if (!s->entries[slot].used || s->entries[slot].key == key) return slot;
         slot = (slot + 1) & mask;
-    return slot;
+    }
+    return -1;
 }
 
 static int set_grow(ManitSet* s) {
@@ -310,6 +323,9 @@ static int set_grow(ManitSet* s) {
     for (int64_t i = 0; i < ocap; i++) {
         if (!oe[i].used) continue;
         int64_t slot = set_slot(s, oe[i].key);
+        if (slot < 0) { /* cannot happen: the new table is twice as large */
+            free(ne); s->entries = oe; s->cap = ocap; return 0;
+        }
         s->entries[slot] = oe[i];
     }
     free(oe);
@@ -321,6 +337,7 @@ void Set_insert(ManitSet* s, int64_t x) {
     if (s->count * 2 >= s->cap && !set_grow(s) && s->count + 1 >= s->cap)
         return;
     int64_t slot = set_slot(s, x);
+    if (slot < 0) return;           /* table full and key absent (A13) */
     if (!s->entries[slot].used) s->count++;
     s->entries[slot].used = 1; s->entries[slot].key = x;
 }
@@ -328,13 +345,13 @@ void Set_insert(ManitSet* s, int64_t x) {
 int Set_contains(ManitSet* s, int64_t x) {
     if (!s) return 0;
     int64_t slot = set_slot(s, x);
-    return s->entries[slot].used;
+    return slot >= 0 && s->entries[slot].used;
 }
 
 void Set_remove(ManitSet* s, int64_t x) {
     if (!s) return;
     int64_t slot = set_slot(s, x);
-    if (!s->entries[slot].used) return;
+    if (slot < 0 || !s->entries[slot].used) return;
     s->entries[slot].used = 0;
     s->count--;
     int64_t mask = s->cap - 1;

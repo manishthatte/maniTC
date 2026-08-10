@@ -22,6 +22,16 @@ impl Emulator {
             17..=59 | 70..=74 | 80..=131 => {
                 self.do_syscall_proc(num);
             }
+            // A2: array bounds guard — R1 = index, R2 = length.
+            560 => {
+                let idx = self.regs[1];
+                let len = self.regs[2];
+                if idx < 0 || idx >= len {
+                    self.trap(format!(
+                        "TRAP: index {} is out of bounds for an array of length {}",
+                        idx, len));
+                }
+            }
             _ => {
                 self.trap_unknown_syscall(num);
             }
@@ -31,6 +41,6 @@ impl Emulator {
     /// Graceful path for syscall numbers with no handler: record a TRAP line
     /// instead of panicking, and leave execution to continue.
     pub(super) fn trap_unknown_syscall(&mut self, num: i64) {
-        self.output.push(format!("TRAP: unknown syscall #{}", num));
+        self.trap(format!("TRAP: unknown syscall #{}", num));
     }
 }

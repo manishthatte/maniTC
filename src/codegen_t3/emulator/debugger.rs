@@ -155,7 +155,7 @@ impl Emulator {
             }
         }
         if steps >= MAX_STEPS {
-            self.output.push("TRAP: step limit exceeded".to_string());
+            self.trap("TRAP: step limit exceeded");
         }
     }
 
@@ -211,7 +211,7 @@ impl Emulator {
         if self.halted {
             eprintln!("  program halted normally.");
         } else if steps >= MAX_STEPS {
-            self.output.push("TRAP: step limit exceeded".to_string());
+            self.trap("TRAP: step limit exceeded");
         }
     }
 
@@ -245,8 +245,18 @@ pub fn run_emulator_with_exit(
     emu.string_data = string_data;
     emu.float_data = float_data;
     let out = emu.run_with_output();
-    (out, emu.regs[1])
+    // A5: the exit status normally comes from main's return value in R1, but a
+    // program stopped by a TRAP never returned, so R1 holds whatever the
+    // faulting instruction left behind — including 0, which would report
+    // success. Report a distinct, documented failure status instead.
+    let code = if emu.trapped { T3_TRAP_EXIT } else { emu.regs[1] };
+    (out, code)
 }
+
+/// Process exit status used when a T3 program stops on a TRAP (A5).
+/// Chosen to be non-zero and below 128 so it is not confused with death by
+/// signal, and stable so scripts can test for it.
+pub const T3_TRAP_EXIT: i64 = 70;
 
 /// Run emulator in interactive debug mode.
 pub fn run_emulator_debug(

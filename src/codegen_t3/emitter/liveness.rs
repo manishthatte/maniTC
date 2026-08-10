@@ -62,6 +62,9 @@ fn record_uses_instr(instr: &IRInstr, idx: usize, last_use: &mut HashMap<String,
             record_val_use(ptr, idx, last_use);
             record_val_use(i, idx, last_use);
         }
+        IRInstr::BoundsCheck { idx: i, .. } => {
+            record_val_use(i, idx, last_use);
+        }
         IRInstr::TritMin { a, b, .. } | IRInstr::TritMax { a, b, .. } => {
             record_val_use(a, idx, last_use);
             record_val_use(b, idx, last_use);

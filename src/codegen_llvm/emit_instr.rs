@@ -53,7 +53,20 @@ impl LLVMEmitter {
                             // Coerce operands to the target type if they differ.
                             let (lp, l) = self.resolve_with_coerce(lhs, &ty_str, &format!("{}_l", dst.0));
                             let (rp, r) = self.resolve_with_coerce(rhs, &ty_str, &format!("{}_r", dst.0));
-                            format!("{}{}{} = {} {} {}, {}", lp, rp, dst_name, op_name, ty_str, l, r)
+                            // A7: guard integer division/remainder. Unguarded,
+                            // a zero divisor raised SIGFPE — a hard crash with
+                            // no message, losing all buffered output — while
+                            // the T3 emulator reported a clean TRAP. The guard
+                            // is a call rather than a branch so no extra basic
+                            // blocks are needed here; it aborts via
+                            // manit_fault with the same text and exit status.
+                            let guard = if matches!(op, IRBinOp::Div | IRBinOp::Rem) {
+                                let (wp, w) = self.widen_to_i64(&r, &ty_str, &format!("{}_dz", dst.0));
+                                format!("{}  call void @manit_check_divisor(i64 {})\n", wp, w)
+                            } else {
+                                String::new()
+                            };
+                            format!("{}{}{}{} = {} {} {}, {}", lp, rp, guard, dst_name, op_name, ty_str, l, r)
                         }
                     }
                     // --- Integer comparisons (result is i1; operands keep their type) ---
@@ -572,6 +585,20 @@ impl LLVMEmitter {
                 )
             }
 
+            // A2: array bounds guard. A call rather than a branch so no extra
+            // basic blocks are needed; manit_check_index aborts via manit_fault
+            // with the same message and exit status the T3 emulator uses.
+            IRInstr::BoundsCheck { idx, len } => {
+                let idx_ty = self.actual_type_of(idx);
+                let idx_s = self.resolve_val(idx, &IRType::I64);
+                let uid = self.fresh_anon("bc");
+                let (wp, w) = self.widen_to_i64(&idx_s, &idx_ty, &uid);
+                format!(
+                    "{}call void @manit_check_index(i64 {}, i64 {})",
+                    wp, w, len
+                )
+            }
+
             // ---- Ternary ops ------------------------------------------------
             IRInstr::TritMin { dst, a, b } => {
                 self.record_temp_type(&dst.0, "i8");
@@ -828,14 +855,14 @@ impl LLVMEmitter {
                 if !adapts && actual != ty_str && actual != "void" && ty_str != "void" {
                     if actual == "ptr" && ty_str != "ptr" {
                         // ptr → int: ptrtoint
-                        let ext_name = "%__ret_coerce";
+                        let ext_name = format!("%{}", self.fresh_anon("__ret_coerce"));
                         return vec![
                             format!("{} = ptrtoint ptr {} to {}", ext_name, vs, ty_str),
                             format!("ret {} {}", ty_str, ext_name),
                         ];
                     } else if ty_str == "ptr" && actual != "ptr" {
                         // int → ptr: inttoptr
-                        let ext_name = "%__ret_coerce";
+                        let ext_name = format!("%{}", self.fresh_anon("__ret_coerce"));
                         return vec![
                             format!("{} = inttoptr {} {} to ptr", ext_name, actual, vs),
                             format!("ret ptr {}", ext_name),
@@ -845,7 +872,7 @@ impl LLVMEmitter {
                         let tw = int_width(&ty_str);
                         if aw != tw && aw > 0 && tw > 0 {
                             let op = if aw < tw { "sext" } else { "trunc" };
-                            let ext_name = "%__ret_coerce";
+                            let ext_name = format!("%{}", self.fresh_anon("__ret_coerce"));
                             return vec![
                                 format!("{} = {} {} {} to {}", ext_name, op, actual, vs, ty_str),
                                 format!("ret {} {}", ty_str, ext_name),
@@ -1024,6 +1051,34 @@ impl LLVMEmitter {
             ext_name, op, actual, resolved, target_ty
         );
         (prefix, ext_name)
+    }
+
+    /// Sign-extend an already-resolved integer operand to i64.
+    ///
+    /// Used by the runtime fault guards (A7/A2), whose runtime helpers take
+    /// i64 regardless of the width the arithmetic itself runs at. Returns
+    /// (instruction prefix, operand name); the prefix is empty when the operand
+    /// is already i64 or is a literal, which adapts to any integer width.
+    pub(super) fn widen_to_i64(
+        &self,
+        operand: &str,
+        operand_ty: &str,
+        suffix: &str,
+    ) -> (String, String) {
+        if operand_ty == "i64"
+            || int_width(operand_ty) == 0
+            || operand.parse::<i64>().is_ok()
+            || operand == "true"
+            || operand == "false"
+        {
+            return (String::new(), operand.to_string());
+        }
+        let ext_name = format!("%__w64_{}", suffix);
+        let op = if operand_ty == "i1" { "zext" } else { "sext" };
+        (
+            format!("{} = {} {} {} to i64\n  ", ext_name, op, operand_ty, operand),
+            ext_name,
+        )
     }
 
     /// Look up the actual LLVM type of a value.

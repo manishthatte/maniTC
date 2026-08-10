@@ -411,6 +411,16 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             em.emit(format!("    LOAD  {}, [{}+#0]", AsmEmitter::rn(rd), AsmEmitter::rn(rp)));
         }
 
+        // ------------------------------------------------------- BoundsCheck
+        // A2: verify 0 <= idx < len before a fixed-length array access.
+        // Uses emit_syscall_2arg so the argument registers go through
+        // rescue_reg / emit_parallel_moves — the same machinery that fixed the
+        // N10 loop-carried-temp corruption — rather than clobbering R1/R2.
+        IRInstr::BoundsCheck { idx, len } => {
+            let args = [idx.clone(), IRValue::Const(IRConst::Int(*len as i64))];
+            emit_syscall_2arg(em, &args, &None, 560, "bounds_check");
+        }
+
         // ------------------------------------------------------------------ GetPtr
         IRInstr::GetPtr { dst, ptr, idx, .. } => {
             let rd = em.dst_reg(dst);

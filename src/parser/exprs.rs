@@ -8,7 +8,12 @@ impl Parser {
     // ---------------------------------------------------------------------------
 
     pub fn parse_expr(&mut self) -> CompileResult<Expr> {
-        self.parse_range_expr()
+        // A3: bound the recursion so nested input fails with a diagnostic
+        // rather than exhausting the native stack.
+        self.enter("expression")?;
+        let result = self.parse_range_expr();
+        self.leave();
+        result
     }
 
     /// Parse an expression in condition / iterator / scrutinee position,
@@ -484,6 +489,18 @@ impl Parser {
                     };
                     if n < 0 {
                         return Err(self.err("array repeat count cannot be negative"));
+                    }
+                    // A4: the repeat form is expanded eagerly into n clones of
+                    // the element, so an unbounded n turns three tokens into an
+                    // arbitrarily large allocation ([1; 300000000] asked for
+                    // 64.8 GB and aborted the process). Refuse well above any
+                    // real use — the largest repeat count across the examples,
+                    // the stdlib and all of thatteos is 54.
+                    if n > MAX_ARRAY_REPEAT {
+                        return Err(self.err(format!(
+                            "array repeat count {} exceeds the maximum of {}",
+                            n, MAX_ARRAY_REPEAT,
+                        )));
                     }
                     self.expect(&TokenKind::RBracket)?;
                     self.no_struct_lit = saved;

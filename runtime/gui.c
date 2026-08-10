@@ -62,8 +62,24 @@ static void gui_process_event(SDL_Event* ev) {
         g_gui_wheel_dy   = (int64_t)ev->wheel.y;   /* positive = scroll up */
         break;
     default:
+        /* A11: leave the previous event state alone — see gui_poll_event. */
         g_gui_event_type = 0;
         break;
+    }
+}
+
+/* True for SDL events gui_process_event actually maps to a ManiT event type.
+   A11: gui_poll_event used to return 1 for *any* event while reporting type 0,
+   so a window event (this window is resizable, so they are frequent) clobbered
+   a real keypress or click that had not been read yet. */
+static int gui_event_is_mapped(const SDL_Event* ev) {
+    switch (ev->type) {
+    case SDL_QUIT: case SDL_KEYDOWN: case SDL_MOUSEMOTION:
+    case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP:
+    case SDL_TEXTINPUT: case SDL_MOUSEWHEEL:
+        return 1;
+    default:
+        return 0;
     }
 }
 
@@ -114,6 +130,15 @@ int64_t gui_init(int64_t width, int64_t height, const char* title) {
     }
 
     SDL_StartTextInput();
+    /* A10: returning 0 here with g_sdl_font == NULL produced a window that
+       opened, painted its rectangles and showed no text at all, with no error
+       anywhere — the first-run experience on any system with SDL2 but no
+       DejaVu/Liberation fonts. Report it distinctly instead. */
+    if (!g_sdl_font) {
+        fprintf(stderr, "manit: gui_init: no usable font found "
+                        "(install fonts-dejavu-core or fonts-liberation)\n");
+        return -5;
+    }
     return 0;
 }
 
@@ -225,15 +250,18 @@ int64_t gui_window_height(void) {
 
 int64_t gui_poll_event(void) {
     SDL_Event ev;
-    if (SDL_PollEvent(&ev)) { gui_process_event(&ev); return 1; }
+    /* Drain unmapped events rather than surfacing them as type 0 (A11). */
+    while (SDL_PollEvent(&ev)) {
+        if (gui_event_is_mapped(&ev)) { gui_process_event(&ev); return 1; }
+    }
     g_gui_event_type = 0;
     return 0;
 }
 
 int64_t gui_wait_event(int64_t timeout_ms) {
     SDL_Event ev;
-    if (SDL_WaitEventTimeout(&ev, (int)timeout_ms)) {
-        gui_process_event(&ev); return 1;
+    while (SDL_WaitEventTimeout(&ev, (int)timeout_ms)) {
+        if (gui_event_is_mapped(&ev)) { gui_process_event(&ev); return 1; }
     }
     g_gui_event_type = 0;
     return 0;

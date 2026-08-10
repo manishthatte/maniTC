@@ -3,6 +3,38 @@ use super::*;
 use super::super::isa::*;
 
 impl Emulator {
+    /// Record a runtime fault and stop the machine.
+    ///
+    /// A5: every TRAP goes through here so that `trapped` is always set
+    /// alongside `halted`; the exit status is derived from R1, which a faulting
+    /// program has no reason to have left meaningful.
+    pub(crate) fn trap(&mut self, msg: impl Into<String>) {
+        self.output.push(msg.into());
+        self.halted = true;
+        self.trapped = true;
+    }
+
+    /// Push a call frame, enforcing the recursion and stack-pointer limits.
+    ///
+    /// Returns false when the call must not proceed, having already trapped.
+    /// A5: runaway recursion in a ManiT program used to abort the emulator
+    /// with a Rust `panic!`; it is a property of the program being run, not a
+    /// compiler bug, so report it the same way as every other runtime fault.
+    fn push_call_frame(&mut self) -> bool {
+        self.call_depth += 1;
+        if self.call_depth > 10000 {
+            self.trap("TRAP: call depth exceeded 10000 (likely infinite recursion)");
+            return false;
+        }
+        self.call_stack.push(self.pc);
+        self.regs[26] = clamp27(self.regs[26] - 1);
+        if self.regs[26] < 0 {
+            self.trap("TRAP: stack pointer went negative");
+            return false;
+        }
+        true
+    }
+
     pub fn step(&mut self) {
         if self.halted { return; }
         if self.pc >= self.memory.len() {
@@ -17,11 +49,29 @@ impl Emulator {
         let Some(op) = Opcode::from_i64(raw_op) else {
             // Silently skipping unknown opcodes let garbage (e.g. a source file
             // read as a binary) "run" to a clean exit — trap loudly instead.
-            self.output.push(format!(
+            self.trap(format!(
                 "TRAP: unknown opcode {} at PC={} (word {})", raw_op, self.pc - 1, word));
-            self.halted = true;
             return;
         };
+
+        // A5: `decode` pulls r1/r2/r3 out of 5-trit fields, so each spans
+        // 0..=242 while the register file has 27 entries. encode/encode_wide
+        // assert 0..=26, so an out-of-range field can only come from a binary
+        // manitc did not produce (a hand-written or third-party .t3b, or a
+        // corrupted file). Trap loudly, exactly like an unknown opcode above,
+        // instead of panicking with an index-out-of-bounds.
+        let bad_reg = if op.uses_wide_immediate() {
+            // r2/r3/imm are immediate digits here, so only r1 is a register.
+            (r1 > 26).then_some(r1)
+        } else {
+            [r1, r2, r3].into_iter().find(|&r| r > 26)
+        };
+        if let Some(r) = bad_reg {
+            self.trap(format!(
+                "TRAP: register index {} out of range (0..=26) at PC={} (word {})",
+                r, self.pc - 1, word));
+            return;
+        }
 
         // Record instruction in profile
         self.profile.record(op);
@@ -29,7 +79,7 @@ impl Emulator {
         macro_rules! wreg {
             ($r:expr, $v:expr) => {
                 if ($r as usize) != 0 {
-                    self.regs[$r as usize] = clamp27($v);
+                    self.regs[($r as usize).min(26)] = clamp27($v);
                 }
             };
         }
@@ -61,8 +111,7 @@ impl Emulator {
             }
             Opcode::Tdiv => {
                 if rhs_eff == 0 {
-                    self.output.push("TRAP: division by zero".to_string());
-                    self.halted = true;
+                    self.trap("TRAP: division by zero");
                     return;
                 }
                 let v = clamp27(self.regs[sr2] / rhs_eff);
@@ -71,8 +120,7 @@ impl Emulator {
             }
             Opcode::Tmod => {
                 if rhs_eff == 0 {
-                    self.output.push("TRAP: modulo by zero".to_string());
-                    self.halted = true;
+                    self.trap("TRAP: modulo by zero");
                     return;
                 }
                 let v = clamp27(self.regs[sr2] % rhs_eff);
@@ -164,8 +212,8 @@ impl Emulator {
                 // encoding: LOAD r1, [r2 + imm]
                 let addr = (self.regs[sr2] + imm) as usize;
                 let v = self.memory.get(addr).copied().unwrap_or(0);
-                if (r1 as usize) != 0 {
-                    self.regs[r1 as usize] = v;
+                if sr1 != 0 {
+                    self.regs[sr1] = v;
                 }
             }
             Opcode::Store => {
@@ -184,8 +232,8 @@ impl Emulator {
 
             Opcode::Mov => {
                 let v = self.regs[sr2];
-                if (r1 as usize) != 0 {
-                    self.regs[r1 as usize] = v;
+                if sr1 != 0 {
+                    self.regs[sr1] = v;
                 }
             }
 
@@ -207,21 +255,21 @@ impl Emulator {
                 // encode_wide(TbrPos, rcond, addr): jump to addr if regs[rcond] > 0
                 let rcond = r1;
                 let addr = word - raw_op * P18 - rcond * P13;
-                if self.regs[rcond as usize] > 0 {
+                if self.regs[sr1] > 0 {
                     self.pc = addr as usize;
                 }
             }
             Opcode::TbrZero => {
                 let rcond = r1;
                 let addr = word - raw_op * P18 - rcond * P13;
-                if self.regs[rcond as usize] == 0 {
+                if self.regs[sr1] == 0 {
                     self.pc = addr as usize;
                 }
             }
             Opcode::TbrNeg => {
                 let rcond = r1;
                 let addr = word - raw_op * P18 - rcond * P13;
-                if self.regs[rcond as usize] < 0 {
+                if self.regs[sr1] < 0 {
                     self.pc = addr as usize;
                 }
             }
@@ -238,31 +286,14 @@ impl Emulator {
                 // caller-save convention (explicit STORE before CALL / LOAD
                 // after RET), so any memory write here would corrupt the
                 // top of the caller-save stack.
-                self.call_depth += 1;
-                if self.call_depth > 10000 {
-                    panic!("Stack overflow: call depth exceeded 10000 (likely infinite recursion)");
-                }
-                self.call_stack.push(self.pc);
-                self.regs[26] = clamp27(self.regs[26] - 1);
-                if self.regs[26] < 0 {
-                    panic!("Stack overflow: stack pointer went negative");
-                }
+                if !self.push_call_frame() { return; }
                 self.pc = addr as usize;
             }
 
             Opcode::Callr => {
                 // CALLR Rx: call to address stored in register r1
-                let r1 = ((word - raw_op * P18) / P13) as usize;
-                let addr = self.regs[r1];
-                self.call_depth += 1;
-                if self.call_depth > 10000 {
-                    panic!("Stack overflow: call depth exceeded 10000 (likely infinite recursion)");
-                }
-                self.call_stack.push(self.pc);
-                self.regs[26] = clamp27(self.regs[26] - 1);
-                if self.regs[26] < 0 {
-                    panic!("Stack overflow: stack pointer went negative");
-                }
+                let addr = self.regs[sr1];
+                if !self.push_call_frame() { return; }
                 self.pc = addr as usize;
             }
 
@@ -289,8 +320,8 @@ impl Emulator {
                 let addr = (self.regs[sr2] + imm) as usize;
                 let raw = self.memory.get(addr).copied().unwrap_or(0);
                 let trit = raw.clamp(-1, 1);
-                if (r1 as usize) != 0 {
-                    self.regs[r1 as usize] = trit;
+                if sr1 != 0 {
+                    self.regs[sr1] = trit;
                 }
                 self.flags = sign_i64(trit);
             }

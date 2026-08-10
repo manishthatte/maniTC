@@ -26,7 +26,30 @@ pub struct Parser {
     /// `match`, `tif`, `tresult`) where the `{` belongs to the construct's
     /// body. Cleared inside any parenthesized/bracketed subexpression.
     pub(super) no_struct_lit: bool,
+    /// Current recursive-descent nesting depth (A3). Guards against native
+    /// stack exhaustion on pathologically nested input, which used to abort
+    /// the process with no diagnostic.
+    pub(super) depth: usize,
 }
+
+/// Maximum recursive-descent nesting depth (A3).
+///
+/// Deeply nested source — `((((…1…))))`, `1 + (1 + (1 + …))`, nested blocks —
+/// used to overflow the native stack and abort with "has overflowed its stack"
+/// and no file:line. Refuse past this depth with an ordinary parse error
+/// instead. Real code nests far shallower: the deepest construct across the
+/// examples, the stdlib and all of thatteos is under 20. main() reserves a
+/// large stack (COMPILER_STACK_BYTES) so this limit is reachable, and so that
+/// the later passes, which recurse over the same tree, survive it too.
+pub const MAX_PARSE_DEPTH: usize = 256;
+
+/// Maximum element count for the `[value; N]` array repeat form (A4).
+///
+/// The parser expands the form eagerly into N clones of the element
+/// expression, so N is a direct multiplier on compiler memory. Bounded far
+/// above real use (the largest repeat count in the examples, the stdlib and
+/// thatteos is 54) but low enough that a typo cannot exhaust memory.
+pub const MAX_ARRAY_REPEAT: i64 = 65_536;
 
 impl Parser {
     pub fn new(mut tokens: Vec<Token>) -> Self {
@@ -42,7 +65,31 @@ impl Parser {
             pending_gt: false,
             split_gt: Token::new(TokenKind::Gt, Span::zero()),
             no_struct_lit: false,
+            depth: 0,
         }
+    }
+
+    // --- recursion depth guard (A3) ---
+
+    /// Enter one level of recursive descent. Returns an ordinary parse error
+    /// once the nesting limit is reached, so pathological input is rejected
+    /// with a file:line instead of aborting the process on a stack overflow.
+    /// Every `enter` must be paired with a `leave` on the success path.
+    pub(super) fn enter(&mut self, what: &str) -> CompileResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(self.err(format!(
+                "{} nested too deeply (limit {}); simplify the expression \
+                 or split it across bindings",
+                what, MAX_PARSE_DEPTH,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Leave one level of recursive descent.
+    pub(super) fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     pub fn with_file(tokens: Vec<Token>, file: impl Into<String>) -> Self {

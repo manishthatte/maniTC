@@ -80,6 +80,66 @@ impl ManiTLanguageServer {
 }
 
 // ---------------------------------------------------------------------------
+// LSP position conversion (A6)
+//
+// `Position.character` is an offset in UTF-16 code units, not bytes. Using it
+// directly as a byte index mis-locates the cursor on any line containing a
+// non-ASCII character, and slicing at an offset that lands inside a multi-byte
+// character panics — Rust rejects non-char-boundary `str` indices even for an
+// empty range. Both directions are converted explicitly here.
+// ---------------------------------------------------------------------------
+
+/// Characters that make up a ManiT identifier, matching the lexer.
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Convert an LSP `character` offset (UTF-16 code units) to a byte offset
+/// within `line`. Always returns a char boundary; clamps past the end.
+fn utf16_to_byte(line: &str, character: u32) -> usize {
+    let target = character as usize;
+    let mut units = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if units >= target {
+            return byte_idx;
+        }
+        units += ch.len_utf16();
+    }
+    line.len()
+}
+
+/// Convert a byte offset within `line` to an LSP `character` offset.
+fn byte_to_utf16(line: &str, byte: usize) -> u32 {
+    let mut units = 0usize;
+    for (byte_idx, ch) in line.char_indices() {
+        if byte_idx >= byte {
+            break;
+        }
+        units += ch.len_utf16();
+    }
+    units as u32
+}
+
+/// Byte range of the identifier surrounding `byte_col`, walking whole
+/// characters so the result is always on char boundaries.
+fn ident_range_at(line: &str, byte_col: usize) -> (usize, usize) {
+    let start = line[..byte_col]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_ident_char(*c))
+        .map(|(i, _)| i)
+        .last()
+        .unwrap_or(byte_col);
+    let end = line[byte_col..]
+        .char_indices()
+        .take_while(|(_, c)| is_ident_char(*c))
+        .map(|(i, c)| byte_col + i + c.len_utf8())
+        .last()
+        .unwrap_or(byte_col);
+    (start, end)
+}
+
+// ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
 
@@ -197,27 +257,23 @@ impl LanguageServer for ManiTLanguageServer {
             return Ok(None);
         }
         let line = lines[line_idx];
-        let col = pos.character as usize;
+        // A6: `character` is a UTF-16 offset — convert before indexing bytes.
+        let col = utf16_to_byte(line, pos.character);
         if col >= line.len() {
             return Ok(None);
         }
 
-        // Extract the word at the cursor position
-        let bytes = line.as_bytes();
-        let mut start = col;
-        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
-        {
-            start -= 1;
-        }
-        let mut end = col;
-        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-            end += 1;
-        }
+        // Extract the identifier at the cursor position on char boundaries.
+        let (start, end) = ident_range_at(line, col);
         let word = &line[start..end];
 
         if word.is_empty() {
             return Ok(None);
         }
+
+        // Response ranges are in UTF-16 units too.
+        let range_start = byte_to_utf16(line, start);
+        let range_end = byte_to_utf16(line, end);
 
         // Provide hover information for keywords and built-in types
         let info = match word {
@@ -275,11 +331,11 @@ impl LanguageServer for ManiTLanguageServer {
                 range: Some(Range {
                     start: Position {
                         line: pos.line,
-                        character: start as u32,
+                        character: range_start,
                     },
                     end: Position {
                         line: pos.line,
-                        character: end as u32,
+                        character: range_end,
                     },
                 }),
             }))
@@ -299,11 +355,11 @@ impl LanguageServer for ManiTLanguageServer {
                     range: Some(Range {
                         start: Position {
                             line: pos.line,
-                            character: start as u32,
+                            character: range_start,
                         },
                         end: Position {
                             line: pos.line,
-                            character: end as u32,
+                            character: range_end,
                         },
                     }),
                 }))
@@ -389,7 +445,7 @@ impl ManiTLanguageServer {
         // Search for matching function name
         for func in &typed.functions {
             if func.name == _name {
-                return Some(format!("fn(…) -> {:?}", func.ret_ty));
+                return Some(format!("fn(…) -> {}", func.ret_ty.display()));
             }
         }
         // Search for matching struct name
@@ -398,7 +454,7 @@ impl ManiTLanguageServer {
                 let fields: Vec<String> = s
                     .fields
                     .iter()
-                    .map(|f| format!("{}: {:?}", f.name, f.ty))
+                    .map(|f| format!("{}: {}", f.name, f.ty.display()))
                     .collect();
                 return Some(format!("struct {{ {} }}", fields.join(", ")));
             }
@@ -426,4 +482,96 @@ pub async fn run_lsp() {
 
     let (service, socket) = LspService::new(|client| ManiTLanguageServer::new(client));
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+// ---------------------------------------------------------------------------
+// Tests — A6 position conversion
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape that used to panic: hovering the `a` after a 3-byte
+    /// character. UTF-16 offset 10 was used as byte index 10, which lands
+    /// inside '€' (bytes 9..12), and `&line[10..10]` panicked.
+    #[test]
+    fn a6_hover_after_multibyte_char_does_not_panic() {
+        let line = "let s = \"\u{20AC}a\";";
+        assert_eq!(line.len(), 15, "byte length");
+        // UTF-16 offset of the 'a'
+        let character = line
+            .encode_utf16()
+            .position(|u| u == b'a' as u16)
+            .expect("'a' present") as u32;
+        assert_eq!(character, 10);
+
+        let col = utf16_to_byte(line, character);
+        assert!(line.is_char_boundary(col), "converted offset must be a char boundary");
+        let (start, end) = ident_range_at(line, col);
+        assert_eq!(&line[start..end], "a", "should find the identifier 'a'");
+    }
+
+    #[test]
+    fn a6_utf16_to_byte_matches_ascii_offsets() {
+        let line = "let value = 1;";
+        for (i, _) in line.char_indices() {
+            assert_eq!(utf16_to_byte(line, i as u32), i);
+        }
+    }
+
+    #[test]
+    fn a6_round_trip_through_utf16_and_back() {
+        for line in ["plain ascii", "caf\u{e9} x", "a \u{20AC} b", "emoji \u{1F600} z"] {
+            for (byte_idx, _) in line.char_indices() {
+                let units = byte_to_utf16(line, byte_idx);
+                assert_eq!(
+                    utf16_to_byte(line, units), byte_idx,
+                    "round trip failed for {:?} at byte {}", line, byte_idx,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a6_ident_range_finds_whole_identifier() {
+        let line = "  let my_var2 = 3;";
+        let col = line.find("my_var2").unwrap() + 3; // inside the identifier
+        let (s, e) = ident_range_at(line, col);
+        assert_eq!(&line[s..e], "my_var2");
+    }
+
+    #[test]
+    fn a6_ident_range_is_empty_in_open_whitespace() {
+        // Not adjacent to any identifier character on either side. (Directly
+        // after an identifier the range still covers it, which is the
+        // long-standing behaviour and what editors expect.)
+        let line = "a  =  b";
+        let (s, e) = ident_range_at(line, 2);
+        assert_eq!(s, e, "no identifier in open whitespace");
+    }
+
+    #[test]
+    fn a6_ident_range_covers_identifier_ending_at_cursor() {
+        let line = "a = b";
+        let (s, e) = ident_range_at(line, 1); // just past 'a'
+        assert_eq!(&line[s..e], "a");
+    }
+
+    /// Every byte offset in a line with astral-plane characters must stay on a
+    /// char boundary, so slicing can never panic wherever the cursor lands.
+    #[test]
+    fn a6_all_utf16_offsets_land_on_char_boundaries() {
+        let line = "x = \"\u{1F600}\u{20AC}\u{e9}ok\";";
+        let max_units = line.encode_utf16().count() as u32;
+        for character in 0..=max_units + 2 {
+            let col = utf16_to_byte(line, character);
+            assert!(
+                line.is_char_boundary(col),
+                "offset {} -> byte {} is not a char boundary", character, col,
+            );
+            let (s, e) = ident_range_at(line, col);
+            let _ = &line[s..e]; // must not panic
+        }
+    }
 }

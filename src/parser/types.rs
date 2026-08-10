@@ -8,6 +8,14 @@ impl Parser {
     // ---------------------------------------------------------------------------
 
     pub(super) fn parse_type(&mut self) -> CompileResult<Type> {
+        // A3: nested generics (Vec<Vec<Vec<…>>>) recurse here.
+        self.enter("type")?;
+        let result = self.parse_type_inner();
+        self.leave();
+        result
+    }
+
+    fn parse_type_inner(&mut self) -> CompileResult<Type> {
         let span = self.span();
         match self.peek().clone() {
             // Infer: `_`

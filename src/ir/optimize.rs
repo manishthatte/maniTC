@@ -235,6 +235,9 @@ fn propagate_in_instruction(instr: &mut IRInstr, const_map: &HashMap<String, IRC
             propagate_value(ptr, const_map);
             propagate_value(idx, const_map);
         }
+        IRInstr::BoundsCheck { idx, .. } => {
+            propagate_value(idx, const_map);
+        }
         IRInstr::TritMin { a, b, .. } => {
             propagate_value(a, const_map);
             propagate_value(b, const_map);
@@ -356,6 +359,9 @@ fn collect_used_in_instruction(instr: &IRInstr, used: &mut HashSet<String>) {
         }
         IRInstr::GetPtr { ptr, idx, .. } => {
             collect_used_from_value(ptr, used);
+            collect_used_from_value(idx, used);
+        }
+        IRInstr::BoundsCheck { idx, .. } => {
             collect_used_from_value(idx, used);
         }
         IRInstr::TritMin { a, b, .. } => {
