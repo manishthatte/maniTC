@@ -112,7 +112,7 @@ impl ExecProfile {
             if self.total_instructions > 0 { self.memory_ops as f64 / self.total_instructions as f64 * 100.0 } else { 0.0 }));
         s.push_str(&format!("  Max call depth:     {}\n", self.max_call_depth));
         s.push_str(&format!("  Max heap used:      {} words\n",
-            self.max_heap_ptr.saturating_sub(64_000)));
+            self.max_heap_ptr.saturating_sub(63_000)));
 
         // Top opcodes
         let mut sorted: Vec<(usize, &str)> = Vec::new();

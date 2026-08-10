@@ -331,6 +331,32 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
 
         // ------------------------------------------------------------------ Alloca
         IRInstr::Alloca { dst, ty } => {
+            // Real structs are heap-allocated, not stack-allocated.  A stack slot
+            // is scoped to its loop iteration: the emitter pops back to the
+            // block's canonical depth on the back edge, so every iteration's
+            // alloca lands on the same address.  That is invisible while the
+            // pointer stays inside the iteration, and wrong the moment it
+            // escapes — `pcbs[i] = age_tick(p)` stores a struct pointer into an
+            // array that outlives the loop, so all nine slots aliased one buffer
+            // and every process read back the same PCB.  The LLVM backend mallocs
+            // struct allocas for exactly this reason; this matches it.
+            //
+            // Heap allocations are deliberately NOT recorded in alloca_slots:
+            // their address is not SP-relative, so Load/Store must go through the
+            // register-based path.
+            if let IRType::Struct(name) = ty {
+                if let Some(&n) = em.struct_sizes.get(name) {
+                    em.rescue_reg_inclusive(1);
+                    em.emit(format!("    TLIT  R1, #{}  ; heap alloca {} ({} words)", n, name, n));
+                    em.emit("    SYSCALL #218  ; heap_alloc_words".to_string());
+                    let rd = em.dst_reg(dst);
+                    if rd != 1 {
+                        em.emit(format!("    MOV   {}, R1  ; heap alloca base", AsmEmitter::rn(rd)));
+                    }
+                    return;
+                }
+            }
+
             // Arrays need n words; structs need n_fields words; everything else needs 1 word.
             let words = match ty {
                 IRType::Array(_, n) => *n,

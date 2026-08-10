@@ -352,6 +352,35 @@ impl Emulator {
                 let b = f64::from_bits(self.regs[2] as u64);
                 self.regs[1] = if a > b { 1 } else if a < b { -1 } else { 0 };
             }
+            218 => {
+                // heap_alloc_words: R1 = word count → R1 = base address.
+                //
+                // Struct allocations go here rather than on the stack.  A stack
+                // slot is scoped to its loop iteration, so a struct pointer that
+                // outlives the iteration — `pcbs[i] = age_tick(p)` stores one
+                // into an array — aliased the next iteration's allocation and
+                // every element ended up reading the same buffer.  The LLVM
+                // backend already mallocs struct allocas for the same reason.
+                let n = self.regs[1].max(1) as usize;
+                let base = self.heap_ptr;
+                if base + n > self.memory.len() {
+                    self.trap(format!(
+                        "TRAP: heap exhausted allocating {} word(s) at {} (limit {})",
+                        n,
+                        base,
+                        self.memory.len()
+                    ));
+                    return;
+                }
+                // Callers read fields before writing them (a partially
+                // initialised struct literal), so hand back zeroed memory
+                // rather than whatever the previous allocation left behind.
+                for i in 0..n {
+                    self.memory[base + i] = 0;
+                }
+                self.heap_ptr += n;
+                self.regs[1] = base as i64;
+            }
             219 => {
                 // float_load: R1 = address → R1 = float bits at that address
                 let addr = self.regs[1] as usize;

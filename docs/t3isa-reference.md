@@ -5,10 +5,21 @@ used as the backend for maniT's balanced ternary compilation target. This docume
 specifies the architecture, instruction set, encoding, assembly syntax, and emulator
 behaviour.
 
-**Specification version 1.2** — tagged `t3isa-spec-v1.2` in this repository.
+**Specification version 1.3** — tagged `t3isa-spec-v1.3` in this repository.
 This document is the normative definition of T3ISA; independent implementations
 should cite the tagged version they were written against. Where this document
 and the manitc emulator disagree, that is a specification bug — please report it.
+
+Changes since 1.2, all corrections to sections that described the emulator
+inaccurately rather than changes to the architecture:
+
+- **§3 Memory model** now gives the actual layout. The initial SP is 60,000, not
+  65,535, and the heap base is 63,000, not "~50000".
+- **§8 String / fmt syscalls** were listed at 140–143. No handler has ever
+  existed at those numbers. The real ones are 14, 15, 127, 129, 130 and 132, and
+  only 9 of the 31 declared `fmt` natives are implemented on T3 at all.
+- **§8** documents syscall 218, `heap_alloc_words`, which struct allocations now
+  use.
 
 ---
 
@@ -70,12 +81,29 @@ The FLAGS register is set by `TCMP Rd, Rx, Ry`:
 Memory is word-addressable. Each address holds one 27-trit word (i64 in storage).
 The emulator implements 65,536 words.
 
-**Stack:** Grows downward from address 65535. `R26` (SP) points to the most
-recently pushed word. Push = `TSUB R26, R26, #1; STORE Rv, [R26+#0]`. Pop =
-`LOAD Rv, [R26+#0]; TADD R26, R26, #1`.
+Only the 65,536-word address space is architectural. The division below is the
+reference emulator's own layout, not a requirement on an implementation — but the
+compiler emits absolute addresses for globals, so an implementation that reuses
+this toolchain's output has to leave those windows alone.
 
-**Heap:** Grows upward from a fixed base (~50000). Heap objects are managed by the
-emulator's built-in allocator; their addresses (handles) are stored in registers.
+| Base | Region |
+|------|--------|
+| 0 | Code, followed by string-literal addresses (`code_size + 1024 + i`) |
+| 60,000 | Initial `R26` (SP); the stack grows **downward** from here |
+| 61,000 | Module globals, one word each |
+| 62,000 | Emulator scratch (`RESULT_AREA`, `TUPLE_AREA`) |
+| 63,000 | Heap, grows **upward** to the top of memory |
+
+**Stack:** `R26` (SP) points to the most recently pushed word. Push =
+`TSUB R26, R26, #1; STORE Rv, [R26+#0]`. Pop = `LOAD Rv, [R26+#0]; TADD R26, R26, #1`.
+Note the initial SP is 60,000, not 65,535 as earlier revisions of this document
+stated.
+
+**Heap:** A bump allocator, exposed to compiled code through syscall #218 and used
+internally for strings, arrays and struct allocations. There is no free; objects
+persist for the life of the program. Collection objects (Vec, Map, Set, Deque,
+Channel) are separate: they live outside addressable memory and are referenced by
+integer handles at or above `0x8000_0000`.
 
 **String data:** String literal addresses are placed past the code section
 (`code_size + 1024 + i`). Strings are not in addressable memory; they are held in
@@ -469,14 +497,36 @@ The emulator handles `SYSCALL #n` by inspecting R1 for the primary operand.
 | 130 | `async::yield_now` | Yield to scheduler |
 | 131 | `async::sleep` | R1 = ms; yield for duration |
 
-### String / fmt (140+)
+### String / fmt
+
+Earlier revisions of this document listed these at 140–143. **That was wrong** —
+no handler has ever existed at those numbers, and calling them traps with
+`unknown syscall`. The real numbers are below. Anything not listed here is not
+implemented on T3 yet: of the 31 `fmt` natives declared in `stdlib/fmt.mt`, the
+emitter maps 9. The rest — `fmt::concat`, `fmt::show_trit`, `fmt::show_bool3`,
+`fmt::format2` among them — fail at **assemble** time with `Undefined label`,
+not at run time. The LLVM backend implements all of them.
 
 | # | Name | Notes |
 |---|------|-------|
-| 140 | `fmt::show_int` | R1 = int; returns string addr |
-| 141 | `fmt::show_float` | R1 = float; returns string addr |
-| 142 | `fmt::concat` | R1, R2 = str addrs; returns concat addr |
-| 143 | `fmt::substr` | R1 = addr, R2 = start, R3 = end |
+| 14 | `fmt::show_int`, `fmt::int_to_str` | R1 = int; returns string addr |
+| 15 | `fmt::align_right`, `fmt::pad_left` | R1 = addr, R2 = width |
+| 127 | `fmt::format` | R1, R2 = str addrs; returns formatted addr |
+| 129 | `fmt::show_float` | R1 = float bits; returns string addr |
+| 130 | `fmt::show_bool` | R1 = bool; returns string addr |
+| 132 | `fmt::align_left`, `fmt::pad_right` | R1 = addr, R2 = width |
+
+### Memory (218)
+
+| # | Name | R1 | Result (R1) |
+|---|------|----|-------------|
+| 218 | `heap_alloc_words` | word count | Base address of a zeroed block |
+
+Struct allocations use this rather than the stack. A stack slot is scoped to its
+loop iteration — the emitter pops back to the block's canonical depth on the back
+edge — so a struct pointer that outlives the iteration would alias the next
+iteration's allocation. Allocating past the top of memory traps rather than
+silently dropping the writes.
 
 ---
 

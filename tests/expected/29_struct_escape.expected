@@ -1,0 +1,14 @@
+-- call result into array --
+PASS ids survive the loop
+PASS values survive the loop
+PASS elements do not alias
+-- fresh structs into array --
+PASS each iteration allocates its own struct
+-- literal into array --
+PASS loop-built literals stay distinct
+-- nested loop allocation --
+PASS outer struct survives inner allocations
+PASS inner sums are correct
+-- non-escaping struct --
+PASS non-escaping struct in a long loop
+all struct escape tests done

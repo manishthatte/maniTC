@@ -783,8 +783,9 @@ fn test_unclaimed_syscalls_in_ranges_trap_gracefully() {
     for num in [27, 28, 29, 37, 38, 39, 45, 46, 47, 48, 49, 217, 218, 513, 519] {
         let mut emu = Emulator::new();
         emu.do_syscall(num);
-        // 217 now has a real handler (print_bool3); everything else traps.
-        if num != 217 {
+        // 217 (print_bool3) and 218 (heap_alloc_words) now have real handlers;
+        // everything else traps.
+        if num != 217 && num != 218 {
             assert!(
                 emu.output.iter().any(|l| l.contains("TRAP: unknown syscall")),
                 "syscall {} should trap gracefully", num
@@ -796,6 +797,48 @@ fn test_unclaimed_syscalls_in_ranges_trap_gracefully() {
 // ---------------------------------------------------------------------------
 // print_bool3 (B11), print_float routing (B7)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_syscall_218_heap_alloc_words() {
+    let mut emu = Emulator::new();
+
+    // Successive allocations must not overlap: a struct pointer that outlives
+    // its loop iteration used to alias the next iteration's stack slot.
+    emu.regs[1] = 4;
+    emu.do_syscall(218);
+    let first = emu.regs[1];
+    emu.regs[1] = 4;
+    emu.do_syscall(218);
+    let second = emu.regs[1];
+    assert_eq!(second - first, 4, "allocations must be disjoint");
+
+    // Memory is handed back zeroed: struct literals read fields they have not
+    // written yet.
+    emu.memory[first as usize] = 7;
+    emu.regs[1] = 2;
+    emu.do_syscall(218);
+    let third = emu.regs[1] as usize;
+    assert!(emu.memory[third..third + 2].iter().all(|&w| w == 0));
+
+    // A zero-word request still yields a distinct, usable address.
+    emu.regs[1] = 0;
+    emu.do_syscall(218);
+    assert!(emu.regs[1] as usize >= third + 2);
+}
+
+#[test]
+fn test_syscall_218_traps_when_heap_exhausted() {
+    let mut emu = Emulator::new();
+    // Overshoot the top of memory in one request rather than looping.
+    emu.regs[1] = emu.memory.len() as i64;
+    emu.do_syscall(218);
+    assert!(emu.trapped, "heap exhaustion must trap, not drop the writes");
+    assert!(
+        emu.output.iter().any(|l| l.contains("heap exhausted")),
+        "expected a heap-exhaustion message, got {:?}",
+        emu.output
+    );
+}
 
 #[test]
 fn test_syscall_217_print_bool3_llvm_format() {

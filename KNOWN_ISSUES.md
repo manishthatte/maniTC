@@ -85,7 +85,12 @@ and proved nothing.
    `data_structures` takes ~4 minutes (interpreted, debug build, close to
    the 10M-step budget). Purely a performance matter.
 
-5. **Loop-body array allocations on T3 are iteration-scoped.** The T3
+5. **Loop-body *array* allocations on T3 are iteration-scoped.** Structs no
+   longer are: as of 11 Aug 2026 struct allocations go to the heap via
+   syscall #218, matching the LLVM backend's malloc, because a struct
+   pointer stored into a longer-lived container (`pcbs[i] = age_tick(p)`)
+   aliased the next iteration's stack slot and every element read back the
+   same buffer. Arrays still use the stack. The T3
    backend reuses a loop body's stack allocations each iteration, so an
    array created inside a loop must not be stored/aliased past its
    iteration (the stdlib hoists its buffers accordingly; array-returning

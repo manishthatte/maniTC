@@ -63,8 +63,22 @@ pub struct Emulator {
     pub float_data: HashMap<usize, i64>,
     pub input_queue: std::collections::VecDeque<i64>,
     call_stack: Vec<usize>,
-    /// Bump pointer for runtime heap allocations (strings, arrays).
-    /// Starts at 64_000, grows upward (well above the string-literal region at 63_000).
+    /// Bump pointer for runtime heap allocations (structs, strings, arrays).
+    ///
+    /// The emulator's memory map, which is emulator-defined rather than
+    /// architectural — the ISA only fixes the 65,536-word address space:
+    ///
+    ///   0 ..        code, then string-literal addresses (code_size + 1024 + i)
+    ///   .. 60_000   stack, grown DOWNWARD from the initial SP
+    ///   61_000      module globals, one word each
+    ///   62_000      RESULT_AREA / TUPLE_AREA scratch (see syscall_proc.rs)
+    ///   63_000      heap, grown UPWARD to the top of memory
+    ///
+    /// The heap base moved down from 64_000 when struct allocations became
+    /// heap-allocated (syscall #218): 63_000 was the base of a dead
+    /// string-literal region and is free, and the extra 1_000 words are worth
+    /// having now that every struct costs heap. Allocation past the top traps
+    /// rather than silently dropping writes.
     heap_ptr: usize,
     /// Heap objects (Vecs, Maps, Sets, Deques, Channels) keyed by handle.
     heap_objs: HashMap<usize, HeapObj>,
@@ -114,7 +128,7 @@ impl Emulator {
             float_data: HashMap::new(),
             input_queue: std::collections::VecDeque::new(),
             call_stack: Vec::new(),
-            heap_ptr: 64_000,
+            heap_ptr: 63_000,
             heap_objs: HashMap::new(),
             string_intern: HashMap::new(),
             files: HashMap::new(),
