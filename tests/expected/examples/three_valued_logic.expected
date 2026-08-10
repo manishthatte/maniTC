@@ -30,37 +30,37 @@ maniT Three-Valued Logic Demo
   tand  (conjunction, min(a,b)):
        |   +      0      -  
   -----+---------------------
-     +   |    +      +      +  
-     0   |    0      0      0  
+     +   |    +      0      -  
+     0   |    0      0      -  
      -   |    -      -      -  
 
   tor   (disjunction, max(a,b)):
        |   +      0      -  
   -----+---------------------
      +   |    +      +      +  
-     0   |    +      +      +  
-     -   |    +      +      +  
+     0   |    +      0      0  
+     -   |    +      0      -  
 
   txor  (exclusive-or, (a+b) mod3 balanced):
        |   +      0      -  
   -----+---------------------
-     +   |    +      +      +  
-     0   |    +      +      +  
-     -   |    +      +      +  
+     +   |    0      +      +  
+     0   |    +      0      +  
+     -   |    +      +      0  
 
   Luk implication  (max(tnot a, b)):
        |   +      0      -  
   -----+---------------------
-     +   |    +      +      +  
-     0   |    +      +      +  
+     +   |    +      0      -  
+     0   |    +      0      0  
      -   |    +      +      +  
 
   Luk biconditional (tnot(a txor b)):
        |   +      0      -  
   -----+---------------------
-     +   |    -      -      -  
-     0   |    -      -      -  
-     -   |    -      -      -  
+     +   |    0      -      -  
+     0   |    -      0      -  
+     -   |    -      -      0  
 
 
 ================================================
@@ -85,10 +85,10 @@ maniT Three-Valued Logic Demo
     Holds: true
 
   Commutativity: a tand b == b tand a, a tor b == b tor a
-    Holds: false
+    Holds: true
 
   Distributivity: a tand (b tor c) == (a tand b) tor (a tand c)
-    Holds: false
+    Holds: true
 
 ================================================
   4. Practical: Multi-Sensor Fusion with bool3
@@ -107,7 +107,7 @@ maniT Three-Valued Logic Demo
 
   System safety: engine AND brakes must both be OK.
   (using tand for conservative AND — min of two sensor readings)
-    engine=OK, brakes=Unknown  =>  safe=OK      
+    engine=OK, brakes=Unknown  =>  safe=UNKNOWN 
 
   Emergency stop: trigger if engine OR brakes is FAULT.
   (using tor for conservative OR — max, but we check for fault=-)

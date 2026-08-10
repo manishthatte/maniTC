@@ -33,11 +33,11 @@ and proved nothing.
 | patent_classify | works | works | byte-identical |
 | stream_demo | works | works | byte-identical |
 | ternary_calculator | works | works | byte-identical |
-| ternary_demo | works | works | diverges in two truth-table cells (T3) |
+| ternary_demo | works | works | byte-identical |
 | ternary_sort | works | works | byte-identical |
-| three_valued_logic | works | works | diverges in truth-table cells (T3) |
+| three_valued_logic | works | works | byte-identical |
 
-`cargo test`: 261 passed, 0 failed, 0 ignored.
+`cargo test`: 307 passed, 0 failed, 0 ignored.
 
 ## Open issues
 
@@ -49,22 +49,37 @@ and proved nothing.
    property, not a bug; portable code — including the shipped stdlib —
    must keep intermediates inside the t27 range.
 
-2. **T3 truth-table cell corruption (register-layout sensitive).** In
-   `three_valued_logic` and `ternary_demo`, some cells of the printed
-   tand/tor/txor tables are wrong on T3 (e.g. a row printing the row value
-   for every column). Minimal reproductions of the same code shape
-   (nested for over `[trit]`, indirect lambda call, `io::print_trit`)
-   produce correct output; the corruption appears only in the full
-   examples' register/stack layout. Suspected residual back-edge register
-   reconciliation gap in the T3 emitter (the general mechanism was added
-   for syscalls in loops; some non-syscall relocation path likely remains).
+2. ~~**T3 truth-table cell corruption (register-layout sensitive).**~~
+   **Fixed 11 Aug 2026.** Two separate register-allocation bugs, both of
+   which needed enough register pressure that minimal reproductions of the
+   same code shape passed — which is why this sat here as "suspected".
+   Both produced silently wrong answers rather than a trap.
 
-3. **T3 prints garbage/NUL runs for some computed strings** in
-   `capability_demo` (one PID line) and the `data_structures` trie section.
-   The string address being printed is not a registered string object, so
-   the emulator's null-terminated-memory fallback dumps raw memory.
-   Same class as issue 2 — a wrong register/stack value used as a string
-   handle in large functions.
+   *Call operands were materialised before the caller-save stores*, which
+   forced them into R21/R22/R24/R25 — the registers the call sequence
+   itself uses for the fn_ptr, the move scratch and the return stash. From
+   the third spilled operand onward the fn_ptr move overwrote an argument,
+   so `op(a, b)` reached the callee as `op(a, a)`. Operands are now
+   resolved before the saves and materialised into their target registers
+   after them, with the fn_ptr folded into the same parallel move.
+
+   *`dst_reg` returned R23 for an already-spilled temp without storing it
+   back to its slot*, silently dropping the assignment. At a short-circuit
+   join where one predecessor had spilled the phi, a later predecessor left
+   its copy in R23 while the slot kept an unrelated temp, so the join read
+   the wrong value. It broke tand/tor distributivity.
+
+   Pinned by `tests/28_regalloc.mt` (expected + cross-target), verified to
+   fail 4 checks against a pre-fix build and 0 after.
+
+3. **T3 prints NUL runs for some computed strings** in the
+   `data_structures` trie section. The same source compiled to two
+   different `-o` paths runs to two different results, so a string address
+   is escaping into uninitialised memory; the emulator's
+   null-terminated-memory fallback then dumps raw bytes. This is why
+   `data_structures` has no golden entry in
+   `tests/example_output_tests.rs`. (The `capability_demo` PID line that
+   used to be listed here was a symptom of issue 2 and is now correct.)
 
 4. **The T3 emulator is slow on allocation-heavy programs**:
    `data_structures` takes ~4 minutes (interpreted, debug build, close to

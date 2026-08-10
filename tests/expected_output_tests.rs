@@ -163,6 +163,7 @@ expected_test!(expected_13_numeric_edge_cases, "13_numeric_edge_cases.mt");
 expected_test!(expected_14_ternary_logic_complete, "14_ternary_logic_complete.mt");
 expected_test!(expected_17_tcon_tany, "17_tcon_tany.mt");
 expected_test!(expected_27_ir_regressions, "27_ir_regressions.mt");
+expected_test!(expected_28_regalloc, "28_regalloc.mt");
 
 // Cross-target consistency (T3 vs LLVM — tests that pass on both)
 // 05_ternary_types is excluded: T3 and LLVM print a char-typed value
@@ -185,3 +186,4 @@ cross_target_test!(cross_14_ternary_logic_complete, "14_ternary_logic_complete.m
 cross_target_test!(cross_15_generics_and_traits, "15_generics_and_traits.mt");
 cross_target_test!(cross_17_tcon_tany, "17_tcon_tany.mt");
 cross_target_test!(cross_27_ir_regressions, "27_ir_regressions.mt");
+cross_target_test!(cross_28_regalloc, "28_regalloc.mt");

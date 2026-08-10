@@ -57,13 +57,13 @@ Single-trit operations:
 tand (min) truth table:
        +    0    -
   +    +    0    -  
-  0    +    0    -  
+  0    0    0    -  
   -    -    -    -  
 
 tor (max) truth table:
        +    0    -
   +    +    +    +  
-  0    +    0    -  
+  0    +    0    0  
   -    +    0    -  
 
 txor (mod-3 add, balanced) truth table:

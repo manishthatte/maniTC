@@ -7,6 +7,18 @@ use emit_instr::{emit_instr, emit_term};
 use crate::ir::*;
 use std::collections::HashMap;
 
+/// Where a call operand lives, resolved before the caller-save stores run and
+/// materialised after them by `emit_call_operands`.
+#[derive(Clone)]
+enum CallSrc {
+    Reg(usize),      // live in a pool register
+    Slot(usize),     // spilled, at this absolute stack depth
+    Lit(i64),        // plain immediate
+    Label(String),   // string literal or global address, resolved by the assembler
+    Float(f64),      // needs the float-load syscall
+    Missing(String), // temp with no known location — an SSA hole
+}
+
 struct AsmEmitter {
     lines:        Vec<String>, // final committed output
     cur_instr:    Vec<String>, // staged body of the current IR instruction
@@ -275,6 +287,182 @@ impl AsmEmitter {
         }
     }
 
+    /// `emit_lit`, but into the current instruction body rather than `lines`.
+    ///
+    /// Call operands must be materialised *after* the caller-save stores have
+    /// run, so they cannot use `emit_lit` (which writes to `lines`, i.e. ahead of
+    /// the saves).  The decomposition scratch is taken from R23/R21/R22 by
+    /// recursion depth — all three are dead during call operand setup, and a
+    /// depth-indexed choice keeps an inner level from clobbering its caller.
+    fn emit_lit_cur(&mut self, r: usize, imm: i64) {
+        self.emit_lit_cur_at(r, imm, 0);
+    }
+
+    fn emit_lit_cur_at(&mut self, r: usize, imm: i64, depth: usize) {
+        const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX; // 797_161
+        const SCRATCH: [usize; 3] = [23, 21, 22];
+        if imm.abs() <= MAX_LIT {
+            self.emit(format!("    TLIT  R{}, #{}", r, imm));
+            return;
+        }
+        // |imm| is bounded by the 27-trit clamp, so this recurses at most twice.
+        let tmp = SCRATCH[depth.min(SCRATCH.len() - 1)];
+        let hi = imm / 1000;
+        let lo = imm - hi * 1000;
+        self.emit_lit_cur_at(tmp, hi, depth + 1);
+        self.emit(format!("    TLIT  R{}, #1000  ; large-lit scale", r));
+        self.emit(format!("    TMUL  R{0}, R{1}, R{0}  ; large-lit r=hi*1000", r, tmp));
+        if lo != 0 {
+            self.emit(format!("    TLIT  R{}, #{}  ; large-lit lo", tmp, lo));
+            self.emit(format!("    TADD  R{0}, R{0}, R{1}  ; large-lit r+=lo", r, tmp));
+        }
+    }
+
+    /// Load the value spilled at absolute stack depth `slot_depth` into `reg`,
+    /// SP-relative against the *current* sp_depth.
+    fn emit_slot_load(&mut self, reg: usize, slot_depth: usize, note: &str) {
+        let offset = self.reg_alloc.sp_depth as i64 - slot_depth as i64;
+        if offset >= 0 && offset <= 13 {
+            self.emit(format!("    LOAD  R{}, [R26+#{}]  ; {}", reg, offset, note));
+        } else if offset > 13 {
+            self.emit(format!("    TLIT  R{}, #{}", reg, offset));
+            self.emit(format!("    TADD  R{0}, R26, R{0}  ; spill addr", reg));
+            self.emit(format!("    LOAD  R{0}, [R{0}+#0]  ; {1}", reg, note));
+        } else {
+            self.emit(format!("    ; BUG: negative spill offset {} for {}", offset, note));
+            self.emit(format!("    TLIT  R{}, #0", reg));
+        }
+    }
+
+    /// Resolve where a call operand lives, without emitting anything.
+    ///
+    /// Must be called before the caller-save stores run: `Reg` names the register
+    /// the value is in right now, which stays valid across the saves because a
+    /// STORE copies a register rather than clearing it.
+    fn resolve_call_src(&self, val: &IRValue) -> CallSrc {
+        match val {
+            IRValue::Temp(t) => {
+                if let Some(&r) = self.reg_alloc.temp_to_reg.get(&t.0) {
+                    CallSrc::Reg(r)
+                } else if let Some(&d) = self.reg_alloc.spill_slots.get(&t.0) {
+                    CallSrc::Slot(d)
+                } else {
+                    CallSrc::Missing(t.0.clone())
+                }
+            }
+            IRValue::Const(IRConst::Str(label)) => {
+                CallSrc::Label(label.trim_start_matches('@').to_string())
+            }
+            IRValue::Const(IRConst::Float(f)) => CallSrc::Float(*f),
+            IRValue::Const(c) => CallSrc::Lit(irconst_to_i64(c)),
+            IRValue::Global(name) => match self.global_addrs.get(name) {
+                Some(&addr) => CallSrc::Lit(addr),
+                // Unknown global: keep the symbolic form so the assembler fails
+                // loudly instead of silently reading address 0.
+                None => CallSrc::Label(name.clone()),
+            },
+            IRValue::Void => CallSrc::Lit(0),
+        }
+    }
+
+    /// Materialise call operands into their target registers.
+    ///
+    /// Runs *after* the caller-save stores, when every pool register holding a
+    /// live value is already on the stack and so free to overwrite.  The phase
+    /// order is load-bearing:
+    ///
+    ///   0. float constants, which need R1 and the float-load syscall, so they
+    ///      must run before any argument register has been written;
+    ///   1. register→register moves, sequentialised so no move overwrites a
+    ///      register another still needs (cycles broken through R23);
+    ///   2. stack reloads and immediates, which read no pool register and so
+    ///      cannot disturb a move that is still pending.
+    ///
+    /// Operands used to be materialised *before* the saves instead, which forced
+    /// them to be parked in R21/R22/R24/R25 — the very registers the call
+    /// sequence uses for the fn_ptr, the move scratch and the return stash.  From
+    /// the third spilled operand onward `val_reg` handed out R25, and the fn_ptr
+    /// move then overwrote it, passing the callee a silently wrong argument.
+    fn emit_call_operands(&mut self, targets: &[(usize, CallSrc)]) {
+        // Staging for phase 0 lives above the argument registers.  Parameters are
+        // allocated R1..R8 (see emit_function), so R9+ is never a target.
+        const STAGE_BASE: usize = 9;
+        assert!(
+            targets.iter().all(|&(t, _)| t < STAGE_BASE || t == 25),
+            "T3ISA internal error: call operand target R{} overlaps the staging range",
+            targets.iter().map(|&(t, _)| t).find(|&t| t >= STAGE_BASE && t != 25).unwrap_or(0)
+        );
+
+        let mut resolved: Vec<(usize, CallSrc)> = Vec::with_capacity(targets.len());
+        let mut stage = STAGE_BASE;
+        for (tgt, src) in targets {
+            match src {
+                CallSrc::Float(f) => {
+                    // Float bit patterns exceed TLIT's range, so they are stored in
+                    // the .float section and fetched by syscall.  R1 is dead here:
+                    // anything live in it went to the stack in the caller-saves.
+                    let bits = f.to_bits() as i64;
+                    let label = format!("@float_{}_{}", self.fn_name, self.float_literals.len());
+                    let clean = label.trim_start_matches('@').to_string();
+                    self.float_literals.push((label, bits));
+                    self.emit(format!("    TLIT  R1, #{}  ; float-lit addr", clean));
+                    self.emit(format!("    SYSCALL #219  ; float_load bits for {}", f));
+                    self.emit(format!("    MOV   R{}, R1  ; stage float operand", stage));
+                    resolved.push((*tgt, CallSrc::Reg(stage)));
+                    stage += 1;
+                }
+                other => resolved.push((*tgt, other.clone())),
+            }
+        }
+
+        // Phase 1: register→register moves.
+        const CYCLE: usize = 23; // spill-write scratch — dead during operand setup
+        let mut pending: Vec<(usize, usize)> = resolved
+            .iter()
+            .filter_map(|(tgt, src)| match src {
+                CallSrc::Reg(r) if r != tgt => Some((*tgt, *r)),
+                _ => None,
+            })
+            .collect();
+
+        while !pending.is_empty() {
+            let sources: std::collections::HashSet<usize> =
+                pending.iter().map(|&(_, s)| s).collect();
+            // A move is ready once its target is no longer needed as a source.
+            if let Some(i) = pending.iter().position(|&(tgt, _)| !sources.contains(&tgt)) {
+                let (tgt, src) = pending.remove(i);
+                self.emit(format!("    MOV   R{}, R{}  ; call operand", tgt, src));
+            } else {
+                // Every remaining move is part of a cycle.  Park one target in the
+                // scratch, close its move, and redirect readers of it to the scratch.
+                // Breaking a cycle leaves a chain whose head is immediately ready, so
+                // this branch cannot run again while the scratch is still needed.
+                let (tgt0, src0) = pending.remove(0);
+                self.emit(format!("    MOV   R{}, R{}  ; break move cycle at R{}", CYCLE, tgt0, tgt0));
+                self.emit(format!("    MOV   R{}, R{}  ; call operand", tgt0, src0));
+                for m in pending.iter_mut() {
+                    if m.1 == tgt0 {
+                        m.1 = CYCLE;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: everything that reads no pool register.
+        for (tgt, src) in &resolved {
+            match src {
+                CallSrc::Reg(_) | CallSrc::Float(_) => {}
+                CallSrc::Slot(d) => self.emit_slot_load(*tgt, *d, "call operand from spill"),
+                CallSrc::Lit(v) => self.emit_lit_cur(*tgt, *v),
+                CallSrc::Label(l) => self.emit(format!("    TLIT  R{}, #{}  ; call operand", tgt, l)),
+                CallSrc::Missing(name) => {
+                    self.emit(format!("    ; BUG: call operand {} has no location", name));
+                    self.emit(format!("    TLIT  R{}, #0", tgt));
+                }
+            }
+        }
+    }
+
     /// Get or assign a register for an IRTemp destination.
     /// If the pool is exhausted, schedules a spill: uses R23 as the physical
     /// destination, and appends TSUB+STORE to pending_post to save R23 to the stack.
@@ -283,8 +471,34 @@ impl AsmEmitter {
         if let Some(&r) = self.reg_alloc.temp_to_reg.get(&t.0) {
             return r;
         }
-        // Already spilled (SSA violation — reuse R23 gracefully)?
-        if self.reg_alloc.spill_slots.contains_key(&t.0) {
+        // Already spilled: reuse R23 as the physical destination, but write the
+        // result back to the slot the value already owns.  Returning R23 with no
+        // store silently dropped the assignment.  It bit phi destinations hardest:
+        // when one predecessor of a join spilled the phi and a later predecessor
+        // reached this branch, that predecessor's copy stayed in R23 and the slot
+        // kept whatever unrelated temp happened to occupy it, so the join read the
+        // wrong value with no trap and no diagnostic.
+        if let Some(&slot) = self.reg_alloc.spill_slots.get(&t.0) {
+            let offset = (self.reg_alloc.sp_depth + self.pending_sp_increments) as i64 - slot as i64;
+            if offset >= 0 && offset <= 13 {
+                self.pending_post.push(format!(
+                    "    STORE R23, [R26+#{}]         ; spill-store {} (existing slot)",
+                    offset, t.0
+                ));
+            } else if offset > 13 {
+                // R21 is free after the instruction body: spill reads are done.
+                self.pending_post.push(format!("    TLIT  R21, #{}", offset));
+                self.pending_post.push("    TADD  R21, R26, R21  ; spill addr".to_string());
+                self.pending_post.push(format!(
+                    "    STORE R23, [R21+#0]         ; spill-store {} (existing slot)",
+                    t.0
+                ));
+            } else {
+                self.pending_post.push(format!(
+                    "    ; BUG: negative spill offset {} for {}",
+                    offset, t.0
+                ));
+            }
             return 23;
         }
         // Try to allocate from pool

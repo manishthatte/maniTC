@@ -1280,11 +1280,11 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
 
                     let cur_instr = em.reg_alloc.current_instr;
 
-                    // Pre-load all args via val_reg BEFORE the caller-saves loop.
-                    // val_reg emits spill-reload LOADs directly to self.lines (not cur_instr),
-                    // so they must be emitted while sp_depth still reflects the pre-save state.
-                    // After flush_instr, lines order is: [arg LOADs] [caller-saves + CALL].
-                    let rargs: Vec<usize> = args.iter().map(|a| em.val_reg(a)).collect();
+                    // Resolve where each argument lives, but emit nothing yet: the
+                    // values are materialised into R1..Rn after the caller-saves,
+                    // when the pool registers are free.  See emit_call_operands.
+                    let arg_srcs: Vec<CallSrc> =
+                        args.iter().map(|a| em.resolve_call_src(a)).collect();
 
                     // Collect all live temps in the general-purpose pool (R1-R20) that
                     // survive past this instruction.
@@ -1315,39 +1315,15 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                         em.reg_alloc.sp_depth += 1;
                     }
 
-                    // Move pre-loaded arg values into argument registers.
-                    // Parallel-move sequentialization: emit move (tgt←src) only when
-                    // `tgt` is not used as a source by any other pending move — i.e.,
-                    // overwriting tgt won't destroy a value still needed elsewhere.
-                    // If all pending moves form cycles, break one cycle via R25.
-                    {
-                        let mut pending: Vec<(usize, usize)> = rargs.iter().enumerate()
-                            .filter(|(i, &ra)| ra != i + 1)
-                            .map(|(i, &ra)| (i + 1, ra))
-                            .collect();
+                    // Materialise the arguments into R1..Rn now that every live
+                    // pool register is safely on the stack.
+                    let targets: Vec<(usize, CallSrc)> = arg_srcs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, s)| (i + 1, s))
+                        .collect();
+                    em.emit_call_operands(&targets);
 
-                        const SCRATCH: usize = 25;
-
-                        while !pending.is_empty() {
-                            let sources: std::collections::HashSet<usize> =
-                                pending.iter().map(|&(_, s)| s).collect();
-                            // A move is ready when its TARGET is not used as a source by
-                            // any remaining pending move (so overwriting it is safe).
-                            if let Some(idx) = pending.iter().position(|&(tgt, _)| !sources.contains(&tgt)) {
-                                let (tgt, src) = pending.remove(idx);
-                                em.emit(format!("    MOV   R{}, {}  ; arg {}", tgt, AsmEmitter::rn(src), tgt - 1));
-                            } else {
-                                // Cycle: save tgt0 to scratch, emit tgt0←src0 immediately,
-                                // then replace any remaining use of tgt0 as a source with SCRATCH.
-                                let (tgt0, src0) = pending.remove(0);
-                                em.emit(format!("    MOV   R{}, {}  ; cycle: save R{}", SCRATCH, AsmEmitter::rn(tgt0), tgt0));
-                                em.emit(format!("    MOV   R{}, {}  ; arg {}", tgt0, AsmEmitter::rn(src0), tgt0 - 1));
-                                for m in pending.iter_mut() {
-                                    if m.1 == tgt0 { m.1 = SCRATCH; }
-                                }
-                            }
-                        }
-                    }
                     em.emit(format!("    CALL  {}", func));
 
                     // Stash the return value in R24 (outside R1-R20 pool, never allocated)
@@ -1402,12 +1378,10 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             // Same caller-save convention as direct Call, but use CALLR Rx.
             let cur_instr = em.reg_alloc.current_instr;
 
-            // Pre-load fn_ptr and all args via val_reg BEFORE the caller-saves loop.
-            // val_reg emits spill-reload LOADs directly to self.lines (not cur_instr),
-            // so they must be resolved while sp_depth still reflects the pre-save state.
-            // After flush_instr, the output order is: [pre-LOADs] [caller-saves + CALLR].
-            let rfp = em.val_reg(fn_ptr);
-            let rargs: Vec<usize> = args.iter().map(|a| em.val_reg(a)).collect();
+            // Resolve fn_ptr and the arguments without emitting: they are
+            // materialised into R25 and R1..Rn after the caller-saves.
+            let fp_src = em.resolve_call_src(fn_ptr);
+            let arg_srcs: Vec<CallSrc> = args.iter().map(|a| em.resolve_call_src(a)).collect();
 
             let to_save: Vec<(String, usize)> = {
                 em.reg_alloc.temp_to_reg
@@ -1435,37 +1409,17 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 em.reg_alloc.sp_depth += 1;
             }
 
-            // Move pre-loaded fn_ptr into R25 and args into R1, R2, ...
-            if rfp != 25 {
-                em.emit(format!("    MOV   R25, {}  ; fn_ptr for indirect call", AsmEmitter::rn(rfp)));
-            }
-            // Parallel-move arg setup using R24 as scratch (R25 holds fn_ptr here).
-            {
-                const SCRATCH: usize = 24;
-                let mut pending: Vec<(usize, usize)> = rargs.iter().enumerate()
-                    .filter(|(i, &ra)| ra != i + 1)
-                    .map(|(i, &ra)| (i + 1, ra))
-                    .collect();
-                while !pending.is_empty() {
-                    let sources: std::collections::HashSet<usize> =
-                        pending.iter().map(|&(_, s)| s).collect();
-                    if let Some(idx) = pending.iter().position(|&(tgt, _)| !sources.contains(&tgt)) {
-                        let (tgt, src) = pending.remove(idx);
-                        em.emit(format!("    MOV   R{}, {}  ; arg {}", tgt, AsmEmitter::rn(src), tgt - 1));
-                    } else {
-                        let (tgt0, src0) = pending.remove(0);
-                        em.emit(format!("    MOV   R{}, {}  ; cycle: save R{}", SCRATCH, AsmEmitter::rn(tgt0), tgt0));
-                        em.emit(format!("    MOV   R{}, {}  ; arg {}", tgt0, AsmEmitter::rn(src0), tgt0 - 1));
-                        for m in pending.iter_mut() { if m.1 == tgt0 { m.1 = SCRATCH; } }
-                    }
-                }
-            }
-            {
-                let _dummy = (); // suppress unused warning
-                for (_i, _ra) in rargs.iter().enumerate() {
-                    // handled above
-                }
-            }
+            // Materialise the arguments into R1..Rn and the callee address into
+            // R25.  Treating the fn_ptr as just another target is what keeps it
+            // from overwriting an argument that happens to share its register.
+            let mut targets: Vec<(usize, CallSrc)> = arg_srcs
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| (i + 1, s))
+                .collect();
+            targets.push((25, fp_src));
+            em.emit_call_operands(&targets);
+
             em.emit("    CALLR R25  ; indirect call through fn_ptr".to_string());
 
             let has_dst = dst.is_some();

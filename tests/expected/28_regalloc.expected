@@ -1,0 +1,20 @@
+-- indirect call operands --
+     +   |    +      0      -  
+     0   |    0      0      -  
+     -   |    -      -      -  
+PASS indirect call passes the second argument
+PASS indirect call passes both arguments
+-- direct call operands --
+PASS direct call keeps four spilled operands distinct
+-- spilled phi at join --
+PASS tand commutes
+PASS tand distributes over tor
+-- known wrong values --
+PASS min(0, +)
+PASS max(0, -)
+PASS min(+, 0)
+PASS max(-, 0)
+PASS apply min(+, -)
+PASS apply max(-, +)
+PASS apply second arg
+all regalloc regression tests done
