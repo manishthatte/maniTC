@@ -2,6 +2,9 @@
 
 [![CI](https://github.com/manishthatte/maniTC/actions/workflows/ci.yml/badge.svg)](https://github.com/manishthatte/maniTC/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21894912.svg)](https://doi.org/10.5281/zenodo.21894912)
+
+Companion paper: [*Three != Two: A Complete Balanced Ternary Software Stack*](https://doi.org/10.5281/zenodo.21894460) (Zenodo, CC BY 4.0).
 
 **ManiT** is a systems programming language in which balanced ternary is the
 native number system: integers are signed by construction, logic is
