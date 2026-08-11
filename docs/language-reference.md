@@ -84,12 +84,26 @@ significant trit comes first.
 
 | Type | Description | Range |
 |------|-------------|-------|
-| `int` | 64-bit signed integer | −2⁶³ … 2⁶³−1 |
+| `int` | Target's native machine word — **width differs by backend** | LLVM: −2⁶³ … 2⁶³−1 · T3ISA: −3,812,798,742,493 … +3,812,798,742,493 (27 trits) |
 | `float` | 64-bit floating point | IEEE 754 double |
 | `bool` | Boolean | `true`, `false` |
 | `char` | Unicode scalar value | U+0000 … U+10FFFF |
 | `str` | String (UTF-8) | — |
 | `void` | Unit / no value | — |
+
+> **`int` is not a fixed width, and portable code must account for that.** It
+> lowers to `i64` on the LLVM backend and to a 27-trit machine word on T3ISA.
+> A value between 3,812,798,742,493 and 2⁶³−1 is representable on one target and
+> not the other, so a program that computes in that band will behave differently
+> depending on how it was compiled.
+>
+> On T3ISA, arithmetic that leaves the 27-trit range **traps** — it does not
+> saturate and it does not wrap. Earlier revisions clamped silently, which let a
+> program produce a wrong answer and still report success; `examples/fibonacci.mt`
+> documents the case that exposed it.
+>
+> Use `t27` when you want the ternary width explicitly on both targets, or guard
+> against the narrower bound as `fib_safe` does.
 
 ### Ternary types
 

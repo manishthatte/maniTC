@@ -240,13 +240,45 @@ impl Emulator {
         ret
     }
 
-    /// Read a length-prefixed string from memory: memory[ptr]=len, memory[ptr+1..ptr+1+len]=chars.
+    /// Read a length-prefixed string out of emulated memory, where
+    /// `memory[ptr]` is the length and `memory[ptr+1..ptr+1+len]` the characters.
+    ///
+    /// Returns the empty string when `ptr` does not address a well-formed
+    /// lp-string. It never reads past the end of memory and never invents
+    /// characters that are not there.
+    ///
+    /// The previous version took the length word on trust: `unwrap_or(0) as
+    /// usize` turned a negative length into ~1.8e19, and the body then pushed
+    /// `char::from_u32(0)` for every word past the end of memory because the
+    /// per-character read also used `unwrap_or(0)`. A single bad address
+    /// therefore produced gigabytes of NUL. It was not theoretical —
+    /// `examples/data_structures.mt` emitted **7.7 GB** on one call to
+    /// `fmt::align_left`, and because the run still exited 0 it read as a
+    /// truncation rather than a fault.
+    ///
+    /// Two independent guards, because either alone would have prevented that:
+    /// the length must be a plausible length, and the read must stay inside
+    /// memory that exists.
     fn read_lp_string(&self, ptr: usize) -> String {
-        let len = self.memory.get(ptr).copied().unwrap_or(0) as usize;
-        let mut s = String::new();
+        let Some(&raw_len) = self.memory.get(ptr) else {
+            return String::new();
+        };
+        // A negative length is not a short string, it is a bad address.
+        if raw_len < 0 {
+            return String::new();
+        }
+        let len = raw_len as usize;
+        // The characters must fit in memory that actually exists. If they do
+        // not, this is not an lp-string and guessing at a prefix of it would
+        // only make the corruption harder to trace.
+        if ptr.saturating_add(1).saturating_add(len) > self.memory.len() {
+            return String::new();
+        }
+        let mut s = String::with_capacity(len);
         for i in 0..len {
-            let ch = self.memory.get(ptr + 1 + i).copied().unwrap_or(0);
-            if let Some(c) = char::from_u32(ch as u32) {
+            // Bounds already proven above; no unwrap_or fabrication.
+            let ch = self.memory[ptr + 1 + i];
+            if let Some(c) = u32::try_from(ch).ok().and_then(char::from_u32) {
                 s.push(c);
             }
         }

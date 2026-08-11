@@ -16,6 +16,33 @@ impl Emulator {
         self.trapped = true;
     }
 
+    /// Result of a value-producing arithmetic op, checked against the 27-trit range.
+    ///
+    /// Returns `None` having already trapped when the true result does not fit.
+    ///
+    /// These ops used to run their result through `clamp27`, which silently
+    /// substituted ±T3_MAX for the real value. A program could then compute a
+    /// wrong answer and still report success — the exact failure `trapped`
+    /// exists to prevent, and the same class of defect as the register
+    /// allocator handing a callee the wrong operand. It was not hypothetical:
+    /// `examples/fibonacci.mt` guards on the 64-bit range, so `fib_safe(70)`
+    /// saturated to T3_MAX and returned `Ok(3812798742493)` instead of
+    /// `Ok(190392490709135)` — a wrong answer wearing a success label, on the
+    /// target whose whole purpose is to be the reference semantics.
+    ///
+    /// Overflow is a property of the program being run, not a compiler bug, so
+    /// it is reported the way division by zero already was.
+    fn checked27(&mut self, v: i64, what: &str) -> Option<i64> {
+        if v > T3_MAX || v < T3_MIN {
+            self.trap(format!(
+                "TRAP: {} overflow: result {} is outside the 27-trit range [{}, {}]",
+                what, v, T3_MIN, T3_MAX
+            ));
+            return None;
+        }
+        Some(v)
+    }
+
     /// Push a call frame, enforcing the recursion and stack-pointer limits.
     ///
     /// Returns false when the call must not proceed, having already trapped.
@@ -97,17 +124,20 @@ impl Emulator {
             Opcode::Nop => {}
 
             Opcode::Tadd => {
-                let v = clamp27(self.regs[sr2] + rhs_eff);
+                let raw = self.regs[sr2].saturating_add(rhs_eff);
+                let Some(v) = self.checked27(raw, "TADD") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
             Opcode::Tsub => {
-                let v = clamp27(self.regs[sr2] - rhs_eff);
+                let raw = self.regs[sr2].saturating_sub(rhs_eff);
+                let Some(v) = self.checked27(raw, "TSUB") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
             Opcode::Tmul => {
-                let v = clamp27(self.regs[sr2].saturating_mul(rhs_eff));
+                let raw = self.regs[sr2].saturating_mul(rhs_eff);
+                let Some(v) = self.checked27(raw, "TMUL") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
@@ -153,7 +183,8 @@ impl Emulator {
             Opcode::Tshi => {
                 // multiply by 3^n; shift amount from register (r3) or immediate
                 let n = rhs_eff.clamp(0, 26) as u32;
-                let v = clamp27(self.regs[sr2].saturating_mul(3i64.pow(n)));
+                let raw = self.regs[sr2].saturating_mul(3i64.pow(n));
+                let Some(v) = self.checked27(raw, "TSHI") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }

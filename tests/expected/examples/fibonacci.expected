@@ -40,11 +40,10 @@ Iterative Fibonacci (n = 0..20):
 Safe Fibonacci with overflow detection:
   fib_safe(30) -> Ok(832040)
   fib_safe(50) -> Ok(12586269025)
-  fib_safe(70) -> Ok(3812798742493)
-  fib_safe(90) -> Ok(3812798742493)
-  fib_safe(92) -> Ok(3812798742493)
-  fib_safe(93) -> Err("overflow: exceeds 64-bit int range")
-  fib_safe(100) -> Err("overflow: exceeds 64-bit int range")
+  fib_safe(61) -> Ok(2504730781961)
+  fib_safe(62) -> Err("overflow: fib(n) exceeds the 27-trit word range for n > 61")
+  fib_safe(93) -> Err("overflow: fib(n) exceeds the 27-trit word range for n > 61")
+  fib_safe(100) -> Err("overflow: fib(n) exceeds the 27-trit word range for n > 61")
 
 F(n) mod 3 for n=0..15 (Pisano period 8):
   0, 1, 1, 2, 0, 2, 2, 1, 0, 1, 1, 2, 0, 2, 2, 1

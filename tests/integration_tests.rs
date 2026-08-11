@@ -344,7 +344,7 @@ fn example_fibonacci_llvm_err_payload_prints() {
     let run = Command::new(&output_base).output().expect("failed to run");
     let stdout = String::from_utf8_lossy(&run.stdout);
     assert!(
-        stdout.contains("Err(\"overflow: exceeds 64-bit int range\")"),
+        stdout.contains("Err(\"overflow: fib(n) exceeds the 27-trit word range for n > 61\")"),
         "Err payload must print its message (was (null) before the Result \
          layout fix), got:\n{}",
         stdout

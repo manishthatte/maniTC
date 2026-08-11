@@ -44,12 +44,21 @@ fn fib_iterative(n: int) -> int {
 // ---------------------------------------------------------------------------
 // Fibonacci with overflow check -> Result<int, str>
 // ---------------------------------------------------------------------------
+// `int` is the target's native word, and the two backends do not agree on how
+// wide that is: 64 bits on LLVM, 27 trits on T3ISA. fib(62) = 4052739537881
+// exceeds the 27-trit range, so a guard written against the 64-bit bound
+// (n > 92) is wrong on T3 — it used to let fib_safe(70) saturate silently and
+// return Ok of the wrong number. The T3 emulator now traps instead of
+// clamping, so the same guard would abort the program rather than lie.
+//
+// Portable code guards at the narrower of the two bounds. fib(61) is the
+// largest Fibonacci number that fits in a 27-trit word.
 fn fib_safe(n: int) -> Result<int, str> {
     if n < 0 {
         return Err("fib is not defined for negative indices");
     }
-    if n > 92 {
-        return Err("overflow: exceeds 64-bit int range");
+    if n > 61 {
+        return Err("overflow: fib(n) exceeds the 27-trit word range for n > 61");
     }
     return Ok(fib_iterative(n));
 }
@@ -92,7 +101,7 @@ fn main() {
     // --- Safe (Result-based) -------------------------------------------------
     io::println("");
     io::println("Safe Fibonacci with overflow detection:");
-    let test_indices: [int] = [30, 50, 70, 90, 92, 93, 100];
+    let test_indices: [int] = [30, 50, 61, 62, 93, 100];
     for idx in test_indices {
         io::print("  fib_safe(");
         io::print_int(idx);

@@ -5,12 +5,24 @@ used as the backend for maniT's balanced ternary compilation target. This docume
 specifies the architecture, instruction set, encoding, assembly syntax, and emulator
 behaviour.
 
-**Specification version 1.3** — tagged `t3isa-spec-v1.3` in this repository.
+**Specification version 1.4** — tagged `t3isa-spec-v1.4` in this repository.
 This document is the normative definition of T3ISA; independent implementations
 should cite the tagged version they were written against. Where this document
-and the manitc emulator disagree, that is a specification bug — please report it.
+and the maniTC emulator disagree, that is a specification bug — please report it.
 
-Changes since 1.2, all corrections to sections that described the emulator
+Change since 1.3, and unlike the 1.3 changes this one **alters the architecture**,
+so implementations written against 1.3 or earlier are not conformant to 1.4:
+
+- **§1 Arithmetic now traps on overflow instead of saturating.** `TADD`, `TSUB`,
+  `TMUL` and `TSHI` halt the machine and report the operation and the offending
+  value when the true result falls outside ±3,812,798,742,493. Every earlier
+  revision ran these results through `clamp27`, so a program that left the range
+  silently received ±T3_MAX and carried on to exit 0 with a wrong answer. That was
+  the wrong call and it cost a correct result: `examples/fibonacci.mt` guards on
+  the 64-bit bound, so `fib_safe(70)` returned `Ok(3812798742493)` instead of
+  `Ok(190392490709135)`. Nothing silently clamps any more.
+
+Changes in 1.3, all corrections to sections that described the emulator
 inaccurately rather than changes to the architecture:
 
 - **§3 Memory model** now gives the actual layout. The initial SP is 60,000, not
@@ -49,11 +61,16 @@ T3ISA is a load/store register machine with a 27-trit word size.
 | Registers | 27 (R0–R26) |
 | FLAGS | 1 trit: −1, 0, +1 |
 | Address space | 65,536 word-addressable cells |
-| Arithmetic | Balanced ternary (saturating at ±T3_MAX) |
+| Arithmetic | Balanced ternary; traps on overflow |
 | Endianness | N/A (ternary, stored as little-endian i64 in binary) |
 
-All arithmetic saturates at the 27-trit boundary (values are clamped to
-[−3,812,798,742,493, +3,812,798,742,493]) rather than overflowing/wrapping.
+Arithmetic neither wraps nor saturates. `TADD`, `TSUB`, `TMUL` and `TSHI` trap
+when the true result falls outside the 27-trit range
+[−3,812,798,742,493, +3,812,798,742,493], halting the machine and reporting the
+operation and the value the way division by zero already did. Overflow is a
+property of the program being run, not of the implementation, and is reported
+rather than absorbed. Revisions up to 1.3 clamped instead; see the changelog
+above.
 
 ---
 

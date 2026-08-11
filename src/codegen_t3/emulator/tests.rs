@@ -840,6 +840,76 @@ fn test_syscall_218_traps_when_heap_exhausted() {
     );
 }
 
+// Arithmetic that leaves the 27-trit range must trap rather than clamp.
+//
+// Clamping was silent: the machine substituted ±T3_MAX for the true result and
+// carried on, so a program computed a wrong number and still exited 0. It was
+// caught by differential-testing the two backends against each other —
+// `fib_safe(70)` returned Ok(3812798742493) on T3 and Ok(190392490709135) on
+// LLVM — and the golden file had recorded the wrong answer as expected output,
+// which is why the suite had been green over it.
+#[test]
+fn test_arithmetic_overflow_traps_instead_of_clamping() {
+    // Run a single instruction with the given register contents.
+    fn run_one(op: Opcode, lhs: i64, rhs: i64) -> Emulator {
+        let mut emu = Emulator::new();
+        emu.regs[2] = lhs;
+        emu.regs[3] = rhs;
+        emu.memory[0] = encode(op, 1, 2, 3, 0);
+        emu.pc = 0;
+        emu.step();
+        emu
+    }
+
+    for (name, op, rhs) in [("TADD", Opcode::Tadd, 1), ("TSUB", Opcode::Tsub, -1)] {
+        let emu = run_one(op, T3_MAX, rhs);
+        assert!(emu.trapped, "{name} past T3_MAX must trap, not clamp");
+        assert!(
+            emu.output.iter().any(|l| l.contains("overflow")),
+            "{name} overflow must say so, got {:?}",
+            emu.output
+        );
+    }
+
+    // Multiplication overshoots by far more than one, and saturating_mul must
+    // not launder that into a plausible-looking T3_MAX.
+    assert!(run_one(Opcode::Tmul, T3_MAX, 3).trapped, "TMUL overflow must trap");
+
+    // The negative boundary is not symmetric by accident — check it too.
+    assert!(run_one(Opcode::Tsub, T3_MIN, 1).trapped, "TSUB past T3_MIN must trap");
+
+    // In-range arithmetic is untouched.
+    let emu = run_one(Opcode::Tadd, T3_MAX - 1, 1);
+    assert!(!emu.trapped, "arithmetic that fits must not trap");
+    assert_eq!(emu.regs[1], T3_MAX);
+}
+
+// A length-prefixed string read must never invent characters it cannot see.
+//
+// The length word used to be taken on trust: a negative length became ~1.8e19
+// as a usize and the body then pushed a NUL for every word past the end of
+// memory. One bad address in `examples/data_structures.mt` produced 7.7 GB of
+// output, and the run still exited 0.
+#[test]
+fn test_read_lp_string_rejects_implausible_lengths() {
+    let mut emu = Emulator::new();
+
+    // Negative length is a bad address, not a short string.
+    emu.memory[5000] = -1;
+    assert_eq!(emu.read_lp_string(5000), "");
+
+    // A length running past the end of memory is not readable.
+    emu.memory[5000] = emu.memory.len() as i64;
+    assert_eq!(emu.read_lp_string(5000), "");
+
+    // A well-formed string still reads back exactly.
+    emu.memory[5000] = 3;
+    for (i, c) in "abc".chars().enumerate() {
+        emu.memory[5001 + i] = c as i64;
+    }
+    assert_eq!(emu.read_lp_string(5000), "abc");
+}
+
 #[test]
 fn test_syscall_217_print_bool3_llvm_format() {
     for (val, expect) in [(1i64, "true"), (0, "unknown"), (-1, "false")] {
