@@ -213,18 +213,25 @@ pub fn run_bench(file: &PathBuf, iterations: usize) -> CompileResult<()> {
         t3_prof.ternary_native_ops as f64 / t3_prof.total_instructions as f64 * 100.0
     } else { 0.0 };
     println!("  Ternary-native ops: {} ({:.1}% of all ops)", t3_prof.ternary_native_ops, ternary_pct);
-    println!("    These ops (TAND/TOR/TNOT/TBRANCH/TMIN/TMAX/TSHI/TSHR) have NO");
-    println!("    binary equivalent — they are native to balanced ternary hardware.");
+    println!("    These ops (TAND/TOR/TNOT/TBRANCH/TMIN/TMAX/TSHI/TSHR) have no");
+    println!("    SINGLE-INSTRUCTION binary equivalent — a binary machine emulates");
+    println!("    each with a compare-and-select sequence.");
 
-    // Three-way branching advantage
-    let tbranch_count = t3_prof.opcode_counts[19]  // Tbranch
+    // Conditional branches executed. NOT a count of three-way branches: TBRANCH
+    // is a pseudo-instruction the assembler expands into TBR_POS + TBR_ZERO +
+    // JUMP, so a single three-way dispatch contributes two to this total. The
+    // previous version of this report called it "three-way branches" and then
+    // multiplied by four to estimate a binary equivalent, double-counting twice
+    // over. No binary-equivalent estimate is printed now; there is no honest way
+    // to derive one from a profile of the ternary side alone.
+    let cond_branch_count = t3_prof.opcode_counts[19]  // Tbranch (legacy packed form)
         + t3_prof.opcode_counts[25]  // TbrPos
         + t3_prof.opcode_counts[26]  // TbrZero
         + t3_prof.opcode_counts[27]; // TbrNeg
-    if tbranch_count > 0 {
-        println!("  Three-way branches: {} (each replaces 2 binary compare+branch)", tbranch_count);
-        println!("    Binary equivalent: ~{} instructions (cmp+jz+cmp+jl pattern)",
-            tbranch_count * 4);
+    if cond_branch_count > 0 {
+        println!("  Conditional branch instructions: {}", cond_branch_count);
+        println!("    TBRANCH expands to TBR_POS + TBR_ZERO + JUMP, so the number of");
+        println!("    three-way dispatches is roughly half this figure.");
     }
 
     println!();
