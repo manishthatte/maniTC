@@ -1,4 +1,4 @@
-# Getting Started with ManiT and THATTEOS
+# Getting Started with ManiT and thatteOS
 
 *The handbook for your first hour with the balanced ternary stack.*
 
@@ -6,21 +6,21 @@ ManiT is a systems language where **three** is the native radix: trits
 (`+`, `0`, `-`) instead of bits, three-valued logic instead of Boolean,
 three-way branches instead of if/else. This guide takes you from nothing to
 running programs on both backends — your own machine (LLVM) and the
-cycle-accurate ternary emulator (T3ISA) — and then to booting the THATTEOS
+cycle-accurate ternary emulator (T3ISA) — and then to booting the thatteOS
 shell.
 
 ## 0. Prerequisites
 
 - **Rust 1.70+** with Cargo — `curl https://sh.rustup.rs -sSf | sh`
 - **clang** (any recent version; scripts default to `clang-19`) — only
-  needed for native execution and THATTEOS
+  needed for native execution and thatteOS
 - Linux (the reference platform)
 
 ## 1. Build the compiler
 
 ```sh
-git clone https://github.com/manishthatte/manitc
-cd manitc
+git clone https://github.com/manishthatte/maniTC
+cd maniTC
 cargo build --release
 export PATH="$PATH:$(pwd)/target/release"
 ```
@@ -118,24 +118,24 @@ Good example progression: `hello.mt` → `ternary_demo.mt` →
 `three_valued_logic.mt` → `fibonacci.mt` → `data_structures.mt` →
 `neural_net.mt` (a ternary neural network).
 
-## 6. Boot THATTEOS
+## 6. Boot thatteOS
 
 The companion repository is a microkernel OS written entirely in ManiT:
 
 ```sh
 cd ..
-git clone https://github.com/manishthatte/thatteos
-cd thatteos
-bash build.sh        # uses ../manitc automatically
-./thatteos           # the THATTEOS interactive shell
+git clone https://github.com/manishthatte/thatteOS
+cd thatteOS
+bash build.sh        # finds ../maniTC automatically
+./thatteos           # the thatteOS interactive shell
 ```
 
 Continue in
-[thatteos/GETTING_STARTED.md](https://github.com/manishthatte/thatteos/blob/main/GETTING_STARTED.md).
+[thatteos/GETTING_STARTED.md](https://github.com/manishthatte/thatteOS/blob/main/GETTING_STARTED.md).
 
 ## 7. Questions?
 
-Open a [GitHub Discussion](https://github.com/manishthatte/manitc/discussions).
+Open a [GitHub Discussion](https://github.com/manishthatte/maniTC/discussions).
 Contributions welcome — read [CONTRIBUTING.md](CONTRIBUTING.md) (one-line CLA
 required).
 

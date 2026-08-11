@@ -1,6 +1,6 @@
 // stream_demo.mt — Zero-Copy Trit Stream IPC Demonstration
 //
-// Demonstrates the THATTEOS trit stream IPC mechanism where
+// Demonstrates the thatteOS trit stream IPC mechanism where
 // the sender's output current IS the receiver's input current
 // on the same physical SWCNT transmission line.
 //

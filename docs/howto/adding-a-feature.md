@@ -23,7 +23,7 @@ Adding any syntactic feature requires touching these files in order:
 
 ## Step 1 — Add the keyword to the lexer
 
-Open `manitc/src/lexer.rs`.
+Open `maniTC/src/lexer.rs`.
 
 Find the `keyword_or_ident` function (around line 150). Add a mapping:
 
@@ -45,7 +45,7 @@ The lexer will now produce `TokenKind::Repeat` when it encounters the text
 
 ## Step 2 — Add an AST node
 
-Open `manitc/src/ast.rs`.
+Open `maniTC/src/ast.rs`.
 
 Add a new expression variant inside the `Expr` enum:
 
@@ -59,7 +59,7 @@ RepeatLoop(Box<Expr>, Block, Span),
 
 ## Step 3 — Parse the new syntax
 
-Open `manitc/src/parser/exprs.rs`.
+Open `maniTC/src/parser/exprs.rs`.
 
 In `parse_primary_expr()`, add a case for `TokenKind::Repeat`:
 
@@ -77,7 +77,7 @@ TokenKind::Repeat => {
 
 ## Step 4 — Add typed AST nodes
 
-Open `manitc/src/semantic/types.rs`.
+Open `maniTC/src/semantic/types.rs`.
 
 Add a variant to `TypedExprKind`:
 
@@ -90,7 +90,7 @@ RepeatLoop(Box<TypedExpr>, TypedBlock),
 
 ## Step 5 — Type-check the new construct
 
-Open `manitc/src/semantic/analyzer.rs`.
+Open `maniTC/src/semantic/analyzer.rs`.
 
 In `check_expr()`, add a case for `Expr::RepeatLoop`:
 
@@ -118,7 +118,7 @@ Expr::RepeatLoop(count_expr, body, _) => {
 
 ## Step 6 — Lower to IR
 
-Open `manitc/src/ir/lower.rs`.
+Open `maniTC/src/ir/lower.rs`.
 
 In `lower_expr()`, add a case for `TypedExprKind::RepeatLoop`:
 

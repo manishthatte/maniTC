@@ -1,7 +1,7 @@
 // examples/capability_demo.mt
-// Capability-Based Security — THATTEOS Three-Ring Model
+// Capability-Based Security — thatteOS Three-Ring Model
 //
-// THATTEOS uses a three-ring privilege model, mapped naturally to trits:
+// thatteOS uses a three-ring privilege model, mapped naturally to trits:
 //   +  =>  Ring + (Kernel)    — full hardware access
 //   0  =>  Ring 0 (Service)   — device drivers, system services
 //   -  =>  Ring - (User)      — application code
@@ -18,7 +18,7 @@
 //   Four rings, but rings 1 and 2 are almost never used
 //   Two wasted levels, more complexity for nothing
 //
-// In THATTEOS:
+// In thatteOS:
 //   Ring comparison = one trit, one gate, one cycle
 //   Three rings, all three used, no waste
 //
@@ -91,7 +91,7 @@ impl Process {
 fn demo_process_rings() {
     heading("1. Process Ring Levels — The Ternary Privilege Model");
 
-    io::println("  THATTEOS three-ring model:");
+    io::println("  thatteOS three-ring model:");
     io::println("    Ring + (Kernel):  full hardware access, memory management");
     io::println("    Ring 0 (Service): device drivers, system daemons");
     io::println("    Ring - (User):    application code, sandboxed");
@@ -405,7 +405,7 @@ fn demo_why_three() {
     io::println("  In practice, only rings 0 and 3 are used.");
     io::println("  Rings 1 and 2 are wasted — complexity for nothing.");
     io::println("");
-    io::println("  THATTEOS has three rings (+, 0, -).");
+    io::println("  thatteOS has three rings (+, 0, -).");
     io::println("  ALL THREE are actively used:");
     io::println("    + (Kernel):  memory management, interrupt handling");
     io::println("    0 (Service): device drivers, file system, network stack");

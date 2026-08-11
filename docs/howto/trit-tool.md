@@ -247,7 +247,7 @@ version = "0.1.0"        # Semantic version
 
 ---
 
-## How trit invokes manitc
+## How trit invokes maniTC
 
 `trit` finds the `manitc` binary by looking for it next to itself (same
 directory as the `trit` executable). If not found there, it falls back to

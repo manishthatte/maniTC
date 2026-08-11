@@ -1,6 +1,6 @@
 # Compiler internals
 
-This document covers every source file in `manitc/src/`, explaining the data
+This document covers every source file in `maniTC/src/`, explaining the data
 structures, key functions, and how the pieces fit together.
 
 ---
@@ -56,7 +56,7 @@ output.
 
 ## 2. main.rs — CLI and orchestration
 
-**File:** `manitc/src/main.rs` (303 lines)
+**File:** `maniTC/src/main.rs` (303 lines)
 
 ### CLI definition
 
@@ -100,7 +100,7 @@ of `addr:content` pairs.
 
 ## 3. error.rs — diagnostics
 
-**File:** `manitc/src/error.rs` (86 lines)
+**File:** `maniTC/src/error.rs` (86 lines)
 
 ### `Diagnostic`
 
@@ -153,7 +153,7 @@ CompileError::codegen(msg)                  // from backends (no location)
 
 ## 4. lexer.rs — tokenisation
 
-**File:** `manitc/src/lexer.rs` (767 lines)
+**File:** `maniTC/src/lexer.rs` (767 lines)
 
 ### `Span`
 
@@ -234,7 +234,7 @@ Accumulates `digit * 3^position`.
 
 ## 5. ast.rs — abstract syntax tree
 
-**File:** `manitc/src/ast.rs` (419 lines)
+**File:** `maniTC/src/ast.rs` (419 lines)
 
 The AST represents the programmer's source code **after parsing** but **before**
 type checking. Every node carries a `Span` for error reporting.
@@ -853,7 +853,7 @@ fn intern_string(&mut self, s: &str) -> String {
 
 ## 9. codegen_llvm.rs — LLVM backend
 
-**File:** `manitc/src/codegen_llvm.rs` (1153 lines)
+**File:** `maniTC/src/codegen_llvm.rs` (1153 lines)
 
 Entry point: `emit_llvm_ir(module: &IRModule) -> String`
 

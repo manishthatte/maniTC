@@ -72,7 +72,7 @@ char* net_http_get(const char* url) {
        a redirect loop run until the 30 s timeout. */
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "THATTEOS/0.3 browser.mt/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "thatteOS/0.3 browser.mt/1.0");
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 
     CURLcode res = curl_easy_perform(curl);

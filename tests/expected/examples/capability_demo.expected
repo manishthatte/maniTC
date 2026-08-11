@@ -5,7 +5,7 @@ Authored by: Manish Jagdish Thatte
 ================================================
   1. Process Ring Levels — The Ternary Privilege Model
 ================================================
-  THATTEOS three-ring model:
+  thatteOS three-ring model:
     Ring + (Kernel):  full hardware access, memory management
     Ring 0 (Service): device drivers, system daemons
     Ring - (User):    application code, sandboxed
@@ -117,7 +117,7 @@ Authored by: Manish Jagdish Thatte
   In practice, only rings 0 and 3 are used.
   Rings 1 and 2 are wasted — complexity for nothing.
 
-  THATTEOS has three rings (+, 0, -).
+  thatteOS has three rings (+, 0, -).
   ALL THREE are actively used:
     + (Kernel):  memory management, interrupt handling
     0 (Service): device drivers, file system, network stack

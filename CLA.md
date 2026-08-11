@@ -1,6 +1,6 @@
 # Contributor License Agreement (Individual)
 
-**Project:** manitc / THATTEOS — the ManiT software stack
+**Project:** maniTC / thatteOS — the ManiT software stack
 **Copyright holder & steward:** Manish Jagdish Thatte (manish@manitlab.org)
 
 The ManiT stack is dual-licensed: free to the world under AGPL-3.0 (with

@@ -1,12 +1,12 @@
-# manitc — the ManiT compiler
+# maniTC — the ManiT compiler
 
-[![CI](https://github.com/manishthatte/manitc/actions/workflows/ci.yml/badge.svg)](https://github.com/manishthatte/manitc/actions/workflows/ci.yml)
+[![CI](https://github.com/manishthatte/maniTC/actions/workflows/ci.yml/badge.svg)](https://github.com/manishthatte/maniTC/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
 **ManiT** is a systems programming language in which balanced ternary is the
 native number system: integers are signed by construction, logic is
 three-valued (`True` / `Unknown` / `False`), and the fundamental control-flow
-construct is a three-way branch. **manitc** is its compiler — written in Rust,
+construct is a three-way branch. **maniTC** is its compiler — written in Rust,
 with two backends:
 
 - **LLVM IR** — compile and run ManiT programs natively on your machine today
@@ -22,7 +22,7 @@ the ground floor.
 ## Quick start
 
 **New here? Read [GETTING_STARTED.md](GETTING_STARTED.md)** — the full
-handbook from install to booting THATTEOS.
+handbook from install to booting thatteOS.
 
 ```sh
 cargo build --release
@@ -53,7 +53,7 @@ is a microkernel operating system written entirely in ManiT.
 
 - **AGPL-3.0** ([LICENSE](LICENSE)) with the
   **[ManiT Runtime Library Exception](COPYING.RUNTIME-EXCEPTION)**:
-  programs you write in ManiT and compile with manitc are **yours, under any
+  programs you write in ManiT and compile with maniTC are **yours, under any
   license** — the copyleft covers only the compiler, runtime, and stdlib
   themselves.
 - **Commercial licenses** for proprietary derivatives of the compiler/runtime
