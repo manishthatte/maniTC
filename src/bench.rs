@@ -79,17 +79,17 @@ pub fn run_bench(file: &PathBuf, iterations: usize) -> CompileResult<()> {
     std::fs::write(&ll_path, &ll_text).ok();
 
     // Resolve runtime
-    let runtime_c_path = match crate::runtime_link::resolve_source(Some(file)) {
+    let runtime_c_path = match manitc::runtime_link::resolve_source(Some(file)) {
         Ok(p) => p,
         Err(e) => {
             return Err(CompileError::Codegen(Diagnostic::unknown(format!(
                 "failed to write the embedded C runtime: {}", e))));
         }
     };
-    let link = crate::runtime_link::flags();
+    let link = manitc::runtime_link::flags();
 
     // Compile LLVM binary
-    let runtime_obj = crate::runtime_link::object_path("bench");
+    let runtime_obj = manitc::runtime_link::object_path("bench");
     let _ = std::process::Command::new("clang")
         .args([runtime_c_path.to_str().unwrap(), "-c", "-O2",
                "-o", runtime_obj.to_str().unwrap()])

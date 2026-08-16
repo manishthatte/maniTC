@@ -16,6 +16,17 @@ fn strip_generics(type_name: &str) -> &str {
     }
 }
 
+/// Is this a `Vec<T>`?
+///
+/// A `Vec` is a heap container whose value is a pointer to a `{data, len, cap}`
+/// header, so it must NOT be indexed the way a flat `[T; N]` array is: a
+/// GetPtr+Load against the header reads the pointer, length and capacity fields
+/// as though they were elements 0, 1 and 2. Indexing lowers to the same native
+/// `Vec::get` / `Vec::set` calls the methods use.
+pub(super) fn is_vec(ty: &ManiType) -> bool {
+    matches!(ty, ManiType::Generic(name, _) if name == "Vec")
+}
+
 impl IRLowerer {
     pub(super) fn lower_expr(&mut self, expr: &TypedExpr) -> IRValue {
         let ty = IRType::from_mani(&expr.ty);
@@ -587,6 +598,22 @@ impl IRLowerer {
             }
 
             TypedExprKind::Index(arr, idx) => {
+                // `v[i]` on a Vec is `v.get(i)`. Falling through to GetPtr+Load
+                // here would read the Vec's {data, len, cap} header instead of
+                // its elements, silently and on both backends.
+                if is_vec(&arr.ty) {
+                    let arr_val = self.lower_expr(arr);
+                    let idx_val = self.lower_expr(idx);
+                    let dst = self.fresh_temp();
+                    self.emit(IRInstr::Call {
+                        dst: Some(dst.clone()),
+                        func: "Vec::get".to_string(),
+                        args: vec![arr_val, idx_val],
+                        ret_ty: ty,
+                    });
+                    return IRValue::Temp(dst);
+                }
+
                 // A2: bounds-check when the element count is statically known.
                 let arr_len = match &arr.ty {
                     ManiType::Array(_, Some(n)) => Some(*n),

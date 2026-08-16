@@ -372,12 +372,40 @@ pub(crate) fn mangle_func_name(name: &str) -> String {
 // Declare-line parser for building the function signature map
 // ---------------------------------------------------------------------------
 
+/// ABI/parameter attributes that may appear beside a type in a `declare` line.
+///
+/// These belong to the declaration, not to the type. `i8 signext` is an `i8`
+/// that the ABI says is sign-extended by the caller; leaving the word attached
+/// makes downstream type logic treat `"i8 signext"` as a distinct type and emit
+/// nonsense like `sext i8 %t to i8 signext`.
+const LLVM_PARAM_ATTRS: &[&str] = &[
+    "signext", "zeroext", "noundef", "inreg", "nonnull", "noalias", "nocapture",
+    "readonly", "writeonly", "immarg", "returned", "nofree", "dead_on_unwind",
+];
+
+/// Strip ABI attributes from one `declare` type slot, leaving the bare type.
+///
+/// `"signext i8"` -> `"i8"`, `"i8 signext"` -> `"i8"`, `"ptr"` -> `"ptr"`,
+/// `"..."` -> `"..."` (the vararg marker must survive).
+pub(crate) fn strip_llvm_attrs(slot: &str) -> String {
+    let kept: Vec<&str> = slot
+        .split_whitespace()
+        .filter(|w| !LLVM_PARAM_ATTRS.contains(w))
+        .collect();
+    kept.join(" ")
+}
+
 /// Parse LLVM `declare` lines to extract function signatures.
 /// Returns a map from function name to (param_types, return_type).
 /// A trailing `"..."` entry in param_types marks a vararg function — Call
 /// emission needs it to print the full callee type
 /// (`call ptr (ptr, ...) @fmt_format(...)`), which the x86-64 varargs ABI
 /// requires (the AL register carries the vector-register count).
+///
+/// Types come back **without** ABI attributes. The attributes stay in the
+/// emitted `declare` line, where they must match the C runtime's ABI exactly;
+/// LLVM's `CallBase::paramHasAttr` falls back to the callee's attribute list,
+/// so a direct call needs no attribute of its own to be lowered correctly.
 pub(crate) fn parse_declare_sigs(decl_text: &str) -> HashMap<String, (Vec<String>, String)> {
     let mut sigs = HashMap::new();
     for line in decl_text.lines() {
@@ -392,7 +420,7 @@ pub(crate) fn parse_declare_sigs(decl_text: &str) -> HashMap<String, (Vec<String
             Some(p) => p,
             None => continue,
         };
-        let ret_str = rest[..at_pos].trim().to_string();
+        let ret_str = strip_llvm_attrs(rest[..at_pos].trim());
         let after_at = &rest[at_pos + 1..];
         // Find opening paren
         let paren_pos = match after_at.find('(') {
@@ -411,7 +439,7 @@ pub(crate) fn parse_declare_sigs(decl_text: &str) -> HashMap<String, (Vec<String
         } else {
             params_str
                 .split(',')
-                .map(|p| p.trim().to_string())
+                .map(|p| strip_llvm_attrs(p.trim()))
                 .collect()
         };
         sigs.insert(name, (params, ret_str));
@@ -436,10 +464,10 @@ declare void @io_print_int(i64)
 declare void @io_println_int(i64)
 declare void @io_print_float(double)
 declare void @io_println_float(double)
-declare void @io_print_char(i8)
-declare void @io_print_trit(i8)
-declare void @io_print_bool3(i8)
-declare void @io_print_tryte(i8)
+declare void @io_print_char(i8 signext)
+declare void @io_print_trit(i8 signext)
+declare void @io_print_bool3(i8 signext)
+declare void @io_print_tryte(i8 signext)
 declare ptr @io_read_line()
 declare i64 @io_read_int()
 
@@ -450,8 +478,8 @@ declare ptr @fmt_int_to_str(i64)
 declare ptr @fmt_show_int(i64)
 declare ptr @fmt_show_float(double)
 declare ptr @fmt_show_bool(i1)
-declare ptr @fmt_show_trit(i8)
-declare ptr @fmt_show_bool3(i8)
+declare ptr @fmt_show_trit(i8 signext)
+declare ptr @fmt_show_bool3(i8 signext)
 declare ptr @fmt_pad_zeros(ptr, i64)
 declare ptr @fmt_align_left(ptr, i64)
 declare ptr @fmt_align_right(ptr, i64)
@@ -478,7 +506,7 @@ declare i64 @math_trit_count(i64)
 
 ; ---- str ----
 declare i64 @str_len(ptr)
-declare i8 @str_char_at(ptr, i64)
+declare signext i8 @str_char_at(ptr, i64)
 declare ptr @str_concat(ptr, ptr)
 declare ptr @str_substr(ptr, i64, i64)
 declare i1 @str_starts_with(ptr, ptr)
@@ -568,14 +596,14 @@ declare ptr @Mutex_lock(ptr)
 declare void @Mutex_unlock(ptr)
 declare i64 @Mutex_get(ptr)
 declare void @Mutex_set(ptr, i64)
-declare ptr @AtomicTrit_new(i8)
-declare i8 @AtomicTrit_get(ptr)
-declare void @AtomicTrit_set(ptr, i8)
-declare i8 @AtomicTrit_swap(ptr, i8)
-declare i1 @AtomicTrit_compare_exchange(ptr, i8, i8)
-declare i8 @AtomicTrit_fetch_and(ptr, i8)
-declare i8 @AtomicTrit_fetch_or(ptr, i8)
-declare i8 @AtomicTrit_fetch_neg(ptr)
+declare ptr @AtomicTrit_new(i8 signext)
+declare signext i8 @AtomicTrit_get(ptr)
+declare void @AtomicTrit_set(ptr, i8 signext)
+declare signext i8 @AtomicTrit_swap(ptr, i8 signext)
+declare i1 @AtomicTrit_compare_exchange(ptr, i8 signext, i8 signext)
+declare signext i8 @AtomicTrit_fetch_and(ptr, i8 signext)
+declare signext i8 @AtomicTrit_fetch_or(ptr, i8 signext)
+declare signext i8 @AtomicTrit_fetch_neg(ptr)
 declare ptr @AtomicInt_new(i64)
 declare i64 @AtomicInt_load(ptr)
 declare void @AtomicInt_store(ptr, i64)
@@ -601,8 +629,8 @@ declare i1 @Semaphore_try_acquire(ptr)
 declare i64 @Semaphore_available(ptr)
 
 ; ---- ternary utils ----
-declare i64 @ternary_trit_to_int(i8)
-declare i8 @ternary_int_to_trit(i64)
+declare i64 @ternary_trit_to_int(i8 signext)
+declare signext i8 @ternary_int_to_trit(i64)
 declare ptr @ternary_t27_to_str(i64)
 
 ; ---- fs (filesystem) ----
@@ -687,7 +715,7 @@ declare ptr @str_reverse(ptr)
 declare ptr @str_from_float(double)
 declare ptr @str_from_bool(i1)
 declare ptr @str_from_trit(i8)
-declare i8 @ternary_trit_median(i8, i8, i8)
+declare signext i8 @ternary_trit_median(i8 signext, i8 signext, i8 signext)
 declare ptr @str_to_int(ptr)
 declare ptr @str_to_float(ptr)
 declare void @Channel_send(ptr, i64)

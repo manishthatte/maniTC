@@ -452,3 +452,58 @@ fn a18_dash_o_without_ll_extension_still_links_a_binary() {
     let ir = std::fs::read_to_string(&ll).expect("IR should be written alongside");
     assert!(ir.contains("@main"), "expected IR next to the binary");
 }
+
+// ---------------------------------------------------------------------------
+// V1 — `v[i]` on a Vec must index the elements, not the header.
+//
+// A `Vec` value is a pointer to a {data, len, cap} header. Index lowering
+// treated it as a flat array, so GetPtr+Load read the header fields as though
+// they were elements 0, 1 and 2. The semantic pass types Vec indexing (it
+// yields the element type), so this compiled and ran on both backends and
+// silently produced wrong values:
+//
+//     v = [3, 1, 4]        T3: v[0..2] = 0, 0, 0
+//                        LLVM: v[0..2] = <heap ptr>, 3 (the len), 8 (the cap)
+//
+// Both now lower to the same native Vec::get / Vec::set the methods use.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v1_vec_index_reads_elements_on_both_backends() {
+    let src = r#"
+fn main() {
+    let mut v: Vec<int> = Vec::new();
+    v.push(3); v.push(1); v.push(4);
+    io::println(fmt::format("{} {} {}", [
+        fmt::show_int(v[0]), fmt::show_int(v[1]), fmt::show_int(v[2])]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("v1_read.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(t3_out.contains("3 1 4"), "t3 must read elements, got:\n{}", t3_out);
+    assert!(ll_out.contains("3 1 4"), "llvm must read elements, got:\n{}", ll_out);
+}
+
+#[test]
+fn v1_vec_index_assignment_writes_elements_on_both_backends() {
+    // Plain and compound assignment through the index operator, cross-checked
+    // against .get() so a regression cannot pass by breaking both alike.
+    let src = r#"
+fn main() {
+    let mut v: Vec<int> = Vec::new();
+    v.push(3); v.push(1); v.push(4);
+    v[1] = 99;
+    v[2] += 10;
+    io::println(fmt::format("{} {} {} len={}", [
+        fmt::show_int(v[0]), fmt::show_int(v.get(1)), fmt::show_int(v[2]),
+        fmt::show_int(v.len())]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("v1_write.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // len=3 is the tell: writing through v[1] must not clobber the header.
+    assert!(t3_out.contains("3 99 14 len=3"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("3 99 14 len=3"), "llvm wrong:\n{}", ll_out);
+}

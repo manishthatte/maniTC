@@ -1,6 +1,6 @@
 mod bench;
-mod runtime_link;
 use bench::{read_source, run_bench};
+use manitc::runtime_link;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

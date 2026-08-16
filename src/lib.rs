@@ -8,3 +8,4 @@ pub mod borrow;
 pub mod codegen_llvm;
 pub mod codegen_t3;
 pub mod lsp;
+pub mod runtime_link;

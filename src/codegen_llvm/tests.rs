@@ -465,3 +465,129 @@ fn test_call_uses_declared_types() {
     // Must NOT contain the wrong types
     assert!(!ir.contains("call i64 @io_println"));
 }
+
+// ===========================================================================
+// The C-runtime ABI must match, attribute for attribute.
+//
+// maniTC declared every trit parameter as a bare `i8`, while clang compiles the
+// C runtime's `int8_t` as `i8 signext`. At -O0 the mismatch is invisible; from
+// -O1 the caller stops zero-filling the register by accident and every `-1`
+// trit arrives as 255. Verified by re-linking one example against an -O2
+// runtime with only the `signext` attributes removed:
+//
+//     -  -> int value: -1      becomes      -  -> int value: 255
+//     0t--+ = -11              becomes      0t--+ = 245
+// ===========================================================================
+
+#[test]
+fn runtime_trit_declares_carry_signext() {
+    use super::helpers::STDLIB_DECLARES;
+    // Every runtime entry point taking or returning a scalar trit/char.
+    for name in [
+        "ternary_trit_to_int", "ternary_int_to_trit", "ternary_trit_median",
+        "io_print_trit", "io_print_bool3", "io_print_char", "io_print_tryte",
+        "fmt_show_trit", "fmt_show_bool3", "str_char_at",
+        "AtomicTrit_new", "AtomicTrit_get", "AtomicTrit_set", "AtomicTrit_swap",
+        "AtomicTrit_fetch_and", "AtomicTrit_fetch_or", "AtomicTrit_fetch_neg",
+        "AtomicTrit_compare_exchange",
+    ] {
+        let line = STDLIB_DECLARES
+            .lines()
+            .find(|l| l.contains(&format!("@{}(", name)))
+            .unwrap_or_else(|| panic!("no declare for @{}", name));
+        assert!(
+            line.contains("signext"),
+            "@{} takes or returns a signed i8 in the C runtime, so its declare \
+             must say signext, got:\n  {}",
+            name, line,
+        );
+    }
+}
+
+#[test]
+fn parse_declare_sigs_strips_abi_attributes() {
+    // The attribute belongs to the declaration, not the type. Leaving it
+    // attached made downstream type logic emit `sext i8 %t to i8 signext`.
+    use super::helpers::parse_declare_sigs;
+    let sigs = parse_declare_sigs(
+        "declare signext i8 @f(ptr, i8 signext, i64 noundef)\n\
+         declare ptr @g(ptr, ...)\n",
+    );
+    let (params, ret) = sigs.get("f").expect("f should parse");
+    assert_eq!(ret, "i8", "return type must come back bare");
+    assert_eq!(params, &vec!["ptr".to_string(), "i8".to_string(), "i64".to_string()]);
+    // The vararg marker is not an attribute and must survive.
+    let (gparams, _) = sigs.get("g").expect("g should parse");
+    assert_eq!(gparams.last().map(String::as_str), Some("..."));
+}
+
+/// The RAVAN check: derive the ABI from the C runtime itself rather than
+/// trusting the list above. Skips when clang or the runtime source is absent.
+#[test]
+fn runtime_declares_match_the_abi_clang_actually_emits() {
+    use super::helpers::STDLIB_DECLARES;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    // runtime_link lives in the binary crate, so resolve both here.
+    let clang = ["clang", "clang-19", "clang-18", "clang-17",
+                 "/usr/lib/llvm-19/bin/clang"]
+        .into_iter()
+        .find(|c| {
+            Command::new(c).arg("--version").output()
+                .map(|o| o.status.success()).unwrap_or(false)
+        });
+    let Some(clang) = clang else {
+        eprintln!("skipping: no clang on this machine");
+        return;
+    };
+    let rt = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/manit_runtime.c");
+    if !rt.exists() {
+        eprintln!("skipping: manit_runtime.c not found");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("manitc_abi_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let ll = dir.join("rt.ll");
+    let out = Command::new(&clang)
+        .args([
+            rt.to_str().unwrap(), "-S", "-emit-llvm", "-O0", "-w",
+            "-DMANIT_NO_GUI", "-o", ll.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run clang");
+    if !out.status.success() {
+        eprintln!("skipping: runtime would not compile here");
+        return;
+    }
+    let ir = std::fs::read_to_string(&ll).expect("read runtime IR");
+
+    let mut checked = 0usize;
+    for line in ir.lines() {
+        let Some(rest) = line.strip_prefix("define ") else { continue };
+        let Some(at) = rest.find('@') else { continue };
+        let Some(open) = rest[at..].find('(').map(|p| p + at) else { continue };
+        let Some(close) = rest[open..].find(')').map(|p| p + open) else { continue };
+        let name = &rest[at + 1..open];
+        let sig = &rest[..close];
+        // Only the functions where a scalar i8 crosses the boundary.
+        if !sig.split_whitespace().any(|w| w.trim_end_matches(',') == "i8") {
+            continue;
+        }
+        let Some(decl) = STDLIB_DECLARES
+            .lines()
+            .find(|l| l.contains(&format!("@{}(", name)))
+        else { continue };
+        assert!(
+            decl.contains("signext"),
+            "@{} crosses the boundary with a scalar i8. clang emits:\n  {}\n\
+             maniTC declares:\n  {}\n\
+             The declaration must carry signext, or every -1 trit arrives as 255 \
+             once the runtime is optimised.",
+            name, sig.trim(), decl,
+        );
+        checked += 1;
+    }
+    assert!(checked >= 15, "expected the whole trit runtime surface, checked {}", checked);
+}

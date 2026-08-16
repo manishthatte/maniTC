@@ -189,6 +189,47 @@ impl IRLowerer {
             TypedStmt::Assign(a) => {
                 let val = self.lower_expr(&a.value);
                 let val = self.coerce_value(val, &a.value.ty, &a.target.ty);
+
+                // `v[i] = x` on a Vec is `v.set(i, x)`. A Vec's value is a
+                // pointer to its {data, len, cap} header, so storing through a
+                // GetPtr against it would overwrite the header rather than an
+                // element — the write-side twin of the read bug above.
+                if let TypedExprKind::Index(base, idx) = &a.target.kind {
+                    if super::lower_expr::is_vec(&base.ty) {
+                        let base_val = self.lower_expr(base);
+                        let idx_val = self.lower_expr(idx);
+                        let elem_ty = IRType::from_mani(&a.target.ty);
+                        let val = if let Some(op) = &a.op {
+                            // Compound assignment: get, apply, set.
+                            let cur = self.fresh_temp();
+                            self.emit(IRInstr::Call {
+                                dst: Some(cur.clone()),
+                                func: "Vec::get".to_string(),
+                                args: vec![base_val.clone(), idx_val.clone()],
+                                ret_ty: elem_ty.clone(),
+                            });
+                            let result_t = self.fresh_temp();
+                            self.emit(IRInstr::BinOp {
+                                dst: result_t.clone(),
+                                op: binop_to_ir(op, &a.value.ty),
+                                lhs: IRValue::Temp(cur),
+                                rhs: val,
+                                ty: elem_ty,
+                            });
+                            IRValue::Temp(result_t)
+                        } else {
+                            val
+                        };
+                        self.emit(IRInstr::Call {
+                            dst: None,
+                            func: "Vec::set".to_string(),
+                            args: vec![base_val, idx_val, val],
+                            ret_ty: IRType::Void,
+                        });
+                        return IRValue::Void;
+                    }
+                }
+
                 let ptr = self.lower_expr_as_ptr(&a.target);
                 // Struct/tuple fields use the uniform 8-byte slot convention,
                 // so field stores/loads must use the slot access width.
