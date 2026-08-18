@@ -1,0 +1,43 @@
+{
+  "title": "maniTC: a compiler for ManiT, a balanced-ternary systems programming language",
+  "version": "0.1.0",
+  "upload_type": "software",
+  "license": "AGPL-3.0-or-later",
+  "access_right": "open",
+  "language": "eng",
+  "creators": [
+    {
+      "name": "Thatte, Manish Jagdish",
+      "affiliation": "maniTLab, Nashik, Maharashtra, India",
+      "orcid": "0009-0003-8050-1242"
+    }
+  ],
+  "description": "<p><strong>ManiT</strong> is a systems programming language in which balanced ternary is the native number system: integers are signed by construction, logic is three-valued (True / Unknown / False), and the fundamental control-flow construct is a three-way branch. <strong>maniTC</strong> is its compiler, written in Rust, with two backends.</p><p>The <strong>LLVM IR</strong> backend compiles and runs ManiT programs natively on ordinary binary hardware today, linking against an embedded C runtime. The <strong>T3ISA</strong> backend targets a balanced ternary instruction set, and ships with an assembler and a cycle-accurate emulator.</p><p>This is not a binary language with ternary features added. Balanced-ternary words and trytes, Kleene three-valued logic, three-way branching, balanced ternary floating point, and a ternary-native standard library are the foundation of the design rather than a layer over it.</p><p>Distributed under AGPL-3.0-or-later with the ManiT Runtime Library Exception covering the runtime and standard library, so programs compiled with maniTC are not themselves derivative works. A commercial licence is available.</p>",
+  "keywords": [
+    "balanced ternary",
+    "ternary computing",
+    "compiler",
+    "programming language",
+    "LLVM",
+    "instruction set architecture",
+    "three-valued logic",
+    "Kleene logic",
+    "Rust",
+    "post-CMOS",
+    "unconventional computing"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/manishthatte/maniTC",
+      "relation": "isSupplementTo",
+      "resource_type": "software",
+      "scheme": "url"
+    },
+    {
+      "identifier": "10.5281/zenodo.21894460",
+      "relation": "isDocumentedBy",
+      "resource_type": "publication-article",
+      "scheme": "doi"
+    }
+  ]
+}

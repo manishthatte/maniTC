@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+title: "maniTC: a compiler for ManiT, a balanced-ternary systems programming language"
+message: If you use this software, please cite it as below.
+type: software
+authors:
+  - family-names: Thatte
+    given-names: Manish Jagdish
+    orcid: "https://orcid.org/0009-0003-8050-1242"
+    affiliation: maniTLab, Nashik, Maharashtra, India
+    email: manish@manitlab.org
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21894912
+    description: Concept DOI, resolving to the latest version
+repository-code: "https://github.com/manishthatte/maniTC"
+url: "https://www.manitlab.org"
+abstract: >-
+  ManiT is a systems programming language in which balanced
+  ternary is the native number system: integers are signed by
+  construction, logic is three-valued, and the fundamental
+  control-flow construct is a three-way branch. maniTC is its
+  compiler, with an LLVM backend for binary hosts and a T3ISA
+  backend for balanced ternary hardware, including an assembler
+  and cycle-accurate emulator.
+keywords:
+  - balanced ternary
+  - compiler
+  - programming language
+  - LLVM
+  - three-valued logic
+license: AGPL-3.0-or-later
+version: 0.1.0
