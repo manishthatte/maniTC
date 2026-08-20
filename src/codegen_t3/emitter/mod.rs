@@ -61,13 +61,17 @@ struct AsmEmitter {
 }
 
 impl AsmEmitter {
-    fn new(last_use: HashMap<String, usize>, struct_sizes: HashMap<String, usize>) -> Self {
+    fn new(
+        last_use: HashMap<String, usize>,
+        first_def: HashMap<String, usize>,
+        struct_sizes: HashMap<String, usize>,
+    ) -> Self {
         AsmEmitter {
             lines: Vec::new(),
             cur_instr: Vec::new(),
             pending_post: Vec::new(),
             pending_sp_increments: 0,
-            reg_alloc: RegAlloc::new(last_use),
+            reg_alloc: RegAlloc::new(last_use, first_def),
             spill_read_idx: 0,
             block_canonical_sp: HashMap::new(),
             block_canonical_regs: HashMap::new(),
@@ -110,6 +114,7 @@ impl AsmEmitter {
             .iter()
             .find(|(name, &r)| {
                 r == reg
+                    && self.reg_alloc.holds_value(name)
                     && self.reg_alloc.last_use
                         .get(*name)
                         .map_or(false, |&lu| lu >= cur)
@@ -151,6 +156,7 @@ impl AsmEmitter {
             .iter()
             .find(|(name, &r)| {
                 r == reg
+                    && self.reg_alloc.holds_value(name)
                     && self.reg_alloc.last_use
                         .get(*name)
                         .map_or(false, |&lu| lu > cur)
@@ -198,6 +204,7 @@ impl AsmEmitter {
         let to_save: Vec<usize> = regs.iter().copied().filter(|&r| {
             self.reg_alloc.temp_to_reg.iter().any(|(name, &tr)| {
                 tr == r
+                    && self.reg_alloc.holds_value(name)
                     && self.reg_alloc.last_use
                         .get(name)
                         .map_or(false, |&lu| lu > cur)
@@ -733,8 +740,8 @@ fn emit_function(
     struct_sizes: HashMap<String, usize>,
     global_addrs: HashMap<String, i64>,
 ) -> (String, Vec<(String, i64)>) {
-    let last_use = compute_last_use(&func.blocks);
-    let mut em = AsmEmitter::new(last_use, struct_sizes);
+    let (last_use, first_def) = compute_last_use(&func.blocks);
+    let mut em = AsmEmitter::new(last_use, first_def, struct_sizes);
     em.fn_name = func.name.clone();
     em.global_addrs = global_addrs;
 

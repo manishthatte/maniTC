@@ -1,7 +1,7 @@
 // ir/lower/lower_stmt.rs — Statement lowering for IRLowerer.
 
 use super::IRLowerer;
-use super::helpers::binop_to_ir;
+use super::helpers::{binop_to_ir, slot_access_ty};
 use crate::ir::types::*;
 use crate::ast::LetPat;
 use crate::semantic::{ManiType, TypedStmt, TypedExprKind};
@@ -30,33 +30,73 @@ impl IRLowerer {
                 // Special case: LetPat::Tuple — destructure a tuple into separate locals.
                 if let LetPat::Tuple(names) = &ls.pat {
                     if let Some(init) = &ls.init {
+                        // Element types, so each name is bound at its OWN width.
+                        //
+                        // Every name used to be bound as I64 regardless. Tuple
+                        // slots really are 8 bytes wide (slot_access_ty), so the
+                        // LOAD was right — but the binding then claimed i64 for
+                        // a `trit`, and a later `carry = c` emitted
+                        //     store i64 %v, ptr %carry   ; %carry = alloca i8
+                        // an eight-byte write into a one-byte stack slot, which
+                        // silently overran the neighbouring allocas. That is
+                        // ORACLE_FINDINGS.md Section 10: it read as "LLVM loses
+                        // a trit argument in a loop" because the clobbered
+                        // neighbour happened to be another local. T3 was
+                        // unaffected — its slots are uniformly one word.
+                        let elem_manitys: Option<Vec<ManiType>> =
+                            match (&init.ty, &ls.ty) {
+                                (ManiType::Tuple(ts), _) => Some(ts.clone()),
+                                (_, ManiType::Tuple(ts)) => Some(ts.clone()),
+                                _ => None,
+                            };
                         // Lower the initializer expression (should produce a tuple/struct pointer)
                         let tuple_ptr = self.lower_expr(init);
                         for (i, name) in names.iter().enumerate() {
+                            let elem_ir = elem_manitys
+                                .as_ref()
+                                .and_then(|ts| ts.get(i))
+                                .map(IRType::from_mani)
+                                .unwrap_or(IRType::I64);
+                            let slot_ty = slot_access_ty(&elem_ir);
                             // Compute pointer to field i
                             let field_ptr = self.fresh_temp();
                             self.emit(IRInstr::GetPtr {
                                 dst: field_ptr.clone(),
                                 ptr: tuple_ptr.clone(),
                                 idx: IRValue::Const(IRConst::Int(i as i64)),
-                                ty: IRType::I64,
+                                ty: slot_ty.clone(),
                             });
-                            // Load the field value
+                            // Load the field value at the slot's width.
                             let val_t = self.fresh_temp();
                             self.emit(IRInstr::Load {
                                 dst: val_t.clone(),
                                 ptr: IRValue::Temp(field_ptr),
-                                ty: IRType::I64,
+                                ty: slot_ty.clone(),
                             });
+                            // Narrow to the element's own type before binding.
+                            let mut val = IRValue::Temp(val_t);
+                            if slot_ty != elem_ir {
+                                let cast_t = self.fresh_temp();
+                                self.emit(IRInstr::Cast {
+                                    dst: cast_t.clone(),
+                                    src: val,
+                                    from_ty: slot_ty,
+                                    to_ty: elem_ir.clone(),
+                                });
+                                val = IRValue::Temp(cast_t);
+                            }
                             // Alloca a slot for this name and store
                             let alloca_t = self.fresh_temp();
-                            self.emit(IRInstr::Alloca { dst: alloca_t.clone(), ty: IRType::I64 });
+                            self.emit(IRInstr::Alloca {
+                                dst: alloca_t.clone(),
+                                ty: elem_ir.clone(),
+                            });
                             self.emit(IRInstr::Store {
                                 ptr: IRValue::Temp(alloca_t.clone()),
-                                val: IRValue::Temp(val_t),
-                                ty: IRType::I64,
+                                val,
+                                ty: elem_ir.clone(),
                             });
-                            self.locals.insert(name.clone(), (alloca_t, IRType::I64));
+                            self.locals.insert(name.clone(), (alloca_t, elem_ir));
                         }
                     }
                     return IRValue::Void;

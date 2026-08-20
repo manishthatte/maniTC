@@ -44,9 +44,9 @@ maniT Three-Valued Logic Demo
   txor  (exclusive-or, (a+b) mod3 balanced):
        |   +      0      -  
   -----+---------------------
-     +   |    0      +      +  
-     0   |    +      0      +  
-     -   |    +      +      0  
+     +   |    -      +      0  
+     0   |    +      0      -  
+     -   |    0      -      +  
 
   Luk implication  (max(tnot a, b)):
        |   +      0      -  
@@ -55,12 +55,12 @@ maniT Three-Valued Logic Demo
      0   |    +      0      0  
      -   |    +      +      +  
 
-  Luk biconditional (tnot(a txor b)):
+  Luk biconditional (1 - |a - b|):
        |   +      0      -  
   -----+---------------------
-     +   |    0      -      -  
-     0   |    -      0      -  
-     -   |    -      -      0  
+     +   |    +      0      -  
+     0   |    0      +      0  
+     -   |    -      0      +  
 
 
 ================================================

@@ -235,9 +235,13 @@ void async_yield_now(void) { sched_yield(); }
 /* ======================== ternary utils ======================== */
 
 int64_t ternary_trit_to_int(int8_t t) { return (int64_t)t; }
-int8_t  ternary_int_to_trit(int64_t n) {
-    return (int8_t)(n > 0 ? 1 : (n < 0 ? -1 : 0));
-}
+/* Superseded 19 August 2026: this is now ManiT source in
+ * stdlib/ternary.mt, so both backends share one definition. Leaving the C
+ * copy here made the linker reject every program that called it -- the
+ * merged ManiT function mangles to the same symbol.
+ * The sign-clamp below is what the ManiT version does, which is why
+ * int_to_trit was DIVERGENT: the T3 emitter treated it as an identity
+ * move, so int_to_trit(5) returned 5 there and +1 here. */
 char* ternary_t27_to_str(int64_t n); /* forward declaration */
 char* ternary_to_balanced_ternary(int64_t n) { return ternary_t27_to_str(n); }
 int64_t ternary_from_balanced_ternary(const char* s) {

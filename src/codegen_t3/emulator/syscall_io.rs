@@ -282,6 +282,53 @@ impl Emulator {
             }
 
             // ----------------------------------------------------------------
+            // char primitives (133-134)
+            //
+            // These are the only two char operations that cannot be written in
+            // ManiT, so every other char-dependent str:: function is built on
+            // them and shares one body across both backends. Byte-indexed, to
+            // match the rest of this block and the C runtime's str_char_at.
+            // ----------------------------------------------------------------
+            133 => {
+                // str_char_at(ptr=R1, i=R2) → R1 = byte value, or 0 if out of range
+                let s = self.get_string_r1();
+                let i = self.regs[2];
+                self.regs[1] = if i < 0 || i >= s.len() as i64 {
+                    0
+                } else {
+                    s.as_bytes()[i as usize] as i64
+                };
+            }
+            134 => {
+                // str_from_char(c=R1) → R1 = ptr to a one-char string
+                let c = self.regs[1];
+                let s = char::from_u32(c as u32).map(String::from).unwrap_or_default();
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
+            }
+            135 => {
+                // ternary_int_to_trits(n=R1, width=R2) → R1 = ptr to a
+                // length-prefixed array of exactly `width` trits, LST-first,
+                // zero-padded, higher trits discarded.
+                //
+                // Mirrors @ternary_int_to_trits in codegen_llvm/helpers.rs.
+                // val == 0 needs no special case: rem 0 gives digit 0 and val
+                // stays 0, which is exactly the zero padding.
+                let mut val = self.regs[1];
+                let width = self.regs[2].max(0);
+                let mut words = Vec::with_capacity(width as usize + 1);
+                words.push(width);
+                for _ in 0..width {
+                    let rem = val.rem_euclid(3);
+                    let d = if rem == 2 { -1 } else { rem };
+                    words.push(d);
+                    val = (val - d) / 3;
+                }
+                let addr = self.heap_alloc_array(&words);
+                self.regs[1] = addr as i64;
+            }
+
+            // ----------------------------------------------------------------
             // String comparison (200) and t27 shifts (201-202)
             // ----------------------------------------------------------------
             200 => {
@@ -307,6 +354,28 @@ impl Emulator {
                 let k = self.regs[2].clamp(0, 26) as u32;
                 let p = 3i64.pow(k);
                 self.regs[1] = (n + (p - 1) / 2).div_euclid(p);
+            }
+            203 => {
+                // __lp_from_flat(R1 = flat array ptr, R2 = len) → R1 = ptr to a
+                // length-prefixed copy (mem[p] = len, trits at mem[p+1..=len]).
+                //
+                // Compiler-internal: emitted only by the IR lowering, when an
+                // unsized `[trit]` parameter — which is flat, element i at slot
+                // i, length passed separately — reaches a stdlib function that
+                // reads length-prefixed (syscalls 8, 11, 12). Without it the
+                // first trit was read as the length.
+                //
+                // T3 memory is one word per slot, so this is a plain copy; the
+                // LLVM counterpart @__lp_from_flat has to sign-extend i8 trits.
+                let ptr = self.regs[1] as usize;
+                let len = self.regs[2].max(0) as usize;
+                let mut words = Vec::with_capacity(len + 1);
+                words.push(len as i64);
+                for i in 0..len {
+                    words.push(self.memory.get(ptr + i).copied().unwrap_or(0));
+                }
+                let addr = self.heap_alloc_array(&words);
+                self.regs[1] = addr as i64;
             }
 
             // ----------------------------------------------------------------

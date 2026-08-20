@@ -162,11 +162,12 @@ fn test_txor() {
     let p: trit = +;
     let z: trit = 0;
     let n: trit = -;
-    check_trit("txor: + txor + = 0", p txor p, 0);
+    // txor is balanced (a + b) mod 3 — sum without carry.
+    check_trit("txor: + txor + = -", p txor p, -1);
     check_trit("txor: + txor 0 = +", p txor z, 1);
-    check_trit("txor: + txor - = +", p txor n, 1);
-    check_trit("txor: - txor - = 0", n txor n, 0);
-    check_trit("txor: 0 txor - = +", z txor n, 1);
+    check_trit("txor: + txor - = 0", p txor n, 0);
+    check_trit("txor: - txor - = +", n txor n, 1);
+    check_trit("txor: 0 txor - = -", z txor n, -1);
 }
 
 // ---------------------------------------------------------------------------

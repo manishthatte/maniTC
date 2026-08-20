@@ -185,7 +185,34 @@ impl LLVMEmitter {
         out.push('\n');
 
         // ---- maniT stdlib declarations -------------------------------------
-        out.push_str(STDLIB_DECLARES);
+        //
+        // Skip any declare the module also DEFINES. A stdlib function that
+        // moves from the C runtime into ManiT source keeps its mangled name —
+        // `fmt::show_bool3` is still `@fmt_show_bool3` — so emitting the
+        // declare alongside the new define is `invalid redefinition` and the IR
+        // will not assemble.
+        //
+        // Filtering here rather than deleting lines from STDLIB_DECLARES is
+        // deliberate. The C implementations stay in the runtime and stay
+        // declared for any program that does not pull in the ManiT body, and
+        // the next function to be reimplemented in ManiT needs no edit here at
+        // all. Two of these moved on 20 August 2026 (show_trit, show_bool3) and
+        // two more followed for the reason in stdlib/fmt.mt's header
+        // (align_left, align_right).
+        let defined: std::collections::HashSet<String> =
+            module.functions.iter().map(|f| mangle_func_name(&f.name)).collect();
+        for line in STDLIB_DECLARES.lines() {
+            let shadowed = line
+                .trim()
+                .strip_prefix("declare ")
+                .and_then(|rest| rest.find('@').map(|p| &rest[p + 1..]))
+                .and_then(|after| after.find('(').map(|p| &after[..p]))
+                .is_some_and(|name| defined.contains(name));
+            if !shadowed {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
         out.push('\n');
 
         // ---- Build function signature map -----------------------------------

@@ -272,7 +272,7 @@ These implement Łukasiewicz three-valued logic on `trit` and `bool3` values:
 | `a tand b` | conjunction | `min(a, b)` |
 | `a tor b` | disjunction | `max(a, b)` |
 | `tnot a` | negation | `-a` |
-| `a txor b` | exclusive or | `|a − b|` clamped to `{−1,0,+1}` |
+| `a txor b` | exclusive or | `(a + b) mod 3`, balanced — sum without carry |
 
 ```
 let a: trit = +;
@@ -280,7 +280,33 @@ let b: trit = -;
 let c = a tand b;   // -1 (false)
 let d = a tor b;    // +1 (true)
 let e = tnot a;     // -1
+let f = a txor b;   //  0 (+1 + -1 = 0)
 ```
+
+`txor` is the balanced-ternary sum digit — the result of adding two trits and
+discarding the carry. A residue of `2` is written `-` and a residue of `-2` is
+written `+`, which is what keeps the digit set balanced.
+
+|  | `b = -` | `b = 0` | `b = +` |
+|---|---|---|---|
+| **`a = -`** | `+` | `-` | `0` |
+| **`a = 0`** | `-` | `0` | `+` |
+| **`a = +`** | `0` | `+` | `-` |
+
+Two properties follow, and both differ from binary XOR:
+
+* **`txor` is not self-inverse.** `x txor k txor k` is not `x`; you need
+  **three** applications, because `3k ≡ 0 (mod 3)`. Binary XOR undoes itself
+  after two only because `2 ≡ 0 (mod 2)` — that is an accident of base 2, not
+  a property of exclusive-or.
+* **For a fixed `k` it is a bijection**, so `x txor k` can be undone and is
+  usable as a keying primitive. It is also surjective onto all three trits.
+
+> Before 19 August 2026 this operator computed `|a - b|` clamped to
+> `{-1, 0, +1}`. That is a difference detector, not a ternary XOR: it can never
+> return `-`, so a third of the digit set was unreachable, and it is not a
+> bijection — for any fixed `b`, two of the three inputs map to `+` — so it
+> could not be undone at all.
 
 ### Bitwise
 

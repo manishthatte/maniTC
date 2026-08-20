@@ -40,6 +40,34 @@ const SOURCE_MODULES: &[(&str, &str)] = &[
     ("bridge", include_str!("../../stdlib/bridge.mt")),
     ("crypto", include_str!("../../stdlib/crypto.mt")),
     ("t27f", include_str!("../../stdlib/t27f.mt")),
+    // `ternary` is the one mixed module: the primitives the backends lower
+    // directly stay `// native` declarations, and everything built on top of
+    // them is ManiT source so both backends get it from one definition.
+    ("ternary", include_str!("../../stdlib/ternary.mt")),
+    // `str` is mixed the same way: len/slice/find/contains/concat/split and
+    // the char-typed formatters stay native, everything derivable from them is
+    // ManiT source. Method syntax reaches the same symbols — `s.reverse()`
+    // lowers to a call to `str::reverse` (ir/lower/lower_expr.rs) — so one
+    // body serves both spellings.
+    ("str", include_str!("../../stdlib/str.mt")),
+    // `fmt` joined them on 20 August 2026. It was wholly native, and 25 of its
+    // 31 functions had no implementation on either backend — the module header
+    // documented names that failed at link. They are now ManiT source over
+    // str:: and ternary::, leaving only format/show_int/show_float/show_bool
+    // native, because those four are what everything else is written in terms
+    // of.
+    ("fmt", include_str!("../../stdlib/fmt.mt")),
+    // `math` joined them on 20 August 2026, and it was the worst of the three:
+    // a census measured **3 of 52** functions working on both backends. The T3
+    // emitter has exactly three `math::` intercepts — trit_count,
+    // to_balanced_ternary, from_balanced_ternary — and 35 of the 52 names have
+    // no LLVM declare either, so most of the module was documentation for
+    // functions that did not exist anywhere.
+    //
+    // Its module-level constants were 0 of 8, and one of them
+    // (`INT_MIN = -9223372036854775808`) was not even LEXABLE, which is why
+    // this entry could not have been added before that line was fixed.
+    ("math", include_str!("../../stdlib/math.mt")),
 ];
 
 /// Expand any used source-implemented stdlib modules into `program`.
@@ -60,11 +88,63 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
             }
         }
     }
+
+    // ...and which does it merely CALL, without importing?
+    //
+    // Requiring `use std::ternary;` would be a trap, because `ternary` is a
+    // mixed module: `ternary::trits_to_str` is native and has always worked
+    // bare, while `ternary::trit_add` is ManiT source and would not — the same
+    // qualified prefix behaving two different ways depending on which function
+    // you happened to pick, and failing at link time rather than at the call.
+    // Referencing a module is intent enough to expand it.
+    //
+    // The reference set comes from the same traversal that does the rewriting
+    // (Rewrite::observed), so a new expression form cannot be handled by one
+    // and missed by the other.
+    let (referenced, methods) = module_refs(program);
+    for (name, src) in SOURCE_MODULES {
+        if used.contains(name) {
+            continue;
+        }
+        // A qualified path is unambiguous. A bare method name is not — every
+        // container has a `len` — so it only counts against functions the
+        // module actually IMPLEMENTS, never its native declarations. That
+        // keeps `v.len()` on a Vec from dragging in the whole str module,
+        // while `s.reverse()` still pulls in the body it needs.
+        let by_method = methods
+            .iter()
+            .any(|m| bodied_fn_names(src).contains(m.trim_start_matches('.')));
+        if referenced.contains(*name) || by_method {
+            used.push(name);
+        }
+    }
+
     if used.is_empty() {
         return Ok(None);
     }
 
-    // Parse each used module (plus transitive source-module uses).
+    // Parse each used module, plus everything it transitively depends on.
+    //
+    // A module pulls in a dependency two ways, and BOTH are needed — the same
+    // two the host program gets above. `use std::X;` is the explicit one. A
+    // bare qualified reference (`fmt::show_trit(t)` with no `use`) is the
+    // implicit one, and until 20 August 2026 only the explicit one was
+    // followed here.
+    //
+    // That asymmetry was a silent trap rather than an error. `str.mt` has no
+    // `use` decls at all yet calls `fmt::show_int`, and `ternary.mt` calls both
+    // `fmt::` and `math::` — all of which resolved fine, because every one of
+    // those targets happens to be NATIVE, and a native needs a `declare`, not
+    // an expansion. The failure only appears when a module references a
+    // ManiT-SOURCE function across module lines: the callee is never queued, so
+    // it is never merged, and the call fails to resolve with nothing pointing
+    // at the missing `use`. `fmt.mt` carries `use std::str;` today purely
+    // because it hit this on the day it was written.
+    //
+    // Following references here rather than requiring the `use` keeps one rule
+    // for host programs and modules alike — referencing a module is intent
+    // enough to expand it — and it is what stops `math` becoming a source
+    // module from breaking `fmt.mt`'s bare `math::` calls.
     let mut parsed: Vec<(String, Program)> = Vec::new();
     let mut queue: Vec<String> = used.iter().map(|s| s.to_string()).collect();
     let mut seen: HashSet<String> = queue.iter().cloned().collect();
@@ -79,16 +159,26 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
         let tokens = lexer.tokenize()?;
         let mut parser = crate::parser::Parser::with_file(tokens, &file);
         let module = parser.parse()?;
+        let mut deps: Vec<String> = Vec::new();
         for item in &module.items {
             if let Item::UseDecl(u) = item {
                 if u.path.len() >= 2 && u.path[0] == "std" {
-                    let dep = u.path[1].clone();
-                    if SOURCE_MODULES.iter().any(|(n, _)| *n == dep)
-                        && seen.insert(dep.clone())
-                    {
-                        queue.push(dep);
-                    }
+                    deps.push(u.path[1].clone());
                 }
+            }
+        }
+        // The reference set, from the same traversal used on the host program.
+        // Method names are deliberately NOT consulted: inside a module a bare
+        // `.len()` is far more likely to be a Vec than a cross-module call, and
+        // a false positive here would drag a whole module into every program.
+        let (referenced, _) = module_refs(&module);
+        deps.extend(referenced);
+        for dep in deps {
+            // Never re-queue the module currently being parsed. `str` and `fmt`
+            // reference each other, so the cycle is real and reachable; `seen`
+            // is what terminates it.
+            if SOURCE_MODULES.iter().any(|(n, _)| *n == dep) && seen.insert(dep.clone()) {
+                queue.push(dep);
             }
         }
         parsed.push((name, module));
@@ -146,6 +236,7 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
             type_names: type_names.clone(),
             const_inits,
             mutable_globals,
+            observed: Default::default(),
         };
 
         // Constant initializers may reference other module constants (or,
@@ -164,6 +255,12 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
 
         for item in &module.items {
             match item {
+                // A body-less `fn` is a `// native` declaration: the backends
+                // provide it, so merging it in would emit a second, empty
+                // definition that shadows the real one. Skipping them lets a
+                // module mix native declarations with ManiT implementations,
+                // which `ternary` does.
+                Item::FnDef(f) if f.body.is_none() => {}
                 Item::FnDef(f) => {
                     let mut f = f.clone();
                     f.name = format!("{}::{}", mod_name, f.name);
@@ -217,6 +314,7 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
         type_names: HashSet::new(),
         const_inits: host_consts,
         mutable_globals: HashSet::new(),
+        observed: Default::default(),
     };
     let mut items = merged_items;
     for item in &program.items {
@@ -287,8 +385,77 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
 // Rewrite context for one module (or, with empty prefix, the host program)
 // ---------------------------------------------------------------------------
 
+/// Source-module prefixes the program refers to by qualified name, e.g. a call
+/// to `ternary::trit_add` yields `"ternary"`.
+///
+/// Runs the ordinary rewrite traversal over a throwaway clone purely to collect
+/// `Rewrite::observed`. Sharing the traversal is the point: a hand-written
+/// second visitor would silently stop seeing new `Expr` variants.
+fn module_refs(program: &Program) -> (HashSet<String>, HashSet<String>) {
+    let probe = Rewrite {
+        prefix: String::new(),
+        fn_names: HashSet::new(),
+        type_names: HashSet::new(),
+        const_inits: HashMap::new(),
+        mutable_globals: HashSet::new(),
+        observed: Default::default(),
+    };
+    let mut copy = program.clone();
+    for item in &mut copy.items {
+        match item {
+            Item::FnDef(f) => {
+                if let Some(body) = &mut f.body {
+                    probe.rewrite_block(body);
+                }
+            }
+            Item::GlobalVar(g) => {
+                if let Some(init) = &mut g.val {
+                    probe.rewrite_expr(init);
+                }
+            }
+            _ => {}
+        }
+    }
+    let observed = probe.observed.into_inner();
+    let prefixes = observed
+        .iter()
+        .filter_map(|n| n.split_once("::").map(|(head, _)| head.to_string()))
+        .collect();
+    let methods = observed
+        .iter()
+        .filter(|n| n.starts_with('.'))
+        .cloned()
+        .collect();
+    (prefixes, methods)
+}
+
+/// Names of functions a module source actually implements, as opposed to the
+/// `// native` signatures it merely declares. A body-less declaration is
+/// provided by the backends and must not trigger expansion.
+fn bodied_fn_names(src: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for line in src.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("fn ") {
+            if line.ends_with('{') {
+                if let Some(name) = rest.split(['(', '<', ' ']).next() {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 struct Rewrite {
     prefix: String,
+    /// Every `Expr::Ident` name the traversal has seen.
+    ///
+    /// Recorded by `rewrite_expr` itself, rather than by a parallel visitor,
+    /// so detection and rewriting can never drift apart as the AST grows new
+    /// expression forms. `module_refs` runs the traversal purely to collect
+    /// this; `expand`'s real passes ignore it.
+    observed: std::cell::RefCell<HashSet<String>>,
     /// Module function names — call callees are renamed to `prefix::name`.
     fn_names: HashSet<String>,
     /// Module struct/enum names — `prefix::T` type refs become bare `T`.
@@ -331,6 +498,7 @@ impl Rewrite {
     fn rewrite_expr(&self, expr: &mut Expr) {
         match expr {
             Expr::Ident(name, span) => {
+                self.observed.borrow_mut().insert(name.clone());
                 if let Some(init) = self.const_inits.get(name.as_str()) {
                     let mut inlined = init.clone();
                     reassign_spans(&mut inlined, *span);
@@ -342,6 +510,7 @@ impl Rewrite {
             Expr::Call(callee, args, _) => {
                 // Rename direct calls to module-local functions.
                 if let Expr::Ident(name, _) = callee.as_mut() {
+                    self.observed.borrow_mut().insert(name.clone());
                     if self.fn_names.contains(name.as_str()) {
                         *name = format!("{}::{}", self.prefix, name);
                     } else {
@@ -366,7 +535,11 @@ impl Rewrite {
                 self.rewrite_expr(e);
                 self.rewrite_type(ty);
             }
-            Expr::MethodCall(recv, _, args, _) => {
+            Expr::MethodCall(recv, name, args, _) => {
+                // Recorded for module_refs: `s.reverse()` never produces an
+                // Ident named "str::reverse", so without this a program that
+                // only uses method syntax would not pull the module in.
+                self.observed.borrow_mut().insert(format!(".{}", name));
                 self.rewrite_expr(recv);
                 for a in args {
                     self.rewrite_expr(a);

@@ -478,28 +478,28 @@ declare ptr @fmt_int_to_str(i64)
 declare ptr @fmt_show_int(i64)
 declare ptr @fmt_show_float(double)
 declare ptr @fmt_show_bool(i1)
-declare ptr @fmt_show_trit(i8 signext)
-declare ptr @fmt_show_bool3(i8 signext)
 declare ptr @fmt_pad_zeros(ptr, i64)
-declare ptr @fmt_align_left(ptr, i64)
-declare ptr @fmt_align_right(ptr, i64)
+; show_trit, show_bool3, align_left and align_right were declared here until
+; 20 August 2026. They are ManiT source now (stdlib/fmt.mt) and their C bodies
+; are deleted, so a declare would name a symbol that no longer exists. The
+; emitter also skips any declare the module defines — see codegen_llvm/mod.rs —
+; which is what makes moving the next one a one-file change.
 declare ptr @fmt_to_upper(ptr)
 declare ptr @fmt_to_lower(ptr)
 
 ; ---- math ----
-declare i64 @math_abs(i64)
+; math_abs, math_min, math_max, math_clamp and math_pow were declared here
+; until 20 August 2026 — ManiT source in stdlib/math.mt now, C bodies deleted.
+; math_pow's declare was `double(double, double)` against a ManiT declaration
+; of `pow(int, int) -> int`, so that call could never have worked.
 declare double @math_abs_float(double)
 declare double @math_sqrt(double)
-declare double @math_pow(double, double)
 declare double @math_log(double)
 declare double @math_log2(double)
 declare double @math_log3(double)
 declare double @math_floor(double)
 declare double @math_ceil(double)
 declare double @math_round(double)
-declare i64 @math_min(i64, i64)
-declare i64 @math_max(i64, i64)
-declare i64 @math_clamp(i64, i64, i64)
 declare double @math_sin(double)
 declare double @math_cos(double)
 declare i64 @math_trit_count(i64)
@@ -508,20 +508,15 @@ declare i64 @math_trit_count(i64)
 declare i64 @str_len(ptr)
 declare signext i8 @str_char_at(ptr, i64)
 declare ptr @str_concat(ptr, ptr)
-declare ptr @str_substr(ptr, i64, i64)
-declare i1 @str_starts_with(ptr, ptr)
-declare i1 @str_ends_with(ptr, ptr)
 declare i1 @str_contains(ptr, ptr)
 declare i64 @str_find(ptr, ptr)
 declare ptr @str_replace(ptr, ptr, ptr)
 declare ptr @str_split(ptr, ptr)
 declare ptr @str_trim(ptr)
-declare i64 @str_parse_int(ptr)
-declare double @str_parse_float(ptr)
-declare ptr @str_from_int(i64)
 declare ptr @str_from_char(i64)
-declare ptr @str_to_upper(ptr)
-declare ptr @str_to_lower(ptr)
+; str_to_upper / str_to_lower are gone: they are ManiT source in stdlib/str.mt
+; as of 19 Aug 2026, and the merged ManiT bodies mangle to those exact symbols,
+; so declaring them here would clash at link time.
 declare i1 @str_eq(ptr, ptr)
 
 ; ---- Vec<T> ----
@@ -630,7 +625,6 @@ declare i64 @Semaphore_available(ptr)
 
 ; ---- ternary utils ----
 declare i64 @ternary_trit_to_int(i8 signext)
-declare signext i8 @ternary_int_to_trit(i64)
 declare ptr @ternary_t27_to_str(i64)
 
 ; ---- fs (filesystem) ----
@@ -707,15 +701,18 @@ declare i64 @ternary_t27_shift_right(i64, i64)
 declare i64 @ternary_t27_rotate_left(i64, i64)
 declare i64 @ternary_t27_rotate_right(i64, i64)
 declare ptr @str_slice(ptr, i64, i64)
-declare ptr @str_repeat(ptr, i64)
 declare i64 @str_index_of(ptr, ptr)
 declare ptr @str_chars(ptr)
-declare ptr @str_join(ptr, ptr)
-declare ptr @str_reverse(ptr)
-declare ptr @str_from_float(double)
-declare ptr @str_from_bool(i1)
-declare ptr @str_from_trit(i8)
-declare signext i8 @ternary_trit_median(i8 signext, i8 signext, i8 signext)
+; str_join went the same way on 20 August 2026 — declared, never defined, ManiT
+; source now.
+; str_parse_float, str_from_float, str_from_bool and str_from_trit were declared
+; here until 20 August 2026. All four were declarations with no definition — no
+; C body ever existed for any of them, on either backend — so every program that
+; called one failed at link with an undefined symbol. They are ManiT source in
+; stdlib/str.mt now, delegating to fmt::, and a declare would clash with the
+; merged body. Their four siblings (from_bool3, from_ternary and the is_*
+; predicates) were never even declared here, which is why those failed one step
+; earlier, at assembly rather than at link.
 declare ptr @str_to_int(ptr)
 declare ptr @str_to_float(ptr)
 declare void @Channel_send(ptr, i64)
@@ -856,13 +853,13 @@ declare i64 @ternary_int_to_t9(i64)
 declare i64 @ternary_t9_to_int(i64)
 declare i64 @ternary_int_to_tryte(i64)
 declare i64 @ternary_tryte_to_int(i64)
-declare i64 @ternary_trit_sign(i64)
 declare i64 @ternary_t27_neg(i64)
+declare i64 @ternary_t27_and(i64, i64)
+declare i64 @ternary_t27_or(i64, i64)
 declare i64 @ternary_trit_shift_left(i64, i64)
 declare i64 @ternary_trit_shift_right(i64, i64)
 declare i64 @ternary_tryte_from_trits(i64, i64, i64)
 declare i64 @ternary_pack_trits(ptr)
-declare ptr @ternary_unpack_trits(i64)
 declare ptr @ternary_trits_to_str(ptr)
 declare ptr @ternary_to_balanced_ternary(i64)
 declare i64 @ternary_from_balanced_ternary(ptr)
@@ -893,6 +890,7 @@ declare void @time_sleep(i64)
 declare ptr @Barrier_new(i64)
 declare i1 @Barrier_wait(ptr)
 declare i64 @Barrier_count(ptr)
+declare ptr @__lp_from_flat(ptr, i64)
 ";
 
 /// The definitions backing INTERNAL_HELPER_SIGS.
@@ -973,14 +971,6 @@ entry:
   ret i64 %n
 }
 
-define internal i64 @ternary_trit_sign(i64 %n) {
-entry:
-  %ispos = icmp sgt i64 %n, 0
-  %isneg = icmp slt i64 %n, 0
-  %neg = select i1 %isneg, i64 -1, i64 0
-  %r = select i1 %ispos, i64 1, i64 %neg
-  ret i64 %r
-}
 
 define internal i64 @ternary_t27_neg(i64 %n) {
 entry:
@@ -1065,32 +1055,6 @@ exit:
 
 ; Returns a raw [trit; 27] array. Trit array elements are single i8 slots
 ; in the LLVM lowering (array_value_ty), so the result is 27 bytes.
-define internal ptr @ternary_unpack_trits(i64 %v) {
-entry:
-  %buf = call ptr @malloc(i64 27)
-  br label %cond
-cond:
-  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
-  %val = phi i64 [ %v, %entry ], [ %valnext, %body ]
-  %done = icmp sge i64 %i, 27
-  br i1 %done, label %exit, label %body
-body:
-  %r0 = srem i64 %val, 3
-  %rneg = icmp slt i64 %r0, 0
-  %radd = select i1 %rneg, i64 3, i64 0
-  %rem = add i64 %r0, %radd
-  %istwo = icmp eq i64 %rem, 2
-  %d = select i1 %istwo, i64 -1, i64 %rem
-  %d8 = trunc i64 %d to i8
-  %ep = getelementptr i8, ptr %buf, i64 %i
-  store i8 %d8, ptr %ep, align 1
-  %sub = sub i64 %val, %d
-  %valnext = sdiv i64 %sub, 3
-  %inext = add i64 %i, 1
-  br label %cond
-exit:
-  ret ptr %buf
-}
 
 define internal ptr @ternary_trits_to_str(ptr %arr) {
 entry:
@@ -1161,16 +1125,160 @@ exit:
   ret ptr %buf
 }
 
+; ternary_int_to_trits(n, width) -> length-prefixed buffer of exactly `width`
+; trits, least-significant first, zero-padded, higher trits discarded.
+;
+; Added 19 August 2026. It had NO implementation on either backend — LLVM
+; emitted a call to an undefined @ternary_int_to_trits and T3 failed to
+; assemble — even though it is the example in stdlib/ternary.mt's own header.
+; Same digit extraction as @math_to_balanced_ternary above; the only
+; differences are the fixed trip count and that val == 0 needs no special case
+; (rem 0 -> digit 0 -> val stays 0, which is exactly the zero padding).
+define internal ptr @ternary_int_to_trits(i64 %n, i64 %w) {
+entry:
+  %wneg = icmp slt i64 %w, 0
+  %width = select i1 %wneg, i64 0, i64 %w
+  %slots = add i64 %width, 1
+  %bytes = mul i64 %slots, 8
+  %buf = call ptr @malloc(i64 %bytes)
+  store i64 %width, ptr %buf, align 8
+  br label %cond
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %val = phi i64 [ %n, %entry ], [ %valnext, %body ]
+  %done = icmp sge i64 %i, %width
+  br i1 %done, label %exit, label %body
+body:
+  %r0 = srem i64 %val, 3
+  %rneg = icmp slt i64 %r0, 0
+  %radd = select i1 %rneg, i64 3, i64 0
+  %rem = add i64 %r0, %radd
+  %istwo = icmp eq i64 %rem, 2
+  %d = select i1 %istwo, i64 -1, i64 %rem
+  %idx = add i64 %i, 1
+  %ep = getelementptr i64, ptr %buf, i64 %idx
+  store i64 %d, ptr %ep, align 8
+  %sub = sub i64 %val, %d
+  %valnext = sdiv i64 %sub, 3
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  ret ptr %buf
+}
+
 define internal ptr @ternary_to_balanced_ternary(i64 %n) {
 entry:
   %r = call ptr @math_to_balanced_ternary(i64 %n)
   ret ptr %r
 }
 
+; Trit-wise min / max of two t27 words.
+;
+; These are single T3ISA instructions on the other backend (TAND / TOR), which
+; is the whole point of a ternary ISA, so the T3 intercept stays and LLVM gets
+; a loop instead. Two implementations of one function is exactly what made four
+; other ternary functions DIVERGENT, so this pair is pinned by a differential
+; test that runs both backends over the same inputs and requires agreement.
+;
+; A balanced digit is `n mod 3` with a residue of 2 rewritten as -1 and carried.
+; i64 holds 3^27 (~7.6e12) comfortably, so `place` needs no overflow guard here
+; the way the ManiT versions do on T3.
+define internal i64 @__t27_zip(i64 %a, i64 %b, i1 %want_max) {
+entry:
+  br label %cond
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %va = phi i64 [ %a, %entry ], [ %vanext, %body ]
+  %vb = phi i64 [ %b, %entry ], [ %vbnext, %body ]
+  %acc = phi i64 [ 0, %entry ], [ %accnext, %body ]
+  %place = phi i64 [ 1, %entry ], [ %placenext, %body ]
+  %done = icmp sge i64 %i, 27
+  br i1 %done, label %exit, label %body
+body:
+  %ra0 = srem i64 %va, 3
+  %raneg = icmp slt i64 %ra0, 0
+  %raadj = select i1 %raneg, i64 3, i64 0
+  %ra = add i64 %ra0, %raadj
+  %raistwo = icmp eq i64 %ra, 2
+  %da = select i1 %raistwo, i64 -1, i64 %ra
+  %vasub = sub i64 %va, %da
+  %vanext = sdiv i64 %vasub, 3
+  %rb0 = srem i64 %vb, 3
+  %rbneg = icmp slt i64 %rb0, 0
+  %rbadj = select i1 %rbneg, i64 3, i64 0
+  %rb = add i64 %rb0, %rbadj
+  %rbistwo = icmp eq i64 %rb, 2
+  %db = select i1 %rbistwo, i64 -1, i64 %rb
+  %vbsub = sub i64 %vb, %db
+  %vbnext = sdiv i64 %vbsub, 3
+  %agt = icmp sgt i64 %da, %db
+  %alt = icmp slt i64 %da, %db
+  %pick = select i1 %want_max, i1 %agt, i1 %alt
+  %d = select i1 %pick, i64 %da, i64 %db
+  %term = mul i64 %d, %place
+  %accnext = add i64 %acc, %term
+  %placenext = mul i64 %place, 3
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  ret i64 %acc
+}
+
+define internal i64 @ternary_t27_and(i64 %a, i64 %b) {
+entry:
+  %r = call i64 @__t27_zip(i64 %a, i64 %b, i1 false)
+  ret i64 %r
+}
+
+define internal i64 @ternary_t27_or(i64 %a, i64 %b) {
+entry:
+  %r = call i64 @__t27_zip(i64 %a, i64 %b, i1 true)
+  ret i64 %r
+}
+
 define internal i64 @math_from_balanced_ternary(ptr %arr) {
 entry:
   %r = call i64 @ternary_pack_trits(ptr %arr)
   ret i64 %r
+}
+
+; __lp_from_flat(flat_ptr, len) -> length-prefixed buffer
+;
+; Bridges the two `[trit]` layouts. A *flat* trit array — which is what an
+; unsized `[trit]` function parameter always is — stores element i at slot i
+; with the length carried out of band, one byte per trit here. The stdlib
+; functions above instead read a length-prefixed buffer: mem[0] = len,
+; trits at mem[1..=len], one i64 slot each. Handing a flat array straight to
+; one of them made the first trit be read as the length.
+;
+; The length is only known at run time, so this cannot be an alloca in the
+; caller — hence a helper that mallocs, exactly as @math_to_balanced_ternary
+; already does. The T3 counterpart is syscall #203; there the flat array is
+; word-per-slot, so it copies without widening.
+;
+; sext, not zext: a trit is a signed i8 and -1 must stay -1 (see §1).
+define internal ptr @__lp_from_flat(ptr %p, i64 %n) {
+entry:
+  %n1 = add i64 %n, 1
+  %bytes = mul i64 %n1, 8
+  %buf = call ptr @malloc(i64 %bytes)
+  store i64 %n, ptr %buf, align 8
+  br label %cond
+cond:
+  %i = phi i64 [ 0, %entry ], [ %inext, %body ]
+  %done = icmp sge i64 %i, %n
+  br i1 %done, label %exit, label %body
+body:
+  %sp = getelementptr i8, ptr %p, i64 %i
+  %t8 = load i8, ptr %sp, align 1
+  %t64 = sext i8 %t8 to i64
+  %di = add i64 %i, 1
+  %dp = getelementptr i64, ptr %buf, i64 %di
+  store i64 %t64, ptr %dp, align 8
+  %inext = add i64 %i, 1
+  br label %cond
+exit:
+  ret ptr %buf
 }
 
 define internal i64 @ternary_from_balanced_ternary(ptr %arr) {

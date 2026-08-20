@@ -99,6 +99,17 @@ pub enum IRConst {
 // Types
 // ---------------------------------------------------------------------------
 
+/// Arity of a structural tuple type, recovered from its IR type name.
+///
+/// `IRType::from_mani` encodes it as `<tuple:N>` precisely so the size
+/// survives to the backends: tuples are structural, so unlike declared
+/// structs and enums they never appear in `IRModule::struct_sizes`. Both
+/// backends size a tuple allocation through this — see the `Alloca` arms in
+/// codegen_llvm/emit_instr.rs and codegen_t3/emitter/emit_instr.rs.
+pub fn tuple_arity_from_name(name: &str) -> Option<usize> {
+    name.strip_prefix("<tuple:")?.strip_suffix('>')?.parse().ok()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IRType {
     I64,
@@ -137,7 +148,14 @@ impl IRType {
             ManiType::Array(elem, None) => {
                 IRType::Ptr(Box::new(IRType::from_mani(elem)))
             }
-            ManiType::Tuple(_) => IRType::Struct("<tuple>".to_string()),
+            // The arity is part of the name because it is the only place the
+            // size survives to the backends. Every tuple used to map to the
+            // single name "<tuple>", which is in no struct table, so the LLVM
+            // backend's size lookup fell through to its `unwrap_or(1)` default
+            // and malloc'd 8 bytes for a tuple of ANY arity — a heap overflow
+            // of 8 bytes per extra element, on every tuple construction.
+            // See tuple_arity_from_name, just above.
+            ManiType::Tuple(elems) => IRType::Struct(format!("<tuple:{}>", elems.len())),
             ManiType::Struct(name) => IRType::Struct(name.clone()),
             ManiType::Enum(name) => IRType::Struct(name.clone()),
             ManiType::Fn(_, _) => IRType::Ptr(Box::new(IRType::I8)),

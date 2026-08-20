@@ -276,8 +276,10 @@ impl SemanticAnalyzer {
             ("str_starts_with",  ss.clone(),          Bool),
             ("str_from_int",     vec![Int],           Str),
             ("str_from_char",    vec![Int],           Str),
-            ("str_to_upper",     s.clone(),           Str),
-            ("str_to_lower",     s.clone(),           Str),
+            // str_to_upper / str_to_lower are deliberately absent: they became
+            // ManiT source in stdlib/str.mt on 19 Aug 2026, so the analyzer
+            // sees their real declared signature. A static entry here would be
+            // a second source of truth that can drift from the stdlib.
             // async module
             ("async::yield_now",   vec![],                 Void),
             ("async::sleep",       vec![Int],              Void),
@@ -375,6 +377,8 @@ impl SemanticAnalyzer {
         for (name, params, ret) in entries {
             self.functions.insert(name.to_string(), (params, ret));
         }
+
+        self.register_native_module_sigs();
 
         // Letter keys a–z: gui_key_a .. gui_key_z
         for ch in b'a'..=b'z' {
@@ -512,6 +516,59 @@ impl SemanticAnalyzer {
     // ---------------------------------------------------------------------------
     // Public entry point
     // ---------------------------------------------------------------------------
+
+    /// Register return types for the qualified names of native stdlib modules.
+    ///
+    /// The table above lists the MANGLED C symbols (`str_slice`, `str_concat`),
+    /// never the qualified spelling a program actually writes (`str::slice`).
+    /// That went unnoticed for as long as `str::` was unreachable — the lexer
+    /// made `str` a type keyword, so no program could name the module at all
+    /// (ORACLE_FINDINGS.md Section 9). The moment the parser accepted it, every
+    /// `str::` call typed as Unknown, and `Unknown == Str` lowers to INTEGER
+    /// equality on two pointers, so `str::slice("hello", 2, 3) == "l"` was
+    /// false on both backends even though the slice really is `"l"`.
+    /// Binding to a `let s: str` first made it work, which is what made this
+    /// look like a memory bug rather than a typing one.
+    ///
+    /// Derived from the module sources rather than hand-listed, so the two
+    /// cannot drift. Only RETURN types are taken: parameters are left Unknown
+    /// so this fixes the typing without turning on argument enforcement for
+    /// calls that were previously unchecked — that is a separate change.
+    fn register_native_module_sigs(&mut self) {
+        const MODULES: &[(&str, &str)] = &[
+            ("str", include_str!("../../../stdlib/str.mt")),
+            ("fmt", include_str!("../../../stdlib/fmt.mt")),
+            ("math", include_str!("../../../stdlib/math.mt")),
+            ("ternary", include_str!("../../../stdlib/ternary.mt")),
+        ];
+        for (module, src) in MODULES {
+            let file = format!("<std::{}>", module);
+            let Ok(tokens) = crate::lexer::Lexer::with_file(src, &file).tokenize() else {
+                continue;
+            };
+            let Ok(program) = crate::parser::Parser::with_file(tokens, &file).parse() else {
+                continue;
+            };
+            for item in &program.items {
+                let Item::FnDef(f) = item else { continue };
+                let qualified = format!("{}::{}", module, f.name);
+                // Never shadow a signature the table states explicitly, and
+                // never a real user function of the same name.
+                if self.functions.contains_key(&qualified) {
+                    continue;
+                }
+                let ret = match &f.ret_ty {
+                    Some(t) => match self.resolve_type(t) {
+                        Ok(ty) => ty,
+                        Err(_) => continue,
+                    },
+                    None => ManiType::Void,
+                };
+                let params = vec![ManiType::Unknown; f.params.len()];
+                self.functions.insert(qualified, (params, ret));
+            }
+        }
+    }
 
     pub fn analyze(&mut self, program: &Program) -> CompileResult<TypedProgram> {
         // Source-implemented stdlib modules (std::bridge / std::crypto /

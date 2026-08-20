@@ -344,8 +344,23 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             // Heap allocations are deliberately NOT recorded in alloca_slots:
             // their address is not SP-relative, so Load/Store must go through the
             // register-based path.
+            //
+            // Tuples take this path too. They are structural, so they are not
+            // in struct_sizes and used to fall through to the stack path — and
+            // a tuple escapes constantly, because returning one IS the reason
+            // it exists. `fn f() -> (int,int,int)` returned a pointer into its
+            // own popped frame, and the caller's destructuring allocas then
+            // grew down over it as it read: `(11,22,33)` came back `11 22 22`,
+            // `(11,22,33,44,55)` came back `11 22 33 33 22`. Found by the
+            // regression test for ORACLE_FINDINGS.md Section 10.
             if let IRType::Struct(name) = ty {
-                if let Some(&n) = em.struct_sizes.get(name) {
+                let n = em
+                    .struct_sizes
+                    .get(name)
+                    .copied()
+                    .or_else(|| crate::ir::types::tuple_arity_from_name(name));
+                if let Some(n) = n {
+                    let n = n.max(1);
                     em.rescue_reg_inclusive(1);
                     em.emit(format!("    TLIT  R1, #{}  ; heap alloca {} ({} words)", n, name, n));
                     em.emit("    SYSCALL #218  ; heap_alloc_words".to_string());
@@ -358,9 +373,33 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             }
 
             // Arrays need n words; structs need n_fields words; everything else needs 1 word.
+            //
+            // Tuples are structural, so they are not in struct_sizes; their
+            // arity rides in the type name. Without that they took the
+            // `unwrap_or(1)` path and a tuple of ANY arity got ONE word, so
+            // element 1 was written past the top of the frame and then popped
+            // — `(11, 22)` read back as `11 11`. Same root cause as the LLVM
+            // side of ORACLE_FINDINGS.md Section 10, found by the regression
+            // test written for it.
             let words = match ty {
                 IRType::Array(_, n) => *n,
-                IRType::Struct(name) => em.struct_sizes.get(name).copied().unwrap_or(1),
+                IRType::Struct(name) => em
+                    .struct_sizes
+                    .get(name)
+                    .copied()
+                    .or_else(|| crate::ir::types::tuple_arity_from_name(name))
+                    .unwrap_or_else(|| {
+                        debug_assert!(
+                            !name.starts_with("<tuple"),
+                            "internal error: tuple type `{}` carries no parsable \
+                             arity — IRType::from_mani must emit `<tuple:N>`",
+                            name
+                        );
+                        // Native opaque handles (Vec, Map, Channel, AtomicTrit,
+                        // ...) are a single word. Declared structs and enums are
+                        // registered in struct_sizes and never reach here.
+                        1
+                    }),
                 _ => 1,
             };
             // Update sp_depth BEFORE dst_reg so that if dest is spilled,
@@ -604,7 +643,12 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 // ------------------------------------------------------------------
                 // ternary:: trivial identity casts (trit/t27/tryte are all i64)
-                "ternary::trit_to_int" | "ternary::int_to_trit" | "ternary::trit_sign"
+                // NOT int_to_trit: that one is a genuine narrowing to the sign,
+                // and treating it as an identity move here is what made it
+                // DIVERGENT — `int_to_trit(5)` returned 5 on T3, which is not a
+                // trit at all, while LLVM clamped. It and trit_sign are ManiT
+                // source in stdlib/ternary.mt now.
+                "ternary::trit_to_int"
                 | "ternary::t27_to_int"  | "ternary::int_to_t27"
                 | "ternary::t9_to_int"   | "ternary::int_to_t9"
                 | "ternary::tryte_to_int" | "ternary::int_to_tryte" => {
@@ -622,27 +666,9 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 // ternary:: unary ops
-                // trit_median(a, b, c) = majority vote: median of three trit values
-                // = TMIN(TMAX(a,b), TMAX(TMIN(a,b), c))
-                "ternary::trit_median" => {
-                    let ra = args.get(0).map(|a| em.val_reg(a)).unwrap_or(0);
-                    let rb = args.get(1).map(|a| em.val_reg(a)).unwrap_or(0);
-                    let rc = args.get(2).map(|a| em.val_reg(a)).unwrap_or(0);
-                    // t1 = TMAX(a, b)
-                    let t1 = em.scratch();
-                    em.emit(format!("    TMAX  {}, {}, {}  ; median: max(a,b)", AsmEmitter::rn(t1), AsmEmitter::rn(ra), AsmEmitter::rn(rb)));
-                    // t2 = TMIN(a, b)
-                    let t2 = em.scratch();
-                    em.emit(format!("    TMIN  {}, {}, {}  ; median: min(a,b)", AsmEmitter::rn(t2), AsmEmitter::rn(ra), AsmEmitter::rn(rb)));
-                    // t3 = TMAX(t2, c)
-                    let t3 = em.scratch();
-                    em.emit(format!("    TMAX  {}, {}, {}  ; median: max(min(a,b),c)", AsmEmitter::rn(t3), AsmEmitter::rn(t2), AsmEmitter::rn(rc)));
-                    if let Some(d) = dst {
-                        let rd = em.dst_reg(d);
-                        em.emit(format!("    TMIN  {}, {}, {}  ; median = min(max(a,b), max(min(a,b),c))", AsmEmitter::rn(rd), AsmEmitter::rn(t1), AsmEmitter::rn(t3)));
-                    }
-                }
-                "ternary::trit_neg" | "ternary::t27_neg" => {
+                // trit_median is ManiT source in stdlib/ternary.mt — it was
+                // DIVERGENT while each backend had its own version.
+                "ternary::t27_neg" => {
                     let ra = args.first().map(|a| em.val_reg(a)).unwrap_or(0);
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
@@ -650,7 +676,7 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 // ternary:: binary ops
-                "ternary::trit_and" | "ternary::t27_and" => {
+                "ternary::t27_and" => {
                     let ra = args.get(0).map(|a| em.val_reg(a)).unwrap_or(0);
                     let rb = args.get(1).map(|a| em.val_reg(a)).unwrap_or(0);
                     if let Some(d) = dst {
@@ -658,7 +684,7 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                         em.emit(format!("    TAND  {}, {}, {}  ; {}", AsmEmitter::rn(rd), AsmEmitter::rn(ra), AsmEmitter::rn(rb), func));
                     }
                 }
-                "ternary::trit_or" | "ternary::t27_or" => {
+                "ternary::t27_or" => {
                     let ra = args.get(0).map(|a| em.val_reg(a)).unwrap_or(0);
                     let rb = args.get(1).map(|a| em.val_reg(a)).unwrap_or(0);
                     if let Some(d) = dst {
@@ -678,7 +704,13 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "ternary::t27_shift_right" => {
                     emit_syscall_2arg_ret(em, args, dst, 202, "t27_shift_right");
                 }
-                "ternary::trit_shift_left" | "ternary::trit_rotate_left" => {
+                // NOT an alias for trit_rotate_left. A shift DISCARDS the trits it
+                // pushes out; a rotation wraps them round. They were aliased here
+                // until 19 August 2026, so `trit_rotate_left` silently computed a
+                // shift on T3 while failing to compile on LLVM — the backends
+                // would have disagreed the moment LLVM gained it. Rotation is now
+                // ManiT source in stdlib/ternary.mt.
+                "ternary::trit_shift_left" => {
                     let ra = args.get(0).map(|a| em.val_reg(a)).unwrap_or(0);
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
@@ -694,7 +726,7 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                         em.emit(format!("    TSHI  {}, {}, {}  ; {} (dyn)", AsmEmitter::rn(rd), AsmEmitter::rn(ra), AsmEmitter::rn(rb), func));
                     }
                 }
-                "ternary::trit_shift_right" | "ternary::trit_rotate_right" => {
+                "ternary::trit_shift_right" => {
                     let ra = args.get(0).map(|a| em.val_reg(a)).unwrap_or(0);
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
@@ -725,7 +757,12 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 // ternary::t27_to_str — syscall #7: R1=value, returns str ptr in R1
-                "ternary::t27_to_str" | "ternary::t27_to_str_padded" | "ternary::t27_explain" => {
+                // Only the plain form. `t27_to_str_padded` (fixed 27 glyphs) and
+                // `t27_explain` (a multi-line breakdown that returns nothing)
+                // were aliased to this until 19 August 2026 and so produced the
+                // unpadded string on T3 while failing to compile on LLVM. Both
+                // are ManiT source in stdlib/ternary.mt now.
+                "ternary::t27_to_str" => {
                     em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
@@ -805,18 +842,14 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                         if rd != 1 { em.emit(format!("    MOV   {}, R1  ; pack_trits result", AsmEmitter::rn(rd))); }
                     }
                 }
-                // ternary::unpack_trits — R1=t27 → R1=ptr to length-prefixed [trit;27] array
-                "ternary::unpack_trits" => {
-                    em.rescue_reg(1);
-                    if let Some(arg) = args.first() {
-                        let ra = em.val_reg(arg);
-                        if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
-                    }
-                    em.emit("    SYSCALL #13  ; unpack_trits".to_string());
-                    if let Some(d) = dst {
-                        let rd = em.dst_reg(d);
-                        if rd != 1 { em.emit(format!("    MOV   {}, R1  ; unpack_trits result", AsmEmitter::rn(rd))); }
-                    }
+                // unpack_trits is ManiT source in stdlib/ternary.mt — it was
+                // DIVERGENT while syscall #13 and the LLVM helper disagreed.
+                // __lp_from_flat(flat_ptr, len) — compiler-internal, syscall #203.
+                // R1 = flat trit array ptr, R2 = length → R1 = length-prefixed copy.
+                // Emitted by the IR lowering when an unsized `[trit]` parameter
+                // reaches a stdlib function that reads length-prefixed.
+                "__lp_from_flat" => {
+                    emit_syscall_2arg_ret(em, args, dst, 203, "lp_from_flat");
                 }
                 // fmt:: string formatting functions
                 // fmt::show_int(n) — format int as string, returns str ptr (syscall #14)
@@ -998,6 +1031,20 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 "str_replace" | "str::replace" => {
                     emit_syscall_3arg_ret(em, args, dst, 69, "str_replace");
+                }
+                // The two char primitives. Everything else that needs a char —
+                // to_upper, to_lower, pad_left, pad_right, center — is ManiT
+                // source in stdlib/str.mt built on these, so there is exactly
+                // one implementation of each and the backends cannot diverge.
+                // 133/134 rather than 70/71: the 60-69 str block is full.
+                "str_char_at" | "str::char_at" => {
+                    emit_syscall_2arg_ret(em, args, dst, 133, "str_char_at");
+                }
+                "str_from_char" | "str::from_char" => {
+                    emit_syscall_1arg_ret(em, args, dst, 134, "str_from_char");
+                }
+                "ternary_int_to_trits" | "ternary::int_to_trits" => {
+                    emit_syscall_2arg_ret(em, args, dst, 135, "ternary_int_to_trits");
                 }
                 "channel" | "channel_new" => {
                     em.rescue_reg(1);

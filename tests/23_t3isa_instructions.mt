@@ -155,15 +155,16 @@ fn test_txor_full() {
     let z: trit = 0;
     let n: trit = -;
 
-    check_trit("t3-txor: +,+=0",  p txor p,  0);
+    // Balanced (a + b) mod 3 — see tests/14_ternary_logic_complete.mt.
+    check_trit("t3-txor: +,+=-",  p txor p, -1);
     check_trit("t3-txor: +,0=+",  p txor z,  1);
-    check_trit("t3-txor: +,-=+",  p txor n,  1);
+    check_trit("t3-txor: +,-=0",  p txor n,  0);
     check_trit("t3-txor: 0,+=+",  z txor p,  1);
     check_trit("t3-txor: 0,0=0",  z txor z,  0);
-    check_trit("t3-txor: 0,-=+",  z txor n,  1);
-    check_trit("t3-txor: -,+=+",  n txor p,  1);
-    check_trit("t3-txor: -,0=+",  n txor z,  1);
-    check_trit("t3-txor: -,-=0",  n txor n,  0);
+    check_trit("t3-txor: 0,-=-",  z txor n, -1);
+    check_trit("t3-txor: -,+=0",  n txor p,  0);
+    check_trit("t3-txor: -,0=-",  n txor z, -1);
+    check_trit("t3-txor: -,-=+",  n txor n,  1);
 }
 
 // ---------------------------------------------------------------------------

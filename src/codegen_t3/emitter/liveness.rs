@@ -81,10 +81,18 @@ fn record_uses_instr(instr: &IRInstr, idx: usize, last_use: &mut HashMap<String,
     }
 }
 
-/// Compute the last-use instruction index for each named temp in the function.
+/// Compute the last-use instruction index for each named temp in the function,
+/// and the index of the instruction that FIRST DEFINES it.
 /// Extends last-use across back edges (loop-carried values) so registers aren't
 /// freed prematurely during loop iterations.
-pub(super) fn compute_last_use(blocks: &[IRBlock]) -> HashMap<String, usize> {
+///
+/// `first_def` used to be computed here and thrown away — it existed only to
+/// scope the back-edge extension below. It is now returned as well, because the
+/// rescue paths in `mod.rs` need it: a temp mapped to a register it has not yet
+/// been written to holds nothing, and moving that register's contents "to safety"
+/// on its behalf both saves a stale value and permanently rebinds the temp away
+/// from the register its real definition is about to write. See `RegAlloc::is_live_value`.
+pub(super) fn compute_last_use(blocks: &[IRBlock]) -> (HashMap<String, usize>, HashMap<String, usize>) {
     let mut last_use: HashMap<String, usize> = HashMap::new();
     let mut first_def: HashMap<String, usize> = HashMap::new();
     let mut block_start: Vec<usize> = Vec::new();
@@ -144,7 +152,7 @@ pub(super) fn compute_last_use(blocks: &[IRBlock]) -> HashMap<String, usize> {
         }
     }
 
-    last_use
+    (last_use, first_def)
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +174,10 @@ pub(super) struct RegAlloc {
     pub(super) spill_slots:   HashMap<String, usize>, // temp → sp_depth at spill time
     pub(super) free_regs:     std::collections::BTreeSet<usize>,
     pub(super) last_use:      HashMap<String, usize>,
+    /// Index of the instruction that first defines each temp. A temp absent from
+    /// this map has no defining instruction — that means a function parameter,
+    /// which is live from function entry, so absence reads as "already defined".
+    pub(super) first_def:     HashMap<String, usize>,
     pub(super) current_instr: usize,
     pub(super) scratch_in_instr: Vec<usize>,
     pub spill_count: usize,
@@ -176,19 +188,42 @@ pub(super) struct RegAlloc {
 impl RegAlloc {
     /// Create allocator with pre-computed last-use map.
     /// Pool: R1–R20.  R21/R22 = spill-read scratch.  R23 = spill-write scratch.
-    pub(super) fn new(last_use: HashMap<String, usize>) -> Self {
+    pub(super) fn new(last_use: HashMap<String, usize>, first_def: HashMap<String, usize>) -> Self {
         let free_regs = (1..=20usize).collect();
         RegAlloc {
             temp_to_reg: HashMap::new(),
             spill_slots: HashMap::new(),
             free_regs,
             last_use,
+            first_def,
             current_instr: 0,
             scratch_in_instr: Vec::new(),
             spill_count: 0,
             sp_depth: 0,
             scratch_fallback_count: 0,
         }
+    }
+
+    /// Does `name` actually hold a value at this point in the emission?
+    ///
+    /// `temp_to_reg` serves two purposes that look identical from the outside: it
+    /// records where a live value currently sits, and it records the register a
+    /// not-yet-emitted definition has RESERVED. Only the first is a value. A
+    /// destination register is allocated before its operands are set up, so
+    /// between `dst_reg()` and the instruction that writes it, the destination
+    /// temp is mapped to a register whose contents belong to something else.
+    ///
+    /// Rescuing such a temp is wrong twice over: it copies a stale value to
+    /// safety, and it rebinds the temp to the copy's register — so the real
+    /// definition writes the original register while every later read looks in
+    /// the copy. That is exactly how `(n as float) * 2.0` returned the value of
+    /// `n as float`: the destination was rescued out of R1 before the multiply
+    /// syscall put the product there.
+    ///
+    /// A temp with no `first_def` entry has no defining instruction — it is a
+    /// function parameter, live from entry — so absence reads as defined.
+    pub(super) fn holds_value(&self, name: &str) -> bool {
+        self.first_def.get(name).map_or(true, |&d| d < self.current_instr)
     }
 
     /// Allocate an anonymous scratch register for use within this instruction.

@@ -42,6 +42,19 @@ fn bool3_name(b: bool3) -> str {
 }
 
 // Print a 3x3 truth table for a binary bool3 operator.
+// Łukasiewicz equivalence on {-1, 0, +1}: a <-> b = 1 - |a - b|.
+//
+// Reads directly as "how far apart are these": equal -> True, one step
+// apart -> Unknown, opposite -> False. The difference a - b lies in
+// [-2, 2], so 1 - |a - b| lands in [-1, +1] with no clamping needed.
+fn luk_iff(a: trit, b: trit) -> trit {
+    let d: int = ternary::trit_to_int(a) - ternary::trit_to_int(b);
+    if d == 0 { return +; }
+    if d == 1 { return 0; }
+    if d == -1 { return 0; }
+    return -;
+}
+
 fn print_truth_table(op_name: str, op: fn(trit, trit) -> trit) {
     io::print("  ");
     io::println(op_name);
@@ -141,9 +154,16 @@ fn demo_truth_tables() {
     print_truth_table("Luk implication  (max(tnot a, b)):",
         fn(a: trit, b: trit) -> trit => (tnot a) tor b);
 
-    // Łukasiewicz biconditional: a <-> b = tnot(a txor b).
-    print_truth_table("Luk biconditional (tnot(a txor b)):",
-        fn(a: trit, b: trit) -> trit => tnot (a txor b));
+    // Łukasiewicz biconditional: a <-> b = 1 - |a - b|.
+    //
+    // This was written as `tnot(a txor b)`, which is not the biconditional
+    // under EITHER txor semantics — corrected 19 August 2026. The defining
+    // property of an equivalence is reflexivity, a <-> a = True, so the
+    // diagonal must be all `+`. The old form gave `0` down the diagonal
+    // (tnot of clamped |a-a| = tnot 0 = 0); the current mod-3 txor would
+    // give `-, 0, +`. Neither is Łukasiewicz. `tnot` negates, but the
+    // definition needs `1 - x`, and those differ by exactly the 1.
+    print_truth_table("Luk biconditional (1 - |a - b|):", luk_iff);
 }
 
 // ---------------------------------------------------------------------------

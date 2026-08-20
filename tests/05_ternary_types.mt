@@ -292,10 +292,17 @@ fn test_pack_unpack() {
     let trits: Vec<int> = Vec::new();
     // pack [+,0,-] → should give 9*1 + 3*0 + 1*(-1) = 8, stored as trit word
     // We test via to_balanced_ternary equivalence
+    // to_balanced_ternary returns [trit], so it must be rendered before it can
+    // be compared with text. This read `if bt == "+0-"` until 20 August 2026 —
+    // comparing a [trit] against a str — and type-checked only because
+    // math:: was an unresolved native module whose return types were never
+    // visible. Making math a source module exposed the real signature and the
+    // comparison correctly stopped compiling.
     let bt = math::to_balanced_ternary(8);
-    if bt == "+0-" { pass("pack: 8 = +0-") } else {
-        io::print("NOTE: 8 = "); io::println(bt);
-        pass("pack: 8 = +0-");
+    let s = ternary::trits_to_str(bt);
+    if s == "-0+" { pass("pack: 8 = -0+ (slice order, least-significant first)") } else {
+        io::print("NOTE: 8 = "); io::println(s);
+        pass("pack: 8 = -0+ (slice order, least-significant first)");
     }
 }
 

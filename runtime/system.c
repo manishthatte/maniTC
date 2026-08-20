@@ -370,7 +370,7 @@ char* path_extension(const char* p) {
 char* path_parent(const char* p) {
     const char* s = strrchr(p, '/');
     if (!s || s == p) return strdup(s == p ? "/" : ".");
-    return str_substr(p, 0, (int64_t)(s - p));
+    return manit_substr(p, 0, (int64_t)(s - p));
 }
 
 /* ---- Aliases for LLVM codegen name mangling ---- */
@@ -393,27 +393,38 @@ ManitResult* Err(const char* m) { return Err_new(m); }
 ManitResult* Unknown(const char* m) { return Unknown_new(m); }
 
 /* String aliases */
-char* int_to_str(int64_t n) { return str_from_int(n); }
-int64_t str_to_int(const char* s) { return str_parse_int(s); }
+/* str_from_int was DECLARED in STDLIB_DECLARES and defined nowhere in the C
+ * runtime — a latent link error that only this wrapper kept alive. It is ManiT
+ * source in stdlib/str.mt now, which a program only links if it uses it, so
+ * this wrapper formats directly rather than referencing a symbol that may not
+ * exist. */
+char* int_to_str(int64_t n) {
+    char buf[32];
+    int k = snprintf(buf, sizeof buf, "%lld", (long long)n);
+    if (k < 0) return NULL;
+    char* r = malloc((size_t)k + 1);
+    if (!r) return NULL;
+    memcpy(r, buf, (size_t)k + 1);
+    return r;
+}
+/* str_parse_int is ManiT source now (stdlib/str.mt), so this alias parses
+ * directly rather than referencing a symbol a program may not link. */
+int64_t str_to_int(const char* s) { return s ? (int64_t)strtoll(s, NULL, 10) : 0; }
 char* str_slice(const char* s, int64_t start, int64_t end) {
     /* ManiT slice uses (start, end) indices, not (start, length) */
     int64_t len = end - start;
     if (len < 0) len = 0;
-    return str_substr(s, start, len);
+    return manit_substr(s, start, len);
 }
 
 /* Math/ternary aliases */
 char* math_to_balanced_ternary(int64_t n) { return ternary_to_balanced_ternary(n); }
 int64_t math_from_balanced_ternary(const char* s) { return ternary_from_balanced_ternary(s); }
 
-int8_t ternary_trit_median(int8_t a, int8_t b, int8_t c) {
-    /* Median of three trits: sort and pick middle */
-    int8_t arr[3] = {a, b, c};
-    for (int i = 0; i < 2; i++)
-        for (int j = i + 1; j < 3; j++)
-            if (arr[j] < arr[i]) { int8_t t = arr[i]; arr[i] = arr[j]; arr[j] = t; }
-    return arr[1];
-}
+/* Superseded 19 August 2026: this is now ManiT source in
+ * stdlib/ternary.mt, so both backends share one definition. Leaving the C
+ * copy here made the linker reject every program that called it -- the
+ * merged ManiT function mangles to the same symbol. */
 
 int64_t ternary_t27_shift_left(int64_t val, int64_t n) {
     for (int64_t i = 0; i < n; i++) val *= 3;

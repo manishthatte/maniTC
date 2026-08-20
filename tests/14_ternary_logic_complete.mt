@@ -87,23 +87,25 @@ fn test_full_txor_table() {
     let p: trit = +;
     let z: trit = 0;
     let n: trit = -;
-    // txor is mod-3 addition (balanced)
-    // +1 txor +1 = +1+1 mod 3 = 2 → but in balanced: 2 = 3-1 mod 3 = -1? Let's test what the impl does
-    // From 02_operators tests we know: + txor + = 0, + txor 0 = +, + txor - = +
-    // Wait, test 02 shows: + txor - = +, which means txor is NOT simple mod-3 add.
-    // According to spec: txor = "Mod-3 addition (balanced XOR)"
-    // Let me use the expected values from the existing 02 test:
-    // + txor + = 0, + txor 0 = +, + txor - = +   (from 02_operators)
-    // - txor - = 0, 0 txor - = +
-    check_trit("txor: +,+=0",  p txor p,  0);
+    // txor is balanced (a + b) mod 3 — the sum digit of balanced-ternary
+    // addition, i.e. sum without carry. A residue of 2 is written -1 and a
+    // residue of -2 is written +1, which is what makes the digit set balanced.
+    //
+    // These values were `0/+/+/+/0/+/+/+/0` until 19 August 2026, pinning an
+    // implementation that computed clamped |a - b| instead — a difference
+    // detector that could never return `-`, and was not a bijection, so
+    // `x txor k` could not be undone. The comment block here used to record
+    // the author noticing the mismatch and deciding to pin the implementation
+    // rather than the spec; the spec won in the end.
+    check_trit("txor: +,+=-",  p txor p, -1);
     check_trit("txor: +,0=+",  p txor z,  1);
-    check_trit("txor: +,-=+",  p txor n,  1);
+    check_trit("txor: +,-=0",  p txor n,  0);
     check_trit("txor: 0,+=+",  z txor p,  1);
     check_trit("txor: 0,0=0",  z txor z,  0);
-    check_trit("txor: 0,-=+",  z txor n,  1);
-    check_trit("txor: -,+=+",  n txor p,  1);
-    check_trit("txor: -,0=+",  n txor z,  1);
-    check_trit("txor: -,-=0",  n txor n,  0);
+    check_trit("txor: 0,-=-",  z txor n, -1);
+    check_trit("txor: -,+=0",  n txor p,  0);
+    check_trit("txor: -,0=-",  n txor z, -1);
+    check_trit("txor: -,-=+",  n txor n,  1);
 }
 
 // ---------------------------------------------------------------------------

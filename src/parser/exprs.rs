@@ -400,6 +400,37 @@ impl Parser {
                 }
             }
 
+            // A type keyword followed by `::` is a module path, not a type.
+            //
+            // `str` is the case that matters: the lexer maps it to StrKw, so
+            // `str::len(s)` used to die at the parser with "unexpected token in
+            // expression: StrKw" and EVERY function in stdlib/str.mt was
+            // unreachable by its documented name — 25+ of them, including the
+            // call in that module's own header comment. Method syntax
+            // (`s.len()`) reached the same functions, which is why it survived.
+            //
+            // Handled for every type keyword rather than just `str`, since the
+            // ambiguity is general: a type name in expression position before
+            // `::` can only be a path. Types are parsed by parse_type, which
+            // never reaches here, so this cannot shadow a real type use.
+            tk if self.peek2() == &TokenKind::ColonColon
+                && !matches!(tk, TokenKind::Ident(_))
+                && self.type_keyword_to_name(&tk).is_some() =>
+            {
+                let head = self.type_keyword_to_name(&tk).expect("guarded above");
+                self.advance();
+                let mut path = vec![head];
+                while self.eat(&TokenKind::ColonColon) {
+                    if let TokenKind::Ident(seg) = self.peek().clone() {
+                        self.advance();
+                        path.push(seg);
+                    } else {
+                        break;
+                    }
+                }
+                Ok(Expr::Ident(path.join("::"), span))
+            }
+
             // Identifiers (possibly struct literal, path, or plain ident)
             TokenKind::Ident(name) => {
                 self.advance();

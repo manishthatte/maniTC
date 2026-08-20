@@ -240,6 +240,7 @@ impl SemanticAnalyzer {
                     }
                     typed_args.push(targ);
                 }
+
                 Ok(TypedExpr {
                     kind: TypedExprKind::Call(Box::new(tcallee), typed_args),
                     ty: ret_ty,
@@ -506,10 +507,40 @@ impl SemanticAnalyzer {
 
             Expr::Array(elems, _) => {
                 // Derive element type hint from outer array hint
-                let outer_elem_hint: Option<ManiType> = match hint {
+                let mut outer_elem_hint: Option<ManiType> = match hint {
                     Some(ManiType::Array(ref et, _)) => Some(*et.clone()),
                     _ => None,
                 };
+
+                // With no usable hint, the element type is the type of the
+                // whole literal, not of its first element. `[0, 0, +]` is a
+                // trit array whose first two entries happen to be writable as
+                // integer literals; typing it from element 0 made it an int
+                // array, and the trit at index 2 was then stored one byte wide
+                // into eight-byte slots. That mis-shaped array reached the
+                // runtime helpers and segfaulted.
+                //
+                // Many stdlib signatures are still Unknown to the analyzer
+                // (report.txt S3-S8), so "no usable hint" is the common case
+                // for exactly the calls that care: pack_trits, trits_to_str.
+                if outer_elem_hint.as_ref().is_none_or(|t| !t.is_known()) && !elems.is_empty() {
+                    let mut probe: Option<ManiType> = None;
+                    for e in elems {
+                        let te = self.check_expr(e, None)?;
+                        // A bare integer literal is the weakest claim on the
+                        // element type: 0 is a legal trit, tryte, t9 and t27
+                        // as well as an int. Anything more specific wins.
+                        let specific = te.ty.is_ternary()
+                            || matches!(te.ty, ManiType::Float | ManiType::Str | ManiType::Char);
+                        if specific && probe.as_ref().is_none_or(|p| !p.is_ternary()) {
+                            probe = Some(te.ty.clone());
+                        } else if probe.is_none() {
+                            probe = Some(te.ty.clone());
+                        }
+                    }
+                    outer_elem_hint = probe.filter(|t| t.is_known());
+                }
+
                 let mut typed_elems = Vec::new();
                 let mut elem_ty = outer_elem_hint.clone().unwrap_or(ManiType::Unknown);
                 for e in elems {

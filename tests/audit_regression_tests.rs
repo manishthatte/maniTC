@@ -507,3 +507,943 @@ fn main() {
     assert!(t3_out.contains("3 99 14 len=3"), "t3 wrong:\n{}", t3_out);
     assert!(ll_out.contains("3 99 14 len=3"), "llvm wrong:\n{}", ll_out);
 }
+
+// ---------------------------------------------------------------------------
+// LP1/LP2 — the two in-memory layouts of `[trit]`.
+//
+// maniTC carries two different layouts behind the single type `[trit]`:
+//
+//   FLAT  an unsized array *parameter* — element i at slot i, with the length
+//         passed alongside in a hidden `__len_` argument. Indexing and `for`
+//         iteration assume this, and tests/27_ir_regressions.mt pins it.
+//
+//   LP    everything else — mem[0] is the length, trits occupy mem[1..=len],
+//         least-significant first. Documented on INTERNAL_RUNTIME_HELPERS in
+//         codegen_llvm/helpers.rs and mirrored by T3 syscalls 8/10/11/12/13.
+//         Runtime producers (math::to_balanced_ternary) emit this, and the
+//         native trit consumers read it.
+//
+// LP_FUNCS in ir/lower/lower_expr.rs bridges FLAT -> LP. Two holes were
+// measured on 18 Aug 2026, both silently wrong on T3 and a segfault on LLVM:
+//
+//   LP1  a flat `[trit]` parameter reaching pack_trits/trits_to_str went
+//        unconverted, because the bridge could only build the prefixed buffer
+//        with a compile-time length (IRInstr::Alloca is statically sized), so
+//        the callee read the first trit as the length. Fixed by the
+//        __lp_from_flat helper — @__lp_from_flat in codegen_llvm/helpers.rs
+//        and T3 syscall #203 — which mallocs the copy at run time.
+//   LP2  `from_balanced_ternary` was listed as `ternary::` but is declared in
+//        stdlib/math.mt, so the name matched nothing and even a *sized* array
+//        went unconverted. Now spelled `math::`.
+// ---------------------------------------------------------------------------
+
+/// LP1, the case that motivated __lp_from_flat: a flat `[trit]` parameter
+/// handed to each of the three length-prefixed callees. Before the helper,
+/// T3 printed -1 for a value of -137 (reading the leading `+` as a length of
+/// 1) and LLVM segfaulted.
+#[test]
+fn lp1_flat_trit_param_reaches_lp_callees_on_both_backends() {
+    let src = r#"
+fn pack(a: [trit]) -> int { return ternary::pack_trits(a); }
+fn show(a: [trit]) -> str { return ternary::trits_to_str(a); }
+fn recover(a: [trit]) -> int { return math::from_balanced_ternary(a); }
+fn main() {
+    // LST-first: 1 - 3 + 0 + 27 + 81 - 243 = -137
+    let s: [trit; 6] = [+, -, 0, +, +, -];
+    io::println(fmt::format("pack={} show={} recover={}", [
+        fmt::show_int(pack(s)), show(s), fmt::show_int(recover(s))]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("lp1_param.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    let want = "pack=-137 show=+-0++- recover=-137";
+    assert!(t3_out.contains(want), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains(want), "llvm wrong:\n{}", ll_out);
+}
+
+/// A zero-length flat parameter must produce an empty prefixed buffer, not a
+/// read of whatever the pointer happens to address.
+#[test]
+fn lp1_empty_flat_trit_param_is_zero() {
+    let src = r#"
+fn pack(a: [trit]) -> int { return ternary::pack_trits(a); }
+fn main() {
+    let z: [trit; 0] = [];
+    io::println(fmt::format("empty={}", [fmt::show_int(pack(z))]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("lp1_empty.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(t3_out.contains("empty=0"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("empty=0"), "llvm wrong:\n{}", ll_out);
+}
+
+/// The false-positive guard, and the reason the bridge keys on the hidden
+/// `#len:` local rather than on the type: a runtime-produced `[trit]` is also
+/// `Array(Trit, None)` but is ALREADY prefixed. Wrapping it in __lp_from_flat
+/// would prefix it twice. It must keep compiling and keep its value.
+#[test]
+fn lp1_runtime_trit_slice_is_not_double_prefixed() {
+    let src = r#"
+fn main() {
+    let r: [trit] = math::to_balanced_ternary(-137);
+    io::println(fmt::format("v={} s={}", [
+        fmt::show_int(math::from_balanced_ternary(r)),
+        ternary::trits_to_str(r)]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("lp1_runtime.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(t3_out.contains("v=-137 s=+-0++-"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("v=-137 s=+-0++-"), "llvm wrong:\n{}", ll_out);
+}
+
+/// The type-check-level guard for the same case: rejecting a runtime-produced
+/// `[trit]` at an LP callee once broke examples/ternary_demo.mt.
+#[test]
+fn lp1_runtime_trit_slice_is_still_accepted() {
+    assert_checks(
+        "lp1_runtime_ok.mt",
+        r#"
+fn main() {
+    let bt: [trit] = math::to_balanced_ternary(42);
+    io::println(ternary::trits_to_str(bt));
+    let lit: [trit] = [+, -, 0, +, +, -];
+    io::print_int(ternary::t27_to_int(ternary::pack_trits(lit)));
+}
+"#,
+    );
+}
+
+/// The other guard: the bridge must not disturb the FLAT layout itself.
+/// Iterating and indexing an unsized `[trit]` parameter still assume element
+/// i at slot i, and must keep working on both backends.
+#[test]
+fn lp1_flat_trit_param_still_iterates_on_both_backends() {
+    let src = r#"
+fn count_pos(ts: [trit]) -> int {
+    let mut c = 0;
+    for t in ts { if t > 0 { c = c + 1; } }
+    return c;
+}
+fn first(ts: [trit]) -> int { return ts[0] as int; }
+fn main() {
+    let a: [trit; 5] = [+, -, +, 0, +];
+    io::println(fmt::format("pos={} first={}", [
+        fmt::show_int(count_pos(a)), fmt::show_int(first(a))]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("lp1_iter.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(t3_out.contains("pos=3 first=1"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("pos=3 first=1"), "llvm wrong:\n{}", ll_out);
+}
+
+#[test]
+fn lp2_from_balanced_ternary_converts_a_sized_array() {
+    // LST-first [+, 0, -] = 1*1 + 0*3 + (-1)*9 = -8. Before the module
+    // qualifier was corrected: T3 returned 0, LLVM segfaulted.
+    let src = r#"
+fn main() {
+    let t: [trit; 3] = [+, 0, -];
+    let rt: [trit] = math::to_balanced_ternary(-8);
+    io::println(fmt::format("sized={} runtime={}", [
+        fmt::show_int(math::from_balanced_ternary(t)),
+        fmt::show_int(math::from_balanced_ternary(rt))]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("lp2_fbt.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(t3_out.contains("sized=-8 runtime=-8"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("sized=-8 runtime=-8"), "llvm wrong:\n{}", ll_out);
+}
+
+// ---------------------------------------------------------------------------
+// TX — `txor` is balanced (a + b) mod 3.
+//
+// Changed 19 August 2026 from clamped |a - b|. The old operator was a
+// difference detector wearing ternary clothes: it could never return `-`, so a
+// third of the digit set was unreachable in its range, and it was not a
+// bijection — for any fixed b, two of the three inputs mapped to `+` — so
+// `x txor k` could not be undone. tests/22_crypto.mt had to hand-roll mod-3 as
+// its own `txor_trit` for exactly that reason.
+//
+// Note which recovery property actually holds. Binary XOR undoes itself after
+// TWO applications only because 2 = 0 (mod 2); that is an accident of base 2.
+// In base 3 it takes THREE, because 3k = 0 (mod 3). Assuming self-inverse here
+// is the binary habit this project exists to avoid.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tx_txor_is_balanced_mod3_on_both_backends() {
+    let src = r#"
+fn main() {
+    let ts: [trit; 3] = [-, 0, +];
+    let mut row: str = "";
+    for i in 0..3 {
+        for j in 0..3 {
+            row = fmt::format("{}{}", [row,
+                ternary::trits_to_str([ts[i] txor ts[j]])]);
+        }
+    }
+    io::println(fmt::format("table={}", [row]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("tx_table.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // Rows a = -, 0, +; columns b = -, 0, + within each row.
+    //   -,-=+  -,0=-  -,+=0 | 0,-=-  0,0=0  0,+=+ | +,-=0  +,0=+  +,+=-
+    let want = "table=+-0-0+0+-";
+    assert!(t3_out.contains(want), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains(want), "llvm wrong:\n{}", ll_out);
+}
+
+#[test]
+fn tx_txor_recovers_after_three_applications_not_two() {
+    let src = r#"
+fn main() {
+    let ts: [trit; 3] = [-, 0, +];
+    let mut twice: bool = true;
+    let mut thrice: bool = true;
+    let mut bijection: bool = true;
+    for j in 0..3 {
+        let k: trit = ts[j];
+        for i in 0..3 {
+            let x: trit = ts[i];
+            if ((x txor k) txor k) != x { twice = false; }
+            if (((x txor k) txor k) txor k) != x { thrice = false; }
+        }
+        let i0: trit = ts[0] txor k;
+        let i1: trit = ts[1] txor k;
+        let i2: trit = ts[2] txor k;
+        if i0 == i1 { bijection = false; }
+        if i1 == i2 { bijection = false; }
+        if i0 == i2 { bijection = false; }
+    }
+    let mut a: str = "no";
+    if twice { a = "yes"; }
+    let mut b: str = "no";
+    if thrice { b = "yes"; }
+    let mut c: str = "no";
+    if bijection { c = "yes"; }
+    io::println(fmt::format("self_inverse={} three={} bijection={}", [a, b, c]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("tx_inv.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // self_inverse=no is the POINT of this test, not an oversight.
+    let want = "self_inverse=no three=yes bijection=yes";
+    assert!(t3_out.contains(want), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains(want), "llvm wrong:\n{}", ll_out);
+}
+
+// ---------------------------------------------------------------------------
+// S10 — tuples: allocation size, and the width a destructured name is bound at.
+//
+// ORACLE_FINDINGS.md Section 10 was filed as "LLVM loses a trit argument when
+// two call results feed a tuple-returning call in a loop". It was actually TWO
+// independent memory bugs, neither specific to trits, loops, or arity two:
+//
+//   1. HEAP. Every tuple mapped to the single IR type name "<tuple>", which is
+//      in no struct-size table, so the LLVM backend's lookup fell through to
+//      its `unwrap_or(1)` default and malloc'd 8 bytes for a tuple of ANY
+//      arity. A 2-tuple overran its allocation by 8 bytes on every
+//      construction. Fixed by encoding the arity as "<tuple:N>".
+//
+//   2. STACK. Destructuring bound every name as i64. Tuple slots really are
+//      8 bytes wide, so the load was right, but the binding then claimed i64
+//      for a `trit`, and assigning it back to a trit variable emitted
+//          store i64 %v, ptr %carry     ; %carry = alloca i8
+//      an 8-byte write into a 1-byte slot, silently overwriting the
+//      neighbouring allocas. Fixed by binding each name at its element type.
+//
+// The reported symptom needed both, which is why the finding recorded it as
+// "not fully isolated" and suspected register allocation. T3 was correct
+// throughout — its slots are uniformly one word.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s10_destructured_trit_assigned_back_does_not_clobber_neighbours() {
+    // The original reproducer, reduced. `carry = c` is the 8-byte store; the
+    // neighbour it used to destroy was `tb`, which read back as 0 from the
+    // second iteration on.
+    let src = r#"
+fn trit_at(n: int, pos: int) -> trit {
+    let mut v: int = n;
+    for _k in 0..pos {
+        let mut d: int = v % 3;
+        if d == 2 { d = -1; }
+        if d == -2 { d = 1; }
+        v = (v - d) / 3;
+    }
+    let mut d: int = v % 3;
+    if d == 2 { d = -1; }
+    if d == -2 { d = 1; }
+    return ternary::int_to_trit(d);
+}
+fn add3(a: trit, b: trit, cin: trit) -> (trit, trit) {
+    let s: int = ternary::trit_to_int(a) + ternary::trit_to_int(b)
+               + ternary::trit_to_int(cin);
+    if s == 3 { return (0, +); }
+    if s == 2 { return (-, +); }
+    if s == 1 { return (+, 0); }
+    if s == 0 { return (0, 0); }
+    if s == -1 { return (-, 0); }
+    if s == -2 { return (+, -); }
+    return (0, -);
+}
+fn main() {
+    let mut carry: trit = 0;
+    let mut row: str = "";
+    for i in 0..4 {
+        let ta: trit = trit_at(40, i);
+        let tb: trit = trit_at(13, i);
+        let (s, c) = add3(ta, tb, carry);
+        row = fmt::format("{}{}", [row, ternary::trits_to_str([tb])]);
+        carry = c;
+    }
+    io::println(fmt::format("tb={}", [row]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s10_carry.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // 13 is `+++` least-significant first, so positions 0..3 are +, +, +, 0.
+    // LLVM used to print `+000`.
+    assert!(t3_out.contains("tb=+++0"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("tb=+++0"), "llvm wrong:\n{}", ll_out);
+}
+
+#[test]
+fn s10_tuple_elements_keep_their_own_widths() {
+    // Mixed widths in one tuple: a trit is one byte, an int is eight. Binding
+    // both as i64 is what produced the oversized store.
+    let src = r#"
+fn mix(t: trit, n: int) -> (trit, int, trit) {
+    return (t, n * 2, tnot t);
+}
+fn main() {
+    let mut acc: trit = 0;
+    for i in 0..3 {
+        let (a, b, c) = mix(+, i);
+        acc = c;
+        io::println(fmt::format("a={} b={} c={} acc={}", [
+            ternary::trits_to_str([a]), fmt::show_int(b),
+            ternary::trits_to_str([c]), ternary::trits_to_str([acc])]));
+    }
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s10_mixed.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "backends disagree:\nT3:\n{}\nLLVM:\n{}", t3_out, ll_out);
+    assert!(t3_out.contains("a=+ b=0 c=- acc=-"), "wrong:\n{}", t3_out);
+    assert!(t3_out.contains("a=+ b=4 c=- acc=-"), "wrong:\n{}", t3_out);
+}
+
+#[test]
+fn s10_wide_tuples_are_allocated_at_full_size() {
+    // Arity beyond two: the old 8-byte allocation overran by 8 bytes per extra
+    // element, so a 5-tuple wrote 32 bytes past its buffer.
+    let src = r#"
+fn five() -> (int, int, int, int, int) {
+    return (11, 22, 33, 44, 55);
+}
+fn main() {
+    let (a, b, c, d, e) = five();
+    io::println(fmt::format("{} {} {} {} {}", [
+        fmt::show_int(a), fmt::show_int(b), fmt::show_int(c),
+        fmt::show_int(d), fmt::show_int(e)]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s10_wide.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(t3_out.contains("11 22 33 44 55"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("11 22 33 44 55"), "llvm wrong:\n{}", ll_out);
+}
+
+// ---------------------------------------------------------------------------
+// §9 tail — the six char-dependent str:: functions
+//
+// Closed 19 August 2026. Before this, all six were `// native` declarations:
+// char_at/to_upper/to_lower existed only in the C runtime (so they worked on
+// LLVM and failed to assemble on T3), and pad_left/pad_right/center existed
+// nowhere at all — `center` did not even have an LLVM declaration, so it
+// failed at link time with "use of undefined value '@str_center'".
+//
+// The fix adds exactly TWO primitives on both backends — str_char_at (133) and
+// str_from_char (134) — and writes the other four in ManiT on top of them, so
+// there is one body per function and the backends cannot drift apart the way
+// §8's aliases did.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s9_char_dependent_str_functions_agree_on_both_backends() {
+    let src = r#"
+fn main() {
+    io::println(fmt::format("up={} low={}", [
+        str::to_upper("Hello, World 42!"),
+        str::to_lower("Hello, World 42!")]));
+    io::println(fmt::format("padl={} padr={} ceven={} codd={}", [
+        str::pad_left("7", 4, '0'),
+        str::pad_right("7", 4, '.'),
+        str::center("hi", 6, '-'),
+        str::center("hi", 5, '-')]));
+    // Width already met: all three must return the string untouched rather
+    // than truncating it.
+    io::println(fmt::format("noop={}{}{}", [
+        str::pad_left("hello", 3, '0'),
+        str::pad_right("hello", 3, '0'),
+        str::center("hello", 2, '-')]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s9_char.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    for want in [
+        "up=HELLO, WORLD 42! low=hello, world 42!",
+        // center's odd remainder goes right: "-hi--", not "--hi-".
+        "padl=0007 padr=7... ceven=--hi-- codd=-hi--",
+        "noop=hellohellohello",
+    ] {
+        assert!(t3_out.contains(want), "t3 missing {:?}:\n{}", want, t3_out);
+        assert!(ll_out.contains(want), "llvm missing {:?}:\n{}", want, ll_out);
+    }
+}
+
+#[test]
+fn s9_printing_a_char_prints_the_character_not_the_codepoint() {
+    // `char` is documented as a Unicode scalar value, but print() grouped it
+    // with the integer types, so `print(str::char_at("hello", 1))` emitted
+    // "101" instead of "e" — which made char_at useless for display and
+    // indistinguishable from an int. Nothing in the tree printed a char at the
+    // time, so the fix was free.
+    let src = r#"
+fn main() {
+    let c: char = str::char_at("hello", 1);
+    io::println(fmt::format("c={} first={} made={}", [
+        str::from_char(c),
+        str::from_char(str::char_at("hello", 0)),
+        str::from_char('Z')]));
+    print(c);
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s9_char_print.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(t3_out.contains("c=e first=h made=Z"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("c=e first=h made=Z"), "llvm wrong:\n{}", ll_out);
+    // The bare print(c) line: the character, never the codepoint.
+    assert!(!t3_out.contains("101"), "t3 printed the codepoint:\n{}", t3_out);
+    assert!(!ll_out.contains("101"), "llvm printed the codepoint:\n{}", ll_out);
+}
+
+#[test]
+fn s9_char_at_out_of_range_is_zero_on_both_backends() {
+    // The C runtime returns 0 for a negative or past-the-end index; the T3
+    // emulator handler must agree rather than trapping or reading out of
+    // bounds. Pinned because the two implementations are necessarily separate.
+    let src = r#"
+fn main() {
+    io::println(fmt::format("neg={} past={} last={}", [
+        fmt::show_int(str::char_at("abc", -1) as int),
+        fmt::show_int(str::char_at("abc", 3) as int),
+        fmt::show_int(str::char_at("abc", 2) as int)]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s9_char_oob.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // 'c' is 99.
+    assert!(t3_out.contains("neg=0 past=0 last=99"), "t3 wrong:\n{}", t3_out);
+    assert!(ll_out.contains("neg=0 past=0 last=99"), "llvm wrong:\n{}", ll_out);
+}
+
+#[test]
+fn s8_int_to_trits_had_no_implementation_on_either_backend() {
+    // ternary::int_to_trits is the worked example in stdlib/ternary.mt's own
+    // module header, and until 19 Aug 2026 it existed only as a `// native`
+    // declaration: LLVM emitted a call to an undefined @ternary_int_to_trits
+    // and T3 could not assemble the label. It was previously recorded as
+    // needing "unsized array returns, a language gap" — that was wrong.
+    // math::to_balanced_ternary already returns an unsized [trit] on both
+    // backends, so the feature was there and only this function was missing.
+    let src = r#"
+fn main() {
+    io::println(fmt::format("a={} b={} c={}", [
+        ternary::trits_to_str(ternary::int_to_trits(11, 4)),
+        ternary::trits_to_str(ternary::int_to_trits(42, 5)),
+        ternary::trits_to_str(ternary::int_to_trits(0, 3))]));
+    io::println(fmt::format("neg={} trunc={} zero_width={}", [
+        ternary::trits_to_str(ternary::int_to_trits(-4, 3)),
+        ternary::trits_to_str(ternary::int_to_trits(11, 2)),
+        ternary::trits_to_str(ternary::int_to_trits(11, 0))]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s8_i2t.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // LST-first, so read each right-to-left to check the value:
+    //   -++0 = -1 + 3 + 9      = 11
+    //   0---+ = -3 -9 -27 + 81 = 42
+    //   --0  = -1 + -3         = -4
+    //   -+   = -1 + 3          = 2   (higher trits discarded, as documented)
+    //   empty renders "0"
+    for want in ["a=-++0 b=0---+ c=000", "neg=--0 trunc=-+ zero_width=0"] {
+        assert!(t3_out.contains(want), "t3 missing {:?}:\n{}", want, t3_out);
+        assert!(ll_out.contains(want), "llvm missing {:?}:\n{}", want, ll_out);
+    }
+}
+
+#[test]
+fn s8_to_balanced_ternary_matches_its_documented_examples() {
+    // stdlib/math.mt carried two WRONG worked examples until 19 Aug 2026: one
+    // was a draft left mid-correction ("[-, +] ... is wrong; actually"), and
+    // to_balanced_ternary(-4) was documented as [-, +, -], which is -7. The
+    // implementation was right both times; only the comment lied. Pinned here
+    // so the doc and the code cannot drift apart again.
+    let src = r#"
+fn main() {
+    io::println(fmt::format("five={} zero={} negfour={}", [
+        ternary::trits_to_str(math::to_balanced_ternary(5)),
+        ternary::trits_to_str(math::to_balanced_ternary(0)),
+        ternary::trits_to_str(math::to_balanced_ternary(-4))]));
+    io::println(fmt::format("rt5={} rtm4={}", [
+        fmt::show_int(math::from_balanced_ternary(math::to_balanced_ternary(5))),
+        fmt::show_int(math::from_balanced_ternary(math::to_balanced_ternary(-4)))]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s8_bt.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // five = --+ : -1 + -3 + 9 = 5.   negfour = -- : -1 + -3 = -4.
+    for want in ["five=--+ zero=0 negfour=--", "rt5=5 rtm4=-4"] {
+        assert!(t3_out.contains(want), "t3 missing {:?}:\n{}", want, t3_out);
+        assert!(ll_out.contains(want), "llvm missing {:?}:\n{}", want, ll_out);
+    }
+}
+
+#[test]
+fn s14_fmt_align_honours_the_pad_char_on_both_backends() {
+    // stdlib/fmt.mt declares align_left/align_right with three parameters and
+    // the lowerer has always emitted a 3-argument call, but the LLVM declares
+    // named only two. clang accepts a 3-argument call to a 2-parameter
+    // function, so the pad char was dropped and the C hardcoded a space:
+    // align_left("ab", 5, '.') printed "ab..." on T3 and "ab   " on LLVM.
+    // Nothing caught it because native call arguments are never type-checked.
+    let src = r#"
+fn main() {
+    io::println(fmt::align_left("ab", 5, '.'));
+    io::println(fmt::align_right("ab", 5, '.'));
+    // A space pad must still work — it is what the broken version always did,
+    // so testing only this case would have passed against the bug.
+    io::println(fmt::align_left("ab", 5, ' '));
+    // Width already met: return the string untouched, never truncated.
+    io::println(fmt::align_left("toolong", 3, '.'));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s14_align.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    for want in ["ab...", "...ab", "ab   ", "toolong"] {
+        assert!(t3_out.contains(want), "t3 missing {:?}:\n{}", want, t3_out);
+        assert!(ll_out.contains(want), "llvm missing {:?}:\n{}", want, ll_out);
+    }
+}
+
+#[test]
+fn s16_tuple_field_access_reads_the_right_element() {
+    // `p.1` loaded element 0. Two independent holes lined up: the analyzer's
+    // resolve_field_type had no tuple arm and returned ManiType::Unknown, and
+    // the IR lowerer looked the field name up in the struct table, missed, and
+    // fell through `unwrap_or(0)`. Both backends agreed on the wrong value and
+    // nothing warned. Destructuring — `let (a, b) = ...` — has its own path and
+    // was always correct, which is why the whole stdlib never tripped over it.
+    //
+    // The heterogeneous tuple matters: with `(int, int)` the missing type
+    // resolution is invisible, so a same-type test would have passed against
+    // half the bug.
+    let src = r#"
+fn main() {
+    let a: (int, int, int) = (7, 8, 9);
+    io::println(fmt::format("{} {} {}", [
+        fmt::show_int(a.0), fmt::show_int(a.1), fmt::show_int(a.2)]));
+
+    let b: (int, str) = (42, "hi");
+    io::println(fmt::format("{} {}", [fmt::show_int(b.0), b.1]));
+
+    // Through a container, and through a tuple-returning stdlib call.
+    let v: Vec<(str, str)> = Vec::new();
+    v.push(("k0", "v0"));
+    v.push(("k1", "v1"));
+    let e: (str, str) = v.get(1);
+    io::println(fmt::format("{}={}", [e.0, e.1]));
+
+    let sc: (trit, trit) = ternary::trit_add(+, +);
+    io::println(fmt::format("sum={} carry={}", [
+        fmt::show_trit(sc.0), fmt::show_trit(sc.1)]));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s16_tuple.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    // 1 + 1 = 3 - 1, so the sum trit is - and the carry is +.
+    for want in ["7 8 9", "42 hi", "k1=v1", "sum=- carry=+"] {
+        assert!(t3_out.contains(want), "t3 missing {:?}:\n{}", want, t3_out);
+        assert!(ll_out.contains(want), "llvm missing {:?}:\n{}", want, ll_out);
+    }
+}
+
+#[test]
+fn s17_the_whole_fmt_surface_runs_on_both_backends() {
+    // 25 of fmt::'s 31 functions were signatures with no implementation on
+    // either backend, and show_trit was worse — it linked on LLVM and had no T3
+    // intercept, so the same source built on one target and not the other. They
+    // are ManiT source now, over str:: and ternary::, so there is one body per
+    // function and the backends cannot disagree.
+    //
+    // This exercises every function the module exports. The point is coverage,
+    // not depth: a link error or a missing T3 label is what regression looks
+    // like here, and it shows up as a non-zero exit long before any assert.
+    let src = r#"
+fn min_op(a: trit, b: trit) -> trit { return ternary::trit_and(a, b); }
+
+fn main() {
+    io::println(fmt::format1("f1={}", "a"));
+    io::println(fmt::format2("f2={},{}", "a", "b"));
+    io::println(fmt::format3("f3={},{},{}", "a", "b", "c"));
+
+    io::println(fmt::format("trit={} bool3={} dual={}", [
+        fmt::show_trit(-), fmt::show_bool3(True), fmt::show_dual(5)]));
+
+    io::println(fmt::format("t27={} pad={} t9={}", [
+        fmt::show_t27(ternary::int_to_t27(5)),
+        fmt::show_t27_padded(ternary::int_to_t27(5), 6),
+        fmt::show_t9(ternary::int_to_t9(40))]));
+    io::println(fmt::format("tryte={}", [fmt::show_tryte(ternary::int_to_tryte(4))]));
+
+    io::println(fmt::format("hex={} HEX={} neg={}", [
+        fmt::show_hex(6699), fmt::show_hex_upper(6699), fmt::show_hex(-26)]));
+    io::println(fmt::format2("oct={} bin={}", fmt::show_octal(493), fmt::show_binary(10)));
+
+    io::println(fmt::format("[{}][{}][{}]", [
+        fmt::align_left("ab", 5, '.'),
+        fmt::align_right("ab", 5, '.'),
+        fmt::align_center("hi", 6, '-')]));
+    io::println(fmt::format2("zp={} zpneg={}", fmt::zero_pad("42", 5), fmt::zero_pad("-42", 5)));
+
+    io::println(fmt::format2("dp={} sci={}", fmt::show_float_dp(2.345, 2),
+                             fmt::show_float_sci(12345.0)));
+
+    io::println(fmt::format1("slice={}", fmt::show_trit_slice([-, -, +])));
+    io::print(fmt::show_trit_table(5));
+    // Colour is ANSI: check it is longer than the plain form rather than
+    // embedding escape bytes in this file.
+    io::println(fmt::format1("colour_len={}", fmt::show_int(
+        str::len(fmt::show_t27_colour(ternary::int_to_t27(5))))));
+
+    fmt::print_separator(4, '-');
+    fmt::print_section("S");
+    let rows: Vec<(str, str)> = Vec::new();
+    rows.push(("k", "v"));
+    rows.push(("long", "w"));
+    fmt::print_table(rows);
+    fmt::print_truth_table("min", min_op);
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s17_fmt.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "the two backends must produce identical output");
+
+    for want in [
+        "f1=a", "f2=a,b", "f3=a,b,c",
+        "trit=- bool3=True dual=5 (+--)",
+        "t27=+-- pad=000+-- t9=++++",
+        "tryte=0++",
+        "hex=0x1a2b HEX=0x1A2B neg=-0x1a",
+        "oct=0o755 bin=0b1010",
+        "[ab...][...ab][--hi--]",
+        "zp=00042 zpneg=-0042",
+        "dp=2.35 sci=1.234500e+04",
+        // Slices are least-significant-first, so [-, -, +] is -1 + -3 + 9 = 5,
+        // and MST-first that reads +--.
+        "slice=+--",
+        // 3 glyphs x (5-byte SGR + glyph + 4-byte reset).
+        "colour_len=30",
+        "----",
+        "  S  ",
+        "k   : v",
+        "long: w",
+        "min  |  +  0  -",
+        "   - |  -  -  -",
+    ] {
+        assert!(t3_out.contains(want), "t3 missing {:?}:\n{}", want, t3_out);
+    }
+    // The decomposition table, checked as a block so column widths are pinned.
+    for want in [
+        "pos       3^pos  trit   contribution",
+        "  2           9     +              9",
+        "  1           3     -             -3",
+        "  0           1     -             -1",
+        "total                              5",
+    ] {
+        assert!(t3_out.contains(want), "t3 missing table row {:?}:\n{}", want, t3_out);
+    }
+}
+
+#[test]
+fn s18_the_whole_str_surface_runs_on_both_backends() {
+    // str:: went from 33 of 43 measurable functions to all of them on 20 August
+    // 2026. Ten were declared and defined NOWHERE — no ManiT body, no C body,
+    // and for six of them not even an LLVM `declare` — so they failed at link on
+    // LLVM and at assembly on T3. The module header documented an API that did
+    // not exist.
+    //
+    // The five from_* converters delegate to fmt:: rather than carrying their
+    // own bodies: they ARE the same conversion under a second name, and a second
+    // implementation is exactly how `align_left` came to mean two different
+    // things at once (section 14a).
+    let src = r#"
+use std::io;
+use std::str;
+use std::fmt;
+
+fn shows(r: Result<int, str>) -> str {
+    match r { Ok(v) => { return fmt::show_int(v); }, Err(e) => { return str::concat("Err:", e); } }
+}
+fn showf(r: Result<float, str>) -> str {
+    match r { Ok(v) => { return fmt::show_float(v); }, Err(e) => { return str::concat("Err:", e); } }
+}
+
+fn main() {
+    io::println(str::concat("conv=", str::from_float(3.5)));
+    io::println(str::concat("bool=", str::from_bool(false)));
+    io::println(str::concat("trit=", str::from_trit(-)));
+    io::println(str::concat("b3=", str::from_bool3(Unknown)));
+    io::println(str::concat("t27=", str::from_ternary(5 as t27)));
+    // parse_ternary and from_ternary must be exact inverses.
+    io::println(str::concat("rt=", str::from_ternary(str::parse_ternary("-++"))));
+
+    io::println(str::concat("pf1=", fmt::show_float(str::parse_float("-12.25"))));
+    io::println(str::concat("pf2=", fmt::show_float(str::parse_float("2500e-3"))));
+    io::println(str::concat("pf3=", fmt::show_float(str::parse_float("-1.5E-2"))));
+
+    io::println(str::concat("num=", fmt::show_bool(str::is_numeric("12345"))));
+    io::println(str::concat("num0=", fmt::show_bool(str::is_numeric(""))));
+    io::println(str::concat("alpha=", fmt::show_bool(str::is_alpha("abc1"))));
+    io::println(str::concat("alnum=", fmt::show_bool(str::is_alphanumeric("a1B2"))));
+    io::println(str::concat("blank=", fmt::show_bool(str::is_blank(" \t\n\r"))));
+    // is_blank(s) and is_empty(trim(s)) must never disagree.
+    io::println(str::concat("agree=", fmt::show_bool(
+        str::is_blank(" \t ") == str::is_empty(str::trim(" \t ")))));
+
+    let v: Vec<str> = Vec::new();
+    v.push("x"); v.push("y"); v.push("z");
+    io::println(str::concat("join=", str::join(v, "-")));
+    let e: Vec<str> = Vec::new();
+    io::println(str::concat("joinempty=[", str::concat(str::join(e, "-"), "]")));
+    io::println(str::concat("split_join=", str::join(str::split("a,b,c", ","), ",")));
+
+    io::println(str::concat("ti=", shows(str::try_parse_int("  13  "))));
+    io::println(str::concat("ti_bad=", shows(str::try_parse_int("12a"))));
+    io::println(str::concat("tf=", showf(str::try_parse_float("-1.5e2"))));
+    io::println(str::concat("tf_bad=", showf(str::try_parse_float("1.2.3"))));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s18_str.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "the two backends must produce identical output");
+
+    for want in [
+        "conv=3.5", "bool=false", "trit=-", "b3=Unknown", "t27=+--", "rt=-++",
+        "pf1=-12.25", "pf2=2.5", "pf3=-0.015",
+        // Empty is FALSE for the three validators and TRUE for is_blank; that
+        // asymmetry is deliberate and is what this pins.
+        "num=true", "num0=false", "alpha=false", "alnum=true", "blank=true",
+        "agree=true",
+        "join=x-y-z", "joinempty=[]", "split_join=a,b,c",
+        "ti=13", "ti_bad=Err:not an integer",
+        "tf=-150", "tf_bad=Err:not a float",
+    ] {
+        assert!(t3_out.contains(want), "t3 missing {:?}:\n{}", want, t3_out);
+    }
+}
+
+#[test]
+fn s19_result_carries_a_float_payload_on_both_backends() {
+    // `Ok(1.5)` did not assemble on LLVM: the Result box is [tag, i64] and the
+    // `@Ok(i64)` constructor took its payload as i64, so handing it a double was
+    // "defined with type 'double' but expected 'i64'". T3, being word-oriented,
+    // had always worked — a backend divergence hidden behind a type nobody had
+    // instantiated with a float until str::try_parse_float needed it.
+    //
+    // The fix reinterprets the bits at the call boundary rather than converting
+    // the value. That is only sound because the slot is TYPE-ERASED; a genuine
+    // numeric conversion is lowered as an explicit cast well before codegen.
+    let src = r#"
+use std::io;
+use std::fmt;
+
+fn mkf() -> Result<float, str> { return Ok(1.5); }
+fn mki() -> Result<int, str> { return Ok(7); }
+fn mke() -> Result<float, str> { return Err("bad"); }
+
+fn main() {
+    match mkf() { Ok(v) => { io::println(fmt::show_float(v)); }, Err(e) => { io::println(e); } }
+    match mki() { Ok(v) => { io::println(fmt::show_int(v)); }, Err(e) => { io::println(e); } }
+    match mke() { Ok(v) => { io::println(fmt::show_float(v)); }, Err(e) => { io::println(e); } }
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s19_okfloat.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "the two backends must produce identical output");
+    // The float must survive the round trip through the i64 payload slot intact.
+    assert!(t3_out.contains("1.5"), "float payload lost:\n{}", t3_out);
+    assert!(t3_out.contains("7"), "int payload lost:\n{}", t3_out);
+    assert!(t3_out.contains("bad"), "err payload lost:\n{}", t3_out);
+}
+
+#[test]
+fn s20_t3_does_not_rescue_a_destination_that_is_not_defined_yet() {
+    // `(n as float) * 2.0` returned `n as float` on T3 and the product on LLVM.
+    //
+    // The T3 allocator hands out the destination register BEFORE emitting the
+    // operand setup, so between `dst_reg()` and the syscall that writes it, the
+    // destination temp is mapped to a register whose contents belong to something
+    // else. `rescue_reg` then found that mapping, saw the temp was live past this
+    // instruction, and "rescued" it — copying a stale value to R5 and, worse,
+    // REBINDING the temp to R5. The multiply syscall duly wrote its product to R1
+    // and the return read R5. The wrong answer was silent: no crash, no warning,
+    // just the first operand where the product should have been.
+    //
+    // `holds_value()` is the guard: a temp whose defining instruction has not been
+    // emitted yet holds nothing, so there is nothing to rescue. Function
+    // parameters have no defining instruction and are live from entry, which is
+    // why absence from `first_def` reads as defined rather than as undefined.
+    //
+    // Each case below drives a different rescue site. `scale` is the original
+    // report (rescue_reg, via float-literal loading); `chain` keeps a second float
+    // live across the syscall so a genuine rescue must still happen; `twoval`
+    // forces rescue_reg_inclusive by consuming both operands in the same
+    // instruction.
+    let src = r#"
+use std::io;
+use std::fmt;
+
+fn scale(n: int) -> float { return (n as float) * 2.0; }
+
+fn chain(n: int) -> float {
+    let a: float = n as float;
+    let b: float = a * 3.0;
+    return a + b;
+}
+
+fn twoval(x: float, y: float) -> float { return (x * y) + 1.0; }
+
+fn main() {
+    io::println(fmt::show_float(scale(3)));
+    io::println(fmt::show_float(chain(2)));
+    io::println(fmt::show_float(twoval(2.5, 4.0)));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s20_rescue.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "the two backends must produce identical output");
+    // Pinned absolutely, not just cross-backend: agreeing on the wrong number is
+    // the failure mode a pure differential check cannot see.
+    for want in ["6", "8", "11"] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}
+
+#[test]
+fn s21_float_rendering_is_identical_on_both_backends() {
+    // The LLVM runtime printed floats with "%g" and the T3 emulator with Rust's
+    // `format!("{}", f)`. Those are different numbers on screen, not two
+    // spellings of one:
+    //
+    //     3.14159265358979  ->  "3.14159"      vs  "3.14159265358979"
+    //     1234567.0         ->  "1.23457e+06"  vs  "1234567"
+    //     2.0/3.0           ->  "0.666667"     vs  "0.6666666666666666"
+    //
+    // "%g" gives six significant figures and switches to scientific notation, so
+    // eleven digits of a double were dropped on one backend and kept on the
+    // other. No float-valued program could be cross-checked — which is the one
+    // thing the two-backend oracle exists to do.
+    //
+    // T3 was the correct side, so the C runtime moved to match it: shortest
+    // round-tripping digits, rendered positionally. Two traps were paid for on
+    // the way, and both are now pinned by the cases below.
+    //
+    //  * "%.0f" is NOT the answer for large values. It renders the exact binary
+    //    value. `big` below is 10.0 multiplied thirty times, which lands on the
+    //    double 9.999999999999999e29 — whose EXACT value is
+    //    999999999999999879147136483328 but whose shortest round-trip rendering
+    //    is 9999999999999999 followed by fourteen zeros. The two part company at
+    //    digit 17, so this case fails loudly under "%.0f" and under "%g" alike.
+    //  * glibc breaks a decimal tie to EVEN and Rust breaks it AWAY FROM ZERO.
+    //    1059438285926254.25 is ...254.2 from one and ...254.3 from the other,
+    //    and both read back as the same double. About 1 double in 4,000 is
+    //    affected. `tie` pins one; a 2,000,012-value differential sweep of the
+    //    C renderer against Rust's found zero disagreements after the fix.
+    let src = r#"
+use std::io;
+use std::fmt;
+fn show(f: float) { io::println(fmt::show_float(f)); }
+fn main() {
+    show(3.14159265358979);
+    show(1234567.0);
+    show(0.0000001);
+    show(0.0);
+    show(-0.0);
+    show(-12.25);
+    let third: float = 2.0 / 3.0;
+    show(third);
+    let big: float = 1.0;
+    let mut b: float = big;
+    let mut i: int = 0;
+    while i < 30 { b = b * 10.0; i = i + 1; }
+    show(b);
+    let tie: float = 1059438285926254.25;
+    show(tie);
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s21_floatfmt.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(!t3_out.trim().is_empty(), "t3 produced no output — an empty-vs-empty comparison is not a pass");
+    assert_eq!(t3_out, ll_out, "the two backends must render floats identically");
+
+    // Pinned absolutely too: agreeing on the wrong string is a failure a pure
+    // differential check cannot see.
+    for want in [
+        "3.14159265358979",     // full precision, not %g's 3.14159
+        "1234567",              // positional, not 1.23457e+06
+        "0.0000001",            // positional, not 1e-07
+        "0.6666666666666666",   // 16 digits, not 0.666667
+        "-12.25",
+        "1059438285926254.3",   // Rust's tie-break, not glibc's ...254.2
+    ] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+    assert!(!t3_out.contains('e') && !t3_out.contains('E'),
+            "no float may render in scientific notation:\n{}", t3_out);
+    // Shortest round-trip digits, zero-padded to position — NOT the exact binary
+    // value 999999999999999879147136483328, and not scientific notation.
+    assert!(t3_out.contains(&format!("9999999999999999{}", "0".repeat(14))),
+            "large float must render from shortest round-trip digits:\n{}", t3_out);
+    assert!(!t3_out.contains("999999999999999879147136483328"),
+            "large float must NOT render its exact binary value:\n{}", t3_out);
+}

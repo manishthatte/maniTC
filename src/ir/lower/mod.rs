@@ -456,9 +456,21 @@ impl IRLowerer {
         }
 
         let string_literals = lowerer.string_literals.clone();
-        let struct_sizes = lowerer.structs.iter()
+        // Declared structs by field count, plus every enum at one slot.
+        //
+        // Enums lower to `IRType::Struct(name)` too (see IRType::from_mani) but
+        // are not in `lowerer.structs`, so they used to reach the LLVM
+        // backend's allocation-size lookup with no entry and be sized by its
+        // silent `unwrap_or(1)` default. One slot is in fact right for a
+        // tag-only enum — but it was right by accident, and the same default
+        // silently under-allocated tuples (ORACLE_FINDINGS.md Section 10).
+        // Recording enums explicitly lets that default become a hard error.
+        let mut struct_sizes: std::collections::HashMap<String, usize> = lowerer.structs.iter()
             .map(|(name, fields)| (name.clone(), fields.len()))
             .collect();
+        for name in lowerer.enum_variants.keys() {
+            struct_sizes.entry(name.clone()).or_insert(1);
+        }
         IRModule {
             name: "main".to_string(),
             functions,

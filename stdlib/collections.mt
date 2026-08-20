@@ -257,22 +257,34 @@ impl<V> TernaryTrie<V> {
     // Create an empty trie.
     fn new() -> TernaryTrie<V> ;  // native
 
-    // Insert a value at the path described by `key` (a trit slice, MST-first).
+    // Keys are `Vec<trit>`, MST-first.
+    //
+    // These were declared `[trit]` until 18 August 2026, which did not match the
+    // implementation: the runtime reads a key as a Vec — `Vec_len(key)` and
+    // `Vec_get(key, i)` — while a `[trit; N]` is emitted as N one-byte trits. So
+    // a three-trit key handed the runtime a 3-byte buffer to read as a 24-byte
+    // {data, len, cap} header, and the length came from past the end of the
+    // allocation. Fresh heap reads as zero, so every key collapsed onto the root
+    // node: distinct keys collided and `contains` returned false positives on
+    // LLVM, while T3 happened to be correct. Build the key with `Vec::new()` and
+    // `push`, and both backends agree.
+
+    // Insert a value at the path described by `key`.
     // Overwrites any existing value at the same path.
-    fn insert(self, key: [trit], val: V) ;  // native
+    fn insert(self, key: Vec<trit>, val: V) ;  // native
 
     // Look up the value at `key`.  Returns the value or panics if absent.
-    fn get(self, key: [trit]) -> V ;  // native
+    fn get(self, key: Vec<trit>) -> V ;  // native
 
     // Return true if the trie contains an entry at `key`.
-    fn contains(self, key: [trit]) -> bool ;  // native
+    fn contains(self, key: Vec<trit>) -> bool ;  // native
 
     // Remove the entry at `key`.  Returns the removed value or panics.
-    fn remove(self, key: [trit]) -> V ;  // native
+    fn remove(self, key: Vec<trit>) -> V ;  // native
 
-    // Return all keys that share `prefix` (MST-first trit slice).
+    // Return all keys that share `prefix`.
     // Useful for autocomplete-style queries over ternary key spaces.
-    fn keys_with_prefix(self, prefix: [trit]) -> Vec<[trit]> ;  // native
+    fn keys_with_prefix(self, prefix: Vec<trit>) -> Vec<Vec<trit>> ;  // native
 
     // Insert using an int key (automatically converted to balanced ternary).
     fn insert_int(self, key: int, val: V) ;  // native

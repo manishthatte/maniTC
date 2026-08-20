@@ -149,6 +149,23 @@ impl SemanticAnalyzer {
     }
 
     pub(super) fn resolve_field_type(&self, obj_ty: &ManiType, field: &str) -> ManiType {
+        // Tuple indexing: `p.0`, `p.1`, … The parser turns the integer token
+        // into a field name, so the digits arrive here as a string.
+        //
+        // This arm did not exist until 20 August 2026, so every tuple field
+        // access fell through to `ManiType::Unknown` below — and the matching
+        // hole in the IR lowerer made it load element 0. `let p = (7, 9); p.1`
+        // evaluated to 7 on both backends with no diagnostic. Destructuring
+        // (`let (a, b) = …`) has its own path and was always correct, which is
+        // why nothing in the stdlib ever tripped over it.
+        if let ManiType::Tuple(elems) = obj_ty {
+            if let Ok(i) = field.parse::<usize>() {
+                if i < elems.len() {
+                    return elems[i].clone();
+                }
+            }
+            return ManiType::Unknown;
+        }
         if let ManiType::Struct(name) = obj_ty {
             if let Some(fields) = self.structs.get(name.as_str()) {
                 for (fname, fty) in fields {

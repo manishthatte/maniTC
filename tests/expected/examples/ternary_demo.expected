@@ -68,9 +68,9 @@ tor (max) truth table:
 
 txor (mod-3 add, balanced) truth table:
        +    0    -
-  +    0    +    +  
-  0    +    0    +  
-  -    +    +    0  
+  +    -    +    0  
+  0    +    0    -  
+  -    0    -    +  
 
 Practical example: signal combining with tand / tor
   enable(+) tand fault(-) = -

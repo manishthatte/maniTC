@@ -411,14 +411,22 @@ fn test_parse_declare_sigs() {
     let (params, ret) = sigs.get("fmt_concat").expect("fmt_concat missing");
     assert_eq!(ret, "ptr");
     assert_eq!(params, &["ptr".to_string(), "ptr".to_string()]);
-    // i64 @math_abs(i64)
-    let (params, ret) = sigs.get("math_abs").expect("math_abs missing");
+    // i64 @math_trit_count(i64)
+    //
+    // This was `math_abs` and `math_pow` until 20 August 2026. Both were deleted
+    // when `math::abs` and `math::pow` became ManiT source — the point of this
+    // test is that parse_declare_sigs reads an integer signature and a
+    // floating-point one correctly, so any surviving pair of that shape serves.
+    // math_trit_count is a good long-term choice: it is one of only three
+    // math:: functions the T3 backend intercepts natively, so it is the least
+    // likely of them to move into ManiT later.
+    let (params, ret) = sigs.get("math_trit_count").expect("math_trit_count missing");
     assert_eq!(ret, "i64");
     assert_eq!(params, &["i64".to_string()]);
-    // double @math_pow(double, double)
-    let (params, ret) = sigs.get("math_pow").expect("math_pow missing");
+    // double @math_sqrt(double)
+    let (params, ret) = sigs.get("math_sqrt").expect("math_sqrt missing");
     assert_eq!(ret, "double");
-    assert_eq!(params, &["double".to_string(), "double".to_string()]);
+    assert_eq!(params, &["double".to_string()]);
 }
 
 #[test]
@@ -483,10 +491,19 @@ fn test_call_uses_declared_types() {
 fn runtime_trit_declares_carry_signext() {
     use super::helpers::STDLIB_DECLARES;
     // Every runtime entry point taking or returning a scalar trit/char.
+    // `ternary_int_to_trit` and `ternary_trit_median` were on this list until
+    // 19 August 2026. They are ManiT source in stdlib/ternary.mt now, so they
+    // no longer cross the C boundary at all and have no declare to check —
+    // moving them is what fixed their DIVERGENT status.
+    //
+    // `fmt_show_trit` and `fmt_show_bool3` left for the same reason on
+    // 20 August 2026: both are three-armed `tif` expressions in stdlib/fmt.mt
+    // now, their C bodies are deleted, and a trit that never reaches C cannot
+    // be sign-extended wrongly on the way.
     for name in [
-        "ternary_trit_to_int", "ternary_int_to_trit", "ternary_trit_median",
+        "ternary_trit_to_int",
         "io_print_trit", "io_print_bool3", "io_print_char", "io_print_tryte",
-        "fmt_show_trit", "fmt_show_bool3", "str_char_at",
+        "str_char_at",
         "AtomicTrit_new", "AtomicTrit_get", "AtomicTrit_set", "AtomicTrit_swap",
         "AtomicTrit_fetch_and", "AtomicTrit_fetch_or", "AtomicTrit_fetch_neg",
         "AtomicTrit_compare_exchange",
@@ -570,9 +587,19 @@ fn runtime_declares_match_the_abi_clang_actually_emits() {
         let Some(open) = rest[at..].find('(').map(|p| p + at) else { continue };
         let Some(close) = rest[open..].find(')').map(|p| p + open) else { continue };
         let name = &rest[at + 1..open];
-        let sig = &rest[..close];
-        // Only the functions where a scalar i8 crosses the boundary.
-        if !sig.split_whitespace().any(|w| w.trim_end_matches(',') == "i8") {
+        let ret = &rest[..at];
+        let params = &rest[open + 1..close];
+
+        // Only the functions where a scalar i8 crosses the boundary. Split the
+        // return and the parameter list apart first: in `void @f(i8 noundef %0`
+        // there is no space after `(`, so a whitespace scan over the whole
+        // signature sees the token `@f(i8` and misses the parameter entirely.
+        let is_i8 = |slot: &str| {
+            slot.split_whitespace().next().map(|w| w.trim_end_matches(',')) == Some("i8")
+        };
+        let crosses_i8 = ret.split_whitespace().any(|w| w == "i8")
+            || params.split(',').any(is_i8);
+        if !crosses_i8 {
             continue;
         }
         let Some(decl) = STDLIB_DECLARES
@@ -585,9 +612,14 @@ fn runtime_declares_match_the_abi_clang_actually_emits() {
              maniTC declares:\n  {}\n\
              The declaration must carry signext, or every -1 trit arrives as 255 \
              once the runtime is optimised.",
-            name, sig.trim(), decl,
+            name, &rest[..close], decl,
         );
         checked += 1;
     }
-    assert!(checked >= 15, "expected the whole trit runtime surface, checked {}", checked);
+    // The floor tracks how many i8-crossing runtime functions actually exist.
+    // It was 15 until 20 August 2026, when fmt_show_trit and fmt_show_bool3
+    // were deleted from runtime/core.c and reimplemented in ManiT. Lower it
+    // only alongside such a removal — a drop with no explanation means the
+    // scan silently stopped finding things, which is the failure this guards.
+    assert!(checked >= 14, "expected the whole trit runtime surface, checked {}", checked);
 }

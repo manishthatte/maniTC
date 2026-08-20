@@ -27,15 +27,15 @@ PASS tnot: ~~(+)=+
 PASS tnot: ~~(0)=0
 PASS tnot: ~~(-)=-
 -- full txor table --
-PASS txor: +,+=0
+PASS txor: +,+=-
 PASS txor: +,0=+
-PASS txor: +,-=+
+PASS txor: +,-=0
 PASS txor: 0,+=+
 PASS txor: 0,0=0
-PASS txor: 0,-=+
-PASS txor: -,+=+
-PASS txor: -,0=+
-PASS txor: -,-=0
+PASS txor: 0,-=-
+PASS txor: -,+=0
+PASS txor: -,0=-
+PASS txor: -,-=+
 -- De Morgan exhaustive --
 PASS de-morgan-1: all pairs
 PASS de-morgan-2: all pairs
@@ -126,4 +126,3 @@ PASS trit-cnt: 13→3
 PASS trit-cnt: -13→3
 PASS trit-cnt: 14 needs 4 trits
 Done.
-

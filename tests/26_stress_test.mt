@@ -200,29 +200,32 @@ fn all_ternary_ops(a: trit, b: trit) -> int {
 }
 
 fn test_all_ops_together() {
+    // txor is balanced (a + b) mod 3 as of 19 August 2026; the three sums
+    // that involve it moved by exactly the change in that one term.
+
     // a=+, b=+:
     //   tand(+,+)=+1, tor(+,+)=+1, tnot(+)=-1,
-    //   txor(+,+)=0, tcon(+,+)=+1, tany(+,+)=+1
-    //   sum = 1+1+(-1)+0+1+1 = 3
-    check_int("all-ops: (+,+) sum=3", all_ternary_ops(+, +), 3);
+    //   txor(+,+)=-1, tcon(+,+)=+1, tany(+,+)=+1
+    //   sum = 1+1+(-1)+(-1)+1+1 = 2
+    check_int("all-ops: (+,+) sum=2", all_ternary_ops(+, +), 2);
 
     // a=+, b=-:
     //   tand(+,-)=-1, tor(+,-)=+1, tnot(+)=-1,
-    //   txor(+,-)=+1, tcon(+,-)=0, tany(+,-)=+1
-    //   sum = -1+1+(-1)+1+0+1 = 1
-    check_int("all-ops: (+,-) sum=1", all_ternary_ops(+, -), 1);
+    //   txor(+,-)=0, tcon(+,-)=0, tany(+,-)=+1
+    //   sum = -1+1+(-1)+0+0+1 = 0
+    check_int("all-ops: (+,-) sum=0", all_ternary_ops(+, -), 0);
 
     // a=0, b=0:
     //   tand(0,0)=0, tor(0,0)=0, tnot(0)=0,
     //   txor(0,0)=0, tcon(0,0)=0, tany(0,0)=0
-    //   sum = 0
+    //   sum = 0                              (unchanged — 0 is the identity)
     check_int("all-ops: (0,0) sum=0", all_ternary_ops(0, 0), 0);
 
     // a=-, b=-:
     //   tand(-,-)=-1, tor(-,-)=-1, tnot(-)=+1,
-    //   txor(-,-)=0, tcon(-,-)=-1, tany(-,-)=-1
-    //   sum = -1+(-1)+1+0+(-1)+(-1) = -3
-    check_int("all-ops: (-,-) sum=-3", all_ternary_ops(-, -), -3);
+    //   txor(-,-)=+1, tcon(-,-)=-1, tany(-,-)=-1
+    //   sum = -1+(-1)+1+1+(-1)+(-1) = -2
+    check_int("all-ops: (-,-) sum=-2", all_ternary_ops(-, -), -2);
 }
 
 // ---------------------------------------------------------------------------
@@ -292,15 +295,17 @@ fn test_trit_call_chain() {
     // Trace for +: chain_a(+) = + tand + = +
     //              chain_b(+) = + tor 0 = +
     //              chain_c(+) = tnot(+) = -
-    //              chain_d(+) = - txor + = + (from truth table: -txor+ = +)
-    //              chain_e(+) = + tcon + = +
-    //              chain_f(+) = 1
-    check_int("trit-chain: f(+)=1", chain_f(+), 1);
+    //              chain_d(+) = - txor + = 0 (mod-3: -1 + 1 = 0)
+    //              chain_e(+) = 0 tcon 0 = 0
+    //              chain_f(+) = 0
+    // Was 1 until 19 August 2026, when txor became mod-3 addition: the old
+    // clamped |a-b| made `- txor +` = + and the chain ended at + instead.
+    check_int("trit-chain: f(+)=0", chain_f(+), 0);
 
     // Trace for 0: chain_a(0) = 0 tand + = 0
     //              chain_b(0) = 0 tor 0 = 0
     //              chain_c(0) = tnot(0) = 0
-    //              chain_d(0) = 0 txor + = + (from truth table: 0txor+ = +)
+    //              chain_d(0) = 0 txor + = + (mod-3: 0 + 1 = +1)
     //              chain_e(0) = + tcon + = +
     //              chain_f(0) = 1
     check_int("trit-chain: f(0)=1", chain_f(0), 1);

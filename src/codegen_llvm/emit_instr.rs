@@ -268,8 +268,44 @@ impl LLVMEmitter {
                     // Struct types: use malloc so the pointer survives function
                     // returns (alloca would create a dangling pointer). All struct
                     // fields are i64, so allocate n_fields * 8 bytes.
-                    let n = self.struct_sizes.get(sname).copied().unwrap_or(1);
-                    let bytes = n * 8;
+                    //
+                    // Tuples are not in struct_sizes — they are structural, not
+                    // declared — so their arity is carried in the name and read
+                    // back here. Before 19 August 2026 they shared the single
+                    // name "<tuple>", missed this lookup, and took the
+                    // `unwrap_or(1)` path: 8 bytes for a tuple of any arity.
+                    // A 2-tuple then overflowed its allocation by 8 bytes on
+                    // every construction, corrupting whatever the allocator had
+                    // placed next. That is ORACLE_FINDINGS.md Section 10, which
+                    // presented as "LLVM loses a trit argument in a loop"
+                    // because the damage depended on allocator state.
+                    let n = self
+                        .struct_sizes
+                        .get(sname)
+                        .copied()
+                        .or_else(|| tuple_arity_from_name(sname))
+                        .unwrap_or_else(|| {
+                            // A tuple-shaped name whose arity would not parse is
+                            // a naming regression, and silently sizing it at one
+                            // slot is exactly the bug this whole path had.
+                            assert!(
+                                !sname.starts_with("<tuple"),
+                                "internal error: tuple type `{}` carries no \
+                                 parsable arity — IRType::from_mani must emit \
+                                 `<tuple:N>`. Sizing it at one slot would \
+                                 overflow the allocation, which is \
+                                 ORACLE_FINDINGS.md Section 10.",
+                                sname
+                            );
+                            // Everything else reaching here is a native opaque
+                            // handle — Vec, Map, Set, Deque, TernaryTrie,
+                            // Channel, Mutex, AtomicTrit, Barrier, Task — which
+                            // the runtime hands back as a single pointer-sized
+                            // value. Declared structs and enums are registered
+                            // in struct_sizes, so they never land here.
+                            1
+                        });
+                    let bytes = (n * 8).max(8);
                     return format!(
                         "%{} = call ptr @malloc(i64 {})",
                         dst.0,
@@ -470,6 +506,36 @@ impl LLVMEmitter {
                                 call_prefix.push_str(&format!(
                                     "{} = {} {} {} to {}\n  ",
                                     coerce_name, op, actual, val_s, declared
+                                ));
+                                return format!("{} {}", declared, coerce_name);
+                            }
+                            // double vs i64: reinterpret the bits, do not convert
+                            // the value.
+                            //
+                            // This is not a numeric conversion — `n as float`
+                            // is lowered as an explicit cast long before here,
+                            // so a raw double/i64 mismatch at a call boundary
+                            // only arises where the callee's slot is
+                            // TYPE-ERASED. The Result/Option box is the case
+                            // that matters: `@Ok(i64)` stores its payload into
+                            // a raw 8-byte word, so `Ok(1.5)` handed a double
+                            // to an i64 parameter and the IR would not
+                            // assemble (added 20 August 2026). A double and an
+                            // i64 are both 8 bytes, which is what makes the
+                            // bitcast legal and lossless.
+                            //
+                            // The width guard matters: bitcast requires equal
+                            // bit widths, so a float/i32 pairing must fall
+                            // through to the mismatch below rather than emit
+                            // invalid IR.
+                            if (declared == "i64" && actual == "double")
+                                || (declared == "double" && actual == "i64")
+                            {
+                                let uid = self.fresh_anon("argb");
+                                let coerce_name = format!("%{}", uid);
+                                call_prefix.push_str(&format!(
+                                    "{} = bitcast {} {} to {}\n  ",
+                                    coerce_name, actual, val_s, declared
                                 ));
                                 return format!("{} {}", declared, coerce_name);
                             }
@@ -1191,5 +1257,28 @@ impl LLVMEmitter {
             "  ret void\n",
             "}\n"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tuple_arity_tests {
+    use crate::ir::types::tuple_arity_from_name;
+
+    #[test]
+    fn arity_round_trips_for_every_shape_the_lowering_emits() {
+        for n in 0..=8 {
+            let name = format!("<tuple:{}>", n);
+            assert_eq!(tuple_arity_from_name(&name), Some(n), "name {}", name);
+        }
+    }
+
+    #[test]
+    fn declared_structs_and_the_old_name_are_not_mistaken_for_tuples() {
+        // The old shared name carried no arity; it must NOT parse, so the
+        // caller panics instead of silently under-allocating again.
+        assert_eq!(tuple_arity_from_name("<tuple>"), None);
+        assert_eq!(tuple_arity_from_name("Point"), None);
+        assert_eq!(tuple_arity_from_name("<tuple:>"), None);
+        assert_eq!(tuple_arity_from_name("<tuple:x>"), None);
     }
 }

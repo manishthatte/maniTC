@@ -225,26 +225,71 @@ impl IRLowerer {
                         return IRValue::Temp(dst);
                     }
                     BinOpKind::Txor => {
-                        // txor(a,b) = min(1, |a-b|)
+                        // txor(a, b) = balanced (a + b) mod 3 — the sum digit of
+                        // balanced-ternary addition, i.e. sum without carry.
+                        //
+                        // Changed 19 August 2026 from clamped |a - b|, which was
+                        // never a ternary XOR: it could not return `-` at all, so
+                        // a third of the digit set was unreachable in its range,
+                        // and it was not invertible — for any fixed b, two of the
+                        // three inputs mapped to `+`, so `x txor k` could not be
+                        // undone. tests/22_crypto.mt had to hand-roll mod-3 as its
+                        // own `txor_trit` for exactly that reason. Mod-3 addition
+                        // is a bijection for fixed b, is surjective onto all three
+                        // trits, and is the true analogue of binary XOR.
+                        //
+                        // Branch-free. With s = a + b in [-2, 2] and c = s clamped
+                        // to [-1, 1], the wrap
+                        //     -2 -> +1,  -1 -> -1,  0 -> 0,  +1 -> +1,  +2 -> -1
+                        // is exactly 3c - 2s:
+                        //     s=+2: 3(+1) - 4 = -1     s=-2: 3(-1) + 4 = +1
+                        //     s=+1: 3(+1) - 2 = +1     s=-1: 3(-1) + 2 = -1
+                        //     s= 0: 0 - 0 = 0
                         let lv = self.lower_expr(lhs);
                         let rv = self.lower_expr(rhs);
-                        let diff = self.fresh_temp();
+                        let s = self.fresh_temp();
                         self.emit(IRInstr::BinOp {
-                            dst: diff.clone(), op: IRBinOp::Sub,
-                            lhs: lv.clone(), rhs: rv.clone(), ty: IRType::I64,
+                            dst: s.clone(), op: IRBinOp::Add,
+                            lhs: lv, rhs: rv, ty: IRType::I64,
                         });
-                        let neg_diff = self.fresh_temp();
-                        self.emit(IRInstr::TritNeg { dst: neg_diff.clone(), a: IRValue::Temp(diff.clone()) });
-                        let abs_diff = self.fresh_temp();
+                        // c = max(min(s, +1), -1)
+                        let lo = self.fresh_temp();
+                        self.emit(IRInstr::TritMin {
+                            dst: lo.clone(),
+                            a: IRValue::Temp(s.clone()),
+                            b: IRValue::Const(IRConst::Int(1)),
+                        });
+                        let c = self.fresh_temp();
                         self.emit(IRInstr::TritMax {
-                            dst: abs_diff.clone(),
-                            a: IRValue::Temp(diff),
-                            b: IRValue::Temp(neg_diff),
+                            dst: c.clone(),
+                            a: IRValue::Temp(lo),
+                            b: IRValue::Const(IRConst::Int(-1)),
                         });
+                        let c3 = self.fresh_temp();
+                        self.emit(IRInstr::BinOp {
+                            dst: c3.clone(), op: IRBinOp::Mul,
+                            lhs: IRValue::Temp(c), rhs: IRValue::Const(IRConst::Int(3)),
+                            ty: IRType::I64,
+                        });
+                        let s2 = self.fresh_temp();
+                        self.emit(IRInstr::BinOp {
+                            dst: s2.clone(), op: IRBinOp::Mul,
+                            lhs: IRValue::Temp(s), rhs: IRValue::Const(IRConst::Int(2)),
+                            ty: IRType::I64,
+                        });
+                        let raw = self.fresh_temp();
+                        self.emit(IRInstr::BinOp {
+                            dst: raw.clone(), op: IRBinOp::Sub,
+                            lhs: IRValue::Temp(c3), rhs: IRValue::Temp(s2),
+                            ty: IRType::I64,
+                        });
+                        // Numerically a no-op — raw is already in [-1, 1] — but it
+                        // makes the result carry the trit type the backends expect,
+                        // exactly as the previous lowering's trailing TritMin did.
                         let dst = self.fresh_temp();
                         self.emit(IRInstr::TritMin {
                             dst: dst.clone(),
-                            a: IRValue::Temp(abs_diff),
+                            a: IRValue::Temp(raw),
                             b: IRValue::Const(IRConst::Int(1)),
                         });
                         return IRValue::Temp(dst);
@@ -371,12 +416,26 @@ impl IRLowerer {
                                 ManiType::Float => self.emit(IRInstr::PrintFloat(val)),
                                 ManiType::Bool3 => self.emit(IRInstr::PrintBool3(val)),
                                 ManiType::Trit => self.emit(IRInstr::PrintTrit(val)),
+                                // A char is a Unicode scalar, so printing one
+                                // prints the character — not its codepoint.
+                                // Routed through str::from_char rather than a
+                                // new IR instruction so both backends share
+                                // the single primitive added for str::.
+                                ManiType::Char => {
+                                    let t = self.fresh_temp();
+                                    self.emit(IRInstr::Call {
+                                        dst: Some(t.clone()),
+                                        func: "str::from_char".to_string(),
+                                        args: vec![val],
+                                        ret_ty: IRType::from_mani(&ManiType::Str),
+                                    });
+                                    self.emit(IRInstr::PrintStr(IRValue::Temp(t)));
+                                }
                                 ManiType::Tryte
                                 | ManiType::T9
                                 | ManiType::T27
                                 | ManiType::T54
                                 | ManiType::Bool
-                                | ManiType::Char
                                 | ManiType::Unknown => {
                                     self.emit(IRInstr::PrintInt(val))
                                 }
@@ -477,14 +536,66 @@ impl IRLowerer {
                         }
                     };
 
-                    // Stdlib functions expecting a length-prefixed [trit] array
+                    // Stdlib functions expecting a length-prefixed [trit] array.
+                    //
+                    // These names are matched against what the source actually
+                    // writes, so the module qualifier has to be right.
+                    // `from_balanced_ternary` is declared in stdlib/math.mt:209,
+                    // NOT stdlib/ternary.mt — the old `ternary::` spelling here
+                    // matched nothing, so every call went unconverted. Measured
+                    // 18 Aug 2026 with a sized `[+, 0, -]` (= -8): T3 returned 0
+                    // and LLVM segfaulted. Fixed by spelling it `math::`.
+                    //
+                    // Not listed, because their layout is unverified and they do
+                    // not currently compile (see §8/§9): `ternary::pack_t9`,
+                    // `fmt::show_trit_slice`. `TernaryTrie`'s key methods do not
+                    // belong here at all — the runtime reads a key as a Vec, not
+                    // as a trit array, so they are declared `Vec<trit>` in
+                    // stdlib/collections.mt rather than bridged.
                     const LP_FUNCS: &[&str] = &[
                         "ternary::pack_trits",
-                        "ternary::from_balanced_ternary",
+                        "math::from_balanced_ternary",
                         "ternary::trits_to_str",
                     ];
                     if LP_FUNCS.contains(&func_name.as_str()) {
                         if let Some(first_arg) = args.first() {
+                            // Unsized `[trit]` PARAMETER — flat, and its length
+                            // is only known at run time, so the prefixed buffer
+                            // cannot be an alloca here. Hand the flat pointer
+                            // and the hidden length to __lp_from_flat, which
+                            // mallocs the copy (LLVM helper in
+                            // codegen_llvm/helpers.rs, T3 syscall #203).
+                            //
+                            // The gate is the hidden `#len:` local, NOT the
+                            // type: a runtime-produced array — say
+                            // `let a = math::to_balanced_ternary(-137)` — is
+                            // also `Array(Trit, None)` but is ALREADY prefixed,
+                            // and wrapping it would prefix it twice. `#len:` is
+                            // registered (mod.rs, in the prologue) only for a
+                            // genuine unsized array parameter, so it is exactly
+                            // the flat-provenance test.
+                            let flat_param = match &first_arg.kind {
+                                TypedExprKind::Ident(name) => self
+                                    .locals
+                                    .contains_key(&Self::unsized_len_key(name)),
+                                _ => false,
+                            };
+                            if flat_param {
+                                if let ManiType::Array(elem_mty, None) = &first_arg.ty {
+                                    if **elem_mty == ManiType::Trit {
+                                        let raw_ptr = arg_vals[0].clone();
+                                        let len_val = self.unsized_array_len(first_arg);
+                                        let buf_t = self.fresh_temp();
+                                        self.emit(IRInstr::Call {
+                                            dst: Some(buf_t.clone()),
+                                            func: "__lp_from_flat".to_string(),
+                                            args: vec![raw_ptr, len_val],
+                                            ret_ty: IRType::Ptr(Box::new(IRType::I64)),
+                                        });
+                                        arg_vals[0] = IRValue::Temp(buf_t);
+                                    }
+                                }
+                            }
                             if let ManiType::Array(elem_mty, Some(n)) = &first_arg.ty {
                                 if **elem_mty == ManiType::Trit {
                                     let n = *n;
@@ -641,13 +752,7 @@ impl IRLowerer {
             }
 
             TypedExprKind::Field(obj, field) => {
-                let struct_name = match &obj.ty {
-                    ManiType::Struct(name) => name.clone(),
-                    _ => obj.ty.display().to_string(),
-                };
-                let field_idx = self.structs.get(&struct_name)
-                    .and_then(|fields| fields.iter().position(|(n, _)| n == field))
-                    .unwrap_or(0) as i64;
+                let field_idx = self.field_slot_index(&obj.ty, field);
 
                 let obj_val = self.lower_expr(obj);
                 let idx = IRValue::Const(IRConst::Int(field_idx));
@@ -994,13 +1099,7 @@ impl IRLowerer {
                 // Return a pointer to the struct field, NOT the field's value.
                 // lower_expr for a Field does GetPtr + Load; here we want only
                 // the GetPtr so that assignment stores into the field slot itself.
-                let struct_name = match &obj.ty {
-                    ManiType::Struct(name) => name.clone(),
-                    _ => obj.ty.display().to_string(),
-                };
-                let field_idx = self.structs.get(&struct_name)
-                    .and_then(|fields| fields.iter().position(|(n, _)| n == field))
-                    .unwrap_or(0) as i64;
+                let field_idx = self.field_slot_index(&obj.ty, field);
                 let obj_val = self.lower_expr(obj);
                 let idx = IRValue::Const(IRConst::Int(field_idx));
                 // Uniform 8-byte slot convention for aggregates (see slot_access_ty).
@@ -1016,5 +1115,37 @@ impl IRLowerer {
             TypedExprKind::UnOp(UnOpKind::Deref, inner) => self.lower_expr(inner),
             _ => self.lower_expr(expr),
         }
+    }
+
+    /// Slot index for `obj.field`, for both the rvalue and lvalue paths.
+    ///
+    /// Two shapes reach here. On a struct the field is a name and the index is
+    /// its position in the declaration. On a tuple the field is a decimal
+    /// literal — `p.0`, `p.1` — and the index is that number.
+    ///
+    /// The tuple case was missing until 20 August 2026. A tuple's type displays
+    /// as `(int, int)`, which is never a key in `self.structs`, so the lookup
+    /// missed and the `unwrap_or(0)` fallback below took over: EVERY tuple
+    /// field access loaded element 0, identically on both backends and with no
+    /// diagnostic. That fallback is the defect, not the missing arm — a lookup
+    /// that cannot fail silently would have surfaced this the first time
+    /// anyone wrote `p.1`.
+    fn field_slot_index(&self, obj_ty: &ManiType, field: &str) -> i64 {
+        if let ManiType::Tuple(elems) = obj_ty {
+            if let Ok(i) = field.parse::<usize>() {
+                if i < elems.len() {
+                    return i as i64;
+                }
+            }
+            return 0;
+        }
+        let struct_name = match obj_ty {
+            ManiType::Struct(name) => name.clone(),
+            _ => obj_ty.display().to_string(),
+        };
+        self.structs
+            .get(&struct_name)
+            .and_then(|fields| fields.iter().position(|(n, _)| n == field))
+            .unwrap_or(0) as i64
     }
 }

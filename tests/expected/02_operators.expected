@@ -59,11 +59,11 @@ PASS tor: - tor - = -
 PASS tnot: tnot + = -
 PASS tnot: tnot 0 = 0
 PASS tnot: tnot - = +
-PASS txor: + txor + = 0
+PASS txor: + txor + = -
 PASS txor: + txor 0 = +
-PASS txor: + txor - = +
-PASS txor: - txor - = 0
-PASS txor: 0 txor - = +
+PASS txor: + txor - = 0
+PASS txor: - txor - = +
+PASS txor: 0 txor - = -
 -- precedence --
 PASS prec: 2+3==5
 PASS prec: -2*3=-6
@@ -71,4 +71,3 @@ PASS prec: 2+3*4=14
 PASS prec: 1+1<<1=4
 PASS prec: 2&3|4=6
 Done.
-
