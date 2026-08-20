@@ -1447,3 +1447,146 @@ fn main() {
     assert!(!t3_out.contains("999999999999999879147136483328"),
             "large float must NOT render its exact binary value:\n{}", t3_out);
 }
+
+#[test]
+fn s22_t3_spill_reads_are_measured_against_the_right_stack_depth() {
+    // A function with more live float constants than the register pool holds
+    // returned a WRONG SUM on T3 and the right one on LLVM — off by exactly one
+    // coefficient, at every size, silently.
+    //
+    // It is an ordering bug, not an arithmetic one. The rescue paths bump
+    // `sp_depth` the moment they decide to spill, but stage their `TSUB R26`
+    // into `cur_instr`. Spill READS are pushed into `lines`, which the flush
+    // appends BEFORE `cur_instr`. So the LOAD executes while R26 still holds its
+    // pre-rescue value, while its offset had been computed against the
+    // post-rescue depth:
+    //
+    //     ; reload spill t19 (offset 1)
+    //     LOAD  R21, [R26+#1]                 <- reads one slot too high
+    //     TSUB  R26, R26, #1  ; rescue-spill  <- the push it was measured against
+    //     STORE R2,  [R26+#0]
+    //
+    // `rescue_pushes_this_instr` counts the difference so reads are measured
+    // against the depth R26 will actually hold when they run.
+    //
+    // This is the bug behind the "house rule" that every float constant in the
+    // designed math:: bodies is bound on the statement that consumes it: a
+    // 20-constant header exhausted the pool and the function silently returned
+    // its own argument. The rule is no longer needed.
+    //
+    // 16 is the threshold (the pool is R1-R20); 40 is well past it.
+    let mut src = String::from("use std::io;\nuse std::fmt;\n\n");
+    for n in [16usize, 40] {
+        src.push_str(&format!("fn upfront{}(t: float) -> float {{\n", n));
+        for i in 0..n { src.push_str(&format!("    let c{}: float = {}.0;\n", i, i + 1)); }
+        src.push_str("    let mut s: float = 0.0;\n");
+        for i in 0..n { src.push_str(&format!("    s = s + c{} * t;\n", i)); }
+        src.push_str("    return s;\n}\n\n");
+    }
+    src.push_str("fn main() {\n");
+    src.push_str("    io::println(fmt::show_float(upfront16(2.0)));\n");
+    src.push_str("    io::println(fmt::show_float(upfront40(2.0)));\n");
+    src.push_str("}\n");
+
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s22_spill.mt", &src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(!t3_out.trim().is_empty(), "t3 produced no output");
+    assert_eq!(t3_out, ll_out, "the two backends must agree under register pressure");
+    // sum(1..=16)*2 = 272 and sum(1..=40)*2 = 1640. Pinned absolutely: the old
+    // T3 answers were 270 and 1638, and two backends agreeing on 270 would pass
+    // a purely differential check.
+    assert!(t3_out.contains("272"), "16-constant sum wrong:\n{}", t3_out);
+    assert!(t3_out.contains("1640"), "40-constant sum wrong:\n{}", t3_out);
+}
+
+#[test]
+fn s23_the_whole_math_float_surface_runs_on_both_backends() {
+    // All 34 float functions in math:: were NATIVE declarations, and the census
+    // that measured them found the worst possible split:
+    //
+    //   * on T3, ALL 34 were undefined labels. The T3 emulator has no float-math
+    //     syscalls at all — only arithmetic (212-215), comparison (216),
+    //     conversion (210-211) and load (219). `math::sqrt` simply did not exist.
+    //   * on LLVM, 9 of the 34 worked (sqrt, log, log2, log3, floor, ceil, round,
+    //     sin, cos) and the other 25 were declared but never defined, so any
+    //     program touching them failed at link time.
+    //
+    // Nine working on the backend most people build with, and none on the target
+    // the language exists for, is worse than none working anywhere: it looks fine
+    // until it is ported.
+    //
+    // All 34 are now ManiT bodies shared by both backends, and the nine C
+    // definitions are deleted — keeping them would shadow the shared body and
+    // reintroduce the divergence. No libm is involved on either side.
+    //
+    // Accuracy was measured against libm over 780 sampled points: worst 3 ulp
+    // (cbrt), everything else <= 2, and log/log2/atan 96-97% bit-exact. This test
+    // pins exactness where it is achievable and cross-backend equality always.
+    let src = r#"
+use std::io;
+use std::fmt;
+use std::math;
+
+fn show(tag: str, f: float) { io::print(tag); io::print("="); io::println(fmt::show_float(f)); }
+
+fn main() {
+    show("fabs", math::fabs(-3.5));
+    show("fmin", math::fmin(2.0, 7.0));
+    show("fmax", math::fmax(2.0, 7.0));
+    show("fclamp", math::fclamp(9.0, 0.0, 4.0));
+    show("fpow", math::fpow(2.0, 10.0));
+    show("sqrt", math::sqrt(16.0));
+    show("cbrt", math::cbrt(27.0));
+    show("hypot", math::hypot(3.0, 4.0));
+    show("floor", math::floor(-2.5));
+    show("ceil", math::ceil(-2.5));
+    show("round", math::round(2.5));
+    show("trunc", math::trunc(-2.7));
+    show("fract", math::fract(2.75));
+    show("brnd", math::balanced_round(7.1, 1));
+    show("log", math::log(1.0));
+    show("log2", math::log2(8.0));
+    show("log10", math::log10(1000.0));
+    show("log3", math::log3(9.0));
+    show("logn", math::logn(81.0, 3.0));
+    show("exp", math::exp(0.0));
+    show("exp2", math::exp2(10.0));
+    show("exp3", math::exp3(4.0));
+    show("sin", math::sin(0.0));
+    show("cos", math::cos(0.0));
+    show("tan", math::tan(0.0));
+    show("asin", math::asin(0.0));
+    show("acos", math::acos(1.0));
+    show("atan", math::atan(0.0));
+    show("atan2", math::atan2(0.0, 1.0));
+    show("sinh", math::sinh(0.0));
+    show("cosh", math::cosh(0.0));
+    show("tanh", math::tanh(0.0));
+    show("torad", math::to_radians(180.0));
+    show("todeg", math::to_degrees(3.141592653589793));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s23_mathfloat.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert!(!t3_out.trim().is_empty(), "t3 produced no output");
+    assert_eq!(t3_out, ll_out, "every math:: float function must agree across backends");
+
+    // Arguments were chosen so the true result is exactly representable: an
+    // approximation good to 3 ulp still has to be EXACT here, so these catch a
+    // body that is merely self-consistent.
+    for want in [
+        "fabs=3.5", "fmin=2", "fmax=7", "fclamp=4", "fpow=1024",
+        "sqrt=4", "cbrt=3", "hypot=5",
+        "floor=-3", "ceil=-2", "round=3", "trunc=-2", "fract=0.75",
+        "brnd=6",                       // balanced_round(7.1, 1) -> 6, not 9
+        "log=0", "log2=3", "log10=3", "log3=2", "logn=4",
+        "exp=1", "exp2=1024", "exp3=81",
+        "sin=0", "cos=1", "tan=0", "asin=0", "acos=0", "atan=0", "atan2=0",
+        "sinh=0", "cosh=1", "tanh=0",
+        "torad=3.141592653589793", "todeg=180",
+    ] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}

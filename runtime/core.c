@@ -362,16 +362,18 @@ char* fmt_to_lower(const char* s) {
  *
  * The float functions below stay native for now; they are the open half of the
  * module. */
+/* math_sqrt/log/log2/log3/floor/ceil/round/sin/cos were defined here and
+ * are gone. They were the only nine of math::'s 34 float functions that
+ * existed at all on LLVM, and NONE of them existed on T3 — the T3 emulator
+ * has no float-math syscalls, only arithmetic (212-215), comparison (216),
+ * conversion (210-211) and load (219). So `math::sqrt` was an undefined
+ * label on T3 while working fine on LLVM: the worst possible split, because
+ * it looks correct on the backend most people build with.
+ *
+ * All 34 are now written in ManiT and shared by both backends from one body.
+ * Keeping a C definition alongside the ManiT one would shadow it and
+ * reintroduce exactly the divergence this closes. */
 double  math_abs_float(double f) { return fabs(f); }
-double  math_sqrt(double x) { return sqrt(x); }
-double  math_log(double x) { return log(x); }
-double  math_log2(double x) { return log2(x); }
-double  math_log3(double x) { return log(x) / log(3.0); }
-double  math_floor(double x) { return floor(x); }
-double  math_ceil(double x) { return ceil(x); }
-double  math_round(double x) { return round(x); }
-double  math_sin(double x) { return sin(x); }
-double  math_cos(double x) { return cos(x); }
 int64_t math_trit_count(int64_t n) {
     /* Count number of trits needed to represent n in balanced ternary.
        trit_count(0) = 1 (the single trit '0').

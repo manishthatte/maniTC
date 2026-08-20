@@ -493,15 +493,6 @@ declare ptr @fmt_to_lower(ptr)
 ; math_pow's declare was `double(double, double)` against a ManiT declaration
 ; of `pow(int, int) -> int`, so that call could never have worked.
 declare double @math_abs_float(double)
-declare double @math_sqrt(double)
-declare double @math_log(double)
-declare double @math_log2(double)
-declare double @math_log3(double)
-declare double @math_floor(double)
-declare double @math_ceil(double)
-declare double @math_round(double)
-declare double @math_sin(double)
-declare double @math_cos(double)
 declare i64 @math_trit_count(i64)
 
 ; ---- str ----

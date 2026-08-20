@@ -423,8 +423,12 @@ fn test_parse_declare_sigs() {
     let (params, ret) = sigs.get("math_trit_count").expect("math_trit_count missing");
     assert_eq!(ret, "i64");
     assert_eq!(params, &["i64".to_string()]);
-    // double @math_sqrt(double)
-    let (params, ret) = sigs.get("math_sqrt").expect("math_sqrt missing");
+    // double @math_abs_float(double) — math_sqrt used to be the example here.
+    // It is gone: all 34 of math::'s float functions moved into ManiT bodies, so
+    // a C definition alongside them would shadow the shared body. Pick a survivor
+    // that is not a candidate to move, or this test breaks again on the next
+    // migration.
+    let (params, ret) = sigs.get("math_abs_float").expect("math_abs_float missing");
     assert_eq!(ret, "double");
     assert_eq!(params, &["double".to_string()]);
 }

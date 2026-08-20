@@ -58,6 +58,14 @@ struct AsmEmitter {
     /// consult this to restore only genuinely displaced temps to the target
     /// block's canonical registers (see emit_term's Jump reconciliation).
     rescued_temps: std::collections::HashSet<String>,
+    /// Stack words pushed by rescue SPILLS during the current instruction.
+    ///
+    /// The rescue paths bump `sp_depth` the moment they decide to spill, but
+    /// stage their `TSUB R26` into `cur_instr`. Spill READS go into `lines`,
+    /// which the flush appends *before* `cur_instr` — so a read executes while
+    /// R26 still holds its pre-rescue value, and must not be measured against
+    /// the post-rescue depth. This counts the difference. Reset every flush.
+    rescue_pushes_this_instr: usize,
 }
 
 impl AsmEmitter {
@@ -84,6 +92,7 @@ impl AsmEmitter {
             emitted_blocks: std::collections::HashSet::new(),
             global_addrs: HashMap::new(),
             rescued_temps: std::collections::HashSet::new(),
+            rescue_pushes_this_instr: 0,
         }
     }
 
@@ -143,6 +152,7 @@ impl AsmEmitter {
                 self.emit(format!("    TSUB  R26, R26, #1  ; rescue-inc-spill {} from R{}", name, reg));
                 self.emit(format!("    STORE R{}, [R26+#0]  ; rescue-inc-spill {}", reg, name));
                 self.reg_alloc.sp_depth += 1;
+                self.rescue_pushes_this_instr += 1;
             }
         }
     }
@@ -186,6 +196,7 @@ impl AsmEmitter {
                 self.emit(format!("    TSUB  R26, R26, #1  ; rescue-spill {} from R{}", name, reg));
                 self.emit(format!("    STORE R{}, [R26+#0]  ; rescue-spill {}", reg, name));
                 self.reg_alloc.sp_depth += 1;
+                self.rescue_pushes_this_instr += 1;
             }
         }
     }
@@ -234,6 +245,7 @@ impl AsmEmitter {
         self.lines.extend(self.pending_post.drain(..));
         self.reg_alloc.sp_depth += self.pending_sp_increments;
         self.pending_sp_increments = 0;
+        self.rescue_pushes_this_instr = 0;
         self.spill_read_idx = 0;
         self.reg_alloc.scratch_fallback_count = 0;
     }
@@ -542,7 +554,11 @@ impl AsmEmitter {
                         _ => 25,
                     };
                     self.spill_read_idx += 1;
-                    let offset = self.reg_alloc.sp_depth as i64 - slot_depth as i64;
+                    // Measured against the depth R26 will ACTUALLY hold when this
+                    // LOAD runs — the start of the instruction — not against the
+                    // depth after rescues whose TSUB has only been staged.
+                    let read_depth = self.reg_alloc.sp_depth - self.rescue_pushes_this_instr;
+                    let offset = read_depth as i64 - slot_depth as i64;
                     self.lines.push(format!("    ; reload spill {} (offset {})", t.0, offset));
                     if offset >= 0 && offset <= 13 {
                         self.lines.push(format!("    LOAD  R{}, [R26+#{}]", scratch, offset));
