@@ -403,7 +403,18 @@ impl SemanticAnalyzer {
                     parts.push(eb.ty.clone());
                     self.check_branch_agreement(&parts, "if branches", span)?;
                 }
-                let ty = telse.as_ref().map(|b| b.ty.clone()).unwrap_or(ManiType::Void);
+                // An `if` with no `else` is a statement and has no value; with
+                // one, its type comes from every branch rather than from the
+                // `else` alone — see unify_branch_type.
+                let ty = match &telse {
+                    None => ManiType::Void,
+                    Some(eb) => {
+                        let mut arms: Vec<&TypedBlock> = vec![&tthen];
+                        arms.extend(telif.iter().map(|(_, b)| b));
+                        arms.push(eb);
+                        Self::unify_branch_type(&arms, eb.ty.clone())
+                    }
+                };
                 Ok(TypedExpr {
                     kind: TypedExprKind::If(TypedIfExpr {
                         cond: Box::new(tcond),
@@ -441,7 +452,7 @@ impl SemanticAnalyzer {
                     "tif arms",
                     span,
                 )?;
-                let ty = tpos.ty.clone();
+                let ty = Self::unify_branch_type(&[&tpos, &tzero, &tneg], tpos.ty.clone());
                 Ok(TypedExpr {
                     kind: TypedExprKind::Tif(TypedTifExpr {
                         cond: Box::new(tcond),
@@ -958,6 +969,73 @@ impl SemanticAnalyzer {
     /// Branches typed `Void` (statement position or diverging via
     /// return/break/continue) and `Unknown` are tolerated; two KNOWN,
     /// non-void, incompatible branch types are an error.
+    /// The result type of a multi-armed expression, chosen from ALL the arms.
+    ///
+    /// Each site used to take one arm and call it the answer: a `tif` took its
+    /// first arm, an `if` took its `else`. That is arbitrary whenever the arms
+    /// are compatible but not identical, and in a ternary language they very
+    /// often are — a bare `0` is a valid `int` AND a valid `trit`, so which one
+    /// it is depends on what sits beside it.
+    ///
+    /// It produced IR that would not assemble (ORACLE_FINDINGS.md Section 15):
+    ///
+    /// ```text
+    /// tif i { + => +, 0 => +, - => 0 }   typed trit — first arm is a trit
+    /// tif i { + => 0, 0 => -, - => - }   typed INT  — first arm is `0`
+    /// ```
+    ///
+    /// Two spellings of the same three-valued function, typed differently
+    /// because of which arm came first. Nested inside a `trit`-valued `tif`,
+    /// the second fed an `i64` into an `i8` phi and clang rejected the module:
+    /// `'%t8' defined with type 'i64' but expected 'i8'`. T3 compiled the same
+    /// source correctly, since every value there is one word — so this is a
+    /// fault the two-backend oracle DID see, and saw as a build failure rather
+    /// than a wrong answer.
+    ///
+    /// The rule: if any arm has a ternary type, and every other arm is a bare
+    /// integer literal that is also a valid trit, the whole expression is that
+    /// ternary type. Otherwise `fallback`, which each caller supplies as the arm
+    /// it used to take unconditionally — so this only ever CHANGES the answer in
+    /// the mixed-ternary case, and every other program types exactly as before.
+    ///
+    /// A literal is required. An arm of `int` type that is not a literal keeps
+    /// the expression `int`: narrowing a computed integer to a trit would turn a
+    /// build failure into a wrong answer, which is the worse trade.
+    pub(crate) fn unify_branch_type(arms: &[&TypedBlock], fallback: ManiType) -> ManiType {
+        let mut ternary: Option<ManiType> = None;
+        let mut others_all_trit_literals = true;
+
+        for b in arms {
+            if !b.ty.is_known() || b.ty == ManiType::Void {
+                continue;
+            }
+            if b.ty.is_ternary() {
+                if ternary.is_none() {
+                    ternary = Some(b.ty.clone());
+                }
+            } else if !(b.ty == ManiType::Int && Self::tail_is_trit_literal(b)) {
+                others_all_trit_literals = false;
+            }
+        }
+
+        match ternary {
+            Some(t) if others_all_trit_literals => t,
+            _ => fallback,
+        }
+    }
+
+    /// Does this block's value come from an integer literal that is also a
+    /// valid trit — that is, one of -1, 0, +1?
+    fn tail_is_trit_literal(b: &TypedBlock) -> bool {
+        match b.stmts.last() {
+            Some(TypedStmt::Expr(te)) => matches!(
+                &te.kind,
+                TypedExprKind::Lit(crate::ast::Lit::Int(n)) if (-1..=1).contains(n)
+            ),
+            _ => false,
+        }
+    }
+
     pub(crate) fn check_branch_agreement(
         &self,
         branch_tys: &[ManiType],

@@ -1912,3 +1912,104 @@ fn s25_a_result_method_with_no_body_is_a_compile_error() {
         "`Result` has no method `map`",
     );
 }
+
+// ---------------------------------------------------------------------------
+// S26 (ORACLE_FINDINGS Section 15) — a branch's type comes from all its arms
+// ---------------------------------------------------------------------------
+// `tif` took its FIRST arm's type and called that the answer; `if` took its
+// `else`. Either is arbitrary whenever the arms are compatible but not
+// identical, and in a ternary language they very often are — a bare `0` is a
+// valid `int` AND a valid `trit`, so which one it is depended on which arm
+// happened to be written first:
+//
+//     tif i { + => +, 0 => +, - => 0 }   typed trit
+//     tif i { + => 0, 0 => -, - => - }   typed INT
+//
+// Two spellings of the same three-valued function. Nested inside a trit-valued
+// tif, the second fed an i64 into an i8 phi and clang rejected the module:
+// "'%t8' defined with type 'i64' but expected 'i8'". T3 compiled the same
+// source correctly, so this one the oracle DID see — as a build failure.
+
+#[test]
+fn s26_a_tif_of_tifs_returning_trit_compiles_and_is_correct() {
+    // Kleene-style consensus. Every inner tif is a different shape, and the
+    // third one — first arm `0` — is the one that used to be typed `int`.
+    let src = r#"
+fn step(s: trit, i: trit) -> trit {
+    return tif s {
+        + => tif i { + => +, 0 => +, - => 0 },
+        0 => tif i { + => +, 0 => 0, - => - },
+        - => tif i { + => 0, 0 => -, - => - }
+    };
+}
+fn main() {
+    io::println_trit(step(+, +));
+    io::println_trit(step(+, 0));
+    io::println_trit(step(+, -));
+    io::println_trit(step(0, +));
+    io::println_trit(step(0, 0));
+    io::println_trit(step(0, -));
+    io::println_trit(step(-, +));
+    io::println_trit(step(-, 0));
+    io::println_trit(step(-, -));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s26_tif.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "a tif of tifs must agree across backends");
+    // All nine cells, read straight off the source.
+    assert_eq!(t3_out, "+\n+\n0\n+\n0\n-\n0\n-\n-\n");
+}
+
+#[test]
+fn s26_arm_order_does_not_change_a_branch_type() {
+    // A false-positive guard, not a test of the fix: measured, all three of
+    // these pass without it. An `int`-typed tif whose value flows straight into
+    // a `trit` return is coerced at the boundary and gives the right answer —
+    // which is exactly why the mistyping stayed invisible until one was nested
+    // inside another (the test above). This pins that widening the rule did not
+    // break the plain cases.
+    let src = r#"
+fn zero_first(t: trit) -> trit { tif t { + => 0, 0 => -, - => - } }
+fn trit_first(t: trit) -> trit { tif t { + => +, 0 => 0, - => - } }
+fn via_if(b: bool, t: trit) -> trit { if b { 0 } else { t } }
+fn main() {
+    io::println_trit(zero_first(+));
+    io::println_trit(zero_first(0));
+    io::println_trit(zero_first(-));
+    io::println_trit(trit_first(+));
+    io::println_trit(trit_first(0));
+    io::println_trit(trit_first(-));
+    io::println_trit(via_if(true, -));
+    io::println_trit(via_if(false, -));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s26_order.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "arm order must not change the result");
+    assert_eq!(t3_out, "0\n-\n-\n+\n0\n-\n0\n-\n");
+}
+
+#[test]
+fn s26_a_computed_int_arm_keeps_the_branch_an_int() {
+    // The guard on the rule. Only a bare literal in -1..=1 lets a ternary arm
+    // pull the whole expression to `trit`; an `int` arm that is COMPUTED keeps
+    // it an `int`, because narrowing a computed integer would turn a build
+    // failure into a wrong answer. 1000 must survive.
+    let src = r#"
+fn pick(b: bool, t: trit) -> int {
+    if b { 500 + 500 } else { t as int }
+}
+fn main() {
+    io::println_int(pick(true, +));
+    io::println_int(pick(false, -));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s26_wide.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "a computed int arm must agree across backends");
+    assert_eq!(t3_out, "1000\n-1\n");
+}
