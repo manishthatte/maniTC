@@ -382,13 +382,20 @@ fn test_internal_runtime_helpers_present() {
     assert!(ir.contains("define internal void @io_println_bool(i1"));
     // Result constructors with the IR's two-word layout
     assert!(ir.contains("define internal ptr @Err_new(ptr"));
-    assert!(ir.contains("define internal i64 @result_unwrap(ptr"));
+    // @result_unwrap is DELETED, not merely absent: it read word 1 with no tag
+    // check, so unwrapping an Err returned the message pointer as the value,
+    // and it was LLVM-only. Both backends now share the lowering in
+    // ir/lower/lower_result.rs. Pinned so it cannot come back.
+    assert!(!ir.contains("@result_unwrap"),
+        "@result_unwrap was an unchecked, LLVM-only unwrap and must stay deleted");
+    // The unwrap tag guard, whose T3 twin is SYSCALL #561.
+    assert!(ir.contains("declare void @manit_check_result_ok(i64)"));
     // ternary array helpers mirroring the T3 emulator
     assert!(ir.contains("define internal ptr @ternary_trits_to_str(ptr"));
     assert!(ir.contains("define internal i64 @ternary_pack_trits(ptr"));
     // no symbol may be both declared and defined
     for name in [
-        "@io_println_bool3", "@Err_new", "@Ok_new", "@result_unwrap",
+        "@io_println_bool3", "@Err_new", "@Ok_new",
         "@ternary_trits_to_str", "@math_to_balanced_ternary",
     ] {
         assert!(

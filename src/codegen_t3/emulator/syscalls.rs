@@ -27,6 +27,22 @@ impl Emulator {
             17..=59 | 70..=74 | 80..=131 => {
                 self.do_syscall_proc(num);
             }
+            // `.unwrap()` guard — R1 = the Result's tag trit.
+            //
+            // The message text must stay byte-identical to
+            // `manit_check_result_ok` in runtime/core.c. They are the one
+            // hand-written pair in the whole Result implementation (everything
+            // else is shared IR from ir/lower/lower_result.rs), so a
+            // divergence between them is precisely what a two-backend test
+            // would catch — and the reason there is only one such pair.
+            561 => {
+                let tag = self.regs[1];
+                if tag != 1 {
+                    self.trap(format!(
+                        "TRAP: unwrap on a Result that is {}",
+                        if tag == 0 { "Unknown" } else { "Err" }));
+                }
+            }
             // A2: array bounds guard — R1 = index, R2 = length.
             560 => {
                 let idx = self.regs[1];

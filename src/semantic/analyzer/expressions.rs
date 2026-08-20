@@ -73,7 +73,7 @@ impl SemanticAnalyzer {
                         const BUILTIN_NAMESPACES: &[&str] = &[
                             "Vec", "Map", "Set", "Deque", "TernaryTrie", "Channel",
                             "Mutex", "MutexGuard", "AtomicTrit", "Barrier", "Semaphore",
-                            "Task", "Result", "Option", "Pair", "Range", "String", "str",
+                            "Task", "Result", "Pair", "Range", "String", "str",
                             "Self", "std",
                         ];
                         if self.enums.contains_key(first) {
@@ -97,10 +97,26 @@ impl SemanticAnalyzer {
                     }
                     ManiType::Unknown
                 } else {
-                    // Result/Option constructors are handled structurally by
-                    // the lowering — never warn for them.
+                    // `Some` and `None` are refused outright rather than
+                    // warned about. They used to sit in the list below, which
+                    // silenced the unknown-identifier warning and let them reach
+                    // codegen, where they failed at assembly ("Undefined label:
+                    // Some"). See the `Option` arm of `resolve_type`: Result is
+                    // this language's option type, and it has a third outcome
+                    // that Option cannot express.
+                    if name == "Some" || name == "None" {
+                        return Err(self.err(span, format!(
+                            "`{}` is not a ManiT constructor. `Result<T, E>` is this \
+                             language's option type and it has three outcomes rather \
+                             than two: `Ok(v)` for a value, `Unknown(msg)` where you \
+                             would write `None`, and `Err(e)` for a failure.",
+                            name,
+                        )));
+                    }
+                    // Result constructors are handled structurally by the
+                    // lowering — never warn for them.
                     const RESULT_CONSTRUCTORS: &[&str] =
-                        &["Ok", "Err", "Unknown", "Some", "None"];
+                        &["Ok", "Err", "Unknown"];
                     // Allow unknown identifiers for now (stdlib etc.)
                     // Emit a warning for likely typos / genuinely unknown names
                     if !name.contains('<') && !RESULT_CONSTRUCTORS.contains(&name.as_str()) {
@@ -253,6 +269,23 @@ impl SemanticAnalyzer {
                 let mut typed_args = Vec::new();
                 for arg in args {
                     typed_args.push(self.check_expr(arg, None)?);
+                }
+                // A method on a `Result` must be one this compiler lowers.
+                // `.map()` used to be typed here and emitted by neither backend
+                // — the same silence as `.unwrap()` (Section 18): accepted by
+                // semantic analysis, undefined at link.
+                if crate::ir::lower::lower_result::is_result(&tobj.ty)
+                    && !crate::ir::lower::lower_result::RESULT_METHODS.contains(&method.as_str())
+                {
+                    return Err(self.err(span, format!(
+                        "`Result` has no method `{}`. Available: {}. Or take all three \
+                         outcomes at once with `match r {{ Ok(v) => …, Unknown(m) => …, \
+                         Err(e) => … }}`, or `tif r.tag() {{ + => …, 0 => …, - => … }}`.",
+                        method,
+                        crate::ir::lower::lower_result::RESULT_METHODS
+                            .iter().map(|m| format!("`{}`", m))
+                            .collect::<Vec<_>>().join(", "),
+                    )));
                 }
                 // For method calls, we do basic resolution
                 let ret_ty = self.resolve_method_type(&tobj.ty, method, span);
@@ -712,7 +745,7 @@ impl SemanticAnalyzer {
             Expr::Question(inner, _) => {
                 let tinner = self.check_expr(inner, hint)?;
                 let unwrapped_ty = match &tinner.ty {
-                    ManiType::Generic(name, args) if name == "Result" || name == "Option" => {
+                    ManiType::Generic(name, args) if name == "Result" => {
                         args.first().cloned().unwrap_or(ManiType::Unknown)
                     }
                     other => other.clone(),

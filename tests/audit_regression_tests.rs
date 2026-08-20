@@ -1718,3 +1718,197 @@ fn s24_the_static_index_check_uses_the_same_folder() {
         "fn main() { let a = [10, 20, 30]; io::println_int(a[1 + 1]); }\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// S25 (ORACLE_FINDINGS Section 18) — Result methods, and Result's lifetime
+// ---------------------------------------------------------------------------
+// `Result` was usable only through `match`: every method passed semantic
+// analysis and was emitted by neither backend, so `.unwrap()` failed at link
+// (`Undefined label: Result::unwrap` / `undefined value '@Result_unwrap'`).
+// The methods now lower to the same loads, compares and branches `match`
+// already uses — one body in ir/lower/lower_result.rs, nothing new in either
+// backend except the tag guard.
+//
+// Fixing that exposed a larger fault underneath: T3 built the Result box on the
+// STACK and returned R26, while LLVM had always malloc'd. A Result therefore
+// died at the `RET` of the function that produced it, and a program that passed
+// one to another function printed nothing at all on T3 and was silent about it.
+
+#[test]
+fn s25_every_result_method_agrees_across_backends() {
+    let src = r#"
+fn ok() -> Result<int,str>   { Ok(7) }
+fn er() -> Result<int,str>   { Err("boom") }
+fn un() -> Result<int,str>   { Unknown("dunno") }
+fn fl() -> Result<float,str> { Ok(2.5) }
+fn st() -> Result<str,str>   { Ok("hi") }
+
+fn show(name: str, r: Result<int,str>) {
+    io::print(name); io::print(" is_ok=");      io::println_bool(r.is_ok());
+    io::print(name); io::print(" is_unknown="); io::println_bool(r.is_unknown());
+    io::print(name); io::print(" is_err=");     io::println_bool(r.is_err());
+    io::print(name); io::print(" or99=");       io::println_int(r.unwrap_or(99));
+}
+
+fn main() {
+    show("Ok", ok());
+    show("Un", un());
+    show("Er", er());
+    io::print("uw_int = "); io::println_int(ok().unwrap());
+    io::print("uw_flt = "); io::println_float(fl().unwrap());
+    io::print("uw_str = "); io::println(st().unwrap());
+    io::print("tag_ok = "); io::println_trit(ok().tag());
+    io::print("tag_un = "); io::println_trit(un().tag());
+    io::print("tag_er = "); io::println_trit(er().tag());
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("s25_methods.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "Result methods must agree across backends");
+
+    for want in [
+        "Ok is_ok=true", "Ok is_unknown=false", "Ok is_err=false", "Ok or99=7",
+        "Un is_ok=false", "Un is_unknown=true", "Un is_err=false", "Un or99=99",
+        "Er is_ok=false", "Er is_unknown=false", "Er is_err=true", "Er or99=99",
+        "uw_int = 7", "uw_flt = 2.5", "uw_str = hi",
+        // The tag IS a trit, which is the point: one value carries all three
+        // outcomes, where is_ok/is_err/is_unknown are its binary decomposition.
+        "tag_ok = +", "tag_un = 0", "tag_er = -",
+    ] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}
+
+#[test]
+fn s25_a_result_outlives_the_function_that_built_it() {
+    // T3 allocated the box on the callee's stack and returned R26, so the
+    // caller's frame grew straight over it: the tag read as garbage, no arm
+    // matched, and the program stopped mid-line with no diagnostic. LLVM had
+    // always malloc'd, so this was a representation divergence, not a tuning
+    // difference.
+    //
+    // The producer here is deliberately TINY. A larger one (`if b == 0 { … }
+    // Ok(a / b)`) leaves the box deeper in a frame the callee's prologue does
+    // not immediately reach, and survives by luck — measured, and it does pass
+    // at the previous commit. `fn ok() -> Result<int,str> { Ok(7) }` puts the
+    // box at the very bottom of the frame, where the next call's first alloca
+    // lands on it.
+    let src = r#"
+fn ok() -> Result<int,str> { Ok(7) }
+fn er() -> Result<int,str> { Err("div by zero") }
+fn rewrap(r: Result<int,str>) -> Result<int,str> {
+    match r {
+        Ok(v)      => Ok(v),
+        Err(e)     => Err(e),
+        Unknown(m) => Unknown(m),
+    }
+}
+fn consume(name: str, r: Result<int,str>) {
+    io::print(name);
+    match r {
+        Ok(v)      => io::println_int(v),
+        Err(e)     => io::println(e),
+        Unknown(m) => io::println(m),
+    }
+}
+fn main() {
+    consume("passed-ok:  ", ok());
+    consume("passed-err: ", er());
+    consume("rewrap-ok:  ", rewrap(ok()));
+    consume("rewrap-err: ", rewrap(er()));
+    io::print("method-across-call: ");
+    io::println_int(rewrap(ok()).unwrap_or(0));
+    io::println("done");
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("s25_lifetime.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "a Result must mean the same thing on both backends");
+
+    for want in [
+        "passed-ok:  7", "passed-err: div by zero",
+        "rewrap-ok:  7", "rewrap-err: div by zero",
+        "method-across-call: 7",
+        // The truncation was silent, so the last line is the load-bearing one:
+        // at the previous commit this program stopped after "passed-ok:  ".
+        "done",
+    ] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}
+
+#[test]
+fn s25_unwrap_on_a_non_ok_result_faults_identically() {
+    // A Result has three outcomes and `unwrap` names one of them. The other
+    // two fault, with the same message and the same exit status on both
+    // backends — the C guard and SYSCALL #561 are the one hand-written pair in
+    // the whole Result implementation, so this test is what watches them.
+    for (ctor, want) in [
+        ("Err(\"boom\")",     "TRAP: unwrap on a Result that is Err"),
+        ("Unknown(\"dunno\")", "TRAP: unwrap on a Result that is Unknown"),
+    ] {
+        let src = format!(
+            "fn g() -> Result<int,str> {{ {} }}\n\
+             fn main() {{ io::println(\"before\"); io::println_int(g().unwrap()); io::println(\"after\"); }}\n",
+            ctor,
+        );
+        let name = format!("s25_trap_{}.mt", if ctor.starts_with("Err") { "err" } else { "unk" });
+        let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends(&name, &src);
+        assert_eq!(t3_code, 70, "t3 should fault with 70 for {}, got:\n{}", ctor, t3_out);
+        assert_eq!(ll_code, 70, "llvm should fault with 70 for {}, got:\n{}", ctor, ll_out);
+        for out in [&t3_out, &ll_out] {
+            assert!(out.contains("before"), "the program must run up to the unwrap:\n{}", out);
+            assert!(out.contains(want), "expected {:?} in:\n{}", want, out);
+            assert!(!out.contains("after"), "execution must stop at the unwrap:\n{}", out);
+        }
+    }
+}
+
+#[test]
+fn s25_option_is_refused_and_points_at_result() {
+    // `Option<T>` was half-declared surface: resolvable as a type, typed for
+    // `.unwrap()`, and constructible on neither backend, so `Some(7)` died at
+    // assembly with "Undefined label: Some". It is refused rather than
+    // implemented because `Result` already carries the third outcome `Option`
+    // cannot express — `Unknown` IS `None`.
+    assert_check_error(
+        "s25_opt_ty.mt",
+        "fn f(x: Option<int>) -> int { 0 }\nfn main() { io::println_int(1); }\n",
+        "there is no `Option<T>` in ManiT",
+    );
+    assert_check_error(
+        "s25_opt_some.mt",
+        "fn main() { let x = Some(7); io::println_int(1); }\n",
+        "`Some` is not a ManiT constructor",
+    );
+    assert_check_error(
+        "s25_opt_none.mt",
+        "fn main() { let x = None; io::println_int(1); }\n",
+        "`None` is not a ManiT constructor",
+    );
+    // The three real constructors must of course still work.
+    assert_checks(
+        "s25_opt_ok.mt",
+        "fn g() -> Result<int,str> { Ok(1) }\n\
+         fn h() -> Result<int,str> { Unknown(\"m\") }\n\
+         fn i() -> Result<int,str> { Err(\"e\") }\n\
+         fn main() { io::println_int(g().unwrap()); }\n",
+    );
+}
+
+#[test]
+fn s25_a_result_method_with_no_body_is_a_compile_error() {
+    // `.map()` was typed by resolve_method_type and emitted by neither backend
+    // — the identical silence that made `.unwrap()` a link failure. The
+    // semantic pass now checks the method against the list the lowering
+    // actually implements, so the two cannot drift apart.
+    assert_check_error(
+        "s25_map.mt",
+        "fn g() -> Result<int,str> { Ok(7) }\nfn main() { let x = g().map(); io::println_int(1); }\n",
+        "`Result` has no method `map`",
+    );
+}

@@ -38,6 +38,21 @@ void manit_check_index(int64_t idx, int64_t len) {
     }
 }
 
+/* Result guard: called by `.unwrap()` before word 1 is read.
+ *
+ * The tag is a trit — +1 Ok, 0 Unknown, -1 Err — so a Result has three
+ * outcomes and `unwrap` names only one of them. The other two fault here.
+ * The message must stay byte-identical to SYSCALL #561 in the T3 emulator
+ * (src/codegen_t3/emulator/syscalls.rs): they are the one pair of hand-written
+ * twins in the whole Result implementation, and a divergence between them is
+ * exactly what the two-backend tests are watching for. */
+void manit_check_result_ok(int64_t tag) {
+    if (tag == 1) return;
+    manit_fault(tag == 0
+        ? "unwrap on a Result that is Unknown"
+        : "unwrap on a Result that is Err");
+}
+
 /* ==================== float rendering (shortest round-trip) ====================
  *
  * The LLVM backend printed floats with "%g" and the T3 emulator with Rust's

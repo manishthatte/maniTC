@@ -665,6 +665,13 @@ impl IRLowerer {
             }
 
             TypedExprKind::MethodCall(obj, method, args) => {
+                // A method on a `Result` lowers to the same loads and branches
+                // that `match` on one already does — see ir/lower/lower_result.rs.
+                // Falling through to the generic call below is what produced
+                // `Undefined label: Result::unwrap` (Section 18).
+                if let Some(v) = self.lower_result_method(obj, method, args, &ty) {
+                    return v;
+                }
                 let obj_val = self.lower_expr(obj);
                 let mut arg_vals = vec![obj_val];
                 for arg in args {
@@ -904,7 +911,7 @@ impl IRLowerer {
             TypedExprKind::Question(inner) => {
                 // ? operator on Result<T,E> — three-way branch.
                 let is_result = matches!(&inner.ty,
-                    ManiType::Generic(n, _) if n == "Result" || n == "Option");
+                    ManiType::Generic(n, _) if n == "Result");
 
                 let inner_val = self.lower_expr(inner);
 

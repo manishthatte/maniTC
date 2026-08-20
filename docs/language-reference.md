@@ -830,6 +830,48 @@ match result {
 }
 ```
 
+### Result methods
+
+| Method | Returns | Notes |
+|---|---|---|
+| `r.tag()` | `trit` | `+` Ok, `0` Unknown, `-` Err |
+| `r.is_ok()` | `bool` | |
+| `r.is_unknown()` | `bool` | |
+| `r.is_err()` | `bool` | |
+| `r.unwrap()` | `T` | **faults** unless the tag is Ok |
+| `r.unwrap_or(d)` | `T` | `d` is evaluated either way |
+
+`tag()` is the one to reach for first. The tag is a trit, so it feeds `tif`
+directly and takes all three outcomes in one dispatch:
+
+```
+tif r.tag() {
+    + => io::println("ok"),
+    0 => io::println("unknown"),
+    - => io::println("failed"),
+}
+```
+
+`is_ok` / `is_unknown` / `is_err` are that same question asked three times, one
+yes-or-no at a time. They are there for convenience; they are not the shape of
+the type.
+
+`unwrap` names one of three outcomes, so the other two fault — the program
+stops with `TRAP: unwrap on a Result that is Err` (or `… that is Unknown`) and
+exit status 70. Use it where a non-Ok really is a bug, and `match`, `tif` or
+`unwrap_or` everywhere else.
+
+### There is no `Option<T>`
+
+`Result` is this language's option type. Where another language writes
+`Option<T>` with `Some`/`None`, ManiT writes `Result<T, str>` and uses
+`Unknown(msg)` for the absent case — which carries a reason, and leaves `Err`
+free to mean something different from "not there".
+
+A two-state option beside a three-state result would be a distinction the
+hardware does not make. `Option<int>`, `Some(x)` and `None` are compile errors,
+and the message names the replacement.
+
 ---
 
 ## 14. Generics

@@ -427,7 +427,28 @@ impl SemanticAnalyzer {
                 let resolved_args = resolved_args?;
                 match name.as_str() {
                     "Result" => Ok(ManiType::Generic("Result".to_string(), resolved_args)),
-                    "Option" => Ok(ManiType::Generic("Option".to_string(), resolved_args)),
+                    // `Option<T>` is refused, not implemented. It was
+                    // half-declared surface — resolvable as a type, typed for
+                    // `.unwrap()`, and with no constructor on either backend, so
+                    // `Some(7)` reached codegen and died at assembly with
+                    // "Undefined label: Some". No `.mt` source in any tree has
+                    // ever used it (the one test called `test_option` is written
+                    // entirely in `Result`).
+                    //
+                    // It is not implemented because it is the wrong shape for
+                    // this language: `Result` already carries THREE outcomes —
+                    // Ok / Unknown / Err — and `Unknown` is precisely what
+                    // `None` means. Adding a two-state type beside a three-state
+                    // one that subsumes it is the binary habit this stack exists
+                    // to break.
+                    "Option" => Err(self.err(*_span, format!(
+                        "there is no `Option<T>` in ManiT. `Result<T, E>` is this \
+                         language's option type and it has three outcomes rather \
+                         than two: `Ok(v)` for a value, `Unknown(msg)` where you \
+                         would write `None`, and `Err(e)` for a failure. Write \
+                         `Result<{}, str>`.",
+                        resolved_args.first().map(|t| t.display()).unwrap_or_else(|| "T".to_string()),
+                    ))),
                     "Vec" => Ok(ManiType::Generic("Vec".to_string(), resolved_args)),
                     "Map" => Ok(ManiType::Generic("Map".to_string(), resolved_args)),
                     "Set" => Ok(ManiType::Generic("Set".to_string(), resolved_args)),

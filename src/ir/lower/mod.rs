@@ -6,6 +6,7 @@ pub(crate) mod helpers;
 mod lower_ctrl;
 mod lower_expr;
 mod lower_loop;
+pub mod lower_result;
 mod lower_stmt;
 
 use helpers::*;

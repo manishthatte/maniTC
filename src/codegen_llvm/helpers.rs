@@ -456,6 +456,7 @@ pub(crate) const STDLIB_DECLARES: &str = "\
 declare void @manit_fault(ptr)
 declare void @manit_check_divisor(i64)
 declare void @manit_check_index(i64, i64)
+declare void @manit_check_result_ok(i64)
 ; ---- io ----
 declare void @io_println(ptr)
 declare void @io_print(ptr)
@@ -865,7 +866,6 @@ declare ptr @Unknown(ptr)
 declare i1 @result_is_ok(ptr)
 declare i1 @result_is_err(ptr)
 declare i1 @result_is_unknown(ptr)
-declare i64 @result_unwrap(ptr)
 declare ptr @Channel_try_recv(ptr)
 declare void @async_sleep(i64)
 declare ptr @async_spawn_task(i64)
@@ -1496,12 +1496,14 @@ entry:
   ret i1 %b
 }
 
-define internal i64 @result_unwrap(ptr %r) {
-entry:
-  %p1 = getelementptr i64, ptr %r, i64 1
-  %v = load i64, ptr %p1, align 8
-  ret i64 %v
-}
+; An internal `result_unwrap` USED TO LIVE HERE (spelled with a leading
+; sigil, which is why this note is not), and it read word 1 with no tag check at
+; all: unwrapping an Err would have handed back the message pointer as if it
+; were the value. It was LLVM-only — T3 had no counterpart, which is why
+; `.unwrap()` failed at assembly there rather than misbehaving here. Both now
+; go through ir/lower/lower_result.rs, which emits the tag guard
+; (manit_check_result_ok / SYSCALL #561) and then the same GetPtr + Load that
+; `match` uses.
 "#;
 
 // ---------------------------------------------------------------------------

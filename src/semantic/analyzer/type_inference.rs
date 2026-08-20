@@ -212,12 +212,23 @@ impl SemanticAnalyzer {
             (ManiType::Int, "to_str") => ManiType::Str,
             (ManiType::Float, "to_str") => ManiType::Str,
             (ManiType::Generic(name, _), "len") if name == "Vec" => ManiType::Int,
-            (ManiType::Generic(name, args), "unwrap") if name == "Option" || name == "Result" => {
+            // Result<T, E> — see ir/lower/lower_result.rs, which lowers each of
+            // these to the loads and branches `match` already uses. The list
+            // here and RESULT_METHODS there must agree; `check_expr` rejects
+            // any other method on a Result rather than letting it reach codegen
+            // and fail at link, which is what Section 18 was.
+            (ManiType::Generic(name, args), "unwrap") if name == "Result" => {
                 args.first().cloned().unwrap_or(ManiType::Unknown)
             }
-            (ManiType::Generic(name, args), "map") if name == "Option" || name == "Result" => {
-                ManiType::Generic(name.clone(), args.clone())
+            (ManiType::Generic(name, args), "unwrap_or") if name == "Result" => {
+                args.first().cloned().unwrap_or(ManiType::Unknown)
             }
+            (ManiType::Generic(name, _), "is_ok") if name == "Result" => ManiType::Bool,
+            (ManiType::Generic(name, _), "is_err") if name == "Result" => ManiType::Bool,
+            (ManiType::Generic(name, _), "is_unknown") if name == "Result" => ManiType::Bool,
+            // The tag is a trit, so `tif r.tag() { … }` dispatches on all three
+            // outcomes at once rather than asking three yes/no questions.
+            (ManiType::Generic(name, _), "tag") if name == "Result" => ManiType::Trit,
             (ManiType::Array(_, _), "len") => ManiType::Int,
 
             // Vec methods
@@ -451,11 +462,6 @@ impl SemanticAnalyzer {
                         "Err" => vec![args.get(1).cloned().unwrap_or(ManiType::Unknown)],
                         "Unknown" => vec![ManiType::Str],
                         _ => vec![ManiType::Unknown; subpats.len()],
-                    },
-                    // Option<T>: Some(T) / None
-                    ManiType::Generic(g, args) if g == "Option" => match variant_name {
-                        "Some" => vec![args.first().cloned().unwrap_or(ManiType::Unknown)],
-                        _ => vec![],
                     },
                     _ => {
                         // User enum: field types from the variant declaration.

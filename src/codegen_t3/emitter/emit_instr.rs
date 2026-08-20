@@ -498,6 +498,13 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
         IRInstr::Call { dst, func, args, .. } => {
             // Map stdlib functions to SYSCALL sequences
             match func.as_str() {
+                // `.unwrap()`'s tag guard, the T3 half of the pair whose LLVM
+                // half is `manit_check_result_ok` in runtime/core.c. Everything
+                // else about Result methods is shared IR — see
+                // ir/lower/lower_result.rs.
+                "manit_check_result_ok" => {
+                    emit_syscall_1arg(em, args, &None, 561, "result_ok_check");
+                }
                 "io::println" | "io::print" => {
                     // Syscall writes R1; rescue any live temp that lives there.
                     em.rescue_reg(1);
@@ -598,28 +605,72 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     em.emit("    SYSCALL #4                  ; newline".to_string());
                 }
                 // Result constructors: Ok(v)/Unknown(m)/Err(e)
-                // Allocate 2 words on the stack: [discriminant, payload].
-                // Return current SP (R26) as the pointer to the Result.
+                // Two words on the HEAP: [tag, payload]. The pointer is the
+                // value, so it must outlive the frame that built it.
+                //
+                // These used to allocate on the stack and return R26. A Result
+                // therefore died at the `RET` of the function that produced it:
+                //
+                //     fn ok() -> Result<int,str> { Ok(7) }
+                //     fn show(r: Result<int,str>) { match r { Ok(v) => … } }
+                //     show(ok());          // T3: no output at all
+                //
+                // The callee's frame grew straight over the box, so the tag read
+                // as garbage, no `match` arm was taken, and the program stopped
+                // silently. LLVM had always `malloc`ed (@Ok_new), so this was a
+                // representation divergence, not a tuning difference — the same
+                // fault, and the same fix, as struct and tuple allocas in
+                // ORACLE_FINDINGS.md Section 10.
                 "Ok" | "Unknown" | "Err" => {
                     let disc_val: i64 = match func.as_str() { "Ok" => 1, "Unknown" => 0, _ => -1 };
-                    // Get payload value BEFORE modifying sp_depth
+                    // Read the payload BEFORE the allocation: SYSCALL #218
+                    // takes its word count in R1 and returns the base there.
                     let raw_ra = if let Some(arg) = args.first() { em.val_reg(arg) } else { 0 };
-                    // If payload is in R22/R23 (scratch regs we'll overwrite), move it first
-                    let ra = if raw_ra == 22 || raw_ra == 23 {
-                        em.emit(format!("    MOV   R21, {}  ; save payload to safe reg", AsmEmitter::rn(raw_ra)));
-                        21usize
+                    // The sequence needs three registers besides the payload:
+                    // R1 (the syscall's argument AND result), R21 (a private
+                    // save of whatever R1 held), and R22 (the tag constant).
+                    // Move the payload clear of all of them, and of R23, which
+                    // belongs to the post-instruction spill store.
+                    let ra = if matches!(raw_ra, 1 | 21 | 22 | 23) {
+                        em.emit(format!("    MOV   R25, {}  ; save payload to safe reg", AsmEmitter::rn(raw_ra)));
+                        25usize
                     } else {
                         raw_ra
                     };
-                    // Allocate 2 stack words
-                    em.reg_alloc.sp_depth += 2;
-                    em.emit(format!("    TSUB  R26, R26, #2  ; alloca Result [disc, payload] ({})", func));
-                    em.emit(format!("    TLIT  R22, #{}  ; disc ({})", disc_val, func));
-                    em.emit("    STORE R22, [R26+#0]  ; store discriminant".to_string());
-                    em.emit(format!("    STORE {}, [R26+#1]  ; store payload", AsmEmitter::rn(ra)));
+                    // R1 is saved and restored by hand rather than through
+                    // `rescue_reg_inclusive`, and that distinction is the whole
+                    // bug. A rescue REBINDS the temp to a different register in
+                    // the allocator, and the allocator's state runs forward
+                    // through emission in block order — but not through
+                    // EXECUTION in block order. Rescuing inside one arm of a
+                    // `match` left the sibling arm, reached directly from the
+                    // branch, reading the temp out of a register that arm never
+                    // wrote:
+                    //
+                    //     match sd(a, b) { Ok(v) => Ok(v), Err(e) => Err(e), … }
+                    //
+                    // the Ok arm rescued the scrutinee pointer from R1 into R4,
+                    // and the Err arm then did `LOAD R5, [R4+#0]` on a register
+                    // holding whatever was left there. Save-and-restore moves a
+                    // value without ever changing where the allocator believes
+                    // it lives, so nothing leaks across the branch.
+                    em.emit("    MOV   R21, R1  ; save R1 across the alloc syscall".to_string());
+                    em.emit(format!("    TLIT  R1, #2  ; heap alloc Result [tag, payload] ({})", func));
+                    em.emit("    SYSCALL #218  ; heap_alloc_words".to_string());
+                    em.emit(format!("    TLIT  R22, #{}  ; tag ({})", disc_val, func));
+                    em.emit("    STORE R22, [R1+#0]  ; store tag".to_string());
+                    em.emit(format!("    STORE {}, [R1+#1]  ; store payload", AsmEmitter::rn(ra)));
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
-                        em.emit(format!("    MOV   {}, R26  ; Result ptr ({})", AsmEmitter::rn(rd), func));
+                        // `dst_reg` returns R1 only when no live temp is mapped
+                        // there, so in that case the saved value is dead and the
+                        // pointer stays put.
+                        if rd != 1 {
+                            em.emit(format!("    MOV   {}, R1  ; Result ptr ({})", AsmEmitter::rn(rd), func));
+                            em.emit("    MOV   R1, R21  ; restore R1".to_string());
+                        }
+                    } else {
+                        em.emit("    MOV   R1, R21  ; restore R1".to_string());
                     }
                 }
                 // ------------------------------------------------------------------
