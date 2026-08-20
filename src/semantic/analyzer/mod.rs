@@ -655,6 +655,26 @@ impl SemanticAnalyzer {
                                 gv.name, ty.display(), te.ty.display()
                             )));
                         }
+                        // S31: a module-level `let` is one word, written by a
+                        // preamble that runs before main — so its value must
+                        // be computable now. It used to be lowered by a match
+                        // whose only arm was a bare literal, with a wildcard
+                        // that returned `IRConst::Null`: every negative
+                        // constant (`-42` is `UnOp(Neg, Lit(42))`, not a
+                        // literal) read as 0 on BOTH backends, and an
+                        // unrepresentable initialiser such as a struct literal
+                        // became a null pointer that faulted at first use.
+                        // Fold it here, and say so when it will not fold.
+                        if let Err(e) = crate::semantic::const_fold::fold(&te) {
+                            return Err(self.err(gv.span, format!(
+                                "the initialiser of global '{}' {}. A module-level `let` is \
+                                 stored as a single word written before `main` runs, so its \
+                                 value must be known at compile time: literals, `+ - * / %` \
+                                 and comparisons on int and float, `!`, unary `-`, and \
+                                 int/float casts. Anything else belongs inside a function.",
+                                gv.name, e.describe(),
+                            )));
+                        }
                         Some(te)
                     } else {
                         None

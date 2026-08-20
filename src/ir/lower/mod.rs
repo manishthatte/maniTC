@@ -481,10 +481,33 @@ impl IRLowerer {
         }
     }
 
+    /// Lower a module-level initialiser, which must be a compile-time constant.
+    ///
+    /// The semantic pass has already folded this same expression and refused
+    /// the program if it would not fold (`analyzer/mod.rs`, S31), so reaching
+    /// the `Null` below means the two disagree — a compiler bug, not a user
+    /// error, and one that would otherwise reappear as a silent zero.
+    ///
+    /// This match used to have exactly one arm, `Lit`, and a wildcard that
+    /// returned `Null`. `-42` is `UnOp(Neg, Lit(42))`, so it missed, and every
+    /// negative module-level constant read as 0 on both backends.
     fn lower_expr_to_const(&mut self, expr: &TypedExpr) -> IRValue {
-        match expr.kind.clone() {
-            TypedExprKind::Lit(lit) => self.lower_lit(&lit),
-            _ => IRValue::Const(IRConst::Null),
+        use crate::semantic::const_fold::{fold, ConstValue};
+        match fold(expr) {
+            Ok(ConstValue::Int(n)) => IRValue::Const(IRConst::Int(n)),
+            Ok(ConstValue::Float(f)) => IRValue::Const(IRConst::Float(f)),
+            Ok(ConstValue::Bool(b)) => IRValue::Const(IRConst::Bool(b)),
+            Ok(ConstValue::Trit(t)) => IRValue::Const(IRConst::Trit(t)),
+            // Strings are interned to a label, exactly as `lower_lit_typed`
+            // does — a global `str` holds the address of the .data entry.
+            Ok(ConstValue::Str(s)) => IRValue::Const(IRConst::Str(self.intern_string(&s))),
+            Ok(ConstValue::Null) => IRValue::Const(IRConst::Null),
+            Err(e) => panic!(
+                "maniT internal error: a global initialiser that the semantic pass accepted \
+                 will not fold during lowering ({}). This is a compiler bug — the two folders \
+                 must agree.",
+                e.describe(),
+            ),
         }
     }
 

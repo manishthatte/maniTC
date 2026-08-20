@@ -203,9 +203,12 @@ fn a2_static_out_of_bounds_index_is_a_compile_error() {
 
 #[test]
 fn a2_static_negative_index_is_a_compile_error() {
-    // A literal negative index folds at compile time. A computed one
-    // (`a[0 - 1]`) is not folded by the semantic pass and is caught by the
-    // runtime guard instead — see a2_runtime_negative_index_faults.
+    // A constant negative index folds at compile time. Since 21 August 2026
+    // that includes computed ones (`a[0 - 1]`, `a[2 * 5]`) — see
+    // s24_the_static_index_check_uses_the_same_folder. Only a genuinely
+    // dynamic index reaches the runtime guard; see
+    // a2_runtime_negative_index_faults_on_both_backends, which builds its
+    // index from a mutable variable for exactly that reason.
     assert_check_error(
         "a2_neg.mt",
         "fn main() { let a = [10, 20, 30]; io::println_int(a[-1]); }\n",
@@ -1589,4 +1592,129 @@ fn main() {
     ] {
         assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
     }
+}
+
+// ---------------------------------------------------------------------------
+// S24 (ORACLE_FINDINGS Section 31) — module-level constants
+// ---------------------------------------------------------------------------
+// Three faults in one place, and the worst of them was invisible to the
+// differential method.
+//
+//   31.1  `lower_expr_to_const` matched a bare `Lit` and nothing else, with a
+//         wildcard returning `IRConst::Null`. `-42` parses as
+//         `UnOp(Neg, Lit(42))`, so every negative module-level constant read
+//         as 0 — identically on BOTH backends, because the fault sat upstream
+//         of the split. Cross-checking t3 against llvm cannot see this; only
+//         the absolute assertions below can.
+//   31.2  A float global's bits were fed to the TLIT/TMUL immediate builder,
+//         which trapped before main: "TMUL overflow: result 4609434218000".
+//   31.3  A `str` global stored 0 on T3 (irconst_to_i64's Str arm) while LLVM
+//         emitted `global ptr @str0`, so printing one dumped emulator memory.
+//
+// Every value below is pinned absolutely as well as cross-backend.
+
+#[test]
+fn s24_module_level_constants_are_folded_not_zeroed() {
+    let src = r#"
+let NEG: int   = -42;
+let SUB: int   = 0 - 42;
+let PROD: int  = 6 * 7;
+let POS: int   = 42;
+let ONE: int   = -1;
+let FLOOR: int = -3812798742493;
+let NEST: int  = -(20 + 1) * 2;
+let PI2: float = -2.25;
+let HALF: float = 1.5;
+let SUM: float = 0.5 - 2.75;
+let TXT: str   = "hello";
+let YES: bool  = true;
+let TN: trit   = -;
+let T27N: t27  = 0t---------------------------;
+
+fn main() {
+    io::print("NEG="); io::println_int(NEG);
+    io::print("SUB="); io::println_int(SUB);
+    io::print("PROD="); io::println_int(PROD);
+    io::print("POS="); io::println_int(POS);
+    io::print("ONE="); io::println_int(ONE);
+    io::print("FLOOR="); io::println_int(FLOOR);
+    io::print("NEST="); io::println_int(NEST);
+    io::print("PI2="); io::println_float(PI2);
+    io::print("HALF="); io::println_float(HALF);
+    io::print("SUM="); io::println_float(SUM);
+    io::print("TXT="); io::println(TXT);
+    io::print("YES="); io::println_bool(YES);
+    io::print("TN="); io::println_trit(TN);
+    io::print("T27N="); io::println_int(T27N as int);
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("s24_globals.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "global initialisers must agree across backends");
+
+    // The absolute half. Before the fix the first seven of these read "=0" on
+    // both backends at once, so `t3_out == ll_out` above passed throughout.
+    for want in [
+        "NEG=-42", "SUB=-42", "PROD=42", "POS=42", "ONE=-1",
+        "FLOOR=-3812798742493", "NEST=-42",
+        "PI2=-2.25", "HALF=1.5", "SUM=-2.25",
+        "TXT=hello", "YES=true", "TN=-", "T27N=-3812798742493",
+    ] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}
+
+#[test]
+fn s24_an_uncomputable_global_initialiser_is_a_compile_error() {
+    // The point of the fix is not only that `-42` now folds, but that anything
+    // which does NOT fold is reported instead of becoming a plausible zero.
+    assert_check_error(
+        "s24_call.mt",
+        "fn f() -> int { 7 }\nlet X: int = f();\nfn main() { io::println_int(X); }\n",
+        "is not a compile-time constant",
+    );
+    // An aggregate cannot live in a global's single word. This used to compile
+    // to a null pointer and fault on first use.
+    assert_check_error(
+        "s24_arr.mt",
+        "let T: [int; 3] = [1, 2, 3];\nfn main() { io::println_int(T[0]); }\n",
+        "is not a compile-time constant",
+    );
+    // A constant expression that IS evaluable but faults gets its own message,
+    // at the line that wrote it rather than at run time.
+    assert_check_error(
+        "s24_dz.mt",
+        "let X: int = 10 / (2 - 2);\nfn main() { io::println_int(X); }\n",
+        "divides by zero",
+    );
+    assert_check_error(
+        "s24_ovf.mt",
+        "let X: int = 9223372036854775807 + 1;\nfn main() { io::println_int(X); }\n",
+        "overflows an int",
+    );
+}
+
+#[test]
+fn s24_the_static_index_check_uses_the_same_folder() {
+    // A2's bounds check carried its own literal-only fold, the same shape as
+    // the one that made 31.1 possible. Sharing the folder means a computed
+    // constant index is caught too — `a[0 - 1]` was previously left to the
+    // runtime guard.
+    assert_check_error(
+        "s24_ix_neg.mt",
+        "fn main() { let a = [10, 20, 30]; io::println_int(a[0 - 1]); }\n",
+        "out of bounds",
+    );
+    assert_check_error(
+        "s24_ix_big.mt",
+        "fn main() { let a = [10, 20, 30]; io::println_int(a[2 * 5]); }\n",
+        "out of bounds",
+    );
+    // ...and an in-range computed index must still be accepted.
+    assert_checks(
+        "s24_ix_ok.mt",
+        "fn main() { let a = [10, 20, 30]; io::println_int(a[1 + 1]); }\n",
+    );
 }

@@ -272,17 +272,15 @@ impl SemanticAnalyzer {
                 // backend reads adjacent emulator memory (a[-1] returned the
                 // array's own length header). When both the length and the
                 // index are statically known, reject it outright.
-                // Literal `a[3]` and negated-literal `a[-1]` are both folded
-                // here; anything more involved (`a[0 - 1]`, `a[n]`) is left to
-                // the runtime guard emitted by IR lowering.
-                let const_idx = match &**idx {
-                    Expr::Lit(Lit::Int(i), _) => Some(*i),
-                    Expr::UnOp(UnOpKind::Neg, inner, _) => match &**inner {
-                        Expr::Lit(Lit::Int(i), _) => Some(-*i),
-                        _ => None,
-                    },
-                    _ => None,
-                };
+                // Any index the compiler can compute is checked here — `a[3]`,
+                // `a[-1]`, `a[0 - 1]`, `a[2 * 5]` alike. A genuinely dynamic
+                // index (`a[n]`) is left to the runtime guard emitted by IR
+                // lowering. This used to be a private two-arm match that saw
+                // literals and negated literals only; it now shares the one
+                // folder with module-level constants, whose identical
+                // literals-only match was a silent miscompile rather than
+                // merely conservative (see semantic/const_fold.rs).
+                let const_idx = crate::semantic::const_fold::fold_int(&tidx);
                 if let (ManiType::Array(_, Some(len)), Some(i)) = (&tarr.ty, &const_idx) {
                     let len = *len as i64;
                     if *i < 0 || *i >= len {

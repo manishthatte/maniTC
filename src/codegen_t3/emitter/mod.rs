@@ -684,15 +684,43 @@ pub fn emit_t3_asm(module: &IRModule) -> String {
         .find(|f| !f.is_extern)
         .map_or(false, |f| f.name == "main");
 
+    // Float bit patterns that the globals preamble needs; merged into the
+    // module's .float section below, alongside the ones functions emit.
+    let mut global_float_literals: Vec<(String, i64)> = Vec::new();
+
     if !module.globals.is_empty() {
         out.push_str("; globals init\n");
         for g in &module.globals {
-            let init = match &g.init {
-                Some(IRValue::Const(c)) => irconst_to_i64(c),
-                _ => 0,
-            };
             let addr = global_addrs[&g.name];
-            lit_into(&mut out, "R1", "R3", init);
+            match &g.init {
+                // A float's bits are a 64-bit pattern — far outside the 27-trit
+                // word, so `lit_into` cannot build it: the TMUL split trapped at
+                // run time before the program reached main (`let P: float = 1.5`
+                // died on "TMUL overflow: result 4609434218000"). Take the same
+                // route function-local float literals already take: park the bits
+                // in the .float section and fetch them with the float-load
+                // syscall.
+                Some(IRValue::Const(IRConst::Float(f))) => {
+                    let label = format!("@float_global_{}", global_float_literals.len());
+                    let clean = label.trim_start_matches('@').to_string();
+                    global_float_literals.push((label, f.to_bits() as i64));
+                    out.push_str(&format!("    TLIT  R1, #{}  ; float-lit addr\n", clean));
+                    out.push_str(&format!("    SYSCALL #219  ; float_load bits for {}\n", f));
+                }
+                // A `str` global holds the ADDRESS of its .data entry. The old
+                // code ran the label through `irconst_to_i64`, whose `Str` arm
+                // returns 0, so every string global was the null address and
+                // printing one dumped emulator memory. LLVM emitted
+                // `@S = global ptr @str0` and was right all along, so this one
+                // did diverge — unlike the negative-integer case, which was
+                // wrong identically on both sides.
+                Some(IRValue::Const(IRConst::Str(label))) => {
+                    let clean = label.trim_start_matches('@');
+                    out.push_str(&format!("    TLIT  R1, #{}  ; &{}\n", clean, clean));
+                }
+                Some(IRValue::Const(c)) => lit_into(&mut out, "R1", "R3", irconst_to_i64(c)),
+                _ => lit_into(&mut out, "R1", "R3", 0),
+            }
             out.push_str(&format!("    TLIT  R2, #{}  ; &{}\n", addr, g.name));
             out.push_str("    STORE R1, [R2+#0]\n");
         }
@@ -738,6 +766,7 @@ pub fn emit_t3_asm(module: &IRModule) -> String {
 
     // Float section for float literals
     let combined_floats: Vec<(String, i64)> = module.float_literals.iter().cloned()
+        .chain(global_float_literals.into_iter())
         .chain(all_float_literals.into_iter())
         .collect();
     if !combined_floats.is_empty() {
