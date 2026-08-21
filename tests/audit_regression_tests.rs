@@ -2586,3 +2586,89 @@ fn main() {
     assert_eq!(ll_out, want, "llvm output");
     assert_eq!(t3_out, want, "t3 output");
 }
+
+// ---------------------------------------------------------------------------
+// S45 (ORACLE_FINDINGS Section 45) — a bool argument reaching a bool3 parameter
+// of a NATIVE stdlib declaration
+// ---------------------------------------------------------------------------
+//
+// `IRLowerer` coerces call arguments to the callee's declared parameter type,
+// and it learned those types from `TypedProgram::functions`. A native stdlib
+// function — `io::println_bool3`, whose body is in the backends and not in
+// `.mt` source — has no body, so it never appears there, and a MISSING entry
+// was indistinguishable from a function with NO parameters: the coercion was
+// skipped and a raw `bool` went through unconverted.
+//
+// bool3 is -1/0/+1 and bool is 0/1, so `false` (0) landed on bool3's UNKNOWN.
+// That is why these tests assert the ABSOLUTE strings and not merely that the
+// backends agree: on `false` the two backends agreed with each other and were
+// both wrong, which is exactly the failure mode a differential oracle cannot
+// see. Only the accidental disagreement on `true` made any of it visible.
+
+#[test]
+fn s45_bool_reaches_a_native_bool3_parameter_as_bool3() {
+    let src = r#"
+use std::io;
+fn no() -> bool { return false; }
+fn main() {
+    io::println_bool3(true);
+    io::println_bool3(false);
+    io::println_bool3(no());
+    io::println_bool3(1 == 2);
+    io::print_bool3(false);
+    io::newline();
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s45_native_bool3.mt", src);
+    assert_eq!(ll_code, 0, "llvm:\n{}", ll_out);
+    assert_eq!(t3_code, 0, "t3:\n{}", t3_out);
+    let want = "true\nfalse\nfalse\nfalse\nfalse\n";
+    assert_eq!(ll_out, want, "llvm output");
+    assert_eq!(t3_out, want, "t3 output");
+}
+
+#[test]
+fn s45_a_real_bool3_argument_is_not_converted_twice() {
+    // The other half of the fix: coercion must fire on bool->bool3 and on
+    // nothing else. A value that is ALREADY bool3 must arrive untouched — a
+    // second `2*b - 1` would send unknown(0) to false(-1) and false(-1) to -3.
+    let src = r#"
+use std::io;
+fn main() {
+    let a: bool3 = unknown;
+    let b: bool3 = true;
+    let c: bool3 = false;
+    io::println_bool3(a);
+    io::println_bool3(b);
+    io::println_bool3(c);
+    io::println_bool(false);
+    io::println_bool(true);
+}
+"#;
+    let ((_, t3_out), (_, ll_out)) = run_both_backends("s45_bool3_passthrough.mt", src);
+    let want = "unknown\ntrue\nfalse\nfalse\ntrue\n";
+    assert_eq!(ll_out, want, "llvm output");
+    assert_eq!(t3_out, want, "t3 output");
+}
+
+#[test]
+fn s45_source_written_stdlib_bool3_parameters_still_work() {
+    // `fmt::show_bool3` and `str::from_bool3` are ManiT source, so they reached
+    // `TypedProgram::functions` and always had their parameter type. Pinned so
+    // that seeding the native declarations first — which is what makes the
+    // tests above pass — cannot later shadow a real definition of the same name.
+    let src = r#"
+use std::io;
+use std::fmt;
+use std::str;
+fn main() {
+    io::println(fmt::show_bool3(false));
+    io::println(fmt::show_bool3(true));
+    io::println(str::from_bool3(false));
+}
+"#;
+    let ((_, t3_out), (_, ll_out)) = run_both_backends("s45_source_bool3.mt", src);
+    let want = "False\nTrue\nFalse\n";
+    assert_eq!(ll_out, want, "llvm output");
+    assert_eq!(t3_out, want, "t3 output");
+}

@@ -447,6 +447,23 @@ impl IRLowerer {
             );
         }
 
+        // Native stdlib declarations first, so a real definition of the same
+        // name — a user function, or a stdlib module that is ManiT source and
+        // was merged in by stdlib_expand — overwrites the declaration below.
+        //
+        // Without this, a body-less function has no entry here at all, and a
+        // missing entry is indistinguishable from a function with no
+        // parameters: `callee_param_manitys` comes back `None` and lower_expr
+        // skips the argument coercion entirely. `io::println_bool3(false)`
+        // therefore passed a raw `bool` 0 where a `bool3` was declared, and 0
+        // is bool3's UNKNOWN — so it printed `unknown` on both backends rather
+        // than diverging. S45, and the first time the two-backend oracle's
+        // blind spot (it compares the backends to each other, not to the truth)
+        // hid a live bug.
+        for (name, ptys) in &typed_program.native_param_manitys {
+            lowerer.fn_param_manitys.insert(name.clone(), ptys.clone());
+        }
+
         for f in &typed_program.functions {
             lowerer.fn_param_manitys.insert(
                 f.name.clone(),

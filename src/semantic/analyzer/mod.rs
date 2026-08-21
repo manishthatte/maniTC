@@ -93,6 +93,12 @@ pub struct SemanticAnalyzer {
     pub(crate) loaded_module_prefixes: std::collections::HashSet<String>,
     /// Non-`pub` items of loaded user modules: full item name → module prefix
     pub(crate) module_private_items: HashMap<String, String>,
+    /// Declared parameter types of every stdlib function, qualified
+    /// (`io::println_bool3` → `[bool3]`). Handed to lowering on the
+    /// `TypedProgram` so that calls into NATIVE declarations — which have no
+    /// body and so never reach `TypedProgram::functions` — still get their
+    /// arguments coerced to the declared parameter type.
+    pub(crate) native_param_manitys: HashMap<String, Vec<ManiType>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +247,7 @@ impl SemanticAnalyzer {
             builtin_names: std::collections::HashSet::new(),
             loaded_module_prefixes: std::collections::HashSet::new(),
             module_private_items: HashMap::new(),
+            native_param_manitys: HashMap::new(),
         };
         analyzer.register_builtins();
         analyzer
@@ -575,17 +582,29 @@ impl SemanticAnalyzer {
     /// look like a memory bug rather than a typing one.
     ///
     /// Derived from the module sources rather than hand-listed, so the two
-    /// cannot drift. Only RETURN types are taken: parameters are left Unknown
-    /// so this fixes the typing without turning on argument enforcement for
-    /// calls that were previously unchecked — that is a separate change.
+    /// cannot drift. Only RETURN types enter `self.functions`: parameters there
+    /// are left Unknown so this fixes the typing without turning on argument
+    /// enforcement for calls that were previously unchecked — that is a
+    /// separate change.
+    ///
+    /// The declared PARAMETER types are recorded separately, in
+    /// `native_param_manitys`, and travel to lowering on the `TypedProgram`.
+    /// That map does not gate anything the analyzer accepts; it exists so the
+    /// IR lowerer can apply the same argument coercion to a stdlib call that it
+    /// already applies to a user-defined one. Every stdlib module contributes
+    /// to it, not just the four whose return types are registered here — a
+    /// native declaration is precisely the case where the declared parameter
+    /// type exists nowhere else, since a body-less function never reaches
+    /// `TypedProgram::functions`. Missing it made `io::println_bool3(false)`
+    /// print `unknown` on BOTH backends (S45).
     fn register_native_module_sigs(&mut self) {
-        const MODULES: &[(&str, &str)] = &[
-            ("str", include_str!("../../../stdlib/str.mt")),
-            ("fmt", include_str!("../../../stdlib/fmt.mt")),
-            ("math", include_str!("../../../stdlib/math.mt")),
-            ("ternary", include_str!("../../../stdlib/ternary.mt")),
-        ];
-        for (module, src) in MODULES {
+        // Modules whose RETURN types are registered in `self.functions`.
+        // Narrower than the parameter scan below, deliberately: adding a return
+        // type changes what the analyzer infers at every call site, whereas the
+        // parameter map only reaches codegen.
+        const SIG_MODULES: &[&str] = &["str", "fmt", "math", "ternary"];
+
+        for (module, src) in STDLIB_SOURCES {
             let file = format!("<std::{}>", module);
             let Ok(tokens) = crate::lexer::Lexer::with_file(src, &file).tokenize() else {
                 continue;
@@ -593,9 +612,34 @@ impl SemanticAnalyzer {
             let Ok(program) = crate::parser::Parser::with_file(tokens, &file).parse() else {
                 continue;
             };
+            let register_ret = SIG_MODULES.contains(module);
             for item in &program.items {
                 let Item::FnDef(f) = item else { continue };
                 let qualified = format!("{}::{}", module, f.name);
+
+                // Declared parameter types, for lowering. Recorded whether or
+                // not the return type is registered, and whether or not the
+                // builtin table already states a signature: the source is the
+                // more precise authority on parameters, and this map is read
+                // only by the lowerer's coercion.
+                let mut ptys = Vec::with_capacity(f.params.len());
+                let mut all_resolved = true;
+                for p in &f.params {
+                    match self.resolve_type(&p.ty) {
+                        Ok(ty) => ptys.push(ty),
+                        Err(_) => {
+                            all_resolved = false;
+                            break;
+                        }
+                    }
+                }
+                if all_resolved {
+                    self.native_param_manitys.insert(qualified.clone(), ptys);
+                }
+
+                if !register_ret {
+                    continue;
+                }
                 // Never shadow a signature the table states explicitly, and
                 // never a real user function of the same name.
                 if self.functions.contains_key(&qualified) {
@@ -745,6 +789,7 @@ impl SemanticAnalyzer {
             struct_fields: self.structs.clone(),
             enums: enums_out,
             globals: typed_globals,
+            native_param_manitys: self.native_param_manitys.clone(),
         })
     }
 

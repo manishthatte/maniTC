@@ -128,6 +128,15 @@ pub struct TypedProgram {
     pub struct_fields: std::collections::HashMap<String, Vec<(String, ManiType)>>,
     pub enums: Vec<EnumDef>,
     pub globals: Vec<TypedGlobal>,
+    /// Declared parameter types of the NATIVE stdlib functions — the ones whose
+    /// bodies live in a backend rather than in `.mt` source, so they never
+    /// appear in `functions` and lowering would otherwise know nothing about
+    /// their signatures. Keyed by qualified name (`io::println_bool3`).
+    ///
+    /// This exists because lowering must coerce call arguments to the declared
+    /// parameter type, and a native declaration is exactly the case where the
+    /// declared type is invisible. See `IRLowerer::lower` and S45.
+    pub native_param_manitys: std::collections::HashMap<String, Vec<ManiType>>,
 }
 
 #[derive(Debug, Clone)]
