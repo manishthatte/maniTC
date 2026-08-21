@@ -81,6 +81,45 @@ impl Emulator {
                 } else { false };
                 self.regs[1] = if found { 1 } else { 0 };
             }
+            38 => {
+                // Vec::contains_str(handle=R1, needle=R2) → R1 = bool.
+                // Compares TEXT. The plain Vec::contains above compares the
+                // type-erased i64, which for a str is its address, so it can
+                // only ever match a value that came from the same place.
+                let h = self.regs[1] as usize;
+                let needle = self.str_at(self.regs[2]);
+                let found = if let Some(HeapObj::Vec(vec)) = self.heap_objs.get(&h) {
+                    vec.iter().any(|&e| self.str_at(e) == needle)
+                } else { false };
+                self.regs[1] = if found { 1 } else { 0 };
+            }
+            39 => {
+                // Vec::sort_str(handle=R1) — sort by TEXT.
+                // Sorting the raw i64 orders addresses, which for string
+                // literals is source order, so a "sorted" vector came back in
+                // the order it was written. Both backends did it, so they
+                // agreed on an answer that was not sorted.
+                let h = self.regs[1] as usize;
+                if let Some(HeapObj::Vec(vec)) = self.heap_objs.get(&h) {
+                    let mut keyed: Vec<(String, i64)> =
+                        vec.iter().map(|&e| (self.str_at(e), e)).collect();
+                    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                    let sorted: Vec<i64> = keyed.into_iter().map(|(_, e)| e).collect();
+                    if let Some(HeapObj::Vec(v)) = self.heap_objs.get_mut(&h) {
+                        *v = sorted;
+                    }
+                }
+            }
+            45 => {
+                // Vec::index_of_str(handle=R1, needle=R2) → R1 = index or -1.
+                let h = self.regs[1] as usize;
+                let needle = self.str_at(self.regs[2]);
+                let idx = if let Some(HeapObj::Vec(vec)) = self.heap_objs.get(&h) {
+                    vec.iter().position(|&e| self.str_at(e) == needle)
+                        .map(|i| i as i64).unwrap_or(-1)
+                } else { -1 };
+                self.regs[1] = idx;
+            }
             26 => {
                 // Vec::remove(handle=R1, index=R2)
                 let h = self.regs[1] as usize;

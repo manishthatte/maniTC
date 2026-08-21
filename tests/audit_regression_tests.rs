@@ -2355,3 +2355,95 @@ fn main() {
         assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
     }
 }
+
+// ---------------------------------------------------------------------------
+// S31 — a `str` inside a collection is compared as TEXT, not as an address
+// (ORACLE_FINDINGS §40).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s31_collections_of_str_compare_text_not_identity() {
+    // `str` is a value for `==` but was an IDENTITY once inside a collection:
+    // every element reaches the runtime type-erased to i64, which is a pointer
+    // natively and an intern id on T3. Measured, against a key built at run
+    // time carrying the same text as a literal already in the collection:
+    //
+    //     vec.contains        LLVM false   T3 false    <- both wrong, agreeing
+    //     vec.index_of        LLVM -1      T3 -1       <- both wrong, agreeing
+    //     map.contains_key    LLVM false   T3 true     <- diverge, LLVM wrong
+    //     set.contains        LLVM false   T3 true     <- diverge, LLVM wrong
+    //     insert same text 2x LLVM len 2   T3 len 1    <- diverge, LLVM wrong
+    //     sort()              unsorted     unsorted    <- both wrong, agreeing
+    //
+    // The three that AGREE are the reason this test pins absolute answers.
+    // Comparing the backends could never have found them: the fault is upstream
+    // of both, so both produce the same wrong result. Only asking what the
+    // answer should BE finds those.
+    let src = r#"
+use std::io;
+use std::str;
+use std::collections;
+fn yn(b: bool) -> str { if b { return "yes"; } return "no"; }
+fn main() {
+    // Same text as the literal "ab", but assembled at run time.
+    let built = str::concat("a", "b");
+
+    let v: Vec<str> = Vec::new();
+    v.push("ab"); v.push("cd");
+    io::print("vec.contains  = "); io::println(yn(v.contains(built)));
+    io::print("vec.index_of  = "); io::println_int(v.index_of(built));
+
+    let m: Map<str,int> = Map::new();
+    m.insert("ab", 7);
+    io::print("map.contains  = "); io::println(yn(m.contains_key(built)));
+    io::print("map.get       = "); io::println_int(m.get(built));
+    io::print("map.get_or    = "); io::println_int(m.get_or(built, 99));
+    m.insert(built, 8);
+    io::print("map.len       = "); io::println_int(m.len());
+    m.remove(built);
+    io::print("map.len rm    = "); io::println_int(m.len());
+
+    let s: Set<str> = Set::new();
+    s.insert("ab");
+    io::print("set.contains  = "); io::println(yn(s.contains(built)));
+    s.insert(built);
+    io::print("set.len       = "); io::println_int(s.len());
+
+    // Set algebra needs no str-aware form of its own: once every stored
+    // element is canonical, comparing stored entries is already correct.
+    let t: Set<str> = Set::new();
+    t.insert(str::concat("a", "b"));
+    io::print("intersection  = ");
+    s.intersection(t).for_each(fn(x: str) { io::print(x); io::print(" "); });
+    io::println("");
+
+    let w: Vec<str> = Vec::new();
+    w.push("pear"); w.push("apple"); w.push("fig");
+    w.sort();
+    io::print("sorted        = ");
+    w.for_each(fn(x: str) { io::print(x); io::print(" "); });
+    io::println("");
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("s31_str_identity.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "a str key must mean the same on both backends");
+
+    for want in [
+        "vec.contains  = yes",
+        "vec.index_of  = 0",
+        "map.contains  = yes",
+        "map.get       = 7",
+        "map.get_or    = 7",
+        "map.len       = 1",   // re-inserting the same TEXT is not a new key
+        "map.len rm    = 0",   // and removing by computed text finds it
+        "set.contains  = yes",
+        "set.len       = 1",
+        "intersection  = ab",
+        "sorted        = apple fig pear",
+    ] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}

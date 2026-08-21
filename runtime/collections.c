@@ -97,6 +97,43 @@ int64_t Vec_index_of(ManitVec* v, int64_t x) {
     return -1;
 }
 
+/* ---- str elements compare as TEXT, not as addresses --------------------
+   A str inside a collection is type-erased to an int64_t, which here is its
+   pointer.  The three functions above therefore answer by identity: they match
+   only a value that came from the same place, so a needle built at run time
+   misses text that is already in the vector, and Vec_sort orders addresses.
+   maniTC routes a Vec<str> to these instead (see STR_SENSITIVE in
+   ir/lower/lower_expr.rs).  The T3 emulator has its own copies for the same
+   reason — its int64_t is an intern id rather than a pointer, which is a
+   different wrong answer to the same question. */
+
+int Vec_contains_str(ManitVec* v, int64_t x) {
+    if (!v || !x) return 0;
+    for (int64_t i = 0; i < v->len; i++)
+        if (v->data[i] && strcmp((const char*)v->data[i], (const char*)x) == 0) return 1;
+    return 0;
+}
+
+int64_t Vec_index_of_str(ManitVec* v, int64_t x) {
+    if (!v || !x) return -1;
+    for (int64_t i = 0; i < v->len; i++)
+        if (v->data[i] && strcmp((const char*)v->data[i], (const char*)x) == 0) return i;
+    return -1;
+}
+
+static int cmp_str_ptr(const void* a, const void* b) {
+    const char* x = (const char*)(*(const int64_t*)a);
+    const char* y = (const char*)(*(const int64_t*)b);
+    if (!x) return y ? -1 : 0;
+    if (!y) return 1;
+    return strcmp(x, y);
+}
+
+void Vec_sort_str(ManitVec* v) {
+    if (v && v->len > 0)
+        qsort(v->data, (size_t)v->len, sizeof(int64_t), cmp_str_ptr);
+}
+
 typedef int64_t (*ManitFn1)(int64_t);
 typedef int64_t (*ManitFn2)(int64_t, int64_t);
 typedef int     (*ManitPred)(int64_t);
@@ -304,6 +341,83 @@ void Map_remove(ManitMap* m, int64_t k) {
 int64_t Map_len(ManitMap* m) { return m ? m->count : 0; }
 int     Map_is_empty(ManitMap* m) { return !m || m->count == 0; }
 
+/* ---- str keys ----------------------------------------------------------
+   Map and Set hash and compare the type-erased int64_t, which for a str is its
+   pointer.  That made a map keyed by strings answer by identity: it matched
+   only literals the C compiler had already merged, a key built at run time
+   missed its own entry, and inserting the same text twice made two entries.
+   The T3 emulator does not have this bug — it interns every str key by content
+   inside the syscall — so this was a real divergence, and T3 was the correct
+   side.
+
+   Interning here makes the native backend agree, and it is the same mechanism:
+   one canonical address per distinct text, so identity BECOMES equality and
+   everything downstream (including the set algebra, which compares stored
+   entries) is correct without further change. */
+
+/* An open-addressed table, hashed on the TEXT, that grows.  A fixed cap with a
+   fall back to identity beyond it would put a silent cliff in the middle of the
+   correctness this is here to provide: a program would be right for the first N
+   distinct strings and quietly wrong afterwards, with nothing to see.  A linear
+   scan would have been simpler and is O(n) per lookup, which is O(n^2) to fill
+   a map — hashing keeps insert and lookup flat. */
+static char**  g_intern = NULL;
+static int64_t g_intern_cap = 0;   /* always a power of two, or 0 */
+static int64_t g_intern_len = 0;
+
+static uint64_t str_hash(const char* s) {
+    uint64_t h = 1469598103934665603ULL;          /* FNV-1a */
+    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+/* Place an already-owned string; used both by the public entry point and by
+   growth, which must not re-copy. */
+static void intern_place(char* owned) {
+    int64_t mask = g_intern_cap - 1;
+    int64_t i = (int64_t)(str_hash(owned) & (uint64_t)mask);
+    while (g_intern[i]) i = (i + 1) & mask;
+    g_intern[i] = owned;
+}
+
+static int intern_grow(void) {
+    int64_t ocap = g_intern_cap;
+    char** old = g_intern;
+    int64_t ncap = ocap ? ocap * 2 : 256;
+    char** ne = calloc((size_t)ncap, sizeof(char*));
+    if (!ne) return 0;
+    g_intern = ne; g_intern_cap = ncap;
+    for (int64_t i = 0; i < ocap; i++)
+        if (old[i]) intern_place(old[i]);
+    free(old);
+    return 1;
+}
+
+int64_t manit_intern_str(int64_t p) {
+    const char* s = (const char*)p;
+    if (!s) return p;
+    if (g_intern_len * 2 >= g_intern_cap && !intern_grow()) return p;  /* OOM only */
+    int64_t mask = g_intern_cap - 1;
+    int64_t i = (int64_t)(str_hash(s) & (uint64_t)mask);
+    while (g_intern[i]) {
+        if (strcmp(g_intern[i], s) == 0) return (int64_t)g_intern[i];
+        i = (i + 1) & mask;
+    }
+    size_t n = strlen(s) + 1;
+    char* copy = malloc(n);
+    if (!copy) return p;
+    memcpy(copy, s, n);
+    g_intern[i] = copy;
+    g_intern_len++;
+    return (int64_t)copy;
+}
+
+void    Map_insert_str(ManitMap* m, int64_t k, int64_t v) { Map_insert(m, manit_intern_str(k), v); }
+int64_t Map_get_str(ManitMap* m, int64_t k)               { return Map_get(m, manit_intern_str(k)); }
+int64_t Map_get_or_str(ManitMap* m, int64_t k, int64_t d) { return Map_get_or(m, manit_intern_str(k), d); }
+int     Map_contains_key_str(ManitMap* m, int64_t k)      { return Map_contains_key(m, manit_intern_str(k)); }
+void    Map_remove_str(ManitMap* m, int64_t k)            { Map_remove(m, manit_intern_str(k)); }
+
 ManitVec* Map_keys(ManitMap* m) {
     ManitVec* v = Vec_new();
     if (!m) return v;
@@ -447,6 +561,13 @@ int Set_is_subset(ManitSet* a, ManitSet* b) {
 }
 
 int Set_is_superset(ManitSet* a, ManitSet* b) { return Set_is_subset(b, a); }
+
+/* str elements — see manit_intern_str above.  Only the three entry points that
+   take an element need it; once every stored element is canonical, the set
+   algebra compares them correctly on its own. */
+void Set_insert_str(ManitSet* s, int64_t x)   { Set_insert(s, manit_intern_str(x)); }
+int  Set_contains_str(ManitSet* s, int64_t x) { return Set_contains(s, manit_intern_str(x)); }
+void Set_remove_str(ManitSet* s, int64_t x)   { Set_remove(s, manit_intern_str(x)); }
 
 int Set_is_disjoint(ManitSet* a, ManitSet* b) {
     if (!a || !b) return 1;

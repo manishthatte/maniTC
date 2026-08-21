@@ -16,6 +16,48 @@ fn strip_generics(type_name: &str) -> &str {
     }
 }
 
+/// Methods that compare or order the elements a collection holds, per receiver.
+///
+/// `str` is a value for `==` but an IDENTITY once it is inside a collection:
+/// every element reaches the runtime type-erased to i64, which is a pointer on
+/// the native backend and an intern id on T3.  So a map keyed by strings used
+/// to answer `contains_key` by pointer, and matched only literals the C
+/// compiler had already merged — a key built at run time missed its own entry,
+/// and the same text could be inserted twice.  Sorting was worse: it ordered
+/// pointers on BOTH backends, so the two agreed on an answer that was not
+/// sorted, which no amount of cross-backend comparison could catch.
+///
+/// These are the methods that actually look at the value.  For each, a
+/// `str`-typed element routes to a `_str` variant that compares text.  The rest
+/// of the surface — len, keys, push, the set algebra — needs nothing: it either
+/// does not compare, or it compares entries that these have already made
+/// canonical.
+const STR_SENSITIVE: &[(&str, &str)] = &[
+    ("Map", "insert"),
+    ("Map", "get"),
+    ("Map", "get_or"),
+    ("Map", "contains_key"),
+    ("Map", "remove"),
+    ("Set", "insert"),
+    ("Set", "contains"),
+    ("Set", "remove"),
+    ("Vec", "contains"),
+    ("Vec", "index_of"),
+    ("Vec", "sort"),
+];
+
+/// Does `method` on this receiver compare `str` values, and so need the text
+/// comparison rather than the pointer one?
+///
+/// The type argument that matters is the first one in every case: `Map<K,V>`
+/// compares keys, `Set<T>` and `Vec<T>` their elements.  A `Map<int,str>` needs
+/// nothing — its values are never compared.
+fn needs_str_compare(recv: &ManiType, method: &str) -> bool {
+    let ManiType::Generic(name, args) = recv else { return false };
+    STR_SENSITIVE.contains(&(name.as_str(), method))
+        && matches!(args.first(), Some(ManiType::Str))
+}
+
 /// Is this a `Vec<T>`?
 ///
 /// A `Vec` is a heap container whose value is a pointer to a `{data, len, cap}`
@@ -698,7 +740,10 @@ impl IRLowerer {
                 }
                 let obj_ty_display = obj.ty.display();
                 let base_type = strip_generics(obj_ty_display.as_str());
-                let func_name = format!("{}::{}", base_type, method);
+                // A collection of `str` compares text, not pointers — route the
+                // comparing methods to their `_str` variants (see STR_SENSITIVE).
+                let suffix = if needs_str_compare(&obj.ty, method) { "_str" } else { "" };
+                let func_name = format!("{}::{}{}", base_type, method, suffix);
                 // Hidden trailing lengths for `[T]` (unsized array) params —
                 // method params include self, so prepend the receiver.
                 let typed_args: Vec<&TypedExpr> =

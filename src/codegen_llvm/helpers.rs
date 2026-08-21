@@ -530,6 +530,11 @@ declare ptr @Vec_map(ptr, ptr)
 declare ptr @Vec_filter(ptr, ptr)
 declare i64 @Vec_fold(ptr, i64, ptr)
 declare ptr @Vec_slice(ptr, i64, i64)
+; A Vec<str> compares and orders its elements as TEXT — the plain forms above
+; compare the type-erased i64, which for a str is its address.
+declare i1 @Vec_contains_str(ptr, i64)
+declare i64 @Vec_index_of_str(ptr, i64)
+declare void @Vec_sort_str(ptr)
 
 ; ---- Map<K,V> ----
 declare ptr @Map_new()
@@ -542,12 +547,24 @@ declare i64 @Map_len(ptr)
 declare i1 @Map_is_empty(ptr)
 declare ptr @Map_keys(ptr)
 declare ptr @Map_values(ptr)
+; A Map<str,V> keys on the TEXT: these intern the key so that identity becomes
+; equality, which is what the T3 emulator has always done.
+declare void @Map_insert_str(ptr, i64, i64)
+declare i64 @Map_get_str(ptr, i64)
+declare i64 @Map_get_or_str(ptr, i64, i64)
+declare i1 @Map_contains_key_str(ptr, i64)
+declare void @Map_remove_str(ptr, i64)
 
 ; ---- Set<T> ----
 declare ptr @Set_new()
 declare void @Set_insert(ptr, i64)
 declare i1 @Set_contains(ptr, i64)
 declare void @Set_remove(ptr, i64)
+; A Set<str> holds TEXT: these intern the element, after which the set algebra
+; above is correct on its own because every stored element is canonical.
+declare void @Set_insert_str(ptr, i64)
+declare i1 @Set_contains_str(ptr, i64)
+declare void @Set_remove_str(ptr, i64)
 declare i64 @Set_len(ptr)
 declare void @Set_for_each(ptr, ptr)
 declare ptr @Set_intersection(ptr, ptr)

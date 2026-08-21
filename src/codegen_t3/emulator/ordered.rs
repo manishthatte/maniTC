@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A map whose iteration order is the order keys were first inserted in.
 #[derive(Default, Clone)]
-pub(super) struct OrderedMap {
+pub(crate) struct OrderedMap {
     entries: BTreeMap<i64, i64>,
     order: Vec<i64>,
 }
@@ -79,7 +79,7 @@ impl OrderedMap {
 
 /// A set whose iteration order is the order elements were first inserted in.
 #[derive(Default, Clone)]
-pub(super) struct OrderedSet {
+pub(crate) struct OrderedSet {
     entries: BTreeSet<i64>,
     order: Vec<i64>,
 }

@@ -142,6 +142,20 @@ Barrier                // synchronisation point
 Semaphore              // counting semaphore
 ```
 
+#### `str` elements and keys
+
+A `Map<str,V>`, `Set<str>` or `Vec<str>` compares its keys and elements **by
+text**, never by where the string came from. `m.get(k)` finds the entry whose
+key reads the same as `k`, whether `k` is a literal, a slice, or something
+concatenated a moment ago; inserting the same text twice makes one entry;
+`v.sort()` on a `Vec<str>` sorts alphabetically.
+
+This is worth stating because the obvious implementation does not do it. A
+`str` reaches the runtime as a machine word — an address natively, an intern id
+on T3 — so a collection that compares what it was handed compares identity
+instead of text, and matches only strings that happen to have come from the
+same place.
+
 #### Iteration order
 
 `Map` and `Set` iterate in **insertion order**, and that is a rule of the

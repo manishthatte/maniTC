@@ -316,6 +316,19 @@ impl Emulator {
         self.read_lp_string(addr)
     }
 
+    /// The text behind an arbitrary `str` value, wherever it came from.
+    ///
+    /// A `str` inside a collection is type-erased to an i64, so a collection
+    /// that has to compare its elements as TEXT — rather than by identity —
+    /// has to come back through here for each one.
+    pub(crate) fn str_at(&self, addr: i64) -> String {
+        let addr = addr as usize;
+        if let Some(s) = self.string_data.get(&addr) {
+            return s.clone();
+        }
+        self.read_lp_string(addr)
+    }
+
     /// Allocate a runtime string, store it in `string_data`, and return its address.
     fn heap_alloc_str(&mut self, s: String) -> usize {
         let addr = self.heap_ptr;

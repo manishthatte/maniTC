@@ -978,6 +978,9 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "Vec::clear" => {
                     emit_syscall_1arg(em, args, dst, 24, "Vec::clear");
                 }
+                "Vec::contains_str" => {
+                    emit_syscall_2arg_ret(em, args, dst, 38, "Vec::contains_str");
+                }
                 "Vec::contains" => {
                     emit_syscall_2arg_ret(em, args, dst, 25, "Vec::contains");
                 }
@@ -986,16 +989,19 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     em.emit("    SYSCALL #30  ; Map::new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
-                "Map::insert" => {
+                // The _str variants exist for the native backend, which keys
+                // on the raw pointer. The emulator interns by content already,
+                // so on T3 they ARE the base syscalls.
+                "Map::insert" | "Map::insert_str" => {
                     emit_syscall_3arg(em, args, dst, 31, "Map::insert");
                 }
-                "Map::get" => {
+                "Map::get" | "Map::get_str" => {
                     emit_syscall_2arg_ret(em, args, dst, 32, "Map::get");
                 }
-                "Map::contains_key" => {
+                "Map::contains_key" | "Map::contains_key_str" => {
                     emit_syscall_2arg_ret(em, args, dst, 33, "Map::contains_key");
                 }
-                "Map::remove" => {
+                "Map::remove" | "Map::remove_str" => {
                     emit_syscall_2arg(em, args, dst, 34, "Map::remove");
                 }
                 "Map::len" => {
@@ -1009,13 +1015,13 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     em.emit("    SYSCALL #40  ; Set::new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
-                "Set::insert" => {
+                "Set::insert" | "Set::insert_str" => {
                     emit_syscall_2arg(em, args, dst, 41, "Set::insert");
                 }
-                "Set::contains" => {
+                "Set::contains" | "Set::contains_str" => {
                     emit_syscall_2arg_ret(em, args, dst, 42, "Set::contains");
                 }
-                "Set::remove" => {
+                "Set::remove" | "Set::remove_str" => {
                     emit_syscall_2arg(em, args, dst, 43, "Set::remove");
                 }
                 "Set::len" => {
@@ -1225,11 +1231,17 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "Vec::remove" => {
                     emit_syscall_2arg(em, args, dst, 26, "Vec::remove");
                 }
+                "Vec::sort_str" => {
+                    emit_syscall_1arg(em, args, dst, 39, "Vec::sort_str");
+                }
                 "Vec::sort" => {
                     emit_syscall_1arg(em, args, dst, 100, "Vec::sort");
                 }
                 "Vec::reverse" => {
                     emit_syscall_1arg(em, args, dst, 101, "Vec::reverse");
+                }
+                "Vec::index_of_str" => {
+                    emit_syscall_2arg_ret(em, args, dst, 45, "Vec::index_of_str");
                 }
                 "Vec::index_of" => {
                     emit_syscall_2arg_ret(em, args, dst, 102, "Vec::index_of");
@@ -1251,7 +1263,7 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     emit_syscall_3arg_ret(em, args, dst, 86, "Vec::slice");
                 }
                 // Map extras
-                "Map::get_or" => {
+                "Map::get_or" | "Map::get_or_str" => {
                     emit_syscall_3arg_ret(em, args, dst, 87, "Map::get_or");
                 }
                 "Map::keys" => {

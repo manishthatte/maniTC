@@ -780,17 +780,30 @@ fn test_syscall_131_routes_to_mutex_set_value() {
 fn test_unclaimed_syscalls_in_ranges_trap_gracefully() {
     // Numbers inside claimed router ranges but without a handler arm used to
     // hit unreachable!() and panic the emulator (B6).
+    //
+    // The gaps get filled over time, so the list below is the numbers this test
+    // once found empty, and CLAIMED names the ones that have since been given a
+    // handler. Stating it that way round means adding a syscall makes this test
+    // fail until the new number is named here, which is how each of these was
+    // noticed.
+    const CLAIMED: &[i64] = &[
+        37,  // Map::values
+        38,  // Vec::contains_str
+        39,  // Vec::sort_str
+        45,  // Vec::index_of_str
+        217, // print_bool3
+        218, // heap_alloc_words
+    ];
     for num in [27, 28, 29, 37, 38, 39, 45, 46, 47, 48, 49, 217, 218, 513, 519] {
         let mut emu = Emulator::new();
         emu.do_syscall(num);
-        // 37 (Map::values), 217 (print_bool3) and 218 (heap_alloc_words) now
-        // have real handlers; everything else still traps.
-        if num != 37 && num != 217 && num != 218 {
-            assert!(
-                emu.output.iter().any(|l| l.contains("TRAP: unknown syscall")),
-                "syscall {} should trap gracefully", num
-            );
+        if CLAIMED.contains(&num) {
+            continue;
         }
+        assert!(
+            emu.output.iter().any(|l| l.contains("TRAP: unknown syscall")),
+            "syscall {} should trap gracefully", num
+        );
     }
 }
 
