@@ -167,7 +167,35 @@ ManitVec* str_split(const char* s, const char* sep) {
 #define MAP_INITIAL_CAP 64
 
 typedef struct { int used; int64_t key; int64_t val; } ManitMapEntry;
-typedef struct { ManitMapEntry* entries; int64_t count; int64_t cap; } ManitMap;
+typedef struct { ManitMapEntry* entries; int64_t count; int64_t cap;
+                 int64_t* order; int64_t order_len; int64_t order_cap; } ManitMap;
+
+/* Iteration order is INSERTION order and is part of the maniT language, not a
+   property of the table it happens to be stored in.  Walking slots 0..cap
+   gives hash order, which is a different sequence from the T3 emulator's, so
+   the same program would print different things on the two backends.  These
+   two helpers maintain the order array both Map and Set now carry alongside
+   the table.  See src/codegen_t3/emulator/ordered.rs for the other half and
+   for why insertion order is the only order both backends can agree on. */
+static int order_push(int64_t** arr, int64_t* len, int64_t* cap, int64_t k) {
+    if (*len >= *cap) {
+        int64_t nc = *cap ? *cap * 2 : MAP_INITIAL_CAP;
+        int64_t* na = realloc(*arr, (size_t)nc * sizeof(int64_t));
+        if (!na) return 0;
+        *arr = na; *cap = nc;
+    }
+    (*arr)[(*len)++] = k;
+    return 1;
+}
+
+static void order_erase(int64_t* arr, int64_t* len, int64_t k) {
+    for (int64_t i = 0; i < *len; i++) {
+        if (arr[i] != k) continue;
+        for (int64_t j = i; j + 1 < *len; j++) arr[j] = arr[j + 1];
+        (*len)--;
+        return;
+    }
+}
 
 static uint64_t map_hash(int64_t key) {
     uint64_t h = (uint64_t)key;
@@ -184,6 +212,7 @@ ManitMap* Map_new(void) {
     if (!m->entries) { free(m); return NULL; }
     m->count = 0;
     m->cap = MAP_INITIAL_CAP;
+    m->order = NULL; m->order_len = 0; m->order_cap = 0;
     return m;
 }
 
@@ -226,7 +255,10 @@ void Map_insert(ManitMap* m, int64_t k, int64_t v) {
         return;
     int64_t s = map_slot(m, k);
     if (s < 0) return;              /* table full and key absent (A13) */
-    if (!m->entries[s].used) m->count++;
+    if (!m->entries[s].used) {
+        m->count++;
+        order_push(&m->order, &m->order_len, &m->order_cap, k);
+    }
     m->entries[s].used = 1; m->entries[s].key = k; m->entries[s].val = v;
 }
 
@@ -254,6 +286,7 @@ void Map_remove(ManitMap* m, int64_t k) {
     if (s < 0 || !m->entries[s].used) return;
     m->entries[s].used = 0;
     m->count--;
+    order_erase(m->order, &m->order_len, k);
     int64_t mask = m->cap - 1;
     int64_t hole = s;
     int64_t j = (s + 1) & mask;
@@ -274,23 +307,25 @@ int     Map_is_empty(ManitMap* m) { return !m || m->count == 0; }
 ManitVec* Map_keys(ManitMap* m) {
     ManitVec* v = Vec_new();
     if (!m) return v;
-    for (int64_t i = 0; i < m->cap; i++)
-        if (m->entries[i].used) Vec_push_internal(v, m->entries[i].key);
+    for (int64_t i = 0; i < m->order_len; i++)
+        Vec_push_internal(v, m->order[i]);
     return v;
 }
 
+/* Same order as Map_keys, so the two can be paired by index. */
 ManitVec* Map_values(ManitMap* m) {
     ManitVec* v = Vec_new();
     if (!m) return v;
-    for (int64_t i = 0; i < m->cap; i++)
-        if (m->entries[i].used) Vec_push_internal(v, m->entries[i].val);
+    for (int64_t i = 0; i < m->order_len; i++)
+        Vec_push_internal(v, Map_get(m, m->order[i]));
     return v;
 }
 
 /* ======================== Set<T> ======================== */
 
 typedef struct { int used; int64_t key; } ManitSetEntry;
-typedef struct { ManitSetEntry* entries; int64_t count; int64_t cap; } ManitSet;
+typedef struct { ManitSetEntry* entries; int64_t count; int64_t cap;
+                 int64_t* order; int64_t order_len; int64_t order_cap; } ManitSet;
 
 ManitSet* Set_new(void) {
     ManitSet* s = malloc(sizeof(ManitSet));
@@ -299,6 +334,7 @@ ManitSet* Set_new(void) {
     if (!s->entries) { free(s); return NULL; }
     s->count = 0;
     s->cap = MAP_INITIAL_CAP;
+    s->order = NULL; s->order_len = 0; s->order_cap = 0;
     return s;
 }
 
@@ -338,7 +374,10 @@ void Set_insert(ManitSet* s, int64_t x) {
         return;
     int64_t slot = set_slot(s, x);
     if (slot < 0) return;           /* table full and key absent (A13) */
-    if (!s->entries[slot].used) s->count++;
+    if (!s->entries[slot].used) {
+        s->count++;
+        order_push(&s->order, &s->order_len, &s->order_cap, x);
+    }
     s->entries[slot].used = 1; s->entries[slot].key = x;
 }
 
@@ -354,6 +393,7 @@ void Set_remove(ManitSet* s, int64_t x) {
     if (slot < 0 || !s->entries[slot].used) return;
     s->entries[slot].used = 0;
     s->count--;
+    order_erase(s->order, &s->order_len, x);
     int64_t mask = s->cap - 1;
     int64_t hole = slot;
     int64_t j = (slot + 1) & mask;
@@ -372,35 +412,30 @@ int64_t Set_len(ManitSet* s) { return s ? s->count : 0; }
 
 void Set_for_each(ManitSet* s, ManitFn1 f) {
     if (!s || !f) return;
-    for (int64_t i = 0; i < s->cap; i++)
-        if (s->entries[i].used) f(s->entries[i].key);
+    for (int64_t i = 0; i < s->order_len; i++) f(s->order[i]);
 }
 
 ManitSet* Set_intersection(ManitSet* a, ManitSet* b) {
     ManitSet* r = Set_new();
     if (!r || !a || !b) return r;
-    for (int64_t i = 0; i < a->cap; i++)
-        if (a->entries[i].used && Set_contains(b, a->entries[i].key))
-            Set_insert(r, a->entries[i].key);
+    for (int64_t i = 0; i < a->order_len; i++)
+        if (Set_contains(b, a->order[i])) Set_insert(r, a->order[i]);
     return r;
 }
 
 ManitSet* Set_union(ManitSet* a, ManitSet* b) {
     ManitSet* r = Set_new();
     if (!r || !a || !b) return r;
-    for (int64_t i = 0; i < a->cap; i++)
-        if (a->entries[i].used) Set_insert(r, a->entries[i].key);
-    for (int64_t i = 0; i < b->cap; i++)
-        if (b->entries[i].used) Set_insert(r, b->entries[i].key);
+    for (int64_t i = 0; i < a->order_len; i++) Set_insert(r, a->order[i]);
+    for (int64_t i = 0; i < b->order_len; i++) Set_insert(r, b->order[i]);
     return r;
 }
 
 ManitSet* Set_difference(ManitSet* a, ManitSet* b) {
     ManitSet* r = Set_new();
     if (!r || !a || !b) return r;
-    for (int64_t i = 0; i < a->cap; i++)
-        if (a->entries[i].used && !Set_contains(b, a->entries[i].key))
-            Set_insert(r, a->entries[i].key);
+    for (int64_t i = 0; i < a->order_len; i++)
+        if (!Set_contains(b, a->order[i])) Set_insert(r, a->order[i]);
     return r;
 }
 

@@ -302,6 +302,11 @@ impl SemanticAnalyzer {
                 let key_ty = args.first().cloned().unwrap_or(ManiType::Str);
                 ManiType::Generic("Vec".to_string(), vec![key_ty])
             }
+            // Same order as keys(), so the two can be paired by index.
+            (ManiType::Generic(name, args), "values") if name == "Map" => {
+                let val_ty = args.get(1).cloned().unwrap_or(ManiType::Unknown);
+                ManiType::Generic("Vec".to_string(), vec![val_ty])
+            }
             (ManiType::Generic(name, _), "contains_key") if name == "Map" => ManiType::Bool,
             (ManiType::Generic(name, _), "remove") if name == "Map" => ManiType::Void,
             (ManiType::Generic(name, _), "len") if name == "Map" => ManiType::Int,
@@ -410,7 +415,7 @@ impl SemanticAnalyzer {
             (ManiType::Generic(gname, _), _) => {
                 let known: Vec<&str> = vec![
                     "len", "is_empty", "push", "pop", "get", "set", "insert", "remove",
-                    "contains", "contains_key", "keys", "clear", "sort", "reverse",
+                    "contains", "contains_key", "keys", "values", "clear", "sort", "reverse",
                     "map", "filter", "for_each", "slice", "index_of", "fold",
                     "push_front", "push_back", "pop_front", "pop_back", "front", "back",
                     "send", "recv", "try_recv", "close", "lock", "unlock", "update",

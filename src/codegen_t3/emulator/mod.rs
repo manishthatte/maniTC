@@ -13,6 +13,8 @@ mod syscalls;
 mod syscall_io;
 mod syscall_fs;
 mod syscall_proc;
+mod ordered;
+use ordered::{OrderedMap, OrderedSet};
 
 #[cfg(test)]
 mod tests;
@@ -29,8 +31,9 @@ use std::net::{TcpListener, TcpStream};
 
 pub(super) enum HeapObj {
     Vec(Vec<i64>),
-    Map(std::collections::BTreeMap<i64, i64>),
-    Set(std::collections::BTreeSet<i64>),
+    /// Iteration order is INSERTION order and is part of the language — see ordered.rs.
+    Map(OrderedMap),
+    Set(OrderedSet),
     Deque(std::collections::VecDeque<i64>),
     Channel(std::collections::VecDeque<i64>),
     ClosedChannel(std::collections::VecDeque<i64>),

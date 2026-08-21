@@ -2254,3 +2254,104 @@ fn main() {
         assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
     }
 }
+
+// ---------------------------------------------------------------------------
+// S30 — Map and Set iterate in INSERTION order, on both backends
+// (ORACLE_FINDINGS §39).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s30_map_and_set_iterate_in_insertion_order() {
+    // Iteration order used to be whatever the storage structure gave. Inserting
+    // 50, 10, 30, 20, 40:
+    //
+    //     LLVM  40 50 30 20 10     open-addressed hash table, slots 0..cap
+    //     T3    10 20 30 40 50     BTreeMap/BTreeSet, key order
+    //
+    // Neither is a property of the program, so the same source printed two
+    // different things. Insertion order is a property of the program, and it is
+    // the only order the two backends can agree on without knowing the key
+    // type: keys reach the runtime type-erased as i64, and a string key is a
+    // pointer on LLVM but an intern id on T3.
+    //
+    // The literal sequence below is pinned deliberately. Asserting only that
+    // the backends agree would pass if both regressed to the same wrong order.
+    let src = r#"
+use std::io;
+use std::collections;
+fn main() {
+    let xs: [int] = [50, 10, 30, 20, 40];
+    let s: Set<int> = Set::new();
+    for x in xs { s.insert(x); }
+    io::print("set: ");
+    s.for_each(fn(x: int) { io::print_int(x); io::print(" "); });
+    io::println("");
+
+    let m: Map<int, int> = Map::new();
+    for x in xs { m.insert(x, x * 2); }
+    let ks = m.keys();
+    let vs = m.values();
+    io::print("map: ");
+    let mut i = 0;
+    while i < ks.len() {
+        io::print_int(ks.get(i)); io::print("->"); io::print_int(vs.get(i)); io::print(" ");
+        i = i + 1;
+    }
+    io::println("");
+
+    // A re-inserted key keeps its original position: it was already present,
+    // so its insertion has already happened. Only the value moves.
+    m.insert(50, 999);
+    io::print("re:  ");
+    let k2 = m.keys();
+    let v2 = m.values();
+    let mut j = 0;
+    while j < k2.len() {
+        io::print_int(k2.get(j)); io::print("->"); io::print_int(v2.get(j)); io::print(" ");
+        j = j + 1;
+    }
+    io::println("");
+
+    // Removal takes the key out of the sequence, leaving the rest in order.
+    m.remove(30);
+    io::print("rm:  ");
+    let k3 = m.keys();
+    let mut n = 0;
+    while n < k3.len() { io::print_int(k3.get(n)); io::print(" "); n = n + 1; }
+    io::println("");
+
+    // Set algebra takes its order from the operands: self's order first, and
+    // for union, whatever the other side adds, in the other side's order.
+    let a: Set<int> = Set::new();
+    for x in xs { a.insert(x); }
+    let b: Set<int> = Set::new();
+    b.insert(30); b.insert(70); b.insert(50);
+    io::print("int: ");
+    a.intersection(b).for_each(fn(x: int) { io::print_int(x); io::print(" "); });
+    io::println("");
+    io::print("uni: ");
+    a.union(b).for_each(fn(x: int) { io::print_int(x); io::print(" "); });
+    io::println("");
+    io::print("dif: ");
+    a.difference(b).for_each(fn(x: int) { io::print_int(x); io::print(" "); });
+    io::println("");
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("s30_insertion_order.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "iteration order is part of the language");
+
+    for want in [
+        "set: 50 10 30 20 40",
+        "map: 50->100 10->20 30->60 20->40 40->80",
+        "re:  50->999 10->20 30->60 20->40 40->80",
+        "rm:  50 10 20 40",
+        "int: 50 30",
+        "uni: 50 10 30 20 40 70",
+        "dif: 10 20 40",
+    ] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}

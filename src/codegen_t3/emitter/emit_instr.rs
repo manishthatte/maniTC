@@ -1257,6 +1257,9 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "Map::keys" => {
                     emit_syscall_1arg_ret(em, args, dst, 88, "Map::keys");
                 }
+                "Map::values" => {
+                    emit_syscall_1arg_ret(em, args, dst, 37, "Map::values");
+                }
                 // Set set-algebra + for_each
                 "Set::intersection" => {
                     emit_syscall_2arg_ret(em, args, dst, 89, "Set::intersection");

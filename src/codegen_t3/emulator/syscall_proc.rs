@@ -93,11 +93,21 @@ impl Emulator {
             }
 
             // ----------------------------------------------------------------
-            // Map syscalls (30-36)
+            // Map syscalls (30-37)
             // ----------------------------------------------------------------
+            37 => {
+                // Map::values(handle) → Vec handle of values, in the SAME order
+                // as Map::keys, so a caller can pair them by index.
+                let h = self.regs[1] as usize;
+                let vals: Vec<i64> = if let Some(HeapObj::Map(map)) = self.heap_objs.get(&h) {
+                    map.values()
+                } else { vec![] };
+                let nh = self.heap_alloc_obj(HeapObj::Vec(vals));
+                self.regs[1] = nh as i64;
+            }
             30 => {
                 // Map::new() → R1 = handle
-                let h = self.heap_alloc_obj(HeapObj::Map(std::collections::BTreeMap::new()));
+                let h = self.heap_alloc_obj(HeapObj::Map(crate::codegen_t3::emulator::OrderedMap::new()));
                 self.regs[1] = h as i64;
             }
             31 => {
@@ -157,7 +167,7 @@ impl Emulator {
             // ----------------------------------------------------------------
             40 => {
                 // Set::new() → R1 = handle
-                let h = self.heap_alloc_obj(HeapObj::Set(std::collections::BTreeSet::new()));
+                let h = self.heap_alloc_obj(HeapObj::Set(crate::codegen_t3::emulator::OrderedSet::new()));
                 self.regs[1] = h as i64;
             }
             41 => {
@@ -398,7 +408,7 @@ impl Emulator {
                 // Map::keys(handle) → Vec handle of keys
                 let h = self.regs[1] as usize;
                 let keys: Vec<i64> = if let Some(HeapObj::Map(map)) = self.heap_objs.get(&h) {
-                    map.keys().copied().collect()
+                    map.keys()
                 } else { vec![] };
                 let nh = self.heap_alloc_obj(HeapObj::Vec(keys));
                 self.regs[1] = nh as i64;
@@ -411,9 +421,9 @@ impl Emulator {
                 // Set::intersection(h1, h2) → new Set handle
                 let h1 = self.regs[1] as usize;
                 let h2 = self.regs[2] as usize;
-                let a: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
-                let b: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
-                let result: std::collections::BTreeSet<i64> = a.intersection(&b).copied().collect();
+                let a = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
+                let b = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
+                let result = a.intersection(&b);
                 let nh = self.heap_alloc_obj(HeapObj::Set(result));
                 self.regs[1] = nh as i64;
             }
@@ -421,9 +431,9 @@ impl Emulator {
                 // Set::union(h1, h2) → new Set handle
                 let h1 = self.regs[1] as usize;
                 let h2 = self.regs[2] as usize;
-                let a: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
-                let b: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
-                let result: std::collections::BTreeSet<i64> = a.union(&b).copied().collect();
+                let a = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
+                let b = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
+                let result = a.union(&b);
                 let nh = self.heap_alloc_obj(HeapObj::Set(result));
                 self.regs[1] = nh as i64;
             }
@@ -431,9 +441,9 @@ impl Emulator {
                 // Set::difference(h1, h2) → new Set handle
                 let h1 = self.regs[1] as usize;
                 let h2 = self.regs[2] as usize;
-                let a: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
-                let b: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
-                let result: std::collections::BTreeSet<i64> = a.difference(&b).copied().collect();
+                let a = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
+                let b = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
+                let result = a.difference(&b);
                 let nh = self.heap_alloc_obj(HeapObj::Set(result));
                 self.regs[1] = nh as i64;
             }
@@ -442,7 +452,7 @@ impl Emulator {
                 let h = self.regs[1] as usize;
                 let fp = self.regs[2] as usize;
                 let elems: Vec<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h) {
-                    s.iter().copied().collect()
+                    s.iter()
                 } else { vec![] };
                 for elem in elems {
                     self.call_fn_ptr(fp, elem);
@@ -566,24 +576,24 @@ impl Emulator {
                 // Set::is_subset(h1, h2) → bool: h1 ⊆ h2
                 let h1 = self.regs[1] as usize;
                 let h2 = self.regs[2] as usize;
-                let a: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
-                let b: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
+                let a = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
+                let b = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
                 self.regs[1] = if a.is_subset(&b) { 1 } else { 0 };
             }
             105 => {
                 // Set::is_superset(h1, h2) → bool: h1 ⊇ h2
                 let h1 = self.regs[1] as usize;
                 let h2 = self.regs[2] as usize;
-                let a: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
-                let b: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
+                let a = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
+                let b = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
                 self.regs[1] = if a.is_superset(&b) { 1 } else { 0 };
             }
             106 => {
                 // Set::disjoint(h1, h2) → bool: h1 ∩ h2 = ∅
                 let h1 = self.regs[1] as usize;
                 let h2 = self.regs[2] as usize;
-                let a: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
-                let b: std::collections::BTreeSet<i64> = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
+                let a = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h1) { s.clone() } else { Default::default() };
+                let b = if let Some(HeapObj::Set(s)) = self.heap_objs.get(&h2) { s.clone() } else { Default::default() };
                 self.regs[1] = if a.is_disjoint(&b) { 1 } else { 0 };
             }
             107 => {

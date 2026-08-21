@@ -142,6 +142,27 @@ Barrier                // synchronisation point
 Semaphore              // counting semaphore
 ```
 
+#### Iteration order
+
+`Map` and `Set` iterate in **insertion order**, and that is a rule of the
+language rather than an artifact of how a backend stores them. `Map::keys()`
+and `Map::values()` return their elements in that order and are aligned with
+each other, so they can be paired by index. `Set::for_each` walks it too.
+
+Re-inserting a key that is already present updates its value and leaves its
+position alone — the insertion has already happened. Removing a key takes it
+out of the sequence and leaves the rest in order.
+
+Set algebra takes its order from its operands: `intersection` and `difference`
+keep the receiver's order, and `union` is the receiver's order followed by
+whatever the argument adds, in the argument's order.
+
+The rule exists because without it the same program prints different things on
+the two backends — the native runtime stores a hash table and the T3 emulator
+an ordered map, and walking either one's own storage gives its own sequence.
+Insertion order is also the only order the two can agree on without knowing the
+key type, since keys reach the runtime type-erased.
+
 ### Type inference
 
 Use `_` as a type annotation to let the compiler infer it:

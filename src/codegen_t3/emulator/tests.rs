@@ -783,9 +783,9 @@ fn test_unclaimed_syscalls_in_ranges_trap_gracefully() {
     for num in [27, 28, 29, 37, 38, 39, 45, 46, 47, 48, 49, 217, 218, 513, 519] {
         let mut emu = Emulator::new();
         emu.do_syscall(num);
-        // 217 (print_bool3) and 218 (heap_alloc_words) now have real handlers;
-        // everything else traps.
-        if num != 217 && num != 218 {
+        // 37 (Map::values), 217 (print_bool3) and 218 (heap_alloc_words) now
+        // have real handlers; everything else still traps.
+        if num != 37 && num != 217 && num != 218 {
             assert!(
                 emu.output.iter().any(|l| l.contains("TRAP: unknown syscall")),
                 "syscall {} should trap gracefully", num
