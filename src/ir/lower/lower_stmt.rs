@@ -270,6 +270,40 @@ impl IRLowerer {
                     }
                 }
 
+                // `x = <struct>` where `x` is an existing struct variable must
+                // COPY the fields into x's storage — the same value semantics
+                // `let b = a;` gets above.
+                //
+                // A struct local's storage IS its pointer (the StructLit alloca
+                // or the callee's sret buffer), so the generic path below
+                // emitted `store ptr %new, ptr %x`, which writes the new
+                // struct's ADDRESS into x's FIRST FIELD. For
+                //     struct P { pub a: int, pub b: int }
+                //     x = bump(x);
+                // that made `x.a` come back as a pointer — 94229577503440 on
+                // LLVM, moving with ASLR between runs — while `x.b` kept its
+                // old value forever, because the freshly built struct was
+                // discarded and nothing ever read it. Both fields wrong, both
+                // backends, for the plainest assignment in the language.
+                //
+                // The storage is copied INTO rather than rebound: an assignment
+                // can sit inside a loop or a branch, where rebinding the local
+                // to a new temp would leave later blocks reading a pointer that
+                // only one path defines.
+                if a.op.is_none() {
+                    if let IRType::Struct(sname) = IRType::from_mani(&a.target.ty) {
+                        if self.is_real_struct(&sname) {
+                            if let TypedExprKind::Ident(name) = &a.target.kind {
+                                if let Some((dst, _)) = self.locals.get(name).cloned() {
+                                    let n = self.struct_nfields(&sname);
+                                    self.emit_struct_copy(val, dst, n);
+                                    return IRValue::Void;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let ptr = self.lower_expr_as_ptr(&a.target);
                 // Struct/tuple fields use the uniform 8-byte slot convention,
                 // so field stores/loads must use the slot access width.

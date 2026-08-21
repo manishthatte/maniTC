@@ -2516,3 +2516,73 @@ fn every_stdlib_test_program_survives_its_own_return() {
     assert!(!ll_out.contains("FAIL"), "a check failed:\n{}", ll_out);
     assert!(ll_out.trim_end().ends_with("Done."), "program did not finish:\n{}", ll_out);
 }
+
+// ---------------------------------------------------------------------------
+// `x = <struct>` on an existing struct variable must copy, not alias.
+//
+// A struct local's storage IS its pointer, so the generic assignment path
+// emitted `store ptr %new, ptr %x` — writing the new struct's ADDRESS into x's
+// FIRST FIELD. `x.a` came back as a pointer (moving between runs with ASLR on
+// LLVM, a T3 address on T3) and `x.b` kept its old value forever, because the
+// freshly built struct was discarded and nothing ever read it.
+//
+// Both fields wrong, on both backends, for the plainest assignment in the
+// language. It survived because the two-backend oracle sees agreement, not
+// correctness, and here the backends disagreed only in WHICH wrong number they
+// printed — so it was filed as a divergence in ten thatteOS programs rather
+// than recognised as one miscompile.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn assigning_a_struct_to_an_existing_variable_copies_it() {
+    let src = r#"
+use std::io;
+struct P { pub a: int, pub b: int }
+fn bump(p: P) -> P { return P { a: p.a, b: p.b + 1 }; }
+fn main() {
+    let mut x = P { a: 42, b: 7 };
+    io::print("a="); io::print_int(x.a); io::print(" b="); io::println_int(x.b);
+    x = bump(x);
+    io::print("a="); io::print_int(x.a); io::print(" b="); io::println_int(x.b);
+    x = bump(x);
+    io::print("a="); io::print_int(x.a); io::print(" b="); io::println_int(x.b);
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("struct_assign.mt", src);
+    assert_eq!(ll_code, 0, "llvm:\n{}", ll_out);
+    assert_eq!(t3_code, 0, "t3:\n{}", t3_out);
+
+    // Absolute values, not just agreement: the two backends AGREED on nothing
+    // here, but a fix that made them agree on the wrong number would still be
+    // wrong. `a` must never move, and `b` must actually advance.
+    let want = "a=42 b=7\na=42 b=8\na=42 b=9\n";
+    assert_eq!(ll_out, want, "llvm output");
+    assert_eq!(t3_out, want, "t3 output");
+}
+
+#[test]
+fn assigning_to_a_struct_typed_field_still_works() {
+    // The sibling case, deliberately left on the generic path: a struct-typed
+    // FIELD slot really does hold a pointer, so storing one there is correct.
+    // Pinned so the fix above is not later "generalised" onto it.
+    let src = r#"
+use std::io;
+struct In  { pub p: int, pub q: int }
+struct Out { pub tag: int, pub inner: In }
+fn mk(p: int) -> In { return In { p: p, q: p * 10 }; }
+fn main() {
+    let mut o = Out { tag: 99, inner: mk(1) };
+    io::print("tag="); io::print_int(o.tag);
+    io::print(" p="); io::print_int(o.inner.p);
+    io::print(" q="); io::println_int(o.inner.q);
+    o.inner = mk(5);
+    io::print("tag="); io::print_int(o.tag);
+    io::print(" p="); io::print_int(o.inner.p);
+    io::print(" q="); io::println_int(o.inner.q);
+}
+"#;
+    let ((_, t3_out), (_, ll_out)) = run_both_backends("struct_field_assign.mt", src);
+    let want = "tag=99 p=1 q=10\ntag=99 p=5 q=50\n";
+    assert_eq!(ll_out, want, "llvm output");
+    assert_eq!(t3_out, want, "t3 output");
+}
