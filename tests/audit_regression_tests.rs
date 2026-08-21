@@ -2143,3 +2143,114 @@ fn s28_the_two_open_operators_still_need_a_tif() {
         "cannot be applied to",
     );
 }
+
+// ---------------------------------------------------------------------------
+// S29 — a block's register state must come from a PREDECESSOR, not from
+// whichever block happened to be emitted just before it (ORACLE_FINDINGS §38).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s29_a_loop_variable_survives_a_call_in_one_branch_arm() {
+    // The last of the 17 examples to diverge. `examples/data_structures.mt`
+    // counted five distinct words on LLVM and two on T3, attributing nine of
+    // the ten occurrences to the empty string.
+    //
+    // The array base pointer lived in R3. The `then` arm rescued it out of R3
+    // before a syscall clobbered R3 as an argument register; the `else` arm,
+    // emitted immediately after, INHERITED the then-arm's allocator state,
+    // concluded R3 was already free, and clobbered it without rescuing. The
+    // merge then restored R3 from the register only the then-arm had written.
+    //
+    // So: on any iteration that took the else arm, the array base became the
+    // `contains_key` result — 0 — and every later iteration read its key from
+    // address zero. The first word survives, which is what made the output
+    // look like a hash collision rather than a wild pointer.
+    let src = r#"
+use std::io;
+use std::collections;
+fn main() {
+    let words: [str] = ["aa", "bb", "aa", "cc"];
+    let freq: Map<str, int> = Map::new();
+    for w in words {
+        if freq.contains_key(w) { freq.insert(w, freq.get(w) + 1); } else { freq.insert(w, 1); }
+        io::print("["); io::print(w); io::println("]");
+    }
+    let ks = freq.keys();
+    ks.sort();
+    let mut i = 0;
+    while i < ks.len() {
+        io::print(ks.get(i)); io::print("="); io::println_int(freq.get(ks.get(i)));
+        i = i + 1;
+    }
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("s29_loopvar_branch.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "both backends must see the same keys");
+
+    // Absolute values, not just agreement: the oracle's blind spot is a fault
+    // upstream of both backends, which would make them agree on nonsense.
+    for want in ["[aa]", "[bb]", "[cc]", "aa=2", "bb=1", "cc=1"] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+    assert!(!t3_out.contains("[]"), "a loop variable went empty:\n{}", t3_out);
+}
+
+#[test]
+fn s29_every_arm_of_a_match_writes_its_phi_to_the_same_place() {
+    // The other half of the same fix, and the reason the first half could not
+    // be applied alone. Once each arm is restored to a common entry state, each
+    // arm allocates independently — so three arms rebuilding one value picked
+    // three DIFFERENT destination registers for the same phi, and the merge
+    // read whichever the first arm chose. Arms two and three lost their value.
+    //
+    // A phi destination is the one binding that is a contract between blocks
+    // rather than a fact about one path, so it is pinned once and reused.
+    //
+    // Measured, so the record is straight: this test PASSES at the previous
+    // commit, because there the arms shared state by accident and landed on one
+    // register anyway. It fails only when the entry-state restore above is in
+    // place and the phi pin is taken out — which is what it guards. It is a
+    // regression test for the fix, not a reproduction of the original bug.
+    let src = r#"
+use std::io;
+fn classify(t: trit) -> str {
+    let s: str = tif t { + => "pos", 0 => "zero", - => "neg" };
+    return s;
+}
+fn rewrap(r: Result<int,str>) -> Result<int,str> {
+    match r {
+        Ok(v)      => Ok(v),
+        Err(e)     => Err(e),
+        Unknown(m) => Unknown(m),
+    }
+}
+fn show(name: str, r: Result<int,str>) {
+    io::print(name);
+    match r {
+        Ok(v)      => io::println_int(v),
+        Err(e)     => io::println(e),
+        Unknown(m) => io::println(m),
+    }
+}
+fn main() {
+    io::println(classify(+));
+    io::println(classify(0));
+    io::println(classify(-));
+    show("ok:  ", rewrap(Ok(7)));
+    show("err: ", rewrap(Err("boom")));
+    show("unk: ", rewrap(Unknown("dunno")));
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("s29_phi_home.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "every arm must deliver its own value");
+
+    for want in ["pos", "zero", "neg", "ok:  7", "err: boom", "unk: dunno"] {
+        assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
+    }
+}

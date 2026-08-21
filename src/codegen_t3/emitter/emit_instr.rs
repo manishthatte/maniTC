@@ -1726,7 +1726,14 @@ pub(super) fn emit_term(em: &mut AsmEmitter, term: &IRTerminator) {
             if let Some(copies) = em.phi_copies.get(&(src, dst)).cloned() {
                 for (phi_dst, incoming_val) in &copies {
                     let rv = em.val_reg(incoming_val);
+                    // Re-install the destination this phi was given by whichever
+                    // predecessor got here first, so `dst_reg` below reproduces
+                    // that choice instead of allocating a fresh one.  Every
+                    // predecessor has to write the value where the merge block
+                    // reads it (see `PhiHome`).
+                    em.pin_phi_home(&phi_dst.0);
                     let rd = em.dst_reg(phi_dst);
+                    em.record_phi_home(&phi_dst.0);
                     if rv != rd {
                         em.emit(format!("    MOV   {}, {}  ; phi-copy {}", AsmEmitter::rn(rd), AsmEmitter::rn(rv), phi_dst.0));
                     }
@@ -1741,15 +1748,22 @@ pub(super) fn emit_term(em: &mut AsmEmitter, term: &IRTerminator) {
             if delta != 0 {
                 em.emit_sp_adj(delta);
             }
-            // Back-edge register reconciliation: a jump to an ALREADY-EMITTED
-            // block must put every live temp back into the register that
-            // block's code was emitted against (its canonical assignment).
-            // Rescue moves earlier in this block may have relocated temps
-            // (e.g. the loop's array base out of a syscall-clobbered R1-R3);
-            // without these fix-up moves the next iteration reads stale
-            // registers.
-            if em.emitted_blocks.contains(label) {
-                if let Some((canon_regs, _)) = em.block_canonical_regs.get(label).cloned() {
+            // Register reconciliation: a jump must leave every live temp in the
+            // register the TARGET block's code is emitted against — its
+            // canonical assignment.  Rescue moves earlier in this block may
+            // have relocated temps (e.g. the loop's array base out of a
+            // syscall-clobbered R1-R3); without these fix-up moves the target
+            // reads stale registers.
+            //
+            // This is not only for back-edges.  A merge block's canonical state
+            // is fixed by whichever arm jumps to it first, so the OTHER arm has
+            // to reconcile to it as well — and that arm is typically not yet
+            // emitted when it jumps.  Gating on "already emitted" left exactly
+            // that edge unreconciled.  The first predecessor costs nothing: its
+            // own state is the canonical one, so the loop below finds no moves.
+            if let Some(canon) = em.block_canonical_regs.get(label).cloned() {
+                {
+                    let canon_regs = canon.temp_to_reg;
                     // (dst_reg, src_reg) register moves and spill reloads.
                     // Restrict to temps a rescue actually displaced, and never
                     // clobber a canonical register that another live temp

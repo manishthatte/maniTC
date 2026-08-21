@@ -19,6 +19,37 @@ enum CallSrc {
     Missing(String), // temp with no known location — an SSA hole
 }
 
+/// The register-allocator state that has to agree on every path into a block.
+///
+/// All three parts are needed and the third is the one that is easy to miss.
+/// `temp_to_reg` and `spill_slots` say where each live value is; `free_regs`
+/// says which registers the next allocation may take.  Restore the first two
+/// without the third and two arms of the same branch will rescue the same temp
+/// into DIFFERENT registers, because the second arm still believes the first
+/// arm's choice is taken — which puts the merge block back in the position of
+/// reading a register only one path wrote.
+#[derive(Clone)]
+struct BlockEntryState {
+    temp_to_reg: HashMap<String, usize>,
+    spill_slots: HashMap<String, usize>,
+    free_regs: std::collections::BTreeSet<usize>,
+}
+
+/// Where a phi destination lives — a register, or a spill slot.
+///
+/// This is the one binding that must SURVIVE a block entry-state restore.
+/// Every other temp's location is a fact about one path; a phi destination is
+/// a contract between all of them, because the merge block reads the value
+/// from exactly one place and each predecessor has to write it there.  Restore
+/// the arms to a common entry state without pinning this and each arm picks
+/// its own destination register, so the merge reads whichever one the first
+/// arm chose and the others' values are lost.
+#[derive(Clone, Copy)]
+enum PhiHome {
+    Reg(usize),
+    Slot(usize),
+}
+
 struct AsmEmitter {
     lines:        Vec<String>, // final committed output
     cur_instr:    Vec<String>, // staged body of the current IR instruction
@@ -29,11 +60,12 @@ struct AsmEmitter {
     /// Canonical sp_depth for each block label, set by the FIRST predecessor that jumps to it.
     /// At block entry we reset sp_depth to this value so all paths agree on stack layout.
     block_canonical_sp: HashMap<String, usize>,
-    /// Canonical register assignment for each block, set at the FIRST entry to that block.
-    /// Used to restore the register state when a backward edge (loop back-edge) jumps to a
-    /// block that has already been emitted.  Without this, rescue moves done in the first
-    /// iteration of a loop body corrupt the allocator state for subsequent iterations.
-    block_canonical_regs: HashMap<String, (HashMap<String, usize>, HashMap<String, usize>)>,
+    /// Canonical allocator state on entry to each block, set by the FIRST
+    /// predecessor that branches to it (see `register_target`).
+    block_canonical_regs: HashMap<String, BlockEntryState>,
+    /// Phi destination → the location every predecessor must write it to.
+    /// Fixed by the first predecessor to emit a copy for it; see `PhiHome`.
+    phi_homes: HashMap<String, PhiHome>,
     /// Current function name, used to qualify block labels (prevents collisions across fns).
     fn_name: String,
     /// Struct name → number of fields (word size on stack).
@@ -83,6 +115,7 @@ impl AsmEmitter {
             spill_read_idx: 0,
             block_canonical_sp: HashMap::new(),
             block_canonical_regs: HashMap::new(),
+            phi_homes: HashMap::new(),
             fn_name: String::new(),
             struct_sizes,
             alloca_slots: HashMap::new(),
@@ -101,10 +134,72 @@ impl AsmEmitter {
         format!("{}_{}", self.fn_name, label)
     }
 
-    /// Register the canonical sp_depth for a target label (first-predecessor wins).
-    /// Returns the canonical sp_depth for that label.
+    /// Snapshot the allocator state that a block entered here would see.
+    fn entry_state(&self) -> BlockEntryState {
+        BlockEntryState {
+            temp_to_reg: self.reg_alloc.temp_to_reg.clone(),
+            spill_slots: self.reg_alloc.spill_slots.clone(),
+            free_regs: self.reg_alloc.free_regs.clone(),
+        }
+    }
+
+    /// Put the allocator back into a previously snapshotted entry state.
+    fn restore_entry_state(&mut self, st: BlockEntryState) {
+        self.reg_alloc.temp_to_reg = st.temp_to_reg;
+        self.reg_alloc.spill_slots = st.spill_slots;
+        self.reg_alloc.free_regs = st.free_regs;
+    }
+
+    /// Re-bind a phi destination to the location an earlier predecessor gave
+    /// it, if any, so `dst_reg` reproduces that choice rather than allocating
+    /// afresh.  A no-op for a phi no predecessor has written yet.
+    fn pin_phi_home(&mut self, name: &str) {
+        match self.phi_homes.get(name).copied() {
+            Some(PhiHome::Reg(r)) => {
+                // Something else live may be sitting in the home register on
+                // this path; move it out first.  The jump's reconciliation,
+                // which runs after these copies, puts it back where the target
+                // block expects to read it.
+                if self.reg_alloc.temp_to_reg.get(name) != Some(&r) {
+                    self.rescue_reg(r);
+                    self.reg_alloc.reserve(name, r);
+                }
+            }
+            Some(PhiHome::Slot(s)) => {
+                self.reg_alloc.temp_to_reg.remove(name);
+                self.reg_alloc.spill_slots.insert(name.to_string(), s);
+            }
+            None => {}
+        }
+    }
+
+    /// Record where `dst_reg` just put a phi destination, on first sight.
+    fn record_phi_home(&mut self, name: &str) {
+        if self.phi_homes.contains_key(name) {
+            return;
+        }
+        if let Some(&r) = self.reg_alloc.temp_to_reg.get(name) {
+            self.phi_homes.insert(name.to_string(), PhiHome::Reg(r));
+        } else if let Some(&s) = self.reg_alloc.spill_slots.get(name) {
+            self.phi_homes.insert(name.to_string(), PhiHome::Slot(s));
+        }
+    }
+
+    /// Register the canonical sp_depth AND register assignment for a target
+    /// label (first-predecessor wins).  Returns the canonical sp_depth.
+    ///
+    /// Both halves answer the same question — what does the machine look like
+    /// on entry to that block? — and the answer has to come from a PREDECESSOR,
+    /// because that is the only place a path into the block actually passes
+    /// through.  Taking it from whichever block happened to be emitted last is
+    /// wrong for the second arm of an if/else: `else` is emitted after `then`,
+    /// but no execution path runs `then` and then `else`.
     fn register_target(&mut self, label: &str) -> usize {
         let cur = self.reg_alloc.sp_depth;
+        if !self.block_canonical_regs.contains_key(label) {
+            let state = self.entry_state();
+            self.block_canonical_regs.insert(label.to_string(), state);
+        }
         *self.block_canonical_sp.entry(label.to_string()).or_insert(cur)
     }
 
@@ -831,31 +926,32 @@ fn emit_block(em: &mut AsmEmitter, block: &IRBlock) {
         em.reg_alloc.sp_depth = canonical;
     }
 
-    // If this block has already been emitted (a loop back-edge target), restore the
-    // register assignment to the canonical state recorded on the first visit.
-    // This prevents rescue moves from one iteration contaminating the next.
-    if em.emitted_blocks.contains(&block.label) {
-        if let Some((regs, spills)) = em.block_canonical_regs.get(&block.label).cloned() {
-            em.reg_alloc.temp_to_reg = regs;
-            em.reg_alloc.spill_slots = spills;
-        }
+    // Restore the register assignment this block is emitted against, to the
+    // canonical state its FIRST PREDECESSOR recorded (see register_target).
+    //
+    // This is not only about loop back-edges, though it covers them: it is
+    // about emission order never being an execution order.  The two arms of an
+    // if/else are emitted one after the other, so without this the second arm
+    // inherits the first arm's rescue moves — a state no path into it has.  It
+    // then declines to rescue a register the first arm already moved out of,
+    // and the merge block's reconciliation restores that register from one the
+    // second arm never wrote.
+    if let Some(state) = em.block_canonical_regs.get(&block.label).cloned() {
+        em.restore_entry_state(state);
     }
 
     em.current_block_label = block.label.clone();
 
-    // Snapshot register assignment at block entry (first visit only).
-    // Two purposes:
-    // 1. Loop header restoration (see above): on a back-edge, we restore to this snapshot
-    //    so every iteration starts with the same register assignment.
-    // 2. Return-block isolation: if this block terminates with Return, rescue moves inside
-    //    it must NOT carry over to the next linearly-emitted block (which is not a successor).
-    let reg_snapshot = em.reg_alloc.temp_to_reg.clone();
-    let spill_snapshot = em.reg_alloc.spill_slots.clone();
+    // Snapshot the state this block is actually emitted against.  Kept for
+    // return-block isolation below: a block ending in Return has no successor,
+    // so rescue moves inside it must not carry into the next block emitted.
+    let entry_snapshot = em.entry_state();
 
-    // Record canonical register state on first visit.
+    // A block with no registered predecessor — the function entry block — has
+    // no canonical state yet.  Its own entry state becomes the canonical one.
     em.block_canonical_regs
         .entry(block.label.clone())
-        .or_insert_with(|| (reg_snapshot.clone(), spill_snapshot.clone()));
+        .or_insert_with(|| entry_snapshot.clone());
     em.emitted_blocks.insert(block.label.clone());
 
     // Block label goes directly to output (not staged)
@@ -874,8 +970,7 @@ fn emit_block(em: &mut AsmEmitter, block: &IRBlock) {
     // rescue moves performed inside this dead-end block do not corrupt the allocator
     // state for the next block.
     if matches!(block.term, IRTerminator::Return(_)) {
-        em.reg_alloc.temp_to_reg = reg_snapshot;
-        em.reg_alloc.spill_slots = spill_snapshot;
+        em.restore_entry_state(entry_snapshot);
     }
 }
 
