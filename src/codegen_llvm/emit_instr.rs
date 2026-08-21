@@ -373,20 +373,44 @@ impl LLVMEmitter {
                     && actual_ty != "void" && declared_ty != "void"
                     && actual_ty != "ptr" && declared_ty != "ptr"
                 {
-                    // Both are integer types but widths differ.
-                    // If actual is narrower, sext to declared width so the
-                    // store matches the alloca. This avoids reading garbage
-                    // bytes on a subsequent wider load.
+                    // Both are integer types but widths differ. Either way the
+                    // ALLOCA is the authority on how many bytes exist here, so
+                    // the value is converted to the slot's width — never the
+                    // other way round.
                     let aw = int_width(&actual_ty);
                     let dw = int_width(&declared_ty);
-                    if aw > 0 && dw > 0 && aw < dw {
-                        // Emit sext inline: rewrite val_s to a sext expression.
-                        // We need to return a multi-line store that includes the sext.
-                        let ext_name = format!("%__store_sext_{}", self.fresh_anon("sx"));
+                    if aw > 0 && dw > 0 && aw != dw {
+                        // Narrower value: sext, so a subsequent wider load does
+                        // not read garbage bytes.
+                        //
+                        // Wider value: trunc. This case used to fall through to
+                        // `actual_ty` below — storing at the VALUE's width into
+                        // a slot sized for the DECLARED type, walking off the
+                        // end of the allocation. `tryte` is i16 and
+                        // `@ternary_tryte_from_trits` returns i64, so
+                        //     %t0 = alloca i16, align 2
+                        //     store i64 %t1, ptr %t0, align 2
+                        // put six bytes past a two-byte stack slot, through the
+                        // return address. The stored value was CORRECT and the
+                        // function computed the right answer — it segfaulted on
+                        // return, after its output had been printed, which is
+                        // why `tests/23_t3isa_instructions.mt` printed 132 PASS
+                        // lines and then died. `int_to_tryte` and `int_to_t9`
+                        // did the same; `fs::is_dir` overran into alignment
+                        // padding and survived, which is worse, not better.
+                        //
+                        // Truncating cannot lose information for any type that
+                        // reaches here: `tryte` holds ±364 and `t9` ±9841, both
+                        // inside their slots by construction. If a native ever
+                        // does return something out of range, a truncated value
+                        // is a bug confined to one variable rather than a
+                        // corrupted return address.
+                        let op = if aw < dw { "sext" } else { "trunc" };
+                        let ext_name = format!("%__store_{}_{}", op, self.fresh_anon("sx"));
                         let ptr_s2 = self.resolve_ptr_val(ptr);
                         return format!(
-                            "{} = sext {} {} to {}\n  store {} {}, ptr {}, align {}",
-                            ext_name, actual_ty, val_s, declared_ty,
+                            "{} = {} {} {} to {}\n  store {} {}, ptr {}, align {}",
+                            ext_name, op, actual_ty, val_s, declared_ty,
                             declared_ty, ext_name, ptr_s2,
                             llvm_align(ty)
                         );

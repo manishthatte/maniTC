@@ -2447,3 +2447,72 @@ fn main() {
         assert!(t3_out.contains(want), "expected {:?} in output:\n{}", want, t3_out);
     }
 }
+
+// ---------------------------------------------------------------------------
+// A narrow-typed native must not store past the end of its stack slot.
+//
+// `tryte` lowers to i16 and `t9` to i32, but the LLVM helpers
+// @ternary_tryte_from_trits, @ternary_int_to_tryte and @ternary_int_to_t9 all
+// return i64. The Store emitter reasoned only about the value being NARROWER
+// than the slot (sext); a WIDER value fell through to storing at the value's
+// own width, so
+//     %t0 = alloca i16, align 2
+//     store i64 %t1, ptr %t0, align 2
+// wrote six bytes past a two-byte allocation, through the return address.
+//
+// What makes this class hard to see: the stored VALUE is correct and the
+// function returns the right answer. `tests/23_t3isa_instructions.mt` printed
+// all 132 of its PASS lines and then segfaulted on the way out — so the failure
+// was invisible to anything reading stdout for correctness, and the two-backend
+// oracle recorded it as "llvm did not run" rather than as a wrong answer.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn narrow_native_return_does_not_overrun_its_slot() {
+    let src = r#"
+use std::io;
+use std::ternary;
+fn main() {
+    let ty = ternary::tryte_from_trits(+, 0, -);
+    io::println_int(ternary::tryte_to_int(ty));
+    let t2 = ternary::int_to_tryte(8);
+    io::println_int(ternary::tryte_to_int(t2));
+    let n9 = ternary::int_to_t9(100);
+    io::println_int(ternary::t9_to_int(n9));
+    io::println("returned cleanly");
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("narrow_slot.mt", src);
+
+    // The crash was on RETURN, after every value had been printed, so exit
+    // status is the assertion that matters — not stdout.
+    assert_eq!(ll_code, 0, "llvm must exit cleanly (139 = the stack smash):\n{}", ll_out);
+    assert_eq!(t3_code, 0, "t3 must exit cleanly:\n{}", t3_out);
+    assert_eq!(t3_out, ll_out, "backends must agree:\nT3:\n{}\nLLVM:\n{}", t3_out, ll_out);
+
+    // And the values must be right, so a future "fix" cannot buy the exit code
+    // by truncating something real.
+    for want in ["8\n", "8\n", "100\n", "returned cleanly"] {
+        assert!(ll_out.contains(want), "expected {:?} in:\n{}", want, ll_out);
+    }
+}
+
+#[test]
+fn every_stdlib_test_program_survives_its_own_return() {
+    // 23_t3isa_instructions.mt is the program that exposed the above. It is run
+    // by the suite already, but nothing checked its EXIT STATUS — it printed
+    // 132 PASS lines and died, and passed. Pin the whole file end to end.
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/23_t3isa_instructions.mt"),
+    )
+    .expect("23_t3isa_instructions.mt");
+    let ((t3_code, t3_out), (ll_code, ll_out)) =
+        run_both_backends("t3isa_full.mt", &src);
+
+    assert_eq!(ll_code, 0, "llvm must exit cleanly:\n{}", ll_out);
+    assert_eq!(t3_code, 0, "t3 must exit cleanly:\n{}", t3_out);
+    assert_eq!(t3_out, ll_out, "backends must agree on all 132 lines");
+    assert!(!ll_out.contains("FAIL"), "a check failed:\n{}", ll_out);
+    assert!(ll_out.trim_end().ends_with("Done."), "program did not finish:\n{}", ll_out);
+}
