@@ -116,14 +116,42 @@ impl SemanticAnalyzer {
             }
             BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Txor
             | BinOpKind::Tcon | BinOpKind::Tany => {
-                // Ternary logic operates on ternary-valued types.
-                let ok = |t: &ManiType| !t.is_known() || t.is_ternary();
+                // Ternary logic operates on ternary-valued types — and on
+                // `bool`, which the lowering converts to `bool3` first (see
+                // IRLowerer::lower_ternary_operand).
+                //
+                // Refusing `bool` here made `a > b tand c > d` unwritable, since
+                // a comparison produces `bool` and nothing produces a trit.
+                // Four real sources did not compile, two of them in thatteOS.
+                // The `bool` to `bool3` coercion this needs was already blessed
+                // by the language and already emitted by `coerce_value`; the
+                // type-checker was refusing an operand pair the lowering knew
+                // how to build.
+                let ok = |t: &ManiType| !t.is_known() || t.is_ternary() || *t == ManiType::Bool;
                 if !ok(lhs) || !ok(rhs) {
                     return Err(self.binop_operand_err(op, lhs, rhs, span));
                 }
-                // Preserve bool3 if both operands are bool3; otherwise trit
+                // Two `bool`s under `tand`/`tor`/`tany` give a `bool`, and that
+                // is provable rather than convenient: with false as -1 and true
+                // as +1, min, max and "either +1 wins" are CLOSED on {-1, +1},
+                // so no two-valued pair can produce `unknown`. The lowering
+                // emits `&&`/`||` for exactly these three (see
+                // IRLowerer::lower_expr), which is why `if a > b tand c > d`
+                // now type-checks — an `if` needs a `bool`, and this is one.
+                //
+                // `txor` and `tcon` are NOT closed: `true txor false` and
+                // `true tcon false` are both `unknown`. They stay `bool3`, and
+                // a caller has to reach for `tif`, which is correct — the value
+                // really does have three outcomes.
+                let closed_on_bools = matches!(
+                    op, BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Tany
+                );
                 match (lhs, rhs) {
-                    (ManiType::Bool3, ManiType::Bool3) => Ok(ManiType::Bool3),
+                    (ManiType::Bool, ManiType::Bool) if closed_on_bools => Ok(ManiType::Bool),
+                    (ManiType::Bool, ManiType::Bool)
+                    | (ManiType::Bool3, ManiType::Bool3)
+                    | (ManiType::Bool, ManiType::Bool3)
+                    | (ManiType::Bool3, ManiType::Bool) => Ok(ManiType::Bool3),
                     _ => Ok(ManiType::Trit),
                 }
             }

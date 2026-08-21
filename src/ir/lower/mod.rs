@@ -346,6 +346,30 @@ impl IRLowerer {
         }
     }
 
+    /// Lower an operand of a ternary-logic operator (`tand`, `tor`, `txor`,
+    /// `tcon`, `tany`), converting a `bool` to a `bool3` on the way.
+    ///
+    /// Those operators lower to `TritBranch` and `TritMin`/`TritMax`, which read
+    /// their operand as a trit: -1, 0, +1. A `bool` is 0 or 1, so feeding one in
+    /// raw makes `false` mean **unknown** — `TritBranch` would take the zero
+    /// edge, and `TritMin(0, rhs)` yields 0. The answer would be wrong rather
+    /// than rejected.
+    ///
+    /// The type-checker used to refuse `bool` here for that reason, which made
+    /// `a > b tand c > d` unwritable: comparisons produce `bool`, and there is
+    /// no comparison that produces a trit. Four real sources did not compile,
+    /// two of them in thatteOS (ORACLE_FINDINGS.md Section 33.1).
+    ///
+    /// So convert instead of refusing — through `coerce_value`, the same
+    /// `2*b - 1` the language already blesses for `bool` to `bool3`, so `false`
+    /// becomes -1 and `true` becomes +1 and the three-valued operators see a
+    /// genuine trit. `unknown` simply never arises from a bool operand, which is
+    /// correct: a two-valued input cannot produce a third outcome.
+    pub(super) fn lower_ternary_operand(&mut self, e: &TypedExpr) -> IRValue {
+        let v = self.lower_expr(e);
+        self.coerce_value(v, &e.ty, &ManiType::Bool3)
+    }
+
     /// Insert a representation conversion where a blessed implicit coercion
     /// changes the value encoding. Today that is exactly bool → bool3:
     /// a logical 0/1 must become -1/+1 (0 would read as `unknown`).

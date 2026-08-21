@@ -2051,3 +2051,95 @@ fn s27_the_stdlib_reference_is_current() {
         text,
     );
 }
+
+// ---------------------------------------------------------------------------
+// S28 (ORACLE_FINDINGS Section 33.1) — ternary logic on bool operands
+// ---------------------------------------------------------------------------
+// `tand` refused two `bool`s, which made `a > b tand c > d` unwritable: a
+// comparison produces `bool` and nothing produces a trit. Four real sources did
+// not compile, two of them in thatteOS.
+//
+// The refusal was not baseless — `tand` lowers to TritBranch and TritMin, which
+// read their operand as -1/0/+1, so a raw `bool` would make `false` mean
+// UNKNOWN. But the fix is to convert, not to refuse, and the `bool` to `bool3`
+// coercion was already blessed by the language and already emitted by
+// `coerce_value`.
+//
+// And for three of the five operators the conversion is not even needed: with
+// false as -1 and true as +1, min, max and "either +1 wins" are CLOSED on
+// {-1, +1}, so `tand`/`tor`/`tany` on two bools ARE `&&`/`||`/`||` and give a
+// `bool` that an `if` will take. `txor` and `tcon` are not closed — both reach
+// `unknown` from two-valued inputs — so they stay three-valued.
+
+#[test]
+fn s28_ternary_logic_accepts_bool_operands() {
+    let src = r#"
+fn tt(a: bool, b: bool) -> bool  { a tand b }
+fn to(a: bool, b: bool) -> bool  { a tor  b }
+fn ty(a: bool, b: bool) -> bool  { a tany b }
+fn tx(a: bool, b: bool) -> bool3 { a txor b }
+fn tc(a: bool, b: bool) -> bool3 { a tcon b }
+fn mixed(a: bool, t: bool3) -> bool3 { a tand t }
+fn main() {
+    io::print("tand "); io::println_bool(tt(true, true));
+    io::print("tand "); io::println_bool(tt(true, false));
+    io::print("tand "); io::println_bool(tt(false, false));
+    io::print("tor  "); io::println_bool(to(true, false));
+    io::print("tor  "); io::println_bool(to(false, false));
+    io::print("tany "); io::println_bool(ty(true, false));
+    io::print("tany "); io::println_bool(ty(false, false));
+    io::print("txor "); io::println_bool3(tx(true, true));
+    io::print("txor "); io::println_bool3(tx(true, false));
+    io::print("txor "); io::println_bool3(tx(false, false));
+    io::print("tcon "); io::println_bool3(tc(true, false));
+    io::print("mixd "); io::println_bool3(mixed(true, unknown));
+    io::print("mixd "); io::println_bool3(mixed(false, unknown));
+    let a = 5;
+    let b = 3;
+    if a > b tand a > 0 { io::println("if-tand works"); }
+    if a < b tor a > 0 { io::println("if-tor works"); }
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s28_tand.mt", src);
+    assert_eq!(t3_code, 0, "t3 should exit cleanly, got:\n{}", t3_out);
+    assert_eq!(ll_code, 0, "llvm should exit cleanly, got:\n{}", ll_out);
+    assert_eq!(t3_out, ll_out, "ternary logic on bools must agree across backends");
+    assert_eq!(
+        t3_out,
+        // tand/tor/tany reduce to boolean and/or exactly. txor is mod-3
+        // addition, so true txor true is FALSE and true txor false is UNKNOWN —
+        // it is not boolean xor, and this pins that it is not quietly made into
+        // one. tcon of two disagreeing bools is unknown by definition.
+        "tand true\ntand false\ntand false\n\
+         tor  true\ntor  false\n\
+         tany true\ntany false\n\
+         txor false\ntxor unknown\ntxor true\n\
+         tcon unknown\n\
+         mixd unknown\nmixd false\n\
+         if-tand works\nif-tor works\n",
+    );
+}
+
+#[test]
+fn s28_the_two_open_operators_still_need_a_tif() {
+    // `txor` and `tcon` on two bools yield `bool3`, so an `if` must reject
+    // them. That is the guard on the rule above: only the three operators that
+    // are provably closed on {-1, +1} collapse to `bool`, and it would be a
+    // silent loss of the third state to let the other two through.
+    assert_check_error(
+        "s28_txor_if.mt",
+        "fn main() { if true txor false { io::println(\"x\"); } }\n",
+        "if condition must be `bool`",
+    );
+    assert_check_error(
+        "s28_tcon_if.mt",
+        "fn main() { if true tcon false { io::println(\"x\"); } }\n",
+        "if condition must be `bool`",
+    );
+    // Non-ternary, non-bool operands are still refused outright.
+    assert_check_error(
+        "s28_str.mt",
+        "fn main() { let x = \"a\" tand \"b\"; io::println(\"x\"); }\n",
+        "cannot be applied to",
+    );
+}

@@ -66,6 +66,25 @@ impl IRLowerer {
             }
 
             TypedExprKind::BinOp(lhs, op, rhs) => {
+                // `tand`, `tor` and `tany` applied to two `bool`s ARE `&&` and
+                // `||`, and that is provable rather than convenient: with false
+                // as -1 and true as +1, min, max and "either +1 wins" are all
+                // CLOSED on {-1, +1}. No two-valued pair can produce 0, so the
+                // three-valued spelling of a two-valued question is the
+                // two-valued operator, and the result is a `bool` that an `if`
+                // will take.
+                //
+                // `txor` and `tcon` are deliberately NOT in that list: mod-3
+                // addition and consensus both reach 0 from two-valued inputs —
+                // `true txor false` is `unknown`, `true tcon false` is
+                // `unknown` — so they stay three-valued and want a `tif`.
+                // See binop_type, which types this the same way.
+                let op = &match (op, &lhs.ty, &rhs.ty) {
+                    (BinOpKind::Tand, ManiType::Bool, ManiType::Bool) => BinOpKind::And,
+                    (BinOpKind::Tor, ManiType::Bool, ManiType::Bool)
+                    | (BinOpKind::Tany, ManiType::Bool, ManiType::Bool) => BinOpKind::Or,
+                    (other, _, _) => other.clone(),
+                };
                 // Special: ternary logic ops
                 match op {
                     BinOpKind::And => {
@@ -145,7 +164,7 @@ impl IRLowerer {
                         //   LHS = -1 → short-circuit to -1 (don't evaluate RHS)
                         //   LHS =  0 → evaluate RHS, result = TritMin(0, RHS)
                         //   LHS = +1 → evaluate RHS, result = TritMin(+1, RHS) = RHS
-                        let lv = self.lower_expr(lhs);
+                        let lv = self.lower_ternary_operand(lhs);
                         let rhs_label   = self.fresh_label("sc_tand_rhs");
                         let neg_label   = self.fresh_label("sc_tand_neg");
                         let end_label   = self.fresh_label("sc_tand_end");
@@ -162,7 +181,7 @@ impl IRLowerer {
                         // RHS evaluation path
                         let rhs_idx = self.new_block(rhs_label);
                         self.switch_to(rhs_idx);
-                        let rv = self.lower_expr(rhs);
+                        let rv = self.lower_ternary_operand(rhs);
                         let rhs_result = self.fresh_temp();
                         self.emit(IRInstr::TritMin { dst: rhs_result.clone(), a: lv, b: rv });
                         let rhs_end = self.blocks[self.current_block].label.clone();
@@ -187,7 +206,7 @@ impl IRLowerer {
                         //   LHS = +1 → short-circuit to +1 (don't evaluate RHS)
                         //   LHS =  0 → evaluate RHS, result = TritMax(0, RHS)
                         //   LHS = -1 → evaluate RHS, result = TritMax(-1, RHS) = RHS
-                        let lv = self.lower_expr(lhs);
+                        let lv = self.lower_ternary_operand(lhs);
                         let rhs_label  = self.fresh_label("sc_tor_rhs");
                         let pos_label  = self.fresh_label("sc_tor_pos");
                         let end_label  = self.fresh_label("sc_tor_end");
@@ -204,7 +223,7 @@ impl IRLowerer {
                         // RHS evaluation path
                         let rhs_idx = self.new_block(rhs_label);
                         self.switch_to(rhs_idx);
-                        let rv = self.lower_expr(rhs);
+                        let rv = self.lower_ternary_operand(rhs);
                         let rhs_result = self.fresh_temp();
                         self.emit(IRInstr::TritMax { dst: rhs_result.clone(), a: lv, b: rv });
                         let rhs_end = self.blocks[self.current_block].label.clone();
@@ -245,8 +264,8 @@ impl IRLowerer {
                         //     s=+2: 3(+1) - 4 = -1     s=-2: 3(-1) + 4 = +1
                         //     s=+1: 3(+1) - 2 = +1     s=-1: 3(-1) + 2 = -1
                         //     s= 0: 0 - 0 = 0
-                        let lv = self.lower_expr(lhs);
-                        let rv = self.lower_expr(rhs);
+                        let lv = self.lower_ternary_operand(lhs);
+                        let rv = self.lower_ternary_operand(rhs);
                         let s = self.fresh_temp();
                         self.emit(IRInstr::BinOp {
                             dst: s.clone(), op: IRBinOp::Add,
@@ -297,8 +316,8 @@ impl IRLowerer {
                     BinOpKind::Tcon => {
                         // tcon(a,b) = consensus: +1 if both +1, -1 if both -1, else 0.
                         // tcon(a,b) = TritMin(TritMax(a,b), 0) + TritMax(TritMin(a,b), 0)
-                        let lv = self.lower_expr(lhs);
-                        let rv = self.lower_expr(rhs);
+                        let lv = self.lower_ternary_operand(lhs);
+                        let rv = self.lower_ternary_operand(rhs);
                         let t_max = self.fresh_temp();
                         self.emit(IRInstr::TritMax { dst: t_max.clone(), a: lv.clone(), b: rv.clone() });
                         let t_min = self.fresh_temp();
@@ -321,8 +340,8 @@ impl IRLowerer {
                         // pos = TritMax(a,b); neg = TritMin(a,b)
                         // pos_clamped = TritMax(pos, 0); neg_clamped = TritMin(neg, 0)
                         // result = pos_clamped + neg_clamped * (1 - pos_clamped)
-                        let lv = self.lower_expr(lhs);
-                        let rv = self.lower_expr(rhs);
+                        let lv = self.lower_ternary_operand(lhs);
+                        let rv = self.lower_ternary_operand(rhs);
                         let t_max = self.fresh_temp();
                         self.emit(IRInstr::TritMax { dst: t_max.clone(), a: lv.clone(), b: rv.clone() });
                         let t_min = self.fresh_temp();
