@@ -519,14 +519,94 @@ fn main() {
 // ===========================================================================
 
 #[test]
-fn s12_unknown_std_item_warns() {
-    let out = assert_checks(
+fn s12_unknown_std_item_is_an_error() {
+    // This was a WARNING until 21 Aug 2026, and the warning was worse than
+    // useless: it typed the path `Unknown` and let it through to codegen,
+    // where the build died against a mangled symbol the programmer never
+    // wrote — `@io_print_bool`, `@_get`, `Undefined label:` — with no line
+    // number and nothing tying it back to the call. Three debugging sessions
+    // were spent walking those symbols back by hand.
+    let path = write_source(
         "s12_sqrtt.mt",
         "use std::math;\nfn main() { let x = math::sqrtt(4.0); }\n",
     );
+    let (ok, out) = run_manitc("check", &path);
+    assert!(!ok, "math::sqrtt must FAIL to check, got:\n{}", out);
     assert!(
         out.contains("has no item 'sqrtt'"),
-        "expected a warning about math::sqrtt, got:\n{}",
+        "expected the item named, got:\n{}",
+        out
+    );
+    // The point of the change is the location, so pin it: the old link error
+    // had none.
+    assert!(
+        out.contains("s12_sqrtt.mt:2:"),
+        "the error must carry file:line:col, got:\n{}",
+        out
+    );
+    assert!(
+        out.contains("did you mean 'sqrt'"),
+        "expected a suggestion, got:\n{}",
+        out
+    );
+}
+
+#[test]
+fn s12_suggestion_is_the_same_on_every_run() {
+    // `env::argv` sits at distance 1 from BOTH `arg` and `args`. The tie used
+    // to be broken by whichever candidate the HashSet iterator yielded first,
+    // and Rust seeds that order randomly PER PROCESS — so this same file
+    // produced "did you mean 'arg'" on one run and "did you mean 'args'" on
+    // the next. Each run is a fresh process, which is exactly what varies.
+    let path = write_source(
+        "s12_tie.mt",
+        "use std::env;\nfn main() { let a = env::argv(); }\n",
+    );
+    let first = run_manitc("check", &path).1;
+    for run in 2..=8 {
+        let out = run_manitc("check", &path).1;
+        assert_eq!(
+            first, out,
+            "run {} disagreed with run 1 on the same input:\n--- 1 ---\n{}\n--- {} ---\n{}",
+            run, first, run, out
+        );
+    }
+    assert!(
+        first.contains("did you mean 'arg'"),
+        "expected the lexicographically-first of the tied candidates, got:\n{}",
+        first
+    );
+}
+
+#[test]
+fn s12_async_natives_are_not_rejected_by_the_hardened_check() {
+    // The guard that makes the error above safe. `async.mt` declares its six
+    // natives as `async fn`, which `scan_module_members` did not recognise
+    // until 50a6f4a — so the member list did not have them and this hardened
+    // path would have rejected three functions that work on BOTH backends.
+    // The unit test `every_registered_builtin_is_in_its_module_member_list`
+    // proves the invariant; this pins the user-visible consequence.
+    assert_checks(
+        "s12_async_ok.mt",
+        "use std::async;\nfn main() { async::sleep(1); }\n",
+    );
+}
+
+#[test]
+fn s12_user_module_shadowing_a_stdlib_name_still_only_warns() {
+    // A user module may legitimately be called `math`. Its module-scope
+    // globals are NOT registered by `load_user_module` (a known gap), so they
+    // reach this same code path — and they must not be measured against the
+    // STDLIB math member list, or a missing feature becomes a hard rejection
+    // of correct code.
+    write_source("math.mt", "pub let SHADOW_ANSWER: int = 42;\n");
+    let out = assert_checks(
+        "s12_shadow.mt",
+        "use math;\nfn main() { let x = math::SHADOW_ANSWER; }\n",
+    );
+    assert!(
+        out.contains("has no item 'SHADOW_ANSWER'"),
+        "expected a warning, not silence, got:\n{}",
         out
     );
 }

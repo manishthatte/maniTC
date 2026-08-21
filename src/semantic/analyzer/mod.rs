@@ -36,7 +36,17 @@ fn did_you_mean(name: &str, candidates: impl Iterator<Item = String>) -> Option<
         if c.len() < 3 { continue; }
         let d = levenshtein(name, &c);
         if d <= 3 {
-            if best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+            // Ties are broken lexicographically, NOT by arrival order.
+            // Callers pass `HashSet::iter()`, and Rust randomises that order
+            // per process, so `d < *bd` — which keeps whichever equally-close
+            // candidate happened to come first — made the suggestion differ
+            // between two identical runs of the same compiler on the same
+            // file: `env::argv` proposed 'arg' one run and 'args' the next,
+            // both at distance 1. Harmless while this was a warning nobody
+            // pinned; not harmless now that the std-module path is a hard
+            // error, because it makes the compiler's own output unpinnable
+            // and any test that asserts on it flaky.
+            if best.as_ref().map_or(true, |(bd, bc)| (d, &c) < (*bd, bc)) {
                 best = Some((d, c));
             }
         }

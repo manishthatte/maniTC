@@ -47,6 +47,34 @@ impl SemanticAnalyzer {
                         if !members.contains(item) {
                             let hint = did_you_mean(item, members.iter().cloned())
                                 .unwrap_or_default();
+                            // A HARD ERROR, not a warning.  A warning here typed the
+                            // path `Unknown` and let it reach codegen, where it died
+                            // against a mangled symbol the programmer never wrote —
+                            // `@io_print_bool`, `@_get`, `Undefined label:` — carrying
+                            // no line, no column and no visible relation to the source
+                            // line that caused it.  Three separate debugging sessions
+                            // were spent walking back from such a symbol to its call.
+                            //
+                            // Safe to harden ONLY because the member list is now
+                            // checked in both directions by `member_list_tests`: every
+                            // registered builtin appears in its module's list (so a
+                            // correct program cannot be rejected), and every entry in
+                            // STDLIB_EXTRA_MEMBERS has a real referent (so nothing is
+                            // waved through).  Without test 1 this change would have
+                            // rejected `async::sleep`, which works on both backends.
+                            //
+                            // The user-module branch below stays a warning on purpose:
+                            // module-scope `pub let` globals are never registered by
+                            // `load_user_module`, so erroring there would turn a
+                            // missing feature into a hard rejection of correct code.
+                            // That is also why a user module shadowing a stdlib name
+                            // is excluded here — its globals would hit this list.
+                            if !self.loaded_module_prefixes.contains(prefix) {
+                                return Err(self.err(span, format!(
+                                    "std module '{}' has no item '{}'{}",
+                                    bare_mod, item, hint,
+                                )));
+                            }
                             self.warnings.push(CompileWarning::new(
                                 WarningKind::UnknownType,
                                 &self.file, span.line, span.col,
