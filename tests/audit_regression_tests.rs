@@ -2672,3 +2672,168 @@ fn main() {
     assert_eq!(ll_out, want, "llvm output");
     assert_eq!(t3_out, want, "t3 output");
 }
+
+// ---------------------------------------------------------------------------
+// S44 (ORACLE_FINDINGS Section 44) — a syscall argument overwritten by the next
+// ---------------------------------------------------------------------------
+//
+// `fmt::format` is variadic: `lower_expr` splats the substitution array, so the
+// call reaches `emit_syscall_2arg_ret` with a template plus one argument per
+// `{}`. That helper used to resolve every argument with `val_reg` and collect
+// the results before moving any of them. `val_reg` does not merely report where
+// a value lives — for a SPILLED temp it emits a reload into a scratch register,
+// and there are three of those (R21, R22, then R25 for every reload after the
+// second). Four spilled arguments therefore reloaded the third and fourth into
+// the same register, and two arguments arrived holding one value.
+//
+// The same defect had already been found and fixed for the general call path;
+// the syscall helpers were simply never migrated to it. They share
+// `emit_call_operands` now.
+
+#[test]
+fn s44_a_wide_format_call_does_not_reuse_an_argument() {
+    // Needs BOTH the guarded reassignments and the loop: they are what push
+    // enough temps into spill slots for the third and fourth reload to collide.
+    let src = r#"
+use std::io;
+use std::fmt;
+use std::ternary;
+fn main() {
+    let ts: [trit; 3] = [-, 0, +];
+    for i in 0..3 {
+        for j in 0..3 {
+            let a: trit = ts[i];
+            let b: trit = ts[j];
+            let ai: int = ternary::trit_to_int(a);
+            let bi: int = ternary::trit_to_int(b);
+            let mut lo: int = ai;
+            if bi < lo { lo = bi; }
+            let mut hi: int = ai;
+            if bi > hi { hi = bi; }
+            let mut m1: str = "no";
+            if ternary::trit_to_int(a tand b) == lo { m1 = "yes"; }
+            let mut m2: str = "no";
+            if ternary::trit_to_int(a tor b) == hi { m2 = "yes"; }
+            io::println(fmt::format("{} {} tand={} tor={} txor={} min={} max={}", [
+                ternary::trits_to_str([a]), ternary::trits_to_str([b]),
+                ternary::trits_to_str([a tand b]),
+                ternary::trits_to_str([a tor b]),
+                ternary::trits_to_str([a txor b]), m1, m2]));
+        }
+    }
+}
+"#;
+    let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s44_wide_format.mt", src);
+    assert_eq!(ll_code, 0, "llvm:\n{}", ll_out);
+    assert_eq!(t3_code, 0, "t3:\n{}", t3_out);
+
+    // Absolute, not agreement — and not merely "the two columns differ" either.
+    // `tand` is min and `tor` is max in balanced ternary, so the whole 3x3 table
+    // is checked against the arithmetic rather than against the other backend.
+    let want = "\
+- - tand=- tor=- txor=+ min=yes max=yes
+- 0 tand=- tor=0 txor=- min=yes max=yes
+- + tand=- tor=+ txor=0 min=yes max=yes
+0 - tand=- tor=0 txor=- min=yes max=yes
+0 0 tand=0 tor=0 txor=0 min=yes max=yes
+0 + tand=0 tor=+ txor=+ min=yes max=yes
++ - tand=- tor=+ txor=0 min=yes max=yes
++ 0 tand=0 tor=+ txor=+ min=yes max=yes
++ + tand=+ tor=+ txor=- min=yes max=yes
+";
+    assert_eq!(ll_out, want, "llvm output");
+    assert_eq!(t3_out, want, "t3 output");
+}
+
+#[test]
+fn s44_binding_the_arguments_first_does_not_move_the_corruption() {
+    // The same call with every argument bound to a local. This shape was ALSO
+    // wrong before the fix, and differently: the collision landed on argument 5
+    // instead of argument 3, so `txor` printed `m1`'s "yes". Pinned because it
+    // is what showed the fault was positional pressure on the scratch registers
+    // and not anything about `tand`.
+    let src = r#"
+use std::io;
+use std::fmt;
+use std::ternary;
+fn main() {
+    let ts: [trit; 3] = [-, 0, +];
+    for i in 0..3 {
+        for j in 0..3 {
+            let a: trit = ts[i];
+            let b: trit = ts[j];
+            let ai: int = ternary::trit_to_int(a);
+            let bi: int = ternary::trit_to_int(b);
+            let mut lo: int = ai;
+            if bi < lo { lo = bi; }
+            let mut hi: int = ai;
+            if bi > hi { hi = bi; }
+            let mut m1: str = "no";
+            if ternary::trit_to_int(a tand b) == lo { m1 = "yes"; }
+            let mut m2: str = "no";
+            if ternary::trit_to_int(a tor b) == hi { m2 = "yes"; }
+            let sa: str = ternary::trits_to_str([a]);
+            let sb: str = ternary::trits_to_str([b]);
+            let sand: str = ternary::trits_to_str([a tand b]);
+            let sor: str = ternary::trits_to_str([a tor b]);
+            let sxor: str = ternary::trits_to_str([a txor b]);
+            io::println(fmt::format("{} {} tand={} tor={} txor={} min={} max={}", [
+                sa, sb, sand, sor, sxor, m1, m2]));
+        }
+    }
+}
+"#;
+    let ((_, t3_out), (_, ll_out)) = run_both_backends("s44_bound_format.mt", src);
+    let want = "\
+- - tand=- tor=- txor=+ min=yes max=yes
+- 0 tand=- tor=0 txor=- min=yes max=yes
+- + tand=- tor=+ txor=0 min=yes max=yes
+0 - tand=- tor=0 txor=- min=yes max=yes
+0 0 tand=0 tor=0 txor=0 min=yes max=yes
+0 + tand=0 tor=+ txor=+ min=yes max=yes
++ - tand=- tor=+ txor=0 min=yes max=yes
++ 0 tand=0 tor=+ txor=+ min=yes max=yes
++ + tand=+ tor=+ txor=- min=yes max=yes
+";
+    assert_eq!(ll_out, want, "llvm output");
+    assert_eq!(t3_out, want, "t3 output");
+}
+
+#[test]
+fn s44_more_than_eight_parameters_is_refused_on_t3() {
+    // The sibling limit the S44 investigation surfaced. `emit_function` reserves
+    // parameter registers with `(i + 1).min(8)`, which is a CLAMP: a ninth
+    // parameter shares R8 with the eighth. There is no stack argument area, so
+    // the function cannot be represented at all and must be refused rather than
+    // miscompiled. Before this check the only thing stopping it was an assertion
+    // about a staging register, which is why `thatteos/src/kernel/context.mt`
+    // (a 15-parameter `context_switch`) failed with an internal error.
+    let src = r#"
+use std::io;
+fn wide(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int) -> int {
+    return a + b + c + d + e + f + g + h + i;
+}
+fn main() { io::println_int(wide(1, 2, 3, 4, 5, 6, 7, 8, 9)); }
+"#;
+    let path = write_source("s44_nine_params.mt", src);
+    let out = temp_dir().join("s44_nine_params");
+    let (ok, so, se) = run_manitc(&[
+        "compile", "--target", "t3", path.to_str().unwrap(), "-o", out.to_str().unwrap(),
+    ]);
+    let all = format!("{}{}", so, se);
+    assert!(!ok, "a 9-parameter function should be refused on T3, but compiled:\n{}", all);
+    assert!(
+        all.contains("R1-R8") && all.contains("9 parameters"),
+        "the diagnostic should name the limit and the count, got:\n{}",
+        all,
+    );
+
+    // LLVM has no such limit and must still compile and run it.
+    let bin = temp_dir().join("s44_nine_params_ll");
+    let (ok, so, se) = run_manitc(&[
+        "compile", "--target", "llvm", path.to_str().unwrap(), "-o", bin.to_str().unwrap(),
+    ]);
+    assert!(ok, "llvm should compile a 9-parameter function:\n{}{}", so, se);
+    let run = Command::new(&bin).output().expect("run llvm binary");
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "45");
+}

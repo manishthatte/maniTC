@@ -1461,7 +1461,7 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                         .enumerate()
                         .map(|(i, s)| (i + 1, s))
                         .collect();
-                    em.emit_call_operands(&targets);
+                    em.emit_call_operands(&targets, 9);  // parameters are R1..R8
 
                     em.emit(format!("    CALL  {}", func));
 
@@ -1557,7 +1557,7 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 .map(|(i, s)| (i + 1, s))
                 .collect();
             targets.push((25, fp_src));
-            em.emit_call_operands(&targets);
+            em.emit_call_operands(&targets, 9);  // parameters are R1..R8
 
             em.emit("    CALLR R25  ; indirect call through fn_ptr".to_string());
 

@@ -497,18 +497,40 @@ impl AsmEmitter {
     /// sequence uses for the fn_ptr, the move scratch and the return stash.  From
     /// the third spilled operand onward `val_reg` handed out R25, and the fn_ptr
     /// move then overwrote it, passing the callee a silently wrong argument.
-    fn emit_call_operands(&mut self, targets: &[(usize, CallSrc)]) {
-        // Staging for phase 0 lives above the argument registers.  Parameters are
-        // allocated R1..R8 (see emit_function), so R9+ is never a target.
-        const STAGE_BASE: usize = 9;
+    /// `stage_base` is the first register phase 0 may use to park a float, and
+    /// therefore also the exclusive upper bound on an argument target. It is the
+    /// caller's convention, not a property of this function, and the two callers
+    /// differ:
+    ///
+    /// * A regular CALL passes 9. `emit_function` binds parameters with
+    ///   `(i + 1).min(8)`, so the ninth parameter and every one after it lands
+    ///   in R8 — the callee cannot read a ninth argument however carefully the
+    ///   caller places it. The assertion below is what turns that into a loud
+    ///   failure instead of a silently wrong argument, and it must stay until
+    ///   the convention grows a stack argument area.
+    /// * A SYSCALL passes one past its own highest target. There is no ManiT
+    ///   callee binding registers — the emulator reads R1.. directly — so
+    ///   `fmt::format` legitimately reaches R8 and beyond.
+    fn emit_call_operands(&mut self, targets: &[(usize, CallSrc)], stage_base: usize) {
+        // R25 is excluded: it is the indirect-call fn_ptr target, not an
+        // argument position.
         assert!(
-            targets.iter().all(|&(t, _)| t < STAGE_BASE || t == 25),
-            "T3ISA internal error: call operand target R{} overlaps the staging range",
-            targets.iter().map(|&(t, _)| t).find(|&t| t >= STAGE_BASE && t != 25).unwrap_or(0)
+            targets.iter().all(|&(t, _)| t < stage_base || t == 25),
+            "T3ISA internal error: call operand target R{} is at or above the \
+             staging base R{}",
+            targets.iter().map(|&(t, _)| t).find(|&t| t >= stage_base && t != 25).unwrap_or(0),
+            stage_base,
+        );
+        let n_float = targets.iter().filter(|(_, s)| matches!(s, CallSrc::Float(_))).count();
+        assert!(
+            stage_base + n_float <= 26,
+            "T3ISA internal error: {} call operands plus {} float staging register(s) \
+             would reach R26 (SP)",
+            targets.len(), n_float,
         );
 
         let mut resolved: Vec<(usize, CallSrc)> = Vec::with_capacity(targets.len());
-        let mut stage = STAGE_BASE;
+        let mut stage = stage_base;
         for (tgt, src) in targets {
             match src {
                 CallSrc::Float(f) => {
@@ -886,6 +908,22 @@ fn emit_function(
     em.global_addrs = global_addrs;
 
     // Pre-allocate param registers: first param → R1, second → R2, …, max R8.
+    //
+    // `.min(8)` is a CLAMP, not a spill: a ninth parameter is reserved into R8
+    // alongside the eighth, and every parameter after it likewise, so the callee
+    // reads one register for several arguments. There is no stack argument area
+    // in this convention. Refuse the function rather than emit code that quietly
+    // reads the wrong value — `thatteos/src/kernel/context.mt` has a 15-parameter
+    // `context_switch` and a 13-parameter `context_save`, and until this check
+    // existed the only thing that stopped them was an assertion further along in
+    // `emit_call_operands`, phrased in terms of a staging register.
+    assert!(
+        func.params.len() <= 8,
+        "T3ISA: `{}` takes {} parameters, but the T3 calling convention passes \
+         arguments only in R1-R8 and has no stack argument area. Pass the extra \
+         values in a struct, or split the function.",
+        func.name, func.params.len(),
+    );
     for (i, (pname, _)) in func.params.iter().enumerate() {
         let reg_num = (i + 1).min(8);
         em.reg_alloc.reserve(&format!("param_{}", pname), reg_num);
@@ -1030,26 +1068,89 @@ fn emit_syscall_1arg_ret(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRT
     }
 }
 
+/// Place `args` into R1, R2, R3, ... ready for a SYSCALL.
+///
+/// The arity in each caller's name is the COMMON case, not a limit: these
+/// helpers have always walked the whole `args` slice, and `fmt::format` reaches
+/// `emit_syscall_2arg_ret` with a template plus one argument per `{}` after
+/// `lower_expr` splats the substitution array. Seven substitutions is eight
+/// registers, R1 through R8.
+///
+/// The old shape was `args.iter().map(|a| em.val_reg(a)).collect()` followed by
+/// one `emit_parallel_moves`. That is wrong for any argument that is SPILLED,
+/// because `val_reg` does not merely report where a value is — for a spilled
+/// temp it EMITS a reload into a scratch register and returns that. There are
+/// exactly three such scratch registers (R21, R22, then R25 for every reload
+/// after the second — `val_reg`'s `spill_read_idx` match saturates), while the
+/// collect above holds all of them live at once. With four spilled arguments
+/// the third and fourth both reload into R25 and the second overwrites the
+/// first, so two different arguments arrive at the syscall holding one value:
+///
+/// ```text
+/// ; reload spill t88  (offset 21)   -> R25
+/// ; reload spill t100 (offset 8)    -> R25   <- t88 is gone
+/// MOV R4, R25    ; wanted t88, gets t100
+/// MOV R5, R25    ; t100
+/// ```
+///
+/// That is S44: `fmt::format("... tand={} tor={} ...", [a tand b, a tor b, ..])`
+/// printed the `tor` value in the `tand` column on T3 while LLVM was right, and
+/// the program's own `min=yes` self-check still passed because the VALUE was
+/// computed correctly — only the copy reaching the argument list was not.
+///
+/// **This exact defect was already found and fixed once** — for the general
+/// call path, whose `emit_call_operands` says so in as many words: *"From the
+/// third spilled operand onward `val_reg` handed out R25, and the fn_ptr move
+/// then overwrote it, passing the callee a silently wrong argument."* The
+/// syscall emitters were simply never migrated to it, so the bug survived here
+/// and came back as S44. They share the machinery now, rather than growing a
+/// second copy that can drift out of step with the first:
+///
+///   1. Rescue EVERY destination, not just R1/R2(/R3). All of R1..Rn are
+///      written here, so a live temp sitting in R5 was being destroyed too.
+///      (Nothing had noticed, because the callers all claim 1-3 arguments.)
+///   2. Resolve where each argument lives, without emitting. This must come
+///      AFTER the rescues: a rescue moves a live temp to another register and
+///      updates the map, so a location read before it can be stale.
+///   3. Hand the resolved locations to `emit_call_operands`, which orders the
+///      float staging, the register-to-register moves and the stack reloads so
+///      that none can disturb another.
+fn emit_syscall_args(em: &mut AsmEmitter, args: &[IRValue], name: &str) {
+    // R26 is SP: writing it would destroy the stack, and the emulator would then
+    // read SP as an argument (syscall 127 indexes regs[i+2] behind nothing but a
+    // bounds check). 25 destinations = a template plus 24 substitutions.
+    const MAX_ARG_REGS: usize = 25;
+    let n = args.len().min(MAX_ARG_REGS);
+    if args.len() > MAX_ARG_REGS {
+        em.emit(format!(
+            "    ; BUG: {} takes {} arguments but only R1-R{} are available",
+            name, args.len(), MAX_ARG_REGS,
+        ));
+    }
+
+    for k in 1..=n {
+        em.rescue_reg(k);
+    }
+
+    let targets: Vec<(usize, CallSrc)> = args.iter().take(n).enumerate()
+        .map(|(i, a)| (i + 1, em.resolve_call_src(a)))
+        .collect();
+    // Stage floats one past our own highest target: a syscall's arguments are
+    // read straight out of R1.. by the emulator, so they are not bounded by the
+    // R1-R8 parameter convention a ManiT callee imposes.
+    em.emit_call_operands(&targets, (n + 1).max(9));
+}
+
 /// Emit SYSCALL with 2 args (R1=arg[0], R2=arg[1]).  No return value.
 fn emit_syscall_2arg(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRTemp>, sc: i64, name: &str) {
-    em.rescue_reg(1);
-    em.rescue_reg(2);
-    let moves: Vec<(usize, usize)> = args.iter().enumerate()
-        .filter_map(|(i, a)| { let ra = em.val_reg(a); Some((i + 1, ra)) })
-        .collect();
-    emit_parallel_moves(em, moves, name);
+    emit_syscall_args(em, args, name);
     em.emit(format!("    SYSCALL #{}  ; {}", sc, name));
     if let Some(d) = dst { let rd = em.dst_reg(d); let _ = rd; }
 }
 
 /// Emit SYSCALL with 2 args, returns R1.
 fn emit_syscall_2arg_ret(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRTemp>, sc: i64, name: &str) {
-    em.rescue_reg(1);
-    em.rescue_reg(2);
-    let moves: Vec<(usize, usize)> = args.iter().enumerate()
-        .filter_map(|(i, a)| { let ra = em.val_reg(a); Some((i + 1, ra)) })
-        .collect();
-    emit_parallel_moves(em, moves, name);
+    emit_syscall_args(em, args, name);
     em.emit(format!("    SYSCALL #{}  ; {}", sc, name));
     if let Some(d) = dst {
         let rd = em.dst_reg(d);
@@ -1059,26 +1160,14 @@ fn emit_syscall_2arg_ret(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRT
 
 /// Emit SYSCALL with 3 args (R1, R2, R3).  No return value.
 fn emit_syscall_3arg(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRTemp>, sc: i64, name: &str) {
-    em.rescue_reg(1);
-    em.rescue_reg(2);
-    em.rescue_reg(3);
-    let moves: Vec<(usize, usize)> = args.iter().enumerate()
-        .filter_map(|(i, a)| { let ra = em.val_reg(a); Some((i + 1, ra)) })
-        .collect();
-    emit_parallel_moves(em, moves, name);
+    emit_syscall_args(em, args, name);
     em.emit(format!("    SYSCALL #{}  ; {}", sc, name));
     if let Some(d) = dst { let rd = em.dst_reg(d); let _ = rd; }
 }
 
 /// Emit SYSCALL with 3 args, returns R1.
 fn emit_syscall_3arg_ret(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRTemp>, sc: i64, name: &str) {
-    em.rescue_reg(1);
-    em.rescue_reg(2);
-    em.rescue_reg(3);
-    let moves: Vec<(usize, usize)> = args.iter().enumerate()
-        .filter_map(|(i, a)| { let ra = em.val_reg(a); Some((i + 1, ra)) })
-        .collect();
-    emit_parallel_moves(em, moves, name);
+    emit_syscall_args(em, args, name);
     em.emit(format!("    SYSCALL #{}  ; {}", sc, name));
     if let Some(d) = dst {
         let rd = em.dst_reg(d);
