@@ -124,6 +124,13 @@ fn scan_module_members(src: &str) -> std::collections::HashSet<String> {
             continue;
         }
         let l = line.strip_prefix("pub ").unwrap_or(line);
+        // `async fn f()` declares `f` just as `fn f()` does.  Missing this
+        // hid all six of async.mt's native declarations, and the gap was
+        // papered over by guessing names into STDLIB_EXTRA_MEMBERS — `yield_`
+        // for `yield_now`, `spawn` for `spawn_task`.  Both guesses were wrong,
+        // and because an extras entry SUPPRESSES the unknown-item diagnostic,
+        // each one silently vouched for a function that does not exist.
+        let l = l.strip_prefix("async ").unwrap_or(l);
         let ident = if let Some(rest) = l.strip_prefix("fn ") {
             leading_ident(rest)
         } else if let Some(rest) = l.strip_prefix("struct ") {
@@ -157,7 +164,13 @@ const STDLIB_EXTRA_MEMBERS: &[(&str, &[&str])] = &[
         "t27_explain", "t27_to_int", "t27_to_str", "t27_to_str_padded",
         "int_to_t27", "int_to_t9", "int_to_trit", "int_to_tryte",
         "t9_to_int", "trit_to_int", "tryte_to_int", "tryte_from_trits",
-        "trits_to_str", "from_balanced_ternary",
+        "trits_to_str",
+        // NOT `from_balanced_ternary` — that is declared in math.mt and nowhere
+        // else, so `ternary::from_balanced_ternary` names nothing.  Listing it
+        // here made the analyzer wave it through: on LLVM it reached a dead
+        // helper that skips `__lp_from_flat`, read the first trit as the array
+        // length and SEGFAULTED; on T3 it failed to assemble.  Removing it
+        // turns both into one located error at the call.
     ]),
     ("math", &["from_balanced_ternary", "to_balanced_ternary", "trit_count"]),
     ("fmt", &["int_to_str", "align_left", "align_right", "pad_left", "pad_right"]),
@@ -165,7 +178,7 @@ const STDLIB_EXTRA_MEMBERS: &[(&str, &[&str])] = &[
         "open", "open2", "close", "read", "write", "exists2",
         "read_bytes", "write_bytes", "remove", "close_file", "open_file",
     ]),
-    ("async", &["spawn", "yield_"]),
+    // async.mt declares everything itself, now that `async fn` is scanned.
     ("str", &["to_int"]),
 ];
 
@@ -1106,3 +1119,104 @@ impl SemanticAnalyzer {
 
 mod stmts;
 mod type_inference;
+
+#[cfg(test)]
+mod member_list_tests {
+    use super::*;
+
+    /// Every builtin the analyzer registers under `mod::item` must also appear
+    /// in that module's member list.
+    ///
+    /// This is what lets `std module 'io' has no item 'print_bool'` be a hard
+    /// error rather than a warning.  The two facts are built by different
+    /// means — `register_builtins` is a hand-written table, the member list is
+    /// scanned out of the stdlib sources plus `STDLIB_EXTRA_MEMBERS` — so
+    /// nothing but this test compares them.  A builtin missing from the member
+    /// list would make a CORRECT program fail to compile, which is a far worse
+    /// failure than the one the hard error fixes.  Add the name to
+    /// `STDLIB_EXTRA_MEMBERS` when this fires.
+    #[test]
+    fn every_registered_builtin_is_in_its_module_member_list() {
+        let analyzer = SemanticAnalyzer::new();
+        let mut missing: Vec<String> = Vec::new();
+
+        for name in &analyzer.builtin_names {
+            let Some(pos) = name.rfind("::") else { continue };
+            let module = &name[..pos];
+            let item = &name[pos + 2..];
+            // Only std modules gate on the member list; `Vec::push` and friends
+            // are builtin namespaces the check deliberately does not enumerate.
+            if !SemanticAnalyzer::STDLIB_MODULES.contains(&module) {
+                continue;
+            }
+            match std_module_members(module) {
+                Some(members) if members.contains(item) => {}
+                _ => missing.push(name.clone()),
+            }
+        }
+
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "these builtins are registered but invisible to the member list, so \
+             calling them would be rejected as unknown: {:#?}",
+            missing
+        );
+    }
+
+    /// The mirror invariant: an entry in `STDLIB_EXTRA_MEMBERS` must name
+    /// something that actually exists.
+    ///
+    /// An extras entry SUPPRESSES the unknown-item diagnostic, so a name that
+    /// is merely guessed vouches for a function nobody wrote — the call sails
+    /// through the analyzer and dies at link time against a symbol the user
+    /// never typed.  `async` carried two such phantoms, `yield_` and `spawn`,
+    /// which existed only because `scan_module_members` could not see
+    /// `async fn`; `ternary::from_balanced_ternary` was a third, and it
+    /// segfaulted rather than merely failing to link.
+    ///
+    /// Extras name intrinsics the BACKENDS implement, and the backends keep
+    /// those names in `match` arms rather than in any table a test could
+    /// import — so this reads the backend sources as text.  That is the whole
+    /// point: this compiler's recurring bug is several sources of truth with
+    /// nothing comparing them, and text is what these ones have in common.
+    #[test]
+    fn no_stdlib_extra_member_is_a_phantom() {
+        // The backends that give an intrinsic its meaning.
+        const BACKEND_SOURCES: &[&str] = &[
+            include_str!("../../codegen_t3/emitter/emit_instr.rs"),
+            include_str!("../../codegen_llvm/helpers.rs"),
+            include_str!("../../ir/lower/lower_expr.rs"),
+        ];
+
+        let analyzer = SemanticAnalyzer::new();
+        let mut phantoms: Vec<String> = Vec::new();
+
+        for (module, extras) in STDLIB_EXTRA_MEMBERS {
+            for item in *extras {
+                let qualified = format!("{}::{}", module, item);
+                let in_source = STDLIB_SOURCES
+                    .iter()
+                    .find(|(m, _)| m == module)
+                    .map(|(_, src)| scan_module_members(src).contains(*item))
+                    .unwrap_or(false);
+                // Quoted, so `io::print_int` never matches `io::print_integer`.
+                let quoted = format!("\"{}\"", qualified);
+                let in_backend = BACKEND_SOURCES.iter().any(|s| s.contains(&quoted));
+                if !analyzer.builtin_names.contains(&qualified) && !in_source && !in_backend {
+                    phantoms.push(qualified);
+                }
+            }
+        }
+
+        phantoms.sort();
+        assert!(
+            phantoms.is_empty(),
+            "these names are listed as stdlib members but are neither \
+             registered builtins nor declared in the module source, so they \
+             silence the unknown-item error for a function that does not \
+             exist: {:#?}",
+            phantoms
+        );
+    }
+}

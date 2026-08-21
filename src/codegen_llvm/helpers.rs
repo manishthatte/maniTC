@@ -871,7 +871,6 @@ declare i64 @ternary_tryte_from_trits(i64, i64, i64)
 declare i64 @ternary_pack_trits(ptr)
 declare ptr @ternary_trits_to_str(ptr)
 declare ptr @ternary_to_balanced_ternary(i64)
-declare i64 @ternary_from_balanced_ternary(ptr)
 declare ptr @math_to_balanced_ternary(i64)
 declare i64 @math_from_balanced_ternary(ptr)
 declare ptr @Ok_new(i64)
@@ -1287,12 +1286,6 @@ body:
   br label %cond
 exit:
   ret ptr %buf
-}
-
-define internal i64 @ternary_from_balanced_ternary(ptr %arr) {
-entry:
-  %r = call i64 @ternary_pack_trits(ptr %arr)
-  ret i64 %r
 }
 
 ; --- Result<T, E> ---------------------------------------------------------
