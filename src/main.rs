@@ -87,6 +87,14 @@ enum Commands {
         /// Run in interactive debug mode (step, breakpoints, register inspection)
         #[arg(long)]
         debug: bool,
+
+        /// Instruction budget before the run is cut off (exit 71).
+        ///
+        /// A runaway guard, not a correctness limit. The default is measured:
+        /// see DEFAULT_MAX_STEPS. Lower it to bound a suspected infinite loop,
+        /// raise it for a benchmark that legitimately runs long.
+        #[arg(long, value_name = "N", default_value_t = codegen_t3::DEFAULT_MAX_STEPS)]
+        max_steps: usize,
     },
 
     /// Benchmark: compile to both LLVM and T3ISA, run both, compare metrics
@@ -473,7 +481,7 @@ fn compile_t3_in_memory(file: &PathBuf) -> CompileResult<(
         Diagnostic::unknown(format!("T3ISA assembler error: {}", e))))
 }
 
-fn run_t3(file: &PathBuf, debug: bool) -> CompileResult<()> {
+fn run_t3(file: &PathBuf, debug: bool, max_steps: usize) -> CompileResult<()> {
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     let (words, str_data, float_data) = if ext == "mt" {
@@ -531,7 +539,7 @@ fn run_t3(file: &PathBuf, debug: bool) -> CompileResult<()> {
     let (output_lines, exit_code) = if debug {
         (codegen_t3::run_emulator_debug(words, str_data, float_data), 0)
     } else {
-        codegen_t3::run_emulator_with_exit(words, str_data, float_data)
+        codegen_t3::run_emulator_with_exit_capped(words, str_data, float_data, max_steps)
     };
     for piece in &output_lines {
         pipe_safe_print(piece);
@@ -589,7 +597,7 @@ fn run() {
         Commands::Check { file, warn_as_error } => run_check(file, *warn_as_error),
         Commands::Lex { file } => run_lex(file),
         Commands::Parse { file } => run_parse(file),
-        Commands::RunT3 { file, debug } => run_t3(file, *debug),
+        Commands::RunT3 { file, debug, max_steps } => run_t3(file, *debug, *max_steps),
         Commands::Bench { file, iterations } => run_bench(file, *iterations),
         Commands::Lsp => {
             tokio::runtime::Runtime::new()

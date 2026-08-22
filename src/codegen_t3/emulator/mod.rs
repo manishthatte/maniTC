@@ -6,7 +6,8 @@ pub use profiler::ExecProfile;
 pub(crate) use profiler::{Task, DebugAction};
 
 pub mod debugger;
-pub use debugger::{run_emulator, run_emulator_debug, run_emulator_profiled, run_emulator_with_exit};
+pub use debugger::{run_emulator, run_emulator_debug, run_emulator_profiled, run_emulator_with_exit,
+                   run_emulator_with_exit_capped, DEFAULT_MAX_STEPS, T3_STEP_LIMIT_EXIT};
 
 mod execute;
 mod syscalls;
@@ -113,6 +114,18 @@ pub struct Emulator {
     pub debug: bool,
     /// Breakpoint addresses for debug mode.
     pub breakpoints: HashSet<usize>,
+    /// Instruction budget for one `run()`. Defaults to
+    /// [`debugger::DEFAULT_MAX_STEPS`]; `manitc run-t3 --max-steps N` overrides
+    /// it. This is a runaway guard, NOT a correctness limit — see the constant.
+    pub max_steps: usize,
+    /// Set when execution stopped because `max_steps` was reached.
+    ///
+    /// Kept separate from `trapped` because the two mean opposite things to a
+    /// caller: a trap is the program doing something illegal, while this is the
+    /// program being *interrupted* while still running legally. Sharing one
+    /// flag made a truncated run indistinguishable from a fault, and the
+    /// adjudicator downstream scored it as the two backends disagreeing.
+    pub step_limited: bool,
 }
 
 impl Emulator {
@@ -145,6 +158,8 @@ impl Emulator {
             profile: ExecProfile::new(),
             debug: false,
             breakpoints: HashSet::new(),
+            max_steps: debugger::DEFAULT_MAX_STEPS,
+            step_limited: false,
         }
     }
 

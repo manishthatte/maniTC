@@ -141,9 +141,9 @@ impl Emulator {
             self.run_debug();
             return;
         }
-        const MAX_STEPS: usize = 10_000_000;
+        let max_steps = self.max_steps;
         let mut steps = 0;
-        while !self.halted && steps < MAX_STEPS {
+        while !self.halted && steps < max_steps {
             self.step();
             steps += 1;
             // Track high-water marks
@@ -154,14 +154,32 @@ impl Emulator {
                 self.profile.max_heap_ptr = self.heap_ptr;
             }
         }
-        if steps >= MAX_STEPS {
-            self.trap("TRAP: step limit exceeded");
+        if steps >= max_steps {
+            self.stop_at_step_limit(max_steps);
         }
+    }
+
+    /// Stop because the instruction budget ran out.
+    ///
+    /// Deliberately NOT `trap()`. A trap says the program did something
+    /// illegal; this says the program was still running legally when we ran out
+    /// of patience. Conflating them cost real accuracy: a truncated run reported
+    /// the same exit status as a fault, so the oracle's adjudicator took the
+    /// "one backend ran and the other did not" branch and called it DIVERGENT —
+    /// which reads as a compiler bug when nothing had gone wrong at all.
+    fn stop_at_step_limit(&mut self, max_steps: usize) {
+        self.output.push(format!(
+            "TRAP: step limit exceeded ({} steps; raise it with \
+             `manitc run-t3 --max-steps N`)\n",
+            max_steps,
+        ));
+        self.halted = true;
+        self.step_limited = true;
     }
 
     /// Interactive debug mode: step through instructions with breakpoints.
     fn run_debug(&mut self) {
-        const MAX_STEPS: usize = 10_000_000;
+        let max_steps = self.max_steps;
         let mut steps = 0;
         let mut continuing = false;
 
@@ -169,7 +187,7 @@ impl Emulator {
         eprintln!("Type 'h' for help. Program loaded ({} words).", self.profile.program_words);
         eprintln!();
 
-        while !self.halted && steps < MAX_STEPS {
+        while !self.halted && steps < max_steps {
             // Print current instruction
             eprintln!("{}", self.disasm_at(self.pc));
 
@@ -210,8 +228,8 @@ impl Emulator {
         }
         if self.halted {
             eprintln!("  program halted normally.");
-        } else if steps >= MAX_STEPS {
-            self.trap("TRAP: step limit exceeded");
+        } else if steps >= max_steps {
+            self.stop_at_step_limit(max_steps);
         }
     }
 
@@ -240,16 +258,37 @@ pub fn run_emulator_with_exit(
     string_data: HashMap<usize, String>,
     float_data: HashMap<usize, i64>,
 ) -> (Vec<String>, i64) {
+    run_emulator_with_exit_capped(words, string_data, float_data, DEFAULT_MAX_STEPS)
+}
+
+/// As [`run_emulator_with_exit`], with an explicit instruction budget.
+pub fn run_emulator_with_exit_capped(
+    words: Vec<i64>,
+    string_data: HashMap<usize, String>,
+    float_data: HashMap<usize, i64>,
+    max_steps: usize,
+) -> (Vec<String>, i64) {
     let mut emu = Emulator::new();
     emu.load_program(words);
     emu.string_data = string_data;
     emu.float_data = float_data;
+    emu.max_steps = max_steps;
     let out = emu.run_with_output();
     // A5: the exit status normally comes from main's return value in R1, but a
     // program stopped by a TRAP never returned, so R1 holds whatever the
     // faulting instruction left behind — including 0, which would report
     // success. Report a distinct, documented failure status instead.
-    let code = if emu.trapped { T3_TRAP_EXIT } else { emu.regs[1] };
+    //
+    // The step limit gets its OWN status rather than reusing 70: "you cut me
+    // off" and "I faulted" are different facts, and a caller that cannot tell
+    // them apart will misclassify the first as the second.
+    let code = if emu.step_limited {
+        T3_STEP_LIMIT_EXIT
+    } else if emu.trapped {
+        T3_TRAP_EXIT
+    } else {
+        emu.regs[1]
+    };
     (out, code)
 }
 
@@ -257,6 +296,37 @@ pub fn run_emulator_with_exit(
 /// Chosen to be non-zero and below 128 so it is not confused with death by
 /// signal, and stable so scripts can test for it.
 pub const T3_TRAP_EXIT: i64 = 70;
+
+/// Process exit status when the program was cut off at the step limit.
+///
+/// Separate from `T3_TRAP_EXIT` because the two are different events and a
+/// caller has to be able to tell them apart: 70 means the program faulted, 71
+/// means it was still running and we stopped it. Sharing 70 is what let a
+/// truncated run be scored as a cross-backend divergence.
+pub const T3_STEP_LIMIT_EXIT: i64 = 71;
+
+/// Default instruction budget for `run-t3`, overridable with `--max-steps`.
+///
+/// **This number is measured, not chosen for looking generous** (ORACLE_FINDINGS
+/// §2, 22 Aug 2026). Over the whole 89-program corpus that compiles and runs on
+/// T3, the median program takes 4,775 steps and p90 is 26,620. Exactly one
+/// program exceeded the old 10 M cap — `benchmarks/01_arithmetic.mt` at
+/// 20,891,806 — with ManiTBench T1-13 next at 11,656,667. Ordinary programs sit
+/// three to four orders of magnitude below.
+///
+/// The old cap was not protecting anything. Uncapped, `01_arithmetic` finishes
+/// in 0.183 s: the emulator runs at ~114 M steps/s, so 10 M was **0.09 seconds**
+/// of emulation, and it was truncating real work rather than catching runaways.
+///
+/// 1e9 is ~8.8 s at that rate — the largest round value whose worst case still
+/// lands inside the oracle's own 20 s per-stage wall-clock timeout with better
+/// than 2x margin. That ordering is the entire point: the DETERMINISTIC bound
+/// must always fire before the non-deterministic one, or the same program starts
+/// producing different verdicts on a loaded machine and an idle one. It is also
+/// 48x the largest real program.
+///
+/// Keep a step cap; never replace it with a wall-clock timeout.
+pub const DEFAULT_MAX_STEPS: usize = 1_000_000_000;
 
 /// Run emulator in interactive debug mode.
 pub fn run_emulator_debug(
