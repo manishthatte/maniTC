@@ -69,6 +69,22 @@ pub struct SemanticAnalyzer {
     pub(crate) lambda_fns: Vec<TypedFnDef>,
     // User-defined impl method return types: type_name → method_name → return_type
     pub(crate) user_method_types: HashMap<String, HashMap<String, ManiType>>,
+    /// User-defined impl method arity: type_name → method_name → the number of
+    /// EXPLICIT arguments a call site must supply, i.e. the parameter count
+    /// with the `self` receiver already subtracted.
+    ///
+    /// Separate from `user_method_types` because that map holds only return
+    /// types, and separate from `functions` — which does register every method
+    /// under `Type::name` with its full parameter list — because `functions`
+    /// stores types without names, so it cannot tell whether the first
+    /// parameter is the receiver. `Point::shifted(self, dx, dy)` is three
+    /// parameters and two arguments, and only the AST knows which.
+    ///
+    /// An entry exists ONLY where the first parameter is literally `self`. A
+    /// method with no entry is not checked at all, which makes false positives
+    /// impossible by construction: trait default bodies, associated functions
+    /// and every builtin method simply have no entry.
+    pub(crate) user_method_arity: HashMap<String, HashMap<String, usize>>,
     // Trait definitions: trait_name → [(method_name, param_types, ret_type, has_default_body)]
     pub(crate) trait_defs: HashMap<String, Vec<(String, Vec<ManiType>, ManiType, bool)>>,
     // Trait implementations: (type_name, trait_name)
@@ -236,6 +252,7 @@ impl SemanticAnalyzer {
             lambda_counter: 0,
             lambda_fns: Vec::new(),
             user_method_types: HashMap::new(),
+            user_method_arity: HashMap::new(),
             trait_defs: HashMap::new(),
             trait_impls: std::collections::HashSet::new(),
             type_params: HashMap::new(),
@@ -888,6 +905,16 @@ impl SemanticAnalyzer {
                         .entry(imp.ty.clone())
                         .or_default()
                         .insert(method.name.clone(), ret_ty);
+                    // Record the explicit-argument count only for real methods
+                    // — those whose first parameter is the `self` receiver.
+                    // Associated functions (`Point::new(x, y)`) are called
+                    // through the path form, which `functions` already checks.
+                    if method.params.first().is_some_and(|p| p.name == "self") {
+                        self.user_method_arity
+                            .entry(imp.ty.clone())
+                            .or_default()
+                            .insert(method.name.clone(), method.params.len() - 1);
+                    }
                 }
                 // Validate trait implementation: every required method must be present
                 if let Some(trait_name) = &imp.trait_ {

@@ -352,6 +352,36 @@ impl SemanticAnalyzer {
                             .collect::<Vec<_>>().join(", "),
                     )));
                 }
+                // Arity, for user-defined methods.
+                //
+                // `arity` was 30 of the 771 uncaught mutations (§54) and the
+                // asymmetry behind it is stark: a free function called with the
+                // wrong number of arguments is a hard error, and has been all
+                // along, but the identical mistake through a receiver was not
+                // checked at all — `v.slice(2)` for a two-argument slice, or a
+                // lambda quietly losing the parameter its body still uses.
+                //
+                // Only USER methods are covered. Builtin methods on Vec, Map,
+                // Set and str have no signature table in the analyzer — that
+                // table is the actual missing feature and is deliberately not
+                // invented here, because a partial table would reject correct
+                // programs, which is far worse than accepting wrong ones.
+                // `user_method_arity` holds an entry only where the receiver is
+                // certain, so a missing entry means no check rather than a
+                // guess.
+                if let ManiType::Struct(tn) | ManiType::Enum(tn) = &tobj.ty {
+                    if let Some(&want) = self.user_method_arity
+                        .get(tn.as_str())
+                        .and_then(|m| m.get(method.as_str()))
+                    {
+                        if typed_args.len() != want {
+                            return Err(self.err(span, format!(
+                                "method '{}::{}' expects {} argument(s), found {}",
+                                tn, method, want, typed_args.len(),
+                            )));
+                        }
+                    }
+                }
                 // For method calls, we do basic resolution
                 let ret_ty = self.resolve_method_type(&tobj.ty, method, span);
                 Ok(TypedExpr {

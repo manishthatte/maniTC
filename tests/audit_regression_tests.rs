@@ -3543,3 +3543,65 @@ fn s54_void_and_typed_returns_both_still_check() {
          fn main() { shout(\"hi\"); io::println_int(twice(21)); }\n",
     );
 }
+
+/// The fourth class. The asymmetry is what makes it a defect rather than a
+/// missing feature: calling a FREE function with the wrong number of arguments
+/// has always been a hard error, while the identical mistake through a receiver
+/// was not checked at all. `v.slice(2)` for a two-argument slice, and a lambda
+/// losing the parameter its body still refers to, both checked clean.
+#[test]
+fn s54_a_user_method_called_with_the_wrong_arity_is_an_error() {
+    assert_check_error(
+        "s54_method_arity.mt",
+        "struct Point { x: int, y: int }\n\
+         impl Point {\n\
+         \x20   fn shifted(self, dx: int, dy: int) -> int { return self.x + dx + dy; }\n\
+         }\n\
+         fn main() {\n\
+         \x20   let p: Point = Point { x: 1, y: 2 };\n\
+         \x20   io::println_int(p.shifted(3));\n\
+         }\n",
+        "expects 2 argument(s), found 1",
+    );
+}
+
+/// The receiver must not be counted as an argument, and a zero-argument method
+/// must still be callable. `fn shifted(self, dx, dy)` is three PARAMETERS and
+/// two ARGUMENTS — off by one here would reject every correct call in the
+/// corpus, which is exactly why the arity map is built from the AST (where
+/// `self` is visible by name) rather than from `functions` (which stores types
+/// only).
+#[test]
+fn s54_correct_method_arity_still_checks() {
+    assert_checks(
+        "s54_method_arity_ok.mt",
+        "struct Point { x: int, y: int }\n\
+         impl Point {\n\
+         \x20   fn shifted(self, dx: int, dy: int) -> int { return self.x + dx + dy; }\n\
+         \x20   fn norm(self) -> int { return self.x + self.y; }\n\
+         }\n\
+         fn main() {\n\
+         \x20   let p: Point = Point { x: 1, y: 2 };\n\
+         \x20   io::println_int(p.shifted(3, 4));\n\
+         \x20   io::println_int(p.norm());\n\
+         }\n",
+    );
+}
+
+/// Builtin methods are deliberately NOT covered: the analyzer has no signature
+/// table for Vec/Map/Set/str, and inventing a partial one would reject correct
+/// programs — a far worse failure than accepting wrong ones. This test records
+/// that boundary as a decision rather than an oversight, so that building the
+/// table later is a deliberate act that updates it.
+#[test]
+fn s54_builtin_method_arity_is_knowingly_unchecked() {
+    assert_checks(
+        "s54_builtin_arity_gap.mt",
+        "fn main() {\n\
+         \x20   let v: Vec<int> = Vec::new();\n\
+         \x20   v.push(1);\n\
+         \x20   let s: Vec<int> = v.slice(2);\n\
+         \x20   io::println_int(s.len());\n\
+         }\n",
+    );
+}
