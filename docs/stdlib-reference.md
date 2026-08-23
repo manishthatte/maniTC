@@ -581,14 +581,21 @@ File system access. Like `env::`, largely one-sided — see the Works column bef
 | Function | Signature | Body | Works | Description |
 |---|---|---|---|---|
 | `fs::append_file` | `(path: str, content: str)` | native | yes | Append `content` to `path`, creating the file if it does not exist. |
+| `fs::copy` | `(src: str, dst: str) -> int` | native | **LLVM only** | Copy `src` to `dst`.  Returns 0 on success. |
 | `fs::copy_file` | `(src: str, dst: str)` | native | **LLVM only** | Copy the file at `src` to `dst`.  Overwrites `dst` if it exists. |
 | `fs::create_dir` | `(path: str)` | native | **LLVM only** | Create the directory at `path`.  Panics if it already exists. |
 | `fs::create_dir_all` | `(path: str)` | native | **LLVM only** | Create `path` and all missing ancestor directories. |
+| `fs::delete` | `(path: str) -> int` | native | yes | Delete the file at `path`.  Returns 0 on success. |
 | `fs::exists` | `(path: str) -> bool` | native | yes | Return true if a file or directory exists at `path`. |
+| `fs::file_size` | `(path: str) -> int` | native | **LLVM only** | Size of the file at `path`, in bytes. |
 | `fs::is_dir` | `(path: str) -> bool` | native | **LLVM only** | Return true if `path` is an existing directory. |
 | `fs::is_file` | `(path: str) -> bool` | native | **LLVM only** | Return true if `path` is an existing regular file. |
 | `fs::list_dir` | `(path: str) -> Vec<str>` | native | **T3 only** | List the immediate children of `path`.  Returns names, not full paths. |
+| `fs::list_dir_entry` | `(handle: int) -> str` | native | **LLVM only** | Return the next entry name from an open directory handle, or "" when the listing is exhausted. |
+| `fs::list_dir_open` | `(path: str) -> int` | native | **LLVM only** | Open `path` for directory iteration; returns a handle. |
 | `fs::metadata` | `(path: str) -> Metadata` | native | **neither** | Return metadata for the entry at `path`.  Panics if not found. |
+| `fs::mkdir` | `(path: str) -> int` | native | **LLVM only** | Create the directory `path`.  Returns 0 on success. |
+| `fs::move` | `(src: str, dst: str) -> int` | native | **LLVM only** | Move (rename) `src` to `dst`.  Returns 0 on success. |
 | `fs::path_extension` | `(p: str) -> str` | native | **neither** | Return the extension of a path string. |
 | `fs::path_file_name` | `(p: str) -> str` | native | **neither** | Return the file name component of a path string. |
 | `fs::path_join` | `(base: str, child: str) -> str` | native | **neither** | Convenience free function: join two path strings. |
@@ -631,7 +638,7 @@ Assertions. Pure ManiT over `io::println` and `env::exit`, so it needs nothing f
 
 ## Census
 
-**318 declarations** across 13 modules: **221 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **60 do not work on at least one backend**.
+**325 declarations** across 13 modules: **222 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **66 do not work on at least one backend**.
 
 The *Works* column records whether a one-line program calling the function compiles and links on each backend. It is a test of existence, not of correctness: a function marked `yes` has a body on both sides, which is exactly what `fmt::`'s twenty-five documented-but-undefined entries did not. A `not probed` row is an admission, not a pass.
 

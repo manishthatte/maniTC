@@ -245,3 +245,46 @@ fn temp_file() -> str ;  // native
 
 // Create a temporary directory and return its path.
 fn temp_dir() -> str ;  // native
+
+// ---------------------------------------------------------------------------
+// The thatteOS shell surface
+// ---------------------------------------------------------------------------
+//
+// Added 23 August 2026. These seven were registered as native builtins in
+// semantic/analyzer/mod.rs and implemented in the C runtime, but never
+// DECLARED here -- so `fs::file_size(p)` reported "std module 'fs' has no item
+// 'file_size'" while the symbol it mangles to, `fs_file_size`, was sitting in
+// the runtime the whole time. thatteOS's own shell (thatteos.mt) calls
+// `fs::file_size` at three places, which is why `bash build.sh` did not build.
+//
+// They return `int` rather than a richer type because that is what the C
+// runtime returns: 0 or a negative errno for the operations, a byte count for
+// file_size. The directory pair is a stateful iterator -- `list_dir_open`
+// returns a handle, `list_dir_entry` returns the next name or "" at the end --
+// which is why it is separate from `list_dir` above.
+//
+// NONE of these has a T3 emitter intercept, so they resolve and link on LLVM
+// and fail at the T3 assembler with an undefined label. That is the general
+// shape of `fs::` on T3: there is no filesystem behind it.
+
+// Size of the file at `path`, in bytes.
+fn file_size(path: str) -> int ;  // native
+
+// Delete the file at `path`.  Returns 0 on success.
+fn delete(path: str) -> int ;  // native
+
+// Create the directory `path`.  Returns 0 on success.
+fn mkdir(path: str) -> int ;  // native
+
+// Copy `src` to `dst`.  Returns 0 on success.
+fn copy(src: str, dst: str) -> int ;  // native
+
+// Move (rename) `src` to `dst`.  Returns 0 on success.
+fn move(src: str, dst: str) -> int ;  // native
+
+// Open `path` for directory iteration; returns a handle.
+fn list_dir_open(path: str) -> int ;  // native
+
+// Return the next entry name from an open directory handle, or "" when the
+// listing is exhausted.
+fn list_dir_entry(handle: int) -> str ;  // native
