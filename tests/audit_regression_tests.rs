@@ -2930,3 +2930,70 @@ fn s49_the_generic_stdlib_modules_type_check() {
         assert!(ok, "stdlib/{}.mt no longer type-checks:\n{}{}", m, so, se);
     }
 }
+
+// ---------------------------------------------------------------------------
+// §48 — too many parameters is a DIAGNOSTIC, not a panic
+// ---------------------------------------------------------------------------
+//
+// The T3 calling convention passes arguments in R1-R8 with no stack argument
+// area, so a function of more than eight parameters cannot be emitted; the
+// register assignment clamps at R8 and several parameters would silently share
+// it. Refusing is correct. Refusing by `assert!` was not: a panic prints a Rust
+// backtrace notice rather than an `error:` line, cannot be caught by anything
+// driving the compiler, and makes a careful compiler look like a crashed one.
+//
+// This test pins BOTH halves — that it is refused, and that it is refused
+// through the error channel. `thatteos/src/kernel/context.mt` is the real file
+// that hits it, with a 13-parameter `context_save` and a 15-parameter
+// `context_switch`.
+#[test]
+fn s48_more_than_eight_params_is_a_t3_error_not_a_panic() {
+    let src = "\
+fn nine(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int) -> int {
+    a + b + c + d + e + f + g + h + i
+}
+
+fn main() { io::println(fmt::show_int(nine(1,2,3,4,5,6,7,8,9))); }
+";
+    let path = write_source("s48_nine_params.mt", src);
+    let out = temp_dir().join("s48_nine_params.t3b");
+    let (ok, so, se) = run_manitc(&[
+        "compile", "--target", "t3", path.to_str().unwrap(), "-o", out.to_str().unwrap(),
+    ]);
+    let blob = format!("{}{}", so, se);
+    assert!(!ok, "a 9-parameter function must be refused on T3, but it compiled");
+    assert!(
+        !blob.contains("panicked"),
+        "refused by PANIC rather than by diagnostic — that is §48:\n{}",
+        blob
+    );
+    assert!(
+        blob.contains("error:") && blob.contains("R1-R8"),
+        "expected a diagnostic naming the calling convention, got:\n{}",
+        blob
+    );
+    assert!(
+        blob.contains("nine"),
+        "the diagnostic must name the offending function, got:\n{}",
+        blob
+    );
+}
+
+// Eight is the boundary and must still WORK. A check written as `>= 8` instead
+// of `> 8` would pass the test above and quietly reject every legal
+// eight-argument function, so the limit is pinned from both sides.
+#[test]
+fn s48_exactly_eight_params_still_compiles_on_both_backends() {
+    let src = "\
+fn eight(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int) -> int {
+    a + b + c + d + e + f + g + h
+}
+
+fn main() { io::println(fmt::show_int(eight(1,2,3,4,5,6,7,8))); }
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("s48_eight_params.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(t3.trim(), "36", "t3 got {:?}", t3);
+    assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
+}

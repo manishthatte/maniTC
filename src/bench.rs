@@ -45,7 +45,7 @@ pub fn run_bench(file: &PathBuf, iterations: usize) -> CompileResult<()> {
     println!();
 
     // ---- T3ISA target ----
-    let t3_asm = codegen_t3::emit_t3_asm(&ir_module);
+    let t3_asm = codegen_t3::emit_t3_asm(&ir_module)?;
     let t3_asm_lines = t3_asm.lines().count();
 
     let (t3_words, t3_str_data, t3_float_data) = match codegen_t3::assemble(&t3_asm) {

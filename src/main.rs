@@ -319,7 +319,7 @@ fn run_compile(file: &PathBuf, target: &str, output: &PathBuf, emit_ir: bool, wa
             }
         }
         "t3" => {
-            let asm_text = codegen_t3::emit_t3_asm(&ir_module);
+            let asm_text = codegen_t3::emit_t3_asm(&ir_module)?;
             let asm_path = output.with_extension("t3s");
             std::fs::write(&asm_path, &asm_text).map_err(|e| {
                 CompileError::Codegen(
@@ -476,7 +476,7 @@ fn compile_t3_in_memory(file: &PathBuf) -> CompileResult<(
     let mut ir_module = IRLowerer::lower(&typed_program);
     ir::optimize::run_passes(&mut ir_module);
 
-    let asm_text = codegen_t3::emit_t3_asm(&ir_module);
+    let asm_text = codegen_t3::emit_t3_asm(&ir_module)?;
     codegen_t3::assemble(&asm_text).map_err(|e| CompileError::Codegen(
         Diagnostic::unknown(format!("T3ISA assembler error: {}", e))))
 }
