@@ -100,6 +100,13 @@ pub struct EnumVariant {
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
     pub ty: String,
+    /// The impl's own generic parameters: the `T` in `impl<T> Vec<T>`.
+    ///
+    /// `ty` stays the BASE name (`Vec`), because method resolution is by base
+    /// name throughout — `Analyzer::current_impl_type` is set from it, and the
+    /// collection methods are resolved in `semantic/analyzer/type_inference.rs`
+    /// against `Vec`/`Map`/`Set` regardless of element type.
+    pub generics: Vec<String>,
     pub trait_: Option<String>,
     pub methods: Vec<FnDef>,
     pub span: Span,

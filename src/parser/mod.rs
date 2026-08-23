@@ -295,21 +295,10 @@ impl Parser {
         let span = self.span();
         let is_async = self.eat(&TokenKind::Async);
         self.expect(&TokenKind::Fn)?;
-        let (name, _) = self.expect_ident()?;
+        // A keyword is a legal name here — nothing else can follow `fn`.
+        let name = self.expect_name("function name")?;
 
-        // Parse optional generic parameters <T, U, ...>
-        let mut generics = Vec::new();
-        if *self.peek() == TokenKind::Lt {
-            self.advance(); // consume <
-            loop {
-                if let TokenKind::Ident(gname) = self.peek().clone() {
-                    generics.push(gname.clone());
-                    self.advance();
-                }
-                if !self.eat(&TokenKind::Comma) { break; }
-            }
-            self.eat_gt(); // consume >
-        }
+        let generics = self.parse_generic_params();
 
         self.expect(&TokenKind::LParen)?;
 
@@ -359,19 +348,7 @@ impl Parser {
         self.expect(&TokenKind::Struct)?;
         let (name, _) = self.expect_ident()?;
 
-        // Parse optional generic parameters <T, U, ...>
-        let mut generics = Vec::new();
-        if *self.peek() == TokenKind::Lt {
-            self.advance(); // consume <
-            loop {
-                if let TokenKind::Ident(gname) = self.peek().clone() {
-                    generics.push(gname.clone());
-                    self.advance();
-                }
-                if !self.eat(&TokenKind::Comma) { break; }
-            }
-            self.eat_gt(); // consume >
-        }
+        let generics = self.parse_generic_params();
 
         self.expect(&TokenKind::LBrace)?;
 
@@ -425,19 +402,65 @@ impl Parser {
 
     // --- impl ---
 
+    /// Parse optional generic parameters `<T, U, …>`, or nothing.
+    ///
+    /// One copy, used by `fn`, `struct` and `impl`. It was two verbatim copies
+    /// (fn and struct) and `impl` had none, which is exactly how the third site
+    /// came to be missing: there was no single place that adding a declaration
+    /// form would have made you look at.
+    fn parse_generic_params(&mut self) -> Vec<String> {
+        let mut generics = Vec::new();
+        if *self.peek() == TokenKind::Lt {
+            self.advance(); // consume <
+            loop {
+                if let TokenKind::Ident(gname) = self.peek().clone() {
+                    generics.push(gname.clone());
+                    self.advance();
+                }
+                if !self.eat(&TokenKind::Comma) { break; }
+            }
+            self.eat_gt(); // consume >
+        }
+        generics
+    }
+
+    /// The base name of a type, for the places that key on it rather than on
+    /// the full type: `Vec<T>` → `Vec`, `collections::Vec` → `Vec`.
+    fn type_base_name(t: &Type) -> String {
+        match t {
+            Type::Named(n, _) => n.clone(),
+            Type::Generic(n, _, _) => n.clone(),
+            Type::Path(segs, _) => segs.last().cloned().unwrap_or_default(),
+            other => other.display(),
+        }
+    }
+
     fn parse_impl_block(&mut self) -> CompileResult<ImplBlock> {
         let span = self.span();
         self.expect(&TokenKind::Impl)?;
-        let (first, _) = self.expect_ident()?;
+
+        // `impl<T> …` — the impl's OWN generic parameters. Without this the
+        // parser stopped at the `<` with "expected identifier, found Lt", which
+        // is why stdlib/collections.mt, stdlib/async.mt and stdlib/sync.mt --
+        // the language's own Vec, Future and Mutex -- did not parse. They are
+        // the three modules STDLIB_SOURCES describes as having "known parse
+        // gaps"; this was the gap.
+        let generics = self.parse_generic_params();
+
+        // The name that follows may itself carry generic ARGUMENTS
+        // (`impl<T> Vec<T>`), so parse a full type rather than a bare
+        // identifier. That also admits `impl<T> Foo<Vec<T>>` for free, because
+        // parse_type is already recursive.
+        let first = self.parse_type()?;
 
         // impl Trait for Type  OR  impl Type
         // `for` is a keyword so we check TokenKind::For directly
         let (ty, trait_) = if self.peek() == &TokenKind::For {
             self.advance(); // eat `for`
-            let (type_name, _) = self.expect_ident()?;
-            (type_name, Some(first))
+            let target = self.parse_type()?;
+            (Self::type_base_name(&target), Some(Self::type_base_name(&first)))
         } else {
-            (first, None)
+            (Self::type_base_name(&first), None)
         };
 
         self.expect(&TokenKind::LBrace)?;
@@ -448,7 +471,7 @@ impl Parser {
             methods.push(m);
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(ImplBlock { ty, trait_, methods, span })
+        Ok(ImplBlock { ty, generics, trait_, methods, span })
     }
 
     // --- trait ---
@@ -470,35 +493,69 @@ impl Parser {
 
     // --- use ---
 
+    /// The source spelling of a keyword that may legitimately also be a NAME.
+    ///
+    /// maniT already decided this question for module paths: `use async::spawn`
+    /// has to work, so `expect_path_segment` has always mapped keyword tokens
+    /// back to their spelling. The same reasoning applies anywhere the position
+    /// admits only a name — after `fn`, and after `.` — because no keyword's
+    /// statement form can appear there. `stdlib/async.mt` declares
+    /// `fn spawn<T>(self, fut: Future<T>) -> Task<T>` and `runtime.spawn(fut)`
+    /// is the natural way to call it; without this the method could not be
+    /// declared or invoked, and the module did not parse.
+    ///
+    /// This is one table used by three positions. It was one table used by one
+    /// position, inline, which is why the other two never got it.
+    pub(super) fn keyword_spelling(tok: &TokenKind) -> Option<&'static str> {
+        Some(match tok {
+            TokenKind::Async => "async",
+            TokenKind::Spawn => "spawn",
+            TokenKind::Await => "await",
+            TokenKind::Channel => "channel",
+            TokenKind::IntKw => "int",
+            TokenKind::FloatKw => "float",
+            TokenKind::CharKw => "char",
+            TokenKind::StrKw => "str",
+            TokenKind::VoidKw => "void",
+            TokenKind::Bool3Kw => "bool3",
+            TokenKind::TritKw => "trit",
+            TokenKind::TryteKw => "tryte",
+            TokenKind::T9Kw => "t9",
+            TokenKind::T27Kw => "t27",
+            TokenKind::T54Kw => "t54",
+            TokenKind::TrintKw => "trint",
+            TokenKind::TfloatKw => "tfloat",
+            _ => return None,
+        })
+    }
+
+    /// Accept an identifier, or a keyword in a position where only a name can
+    /// appear (a function/method declaration name, or a field/method after
+    /// `.`). See `keyword_spelling`.
+    pub(super) fn expect_name(&mut self, what: &str) -> CompileResult<String> {
+        if let TokenKind::Ident(name) = self.peek().clone() {
+            self.advance();
+            return Ok(name);
+        }
+        match Self::keyword_spelling(self.peek()) {
+            Some(s) => { self.advance(); Ok(s.to_string()) }
+            None => Err(self.err(format!(
+                "expected {}, found {:?}", what, self.peek()))),
+        }
+    }
+
     /// Accept both identifiers AND keywords as module path segments.
     /// This allows `use async::spawn`, `use io::println`, etc.
     pub(super) fn expect_path_segment(&mut self) -> CompileResult<String> {
         let _sp = self.span();
         let seg = match self.peek().clone() {
             TokenKind::Ident(name) => name,
-            // Allow common module-name keywords as path segments
-            TokenKind::Async => "async".to_string(),
             // literal keyword names used as module identifiers
             tok => {
                 // Check if this keyword could be a module name
-                let s = match &tok {
-                    TokenKind::Spawn => "spawn".to_string(),
-                    TokenKind::Await => "await".to_string(),
-                    TokenKind::Channel => "channel".to_string(),
-                    TokenKind::IntKw => "int".to_string(),
-                    TokenKind::FloatKw => "float".to_string(),
-                    TokenKind::CharKw => "char".to_string(),
-                    TokenKind::StrKw => "str".to_string(),
-                    TokenKind::VoidKw => "void".to_string(),
-                    TokenKind::Bool3Kw => "bool3".to_string(),
-                    TokenKind::TritKw => "trit".to_string(),
-                    TokenKind::TryteKw => "tryte".to_string(),
-                    TokenKind::T9Kw => "t9".to_string(),
-                    TokenKind::T27Kw => "t27".to_string(),
-                    TokenKind::T54Kw => "t54".to_string(),
-                    TokenKind::TrintKw => "trint".to_string(),
-                    TokenKind::TfloatKw => "tfloat".to_string(),
-                    _ => {
+                let s = match Self::keyword_spelling(&tok) {
+                    Some(s) => s.to_string(),
+                    None => {
                         return Err(self.err(format!("expected module path segment, found {:?}", tok)));
                     }
                 };

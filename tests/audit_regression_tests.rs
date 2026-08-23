@@ -2837,3 +2837,96 @@ fn main() { io::println_int(wide(1, 2, 3, 4, 5, 6, 7, 8, 9)); }
     let run = Command::new(&bin).output().expect("run llvm binary");
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "45");
 }
+
+// ---------------------------------------------------------------------------
+// §49 — generic impl blocks, and keywords as method names
+// ---------------------------------------------------------------------------
+//
+// `impl<T> Vec<T> { … }` did not parse. The parser expected a bare identifier
+// straight after `impl`, so it stopped at the `<` with "expected identifier,
+// found Lt" — and that is why stdlib/collections.mt, stdlib/async.mt and
+// stdlib/sync.mt, the language's own Vec, Future and Mutex, did not parse.
+// 159 functions and 18 structs of the standard library were invisible to the
+// compiler that ships them.
+//
+// tests/15_generics_and_traits.mt existed the whole time and passed. It covers
+// generic FUNCTIONS (`fn identity<T>`) and NON-generic impls (`impl Vec2`) and
+// contains not one `impl<`. A test named for both halves never touched their
+// intersection, which is the shape this pair of tests exists to prevent.
+
+#[test]
+fn s49_generic_impl_blocks_run_on_both_backends() {
+    let src = "\
+struct Box<T> { value: T }
+
+impl<T> Box<T> {
+    fn get(self) -> T { self.value }
+}
+
+struct Pair<A, B> { a: A, b: B }
+
+impl<A, B> Pair<A, B> {
+    fn first(self) -> A { self.a }
+    fn second(self) -> B { self.b }
+}
+
+fn main() {
+    let b = Box { value: 42 };
+    io::println(fmt::show_int(b.get()));
+    let p = Pair { a: 7, b: 9 };
+    io::println(fmt::show_int(p.first()));
+    io::println(fmt::show_int(p.second()));
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("s49_generic_impl.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(t3.trim(), "42\n7\n9", "t3 output wrong: {:?}", t3);
+    assert_eq!(t3.trim(), ll.trim(),
+               "backends disagree on generic impl:\n t3: {:?}\n ll: {:?}", t3, ll);
+}
+
+// `spawn` is a keyword (the `spawn { }` statement), and stdlib/async.mt declares
+// `fn spawn<T>(self, fut: Future<T>) -> Task<T>` — so the module could not
+// declare its own method, and `runtime.spawn(f)` could not have called it.
+// maniT had already decided this question for module paths: `use async::spawn`
+// works because expect_path_segment maps keyword tokens back to their spelling.
+// The same now applies after `fn` and after `.`, the two other positions where
+// only a name can appear. This test pins the general rule, not just `spawn`.
+#[test]
+fn s49_keywords_are_legal_names_after_fn_and_dot() {
+    let src = "\
+struct R { n: int }
+
+impl R {
+    fn spawn(self) -> int { self.n }
+    fn channel(self) -> int { self.n + 1 }
+}
+
+fn main() {
+    let r = R { n: 41 };
+    io::println(fmt::show_int(r.spawn()));
+    io::println(fmt::show_int(r.channel()));
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("s49_kw_names.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(t3.trim(), ll.trim(),
+               "backends disagree:\n t3: {:?}\n ll: {:?}", t3, ll);
+    assert!(t3.contains("41") && t3.contains("42"), "wrong output: {:?}", t3);
+}
+
+// The three stdlib modules themselves must keep type-checking. This is the
+// direct regression: if `impl<T>` breaks again, these fail immediately and name
+// the module, rather than the failure resurfacing as a mysterious gap in a
+// training corpus months later.
+#[test]
+fn s49_the_generic_stdlib_modules_type_check() {
+    for m in ["async", "collections", "sync"] {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/stdlib/");
+        let full = format!("{}{}.mt", path, m);
+        let (ok, so, se) = run_manitc(&["check", &full]);
+        assert!(ok, "stdlib/{}.mt no longer type-checks:\n{}{}", m, so, se);
+    }
+}

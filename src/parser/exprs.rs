@@ -316,7 +316,12 @@ impl Parser {
                         self.advance();
                         expr = Expr::Field(Box::new(expr), n.to_string(), span);
                     } else {
-                        let (field, _) = self.expect_ident()?;
+                        // A keyword is a legal name here too: `runtime.spawn(f)`
+                        // calls stdlib/async.mt's `Runtime::spawn`. Only a name
+                        // can follow `.`, so there is nothing to disambiguate.
+                        // `.await` is handled above and must stay above — it is
+                        // postfix syntax, not a method.
+                        let field = self.expect_name("field or method name")?;
                         if self.peek() == &TokenKind::LParen {
                             self.advance();
                             let args = self.parse_call_args()?;
