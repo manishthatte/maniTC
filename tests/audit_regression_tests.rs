@@ -3370,3 +3370,176 @@ fn s53_a_bool_is_rejected_by_let_and_accepted_by_a_native() {
         "fn main() { io::println_int(5 > 0); }\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// §54 — the checker SAW them and said `warning`
+// ---------------------------------------------------------------------------
+// Triage of the 771 mutations `manitc check` failed to catch (ORACLE_FINDINGS
+// §54, HANDOFF §3.2). Two of the six classes needed no new analysis at all —
+// the checker already detected them, named them, and even suggested the right
+// spelling. It just emitted a warning and exited 0:
+//
+//     undefined_name  357   "unknown identifier 'totl' — did you mean 'total'?"
+//     wrong_type      123   "value 42 overflows type 'Trit' (range -1..1)"
+//     trit_range       50   same diagnostic, different mutation
+//                     ---
+//                     530   of 771, closed by changing a severity
+//
+// Why that mattered beyond the compiler: L1 — the metric the Phase A training
+// gate turns on — is DEFINED as "generations pass `manitc check`". Every typo
+// waved through was scored as a model success, so the gate was measuring the
+// checker's blindness as the model's skill.
+//
+// The flip was rejected once, on 22 Aug, on the belief that `gui_set_color`
+// (runtime/gui.c, no stdlib/*.mt declaration) depended on the leniency. It does
+// not — it is in the native table with a full signature, and calling it wrongly
+// already produced a hard arity error. Measured instead of assumed across all
+// 128 shipped .mt files: exactly ONE name in ONE file depended on it, and it
+// depended on it to call a C symbol that had simply never been registered.
+
+/// Every position an unknown name can appear in, because the fix must not be
+/// positional. Before §54 all five of these exited 0.
+#[test]
+fn s54_an_unknown_identifier_is_an_error_in_every_position() {
+    let cases: &[(&str, &str)] = &[
+        ("s54_undef_native_arg.mt",
+         "fn main() { let total: int = 5; io::println_int(totl); }\n"),
+        ("s54_undef_let_init.mt",
+         "fn main() { let total: int = 5; let y: int = totl; io::println_int(y); }\n"),
+        ("s54_undef_return.mt",
+         "fn f() -> int { let total: int = 5; return totl; }\n\
+          fn main() { io::println_int(f()); }\n"),
+        ("s54_undef_binop.mt",
+         "fn main() { let total: int = 5; let y: int = total + totl; io::println_int(y); }\n"),
+        ("s54_undef_user_fn_arg.mt",
+         "fn g(a: int) -> int { return a; }\n\
+          fn main() { let total: int = 5; io::println_int(g(totl)); }\n"),
+    ];
+    for (name, src) in cases {
+        assert_check_error(name, src, "unknown identifier");
+    }
+}
+
+/// The diagnostic must keep naming the intended spelling. The suggestion is the
+/// whole reason this class is cheap to fix in a training corpus: the compiler
+/// hands the model the answer.
+#[test]
+fn s54_the_unknown_identifier_error_still_suggests_the_right_name() {
+    assert_check_error(
+        "s54_undef_hint.mt",
+        "fn main() { let total: int = 5; io::println_int(totl); }\n",
+        "did you mean 'total'?",
+    );
+}
+
+/// Nothing legitimate is lost, because the escape hatch the leniency stood in
+/// for already exists and is strictly better: a TYPED declaration of a runtime
+/// symbol rather than an untyped hole.
+#[test]
+fn s54_a_declared_native_is_the_escape_hatch() {
+    assert_checks(
+        "s54_user_native.mt",
+        "fn fs_remove_file(path: str) ;  // native\n\
+         fn main() { io::println(\"ok\"); }\n",
+    );
+}
+
+/// Functions are collected in a pre-pass, so a call to one defined later in the
+/// file never reached the unknown-identifier branch. Pinned because if that
+/// ever became single-pass, this change would turn a working idiom into a hard
+/// error across the whole corpus.
+#[test]
+fn s54_forward_references_are_unaffected() {
+    assert_checks(
+        "s54_forward_ref.mt",
+        "fn main() { io::println_int(later(3)); }\n\
+         fn later(a: int) -> int { return a * 2; }\n",
+    );
+}
+
+/// `fs_remove_file` was the ONLY name in 128 shipped files still relying on the
+/// leniency — it is in runtime/system.c and in the LLVM emitter, but had never
+/// been added to the native table. Registering it is what made the flip safe,
+/// so removing it again would silently re-break thatteos/userspace/gui_fm.mt.
+#[test]
+fn s54_fs_remove_file_is_a_registered_native() {
+    assert_checks(
+        "s54_fs_remove_file.mt",
+        "fn main() { fs_remove_file(\"/tmp/s54_nonexistent\"); }\n",
+    );
+}
+
+/// The other severity class. This one is worse than a missed diagnostic: the
+/// program RUNS, and both backends print 42 for a value that has three legal
+/// states. They AGREE, so the differential oracle cannot see it — the same
+/// blind spot as §51's module-level `bool3`.
+#[test]
+fn s54_a_literal_outside_a_ternary_range_is_an_error() {
+    assert_check_error(
+        "s54_trit_42.mt",
+        "fn main() { let n: trit = 42; io::println_int(n); }\n",
+        "overflows type",
+    );
+    // 2 is the mutation gen_repair actually applies — one step outside the set.
+    assert_check_error(
+        "s54_trit_2.mt",
+        "fn main() { let t: trit = 2; io::println_int(t); }\n",
+        "overflows type",
+    );
+    // Ranges are derived from the trit count, not conventional: 6 trits.
+    assert_check_error(
+        "s54_tryte_out.mt",
+        "fn main() { let t: tryte = 365; io::println_int(t); }\n",
+        "overflows type",
+    );
+}
+
+/// The complement, so the check cannot be "reject every ternary literal".
+/// All three legal trits, and a tryte at each end of its exact range.
+#[test]
+fn s54_ternary_literals_inside_their_range_still_check() {
+    assert_checks(
+        "s54_trit_legal.mt",
+        "fn main() {\n\
+         \x20   let a: trit = -1;\n\
+         \x20   let b: trit = 0;\n\
+         \x20   let c: trit = 1;\n\
+         \x20   let d: tryte = 364;\n\
+         \x20   let e: tryte = -364;\n\
+         \x20   io::println_int(a + b + c + d + e);\n\
+         }\n",
+    );
+}
+
+/// The third class, and the only one of the six where the two backends give
+/// DIFFERENT answers rather than the same wrong one — so it is a wrong result,
+/// not merely an unreported mutation:
+///
+///     fn f(n: int) { return n + 1; }   io::println_int(f(41))
+///         LLVM   clang link failure
+///         T3     prints 0, silently, for an expected 42
+///
+/// §A1 already enforced the other direction (a non-void function must supply a
+/// value on every path). This one was missing because `current_fn_ret` was
+/// consulted only as an inference HINT and never compared against.
+#[test]
+fn s54_a_function_with_no_return_type_may_not_return_a_value() {
+    assert_check_error(
+        "s54_dropped_ret_ty.mt",
+        "fn f(n: int){ return n + 1; }\nfn main() { io::println_int(f(41)); }\n",
+        "no declared return type",
+    );
+}
+
+/// The complement: a genuinely void function must still be able to say
+/// `return;` for an early exit, and a declared return type must still work.
+/// Without this the check above could be "reject every return".
+#[test]
+fn s54_void_and_typed_returns_both_still_check() {
+    assert_checks(
+        "s54_void_return_ok.mt",
+        "fn shout(m: str) { io::println(m); return; }\n\
+         fn twice(n: int) -> int { return n * 2; }\n\
+         fn main() { shout(\"hi\"); io::println_int(twice(21)); }\n",
+    );
+}

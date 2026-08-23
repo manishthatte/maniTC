@@ -145,22 +145,59 @@ impl SemanticAnalyzer {
                     // lowering — never warn for them.
                     const RESULT_CONSTRUCTORS: &[&str] =
                         &["Ok", "Err", "Unknown"];
-                    // Allow unknown identifiers for now (stdlib etc.)
-                    // Emit a warning for likely typos / genuinely unknown names
+                    // An unknown identifier is an ERROR, not a warning.
+                    //
+                    // It was a warning from the beginning, under the comment
+                    // "Allow unknown identifiers for now (stdlib etc.)", and
+                    // the cost of that `for now` was measured on 23 Aug 2026:
+                    // of 771 mutations that `manitc check` failed to catch,
+                    // 357 -- the largest class by far -- were nothing more
+                    // than a variable referenced under a misspelled name. The
+                    // checker SAW every one of them, named them, and even
+                    // offered the correct spelling; it just said `warning` and
+                    // exited 0.
+                    //
+                    // That is not only a compiler question. L1, the metric the
+                    // Phase A training gate turns on, is DEFINED as "generations
+                    // pass `manitc check`" -- so every typo the checker waved
+                    // through was scored as a success, and the gate measured
+                    // the checker's blindness as the model's skill.
+                    //
+                    // Flipping this was considered on 22 Aug and rejected,
+                    // because `gui_set_color` lives in runtime/gui.c with no
+                    // stdlib/*.mt declaration and appeared to need the
+                    // leniency. It does not: it is registered in the native
+                    // table in analyzer/mod.rs with a full signature, and
+                    // calling it wrongly already produced a hard arity error.
+                    // The premise was wrong, so the conclusion did not hold.
+                    //
+                    // Checked rather than assumed, across all 128 shipped .mt
+                    // files in maniTC and thatteOS: exactly ONE name in ONE
+                    // file still depended on the leniency -- `fs_remove_file`
+                    // in thatteos/userspace/gui_fm.mt -- and it depended on it
+                    // to call a C symbol that exists in runtime/system.c and
+                    // in the LLVM emitter but had never been added to the
+                    // native table. It is registered now.
+                    //
+                    // Nothing legitimate is lost, because the escape hatch this
+                    // leniency was standing in for already exists and is
+                    // better: any file may write `fn foo(x: str) ;  // native`
+                    // and get a TYPED declaration of a runtime symbol instead
+                    // of an untyped hole. Forward references are unaffected --
+                    // functions are collected in a pre-pass, so calling one
+                    // defined later in the file never reached this branch.
                     if !name.contains('<') && !RESULT_CONSTRUCTORS.contains(&name.as_str()) {
                         let var_names = self.symbols.all_names();
                         let fn_names = self.functions.keys().cloned();
                         let candidates = var_names.chain(fn_names);
-                        let msg = if let Some(hint) = did_you_mean(name, candidates) {
-                            format!("unknown identifier '{}'{}", name, hint)
-                        } else {
-                            format!("unknown identifier '{}' — type inferred as Unknown", name)
-                        };
-                        self.warnings.push(CompileWarning::new(
-                            WarningKind::UnknownType,
-                            &self.file, span.line, span.col,
-                            msg,
-                        ));
+                        let hint = did_you_mean(name, candidates).unwrap_or_else(|| {
+                            ". If this names a C runtime symbol, declare it: \
+                             `fn <name>(<params>) -> <type> ;  // native`"
+                                .to_string()
+                        });
+                        return Err(self.err(span, format!(
+                            "unknown identifier '{}'{}", name, hint,
+                        )));
                     }
                     ManiType::Unknown
                 };

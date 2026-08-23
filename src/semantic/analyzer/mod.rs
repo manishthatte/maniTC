@@ -334,6 +334,13 @@ impl SemanticAnalyzer {
             ("fs_copy_file",      ss.clone(),   Void),
             ("fs_rename",         ss.clone(),   Void),
             ("fs_delete",         s.clone(),    Int),
+            // Defined in runtime/system.c and declared in the LLVM emitter, but
+            // absent from this table until 23 Aug 2026 — so every call to it
+            // resolved to Unknown and got a warning instead of a signature.
+            // It was the ONLY name in all 128 shipped .mt files still relying
+            // on that leniency, which is why it had to be registered before
+            // unknown identifiers could become errors.
+            ("fs_remove_file",    s.clone(),    Void),
             // Path helpers
             ("path_join",         ss.clone(),   Str),
             ("path_parent",       s.clone(),    Str),

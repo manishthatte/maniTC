@@ -77,19 +77,42 @@ impl SemanticAnalyzer {
                         (Some(h), _) => h,
                         (None, _) => inferred_ty.clone(),
                     };
-                    // Integer overflow detection for ternary types
+                    // A literal outside a ternary type's range is an ERROR.
+                    //
+                    // It was a warning, and on 23 Aug 2026 that accounted for
+                    // 173 of the 771 uncaught mutations -- `wrong_type` (123,
+                    // a binding retyped int -> trit) and `trit_range` (50, a
+                    // trit given a literal outside {-1, 0, +1}).
+                    //
+                    // What makes this class worse than a missed diagnostic is
+                    // what the program then DOES. `let n: trit = 42;` prints
+                    // 42 on the LLVM backend and 42 on T3: the two backends
+                    // AGREE, and both are wrong. A trit that holds 42 is not a
+                    // trit. Because they agree, the differential oracle -- the
+                    // main instrument for finding backend defects -- is blind
+                    // to it by construction, exactly as in the module-level
+                    // `bool3` case (section 51). Nothing downstream clamps or
+                    // rejects the value, so it simply travels.
+                    //
+                    // The ranges are exact and derived, not conventional:
+                    // trit -1..1, tryte +-364, T9 +-9841, T27 +-3_812_798_742_493
+                    // (see ternary_type_range). There is no reading of the
+                    // language in which a literal outside them is meant.
+                    //
+                    // Blast radius, measured across all 128 shipped .mt files
+                    // in maniTC and thatteOS before changing it: ZERO produce
+                    // this diagnostic today. Nothing legitimate depends on the
+                    // leniency. Only a `let` with a direct integer literal is
+                    // covered -- `let n: trit = 40 + 2;` still slips through,
+                    // because constant folding does not run before this check.
                     if let TypedExprKind::Lit(Lit::Int(val)) = &te.kind {
                         let range = super::type_inference::ternary_type_range(&final_ty);
                         if let Some((lo, hi)) = range {
                             if *val < lo || *val > hi {
-                                self.warnings.push(CompileWarning::new(
-                                    WarningKind::IntegerOverflow,
-                                    &self.file, ls.span.line, ls.span.col,
-                                    format!(
-                                        "value {} overflows type '{:?}' (range {}..{})",
-                                        val, final_ty, lo, hi
-                                    ),
-                                ));
+                                return Err(self.err(ls.span, format!(
+                                    "value {} overflows type '{:?}' (range {}..{})",
+                                    val, final_ty, lo, hi,
+                                )));
                             }
                         }
                     }
@@ -182,13 +205,46 @@ impl SemanticAnalyzer {
                 let te = self.check_expr(e, None)?;
                 Ok(TypedStmt::Expr(te))
             }
-            Stmt::Return(e, _span) => {
+            Stmt::Return(e, span) => {
                 let ret_hint = self.current_fn_ret.clone();
                 let te = if let Some(expr) = e {
                     Some(self.check_expr(expr, Some(&ret_hint))?)
                 } else {
                     None
                 };
+                // A function with no declared return type must not return a
+                // value. §A1 above already enforces the other direction — a
+                // non-void function must supply one on every path — but this
+                // direction was never checked: `current_fn_ret` was used only
+                // as a HINT for inferring the expression, never compared
+                // against it.
+                //
+                // That was `drop_return_type`, 152 of the 771 uncaught
+                // mutations (ORACLE_FINDINGS §54) and the only class of the
+                // six where the two backends actually DISAGREE, so it is a
+                // wrong answer rather than merely an unreported one:
+                //
+                //     fn f(n: int)     { return n + 1; }
+                //     io::println_int(f(41))
+                //         LLVM   clang link failure — the IR names a value the
+                //                function was never compiled to produce
+                //         T3     prints 0, silently, for an expected 42
+                //
+                // Void is checked rather than Unknown on purpose: an Unknown
+                // return type means inference has not settled, and rejecting
+                // there would refuse correct programs.
+                if matches!(ret_hint, ManiType::Void) {
+                    if let Some(t) = &te {
+                        if !matches!(t.ty, ManiType::Void | ManiType::Unknown) {
+                            return Err(self.err(*span, format!(
+                                "function has no declared return type but returns \
+                                 a value of type '{:?}' — add `-> {:?}` to its \
+                                 signature, or drop the value from `return`",
+                                t.ty, t.ty,
+                            )));
+                        }
+                    }
+                }
                 Ok(TypedStmt::Return(te))
             }
             Stmt::Break(_) => Ok(TypedStmt::Break),
