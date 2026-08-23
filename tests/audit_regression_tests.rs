@@ -3492,6 +3492,21 @@ fn s54_a_literal_outside_a_ternary_range_is_an_error() {
         "fn main() { let t: tryte = 365; io::println_int(t); }\n",
         "overflows type",
     );
+    // BOTH polarities. `-17` is not `Lit::Int(-17)` — it parses as a negation
+    // of `17` — so the first version of this check caught `17` and waved
+    // through `-17`. Found by re-running the mutation corpus against the fix
+    // itself. §53 is the same lesson: a rule tested on one polarity is correct
+    // on one polarity.
+    assert_check_error(
+        "s54_trit_neg.mt",
+        "fn main() { let y: trit = -17; io::println_int(y); }\n",
+        "value -17 overflows",
+    );
+    assert_check_error(
+        "s54_tryte_neg.mt",
+        "fn main() { let t: tryte = -365; io::println_int(t); }\n",
+        "overflows type",
+    );
 }
 
 /// The complement, so the check cannot be "reject every ternary literal".
@@ -3603,5 +3618,42 @@ fn s54_builtin_method_arity_is_knowingly_unchecked() {
          \x20   let s: Vec<int> = v.slice(2);\n\
          \x20   io::println_int(s.len());\n\
          }\n",
+    );
+}
+
+/// ManiT has TWO return paths and the first version of the dropped-return-type
+/// check only covered one. A `return` inside a `tif` arm is an EXPRESSION, not
+/// a statement, so 24 `drop_return_type` mutations walked straight past it —
+/// every one of them a function returning through `tif`, which is the idiomatic
+/// ternary dispatch and therefore common in exactly the code that matters.
+///
+/// §53's lesson a third time: the rule now lives once, in
+/// `check_return_value_allowed`, and both sites call it.
+#[test]
+fn s54_a_tif_arm_return_obeys_the_same_return_type_rule() {
+    assert_check_error(
+        "s54_tif_return_no_ty.mt",
+        "fn perm_str(p: trit) {\n\
+         \x20   tif p {\n\
+         \x20       + => return \"GRANT\",\n\
+         \x20       0 => return \"CHECK\",\n\
+         \x20       - => return \"DENY \",\n\
+         \x20   }\n\
+         }\n\
+         fn main() { io::println(perm_str(1)); }\n",
+        "no declared return type",
+    );
+    // The same function with its type restored must still check, or the rule
+    // would be "reject tif dispatch" rather than "reject an undeclared return".
+    assert_checks(
+        "s54_tif_return_ok.mt",
+        "fn perm_str(p: trit) -> str {\n\
+         \x20   tif p {\n\
+         \x20       + => return \"GRANT\",\n\
+         \x20       0 => return \"CHECK\",\n\
+         \x20       - => return \"DENY \",\n\
+         \x20   }\n\
+         }\n\
+         fn main() { io::println(perm_str(1)); }\n",
     );
 }

@@ -866,6 +866,11 @@ impl SemanticAnalyzer {
             Expr::Return(e, _) => {
                 let ret_hint = self.current_fn_ret.clone();
                 let te = self.check_expr(e, Some(&ret_hint))?;
+                // The EXPRESSION form of `return` — what a `tif` arm contains.
+                // Same rule as the statement form, and deliberately the same
+                // function: see check_return_value_allowed in stmts.rs for why
+                // it is not written out twice.
+                self.check_return_value_allowed(&te.ty, span)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::Return(Box::new(te)),
                     ty: ManiType::Void,

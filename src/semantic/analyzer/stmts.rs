@@ -2,6 +2,42 @@
 use super::*;
 
 impl SemanticAnalyzer {
+    // A function with no declared return type must not return a value.
+    //
+    // ONE definition, called from both places a `return` can appear —
+    // `Stmt::Return` here and `Expr::Return` in expressions.rs. ManiT has two,
+    // because a `return` inside a `tif` arm is an EXPRESSION:
+    //
+    //     fn perm_str(p: trit) -> str {
+    //         tif p { + => return "GRANT", 0 => return "CHECK", - => return "DENY" }
+    //     }
+    //
+    // The first version of this check lived only in the statement arm, and 24
+    // `drop_return_type` mutations walked straight past it — every one of them
+    // a function returning through `tif`. §53's lesson a third time: a rule
+    // re-derived at each site will be wrong at some of them, so it goes in one
+    // place and both sites call it.
+    //
+    // (A `///` doc comment here became a failing DOCTEST: rustdoc compiles an
+    // indented block inside one as Rust, and that block is ManiT.)
+    pub(super) fn check_return_value_allowed(
+        &self, ty: &ManiType, span: Span,
+    ) -> CompileResult<()> {
+        // Unknown means inference has not settled; rejecting there would refuse
+        // correct programs.
+        if matches!(self.current_fn_ret, ManiType::Void)
+            && !matches!(ty, ManiType::Void | ManiType::Unknown)
+        {
+            return Err(self.err(span, format!(
+                "function has no declared return type but returns a value of \
+                 type '{:?}' — add `-> {:?}` to its signature, or drop the \
+                 value from `return`",
+                ty, ty,
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn check_block(&mut self, block: &Block) -> CompileResult<TypedBlock> {
         self.symbols.push_scope();
         let mut typed_stmts = Vec::new();
@@ -105,10 +141,30 @@ impl SemanticAnalyzer {
                     // leniency. Only a `let` with a direct integer literal is
                     // covered -- `let n: trit = 40 + 2;` still slips through,
                     // because constant folding does not run before this check.
-                    if let TypedExprKind::Lit(Lit::Int(val)) = &te.kind {
+                    // BOTH polarities. `-17` does not parse as `Lit::Int(-17)`
+                    // — it is `UnOp(Neg, Lit(17))` — so a check that matches
+                    // only the literal form catches `let t: trit = 17` and
+                    // waves through `let t: trit = -17`. Measured 23 Aug 2026
+                    // by re-running the mutation corpus against this very fix:
+                    // negative literals were still surviving it.
+                    //
+                    // This is §53 repeating in a new place. There, four of
+                    // eight widening sites sign-extended an i1, and the defect
+                    // was invisible for `false` because `sext i1 false` is 0 —
+                    // the right answer. A rule that is only tested on one
+                    // polarity is only correct on one polarity.
+                    let lit_val = match &te.kind {
+                        TypedExprKind::Lit(Lit::Int(v)) => Some(*v),
+                        TypedExprKind::UnOp(UnOpKind::Neg, inner) => match &inner.kind {
+                            TypedExprKind::Lit(Lit::Int(v)) => Some(-*v),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(val) = lit_val {
                         let range = super::type_inference::ternary_type_range(&final_ty);
                         if let Some((lo, hi)) = range {
-                            if *val < lo || *val > hi {
+                            if val < lo || val > hi {
                                 return Err(self.err(ls.span, format!(
                                     "value {} overflows type '{:?}' (range {}..{})",
                                     val, final_ty, lo, hi,
@@ -229,21 +285,8 @@ impl SemanticAnalyzer {
                 //         LLVM   clang link failure — the IR names a value the
                 //                function was never compiled to produce
                 //         T3     prints 0, silently, for an expected 42
-                //
-                // Void is checked rather than Unknown on purpose: an Unknown
-                // return type means inference has not settled, and rejecting
-                // there would refuse correct programs.
-                if matches!(ret_hint, ManiType::Void) {
-                    if let Some(t) = &te {
-                        if !matches!(t.ty, ManiType::Void | ManiType::Unknown) {
-                            return Err(self.err(*span, format!(
-                                "function has no declared return type but returns \
-                                 a value of type '{:?}' — add `-> {:?}` to its \
-                                 signature, or drop the value from `return`",
-                                t.ty, t.ty,
-                            )));
-                        }
-                    }
+                if let Some(t) = &te {
+                    self.check_return_value_allowed(&t.ty, *span)?;
                 }
                 Ok(TypedStmt::Return(te))
             }
