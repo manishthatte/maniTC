@@ -43,6 +43,8 @@ pub struct IRLowerer {
     fn_param_manitys: std::collections::HashMap<String, Vec<ManiType>>,
     // struct name → field ManiTypes in declaration order
     struct_field_manitys: std::collections::HashMap<String, Vec<ManiType>>,
+    // static payloads behind struct-valued globals, in emission order
+    static_structs: Vec<IRStaticStruct>,
     // declared return ManiType of the function currently being lowered
     current_fn_ret: ManiType,
 }
@@ -291,6 +293,7 @@ impl IRLowerer {
             global_vars: std::collections::HashMap::new(),
             fn_param_manitys: std::collections::HashMap::new(),
             struct_field_manitys: std::collections::HashMap::new(),
+            static_structs: Vec::new(),
             current_fn_ret: ManiType::Void,
         }
     }
@@ -482,9 +485,19 @@ impl IRLowerer {
         }
 
         for g in &typed_program.globals {
-            let ty = IRType::from_mani(&g.ty);
+            // A struct-valued global holds the ADDRESS of its payload, never
+            // the struct: a global is one word and a struct value is a
+            // pointer everywhere else in the compiler. Typing it as the
+            // struct made the LLVM backend emit `@G = global %struct.S` and
+            // `load %struct.S, ptr @G` — an aggregate by value, which the
+            // rest of the pipeline treats as a pointer.
+            let ty = match &g.ty {
+                ManiType::Struct(_) => IRType::Ptr(Box::new(IRType::from_mani(&g.ty))),
+                _ => IRType::from_mani(&g.ty),
+            };
             lowerer.global_vars.insert(g.name.clone(), ty.clone());
-            let init = g.init.as_ref().map(|e| lowerer.lower_expr_to_const(e));
+            let init = g.init.as_ref()
+                .map(|e| lowerer.lower_expr_to_const(e, &g.name, &g.ty));
             globals.push(IRGlobal { name: g.name.clone(), ty, init });
         }
 
@@ -519,6 +532,7 @@ impl IRLowerer {
             globals,
             string_literals,
             float_literals: Vec::new(),
+            static_structs: lowerer.static_structs.clone(),
             struct_sizes,
         }
     }
@@ -533,17 +547,21 @@ impl IRLowerer {
     /// This match used to have exactly one arm, `Lit`, and a wildcard that
     /// returned `Null`. `-42` is `UnOp(Neg, Lit(42))`, so it missed, and every
     /// negative module-level constant read as 0 on both backends.
-    fn lower_expr_to_const(&mut self, expr: &TypedExpr) -> IRValue {
-        use crate::semantic::const_fold::{fold, ConstValue};
+    /// `name` is the global being initialised and `declared` its declared
+    /// type — not the initialiser's. `let B: bool3 = false;` folds to `Bool`
+    /// and must be stored as −1: before this took the declared type it stored
+    /// 0, which is bool3's UNKNOWN, on both backends. The same literal inside
+    /// a function has always been −1 (`lower_lit_typed`), so a module-level
+    /// `bool3` disagreed with a local one.
+    fn lower_expr_to_const(
+        &mut self,
+        expr: &TypedExpr,
+        name: &str,
+        declared: &ManiType,
+    ) -> IRValue {
+        use crate::semantic::const_fold::fold;
         match fold(expr) {
-            Ok(ConstValue::Int(n)) => IRValue::Const(IRConst::Int(n)),
-            Ok(ConstValue::Float(f)) => IRValue::Const(IRConst::Float(f)),
-            Ok(ConstValue::Bool(b)) => IRValue::Const(IRConst::Bool(b)),
-            Ok(ConstValue::Trit(t)) => IRValue::Const(IRConst::Trit(t)),
-            // Strings are interned to a label, exactly as `lower_lit_typed`
-            // does — a global `str` holds the address of the .data entry.
-            Ok(ConstValue::Str(s)) => IRValue::Const(IRConst::Str(self.intern_string(&s))),
-            Ok(ConstValue::Null) => IRValue::Const(IRConst::Null),
+            Ok(v) => self.const_to_irvalue(&v, name, declared),
             Err(e) => panic!(
                 "maniT internal error: a global initialiser that the semantic pass accepted \
                  will not fold during lowering ({}). This is a compiler bug — the two folders \
@@ -551,6 +569,83 @@ impl IRLowerer {
                 e.describe(),
             ),
         }
+    }
+
+    /// One folded constant as an IR value, in the representation the runtime
+    /// path would have produced for the same expression.
+    ///
+    /// `base` names the symbol this value is being built for; nested struct
+    /// payloads derive their labels from it so generated code stays readable.
+    /// `ty` is the DECLARED type of the slot the value lands in — needed
+    /// because `bool` and `bool3` share the `Bool` fold but not the
+    /// representation.
+    fn const_to_irvalue(
+        &mut self,
+        v: &crate::semantic::const_fold::ConstValue,
+        base: &str,
+        ty: &ManiType,
+    ) -> IRValue {
+        use crate::semantic::const_fold::ConstValue;
+        match v {
+            ConstValue::Int(n) => IRValue::Const(IRConst::Int(*n)),
+            ConstValue::Float(f) => IRValue::Const(IRConst::Float(*f)),
+            // The one coercion `coerce_value` performs, and `lower_lit_typed`
+            // with it: a `bool` in a `bool3` slot is 2b − 1, not 0/1. Fold
+            // keeps `Bool` because it has no declared type to consult; here
+            // there is one.
+            ConstValue::Bool(b) if matches!(ty, ManiType::Bool3) => {
+                IRValue::Const(IRConst::Trit(if *b { 1 } else { -1 }))
+            }
+            ConstValue::Bool(b) => IRValue::Const(IRConst::Bool(*b)),
+            ConstValue::Trit(t) => IRValue::Const(IRConst::Trit(*t)),
+            // Strings are interned to a label, exactly as `lower_lit_typed`
+            // does — a `str` slot holds the address of the .data entry.
+            ConstValue::Str(s) => IRValue::Const(IRConst::Str(self.intern_string(s))),
+            ConstValue::Null => IRValue::Const(IRConst::Null),
+            ConstValue::Struct(name, fields) => self.intern_static_struct(name, fields, base),
+        }
+    }
+
+    /// Give a folded struct constant static storage, and return its ADDRESS.
+    ///
+    /// A struct value is a pointer to its fields everywhere else in the
+    /// compiler (see `slot_access_ty`), and a module-level `let` is one word,
+    /// so this is the only representation available to it: the word holds the
+    /// address, and the fields live in a payload the backends materialise —
+    /// LLVM as another global, T3 as words in the globals window written by
+    /// the same preamble that writes the globals themselves.
+    fn intern_static_struct(
+        &mut self,
+        name: &str,
+        fields: &[crate::semantic::const_fold::ConstValue],
+        base: &str,
+    ) -> IRValue {
+        let label = format!("{}.static{}", base, self.static_structs.len());
+        // Reserve the slot before recursing: a nested payload interns itself
+        // during the loop below and must not take this one's index.
+        self.static_structs.push(IRStaticStruct {
+            label: label.clone(),
+            struct_name: name.to_string(),
+            fields: Vec::new(),
+        });
+        let slot = self.static_structs.len() - 1;
+
+        let field_manitys = self.struct_field_manitys.get(name).cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(fields.len());
+        for (i, fval) in fields.iter().enumerate() {
+            // An absent declared type would mean the analyzer admitted a
+            // literal of a struct it has no fields for, which S1 rejects.
+            // `Int` is the inert choice if it ever happens: it is the slot
+            // type every non-float, non-pointer field already has.
+            let fty = field_manitys.get(i).cloned().unwrap_or(ManiType::Int);
+            let v = self.const_to_irvalue(fval, &label, &fty);
+            // The payload's layout is the layout the runtime field access
+            // uses — the same `slot_access_ty` call the StructLit lowering
+            // makes — rather than a second opinion about it.
+            out.push((slot_access_ty(&IRType::from_mani(&fty)), v));
+        }
+        self.static_structs[slot].fields = out;
+        IRValue::Global(label)
     }
 
     // ---------------------------------------------------------------------------

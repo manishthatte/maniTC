@@ -28,6 +28,7 @@ fn add_module() -> IRModule {
         globals: vec![],
         string_literals: vec![],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     }
 }
@@ -64,6 +65,7 @@ fn test_extern_function() {
         globals: vec![],
         string_literals: vec![],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);
@@ -82,6 +84,7 @@ fn test_global_variable() {
         }],
         string_literals: vec![],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);
@@ -96,6 +99,7 @@ fn test_string_literal() {
         globals: vec![],
         string_literals: vec![("@str0".to_string(), "hello".to_string())],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);
@@ -146,6 +150,7 @@ fn test_float_operations() {
         globals: vec![],
         string_literals: vec![],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);
@@ -184,6 +189,7 @@ fn test_alloca_and_store_load() {
         globals: vec![],
         string_literals: vec![],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);
@@ -329,6 +335,7 @@ fn test_vararg_call_emits_full_function_type() {
         globals: vec![],
         string_literals: vec![("fmt0".to_string(), "n = {}".to_string())],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);
@@ -365,6 +372,7 @@ fn test_main_wrapper_emitted() {
         globals: vec![],
         string_literals: vec![],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);
@@ -469,6 +477,7 @@ fn test_call_uses_declared_types() {
         globals: vec![],
         string_literals: vec![("greeting".to_string(), "hello".to_string())],
         float_literals: vec![],
+        static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
     };
     let ir = emit_llvm_ir(&m, None);

@@ -151,6 +151,36 @@ impl LLVMEmitter {
             out.push('\n');
         }
 
+        // ---- Static struct payloads -------------------------------------------
+        //
+        // The storage a struct-valued global points at. Emitted as a literal
+        // aggregate of the field SLOT types rather than as `%struct.Name`,
+        // because that is what the field access actually walks: GetPtr into
+        // an aggregate strides by `i64` (see emit_instr.rs), so the payload
+        // must be a flat run of 8-byte slots and not a named struct type
+        // whose layout LLVM is free to reason about separately.
+        // `llvm_abi_type`, not `llvm_type`: a field whose slot type is a
+        // struct holds a POINTER to that struct, so its spelling here is
+        // `ptr`. Spelled `%struct.Inner` it is an aggregate by value, and
+        // LLVM rejects the initialiser outright — "global variable reference
+        // must have pointer type".
+        for s in &module.static_structs {
+            let tys: Vec<String> = s.fields.iter().map(|(t, _)| llvm_abi_type(t)).collect();
+            let vals: Vec<String> = s.fields.iter()
+                .map(|(t, v)| format!("{} {}", llvm_abi_type(t), irvalue_to_operand(v, t)))
+                .collect();
+            out.push_str(&format!(
+                "@{} = private global {{ {} }} {{ {} }}  ; {}\n",
+                mangle_func_name(&s.label),
+                tys.join(", "),
+                vals.join(", "),
+                s.struct_name,
+            ));
+        }
+        if !module.static_structs.is_empty() {
+            out.push('\n');
+        }
+
         // ---- Global variables -----------------------------------------------
         for g in &module.globals {
             self.emit_global(g, out);

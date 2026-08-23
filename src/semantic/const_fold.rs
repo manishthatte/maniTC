@@ -27,10 +27,11 @@ use super::types::{TypedExpr, TypedExprKind};
 
 /// A value the compiler can compute for itself.
 ///
-/// The variants mirror `lit_to_irvalue` in `ir/lower/helpers.rs` exactly —
-/// notably `char` folds to its code point, as it does there — so that a folded
-/// constant and a directly-lowered literal can never disagree about what a
-/// given literal means.
+/// The scalar variants mirror `lit_to_irvalue` in `ir/lower/helpers.rs`
+/// exactly — notably `char` folds to its code point, as it does there — so
+/// that a folded constant and a directly-lowered literal can never disagree
+/// about what a given literal means. `Struct` has no counterpart there: it is
+/// an aggregate, not a literal, and the lowering gives it static storage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
     Int(i64),
@@ -39,6 +40,24 @@ pub enum ConstValue {
     Trit(i8),
     Str(String),
     Null,
+    /// A struct literal whose every field folded — `T27F { raw: 0 }`.
+    ///
+    /// Unlike the scalars this is not one word: a struct value is a POINTER to
+    /// its fields, so the consumer must place the fields in static storage and
+    /// keep the address. `ir/lower` does that (`IRStaticStruct`); the analyzer
+    /// only asks whether the fold succeeded.
+    ///
+    /// Field values are in STRUCT DECLARATION ORDER, which is what
+    /// `check_expr` normalises a struct literal to and what field access
+    /// assigns by position. Source order never reaches here.
+    ///
+    /// No coercion is applied to the fields — `bool` in a `bool3` field is
+    /// still `Bool` here. The bool→bool3 mapping (`2b − 1`) lives in
+    /// `coerce_value` in the lowering, and writing it a second time in this
+    /// file is exactly the drift the header warns about. The lowering applies
+    /// it when it materialises the payload, where the declared field types are
+    /// in hand.
+    Struct(String, Vec<ConstValue>),
 }
 
 /// Why an expression could not be reduced to a constant.
@@ -77,6 +96,19 @@ pub fn fold(expr: &TypedExpr) -> Folded {
         TypedExprKind::UnOp(op, inner) => fold_unop(op, fold(inner)?),
         TypedExprKind::BinOp(lhs, op, rhs) => fold_binop(fold(lhs)?, op, fold(rhs)?),
         TypedExprKind::Cast(inner, ty) => fold_cast(fold(inner)?, ty),
+        // A struct literal is constant exactly when every field is. This is
+        // what makes `let ZERO: T27F = T27F { raw: 0 };` legal at module
+        // level: before it, `stdlib/t27f.mt` did not type-check standalone,
+        // and the module only worked because `stdlib_expand` inlines constants
+        // at their use sites — where the initialiser is reachable inside a
+        // function (ORACLE_FINDINGS.md Section 50).
+        TypedExprKind::StructLit(name, fields) => {
+            let mut vals = Vec::with_capacity(fields.len());
+            for (_, fexpr) in fields {
+                vals.push(fold(fexpr)?);
+            }
+            Ok(ConstValue::Struct(name.clone(), vals))
+        }
         _ => Err(ConstError::NotConstant),
     }
 }

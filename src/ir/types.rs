@@ -22,6 +22,7 @@ pub struct IRModule {
     pub globals: Vec<IRGlobal>,
     pub string_literals: Vec<(String, String)>, // (label, content)
     pub float_literals: Vec<(String, i64)>,    // (label, f64-bits-as-i64)
+    pub static_structs: Vec<IRStaticStruct>,   // payloads for struct-valued globals
     pub struct_sizes: std::collections::HashMap<String, usize>, // struct name → number of fields
 }
 
@@ -30,6 +31,34 @@ pub struct IRGlobal {
     pub name: String,
     pub ty: IRType,
     pub init: Option<IRValue>,
+}
+
+/// The static storage behind a struct constant.
+///
+/// A struct VALUE in maniT is a pointer to n_fields consecutive 8-byte slots
+/// (`slot_access_ty`), so a module-level `let` of struct type cannot hold the
+/// struct — it holds its address, exactly as a `str` global holds the address
+/// of its `.data` entry. This is the thing the address points at.
+///
+/// Emitted once per struct constant. A field that is itself a struct constant
+/// gets its own entry and is referenced from its parent as `IRValue::Global`,
+/// so nesting needs no extra machinery on either backend.
+#[derive(Debug, Clone)]
+pub struct IRStaticStruct {
+    /// The symbol the payload is emitted under, and what `IRValue::Global`
+    /// refers to from the initialiser that points here.
+    pub label: String,
+    /// The struct this is an instance of — for the comment the backends emit,
+    /// and to keep the payload readable in generated assembly.
+    pub struct_name: String,
+    /// One entry per field IN DECLARATION ORDER (`check_expr` normalises
+    /// struct literals to that order, and field access assigns by position).
+    ///
+    /// The `IRType` is the field's SLOT type — what `slot_access_ty` returns
+    /// for it — so the static payload's layout is, by construction, the same
+    /// layout the runtime load/store path uses rather than a second guess at
+    /// it.
+    pub fields: Vec<(IRType, IRValue)>,
 }
 
 #[derive(Debug, Clone)]

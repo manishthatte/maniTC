@@ -2997,3 +2997,100 @@ fn main() { io::println(fmt::show_int(eight(1,2,3,4,5,6,7,8))); }
     assert_eq!(t3.trim(), "36", "t3 got {:?}", t3);
     assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
 }
+
+// ---------------------------------------------------------------------------
+// §51 — a module-level `let` of struct type
+// ---------------------------------------------------------------------------
+//
+// `let ZERO: T27F = T27F { raw: 0 };` did not type-check: const-folding
+// admitted literals and arithmetic but not struct literals, so `stdlib/t27f.mt`
+// failed a standalone `manitc check` and only worked because `stdlib_expand`
+// inlines module constants at their use sites, where the initialiser sits
+// inside a function. A struct VALUE is a pointer to its fields, and a global
+// is one word, so the word now holds the address of a static payload — the
+// same shape a `str` global has always had.
+
+#[test]
+fn s51_struct_constant_global_works_on_both_backends() {
+    let src = "\
+struct Inner {
+    pub a: int,
+    pub b: float,
+}
+
+struct Outer {
+    pub tag: str,
+    pub inner: Inner,
+    pub flag: bool3,
+    pub t: trit,
+    pub n: int,
+}
+
+let I: Inner = Inner { a: 7, b: 2.5 };
+let O: Outer = Outer { tag: \"nested\", inner: Inner { a: -1, b: 0.5 }, flag: false, t: -1, n: 3 * 4 };
+
+fn main() {
+    io::println_int(I.a);
+    io::println_float(I.b);
+    io::println(O.tag);
+    io::println_int(O.inner.a);
+    io::println_float(O.inner.b);
+    io::println_int(O.flag as int);
+    io::println_int(O.t as int);
+    io::println_int(O.n);
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("s51_struct_global.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    // Every field kind a payload slot can hold: int, float (64-bit bits, which
+    // the T3 word cannot carry and which travel through the .float section),
+    // str (an address), a NESTED struct (another address), bool3 and trit.
+    assert_eq!(
+        t3.trim(),
+        "7\n2.5\nnested\n-1\n0.5\n-1\n-1\n12",
+        "t3 got {:?}",
+        t3
+    );
+    assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+// The module this defect was found in. It is checked as a FILE rather than
+// re-inlined here, so the test fails if `t27f.mt` regains an unfoldable
+// initialiser — which is the thing that was actually broken.
+#[test]
+fn s51_t27f_type_checks_standalone() {
+    let t27f = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("stdlib/t27f.mt");
+    let (ok, so, se) = run_manitc(&["check", t27f.to_str().unwrap()]);
+    assert!(ok, "stdlib/t27f.mt must check standalone:\n{}{}", so, se);
+}
+
+// A module-level `bool3` took its representation from the FOLD, which knows
+// only `Bool`, instead of from the declared type. `false` was stored as 0 —
+// bool3's UNKNOWN — while the same literal inside a function was -1. Both
+// backends were wrong identically, so the differential oracle could not see
+// it; this pins the value, not the agreement.
+#[test]
+fn s51_module_level_bool3_false_is_minus_one() {
+    let src = "\
+let B: bool3 = false;
+let T: bool3 = true;
+
+fn main() {
+    io::println_int(B as int);
+    io::println_int(T as int);
+    let local: bool3 = false;
+    io::println_int(local as int);
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("s51_global_bool3.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(
+        t3.trim(),
+        "-1\n1\n-1",
+        "a module-level bool3 must agree with a local one; t3 got {:?}",
+        t3
+    );
+    assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
+}

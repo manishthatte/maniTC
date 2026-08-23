@@ -773,9 +773,36 @@ pub fn emit_t3_asm(module: &IRModule) -> CompileResult<String> {
     // at 60_000 and grows down) and the emulator's reserved areas (62_000+):
     // one word per global, initialized by a preamble emitted before main.
     const GLOBALS_BASE: i64 = 61_000;
+    // The first address the globals window may NOT use: 62_000 is the
+    // emulator's RESULT_AREA / TUPLE_AREA scratch (emulator/mod.rs).
+    const GLOBALS_LIMIT: i64 = 62_000;
     let mut global_addrs: HashMap<String, i64> = HashMap::new();
     for (i, g) in module.globals.iter().enumerate() {
         global_addrs.insert(g.name.clone(), GLOBALS_BASE + i as i64);
+    }
+    // Static struct payloads follow the one-word globals in the same window.
+    // A struct-valued global holds the ADDRESS of its payload, so the payload
+    // needs storage of its own that outlives no scope and is written before
+    // main — which is exactly what this window and its preamble are.
+    let mut payload_next = GLOBALS_BASE + module.globals.len() as i64;
+    for s in &module.static_structs {
+        global_addrs.insert(s.label.clone(), payload_next);
+        payload_next += s.fields.len() as i64;
+    }
+    if payload_next > GLOBALS_LIMIT {
+        // Silence here would corrupt the emulator's scratch area at run time,
+        // with no sign of where it came from.
+        return Err(CompileError::Codegen(Diagnostic::unknown(format!(
+            "T3 backend: module globals need {} words but the globals window holds {} \
+             (addresses {}..{}, above which the emulator's scratch areas begin). \
+             {} globals and {} static struct payloads.",
+            payload_next - GLOBALS_BASE,
+            GLOBALS_LIMIT - GLOBALS_BASE,
+            GLOBALS_BASE,
+            GLOBALS_LIMIT - 1,
+            module.globals.len(),
+            module.static_structs.len(),
+        ))));
     }
 
     /// Materialize `imm` into `reg` (clobbering `tmp` for the large split),
@@ -806,39 +833,81 @@ pub fn emit_t3_asm(module: &IRModule) -> CompileResult<String> {
     // module's .float section below, alongside the ones functions emit.
     let mut global_float_literals: Vec<(String, i64)> = Vec::new();
 
+    /// Materialise one compile-time initialiser into R1, clobbering R3.
+    ///
+    /// Shared by the globals themselves and by the words of a static struct
+    /// payload, because a payload field is the same kind of thing as a global
+    /// initialiser: a constant that must exist before main runs.
+    fn init_into_r1(
+        out: &mut String,
+        global_float_literals: &mut Vec<(String, i64)>,
+        global_addrs: &HashMap<String, i64>,
+        init: Option<&IRValue>,
+    ) {
+        match init {
+            // A float's bits are a 64-bit pattern — far outside the 27-trit
+            // word, so `lit_into` cannot build it: the TMUL split trapped at
+            // run time before the program reached main (`let P: float = 1.5`
+            // died on "TMUL overflow: result 4609434218000"). Take the same
+            // route function-local float literals already take: park the bits
+            // in the .float section and fetch them with the float-load
+            // syscall.
+            Some(IRValue::Const(IRConst::Float(f))) => {
+                let label = format!("@float_global_{}", global_float_literals.len());
+                let clean = label.trim_start_matches('@').to_string();
+                global_float_literals.push((label, f.to_bits() as i64));
+                out.push_str(&format!("    TLIT  R1, #{}  ; float-lit addr\n", clean));
+                out.push_str(&format!("    SYSCALL #219  ; float_load bits for {}\n", f));
+            }
+            // A `str` global holds the ADDRESS of its .data entry. The old
+            // code ran the label through `irconst_to_i64`, whose `Str` arm
+            // returns 0, so every string global was the null address and
+            // printing one dumped emulator memory. LLVM emitted
+            // `@S = global ptr @str0` and was right all along, so this one
+            // did diverge — unlike the negative-integer case, which was
+            // wrong identically on both sides.
+            Some(IRValue::Const(IRConst::Str(label))) => {
+                let clean = label.trim_start_matches('@');
+                out.push_str(&format!("    TLIT  R1, #{}  ; &{}\n", clean, clean));
+            }
+            // A struct constant — either a struct-valued global or a field
+            // that is itself one — holds the ADDRESS of its static payload,
+            // for the same reason a `str` holds the address of its `.data`
+            // entry: the word cannot hold the aggregate.
+            Some(IRValue::Global(label)) => match global_addrs.get(label) {
+                Some(&addr) => out.push_str(&format!("    TLIT  R1, #{}  ; &{}\n", addr, label)),
+                // Unknown symbol: keep the symbolic form so the assembler
+                // fails loudly rather than the program reading address 0.
+                None => out.push_str(&format!("    TLIT  R1, #{}\n", label)),
+            },
+            Some(IRValue::Const(c)) => lit_into(out, "R1", "R3", irconst_to_i64(c)),
+            _ => lit_into(out, "R1", "R3", 0),
+        }
+    }
+
     if !module.globals.is_empty() {
+        // Payloads first: a global's word is the address of one, and writing
+        // the address before the thing it points at would still be correct
+        // here (nothing reads memory until main), but this order keeps the
+        // listing readable.
+        if !module.static_structs.is_empty() {
+            out.push_str("; static struct payloads\n");
+            for s in &module.static_structs {
+                let base = global_addrs[&s.label];
+                for (i, (_, v)) in s.fields.iter().enumerate() {
+                    init_into_r1(&mut out, &mut global_float_literals, &global_addrs, Some(v));
+                    out.push_str(&format!(
+                        "    TLIT  R2, #{}  ; &{}.{} ({})\n",
+                        base + i as i64, s.label, i, s.struct_name,
+                    ));
+                    out.push_str("    STORE R1, [R2+#0]\n");
+                }
+            }
+        }
         out.push_str("; globals init\n");
         for g in &module.globals {
             let addr = global_addrs[&g.name];
-            match &g.init {
-                // A float's bits are a 64-bit pattern — far outside the 27-trit
-                // word, so `lit_into` cannot build it: the TMUL split trapped at
-                // run time before the program reached main (`let P: float = 1.5`
-                // died on "TMUL overflow: result 4609434218000"). Take the same
-                // route function-local float literals already take: park the bits
-                // in the .float section and fetch them with the float-load
-                // syscall.
-                Some(IRValue::Const(IRConst::Float(f))) => {
-                    let label = format!("@float_global_{}", global_float_literals.len());
-                    let clean = label.trim_start_matches('@').to_string();
-                    global_float_literals.push((label, f.to_bits() as i64));
-                    out.push_str(&format!("    TLIT  R1, #{}  ; float-lit addr\n", clean));
-                    out.push_str(&format!("    SYSCALL #219  ; float_load bits for {}\n", f));
-                }
-                // A `str` global holds the ADDRESS of its .data entry. The old
-                // code ran the label through `irconst_to_i64`, whose `Str` arm
-                // returns 0, so every string global was the null address and
-                // printing one dumped emulator memory. LLVM emitted
-                // `@S = global ptr @str0` and was right all along, so this one
-                // did diverge — unlike the negative-integer case, which was
-                // wrong identically on both sides.
-                Some(IRValue::Const(IRConst::Str(label))) => {
-                    let clean = label.trim_start_matches('@');
-                    out.push_str(&format!("    TLIT  R1, #{}  ; &{}\n", clean, clean));
-                }
-                Some(IRValue::Const(c)) => lit_into(&mut out, "R1", "R3", irconst_to_i64(c)),
-                _ => lit_into(&mut out, "R1", "R3", 0),
-            }
+            init_into_r1(&mut out, &mut global_float_literals, &global_addrs, g.init.as_ref());
             out.push_str(&format!("    TLIT  R2, #{}  ; &{}\n", addr, g.name));
             out.push_str("    STORE R1, [R2+#0]\n");
         }
