@@ -3094,3 +3094,279 @@ fn main() {
     );
     assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
 }
+
+// ---------------------------------------------------------------------------
+// §52 — the command-line argument trio worked on neither backend
+// ---------------------------------------------------------------------------
+//
+// `thatteos/userspace/editor.mt` was the one shipped program that failed on
+// BOTH backends, and the reason was three separate defects wearing one name:
+//
+//   env::arg   the maniT spelling is `arg`, so the LLVM backend emits
+//              `@env_arg` — but runtime/system.c defined `env_argv`, a symbol
+//              no maniT program could name. Neither backend had it.
+//   env::argc  implemented on LLVM, no T3 syscall at all.
+//   env::args  no `env_args` symbol on LLVM; on T3 a syscall that returned an
+//              EMPTY VEC to every caller, which the stdlib census scored as
+//              "T3 only" — a stub counted as an implementation.
+//
+// `args` is now maniT source over the two scalar natives, so there is one
+// implementation instead of two that could drift, and `run-t3` takes the
+// program's arguments after the binary.
+//
+// These tests pin the VALUES on both backends, not merely that the backends
+// agree: `args` agreed with nothing (LLVM could not link) and the T3 stub
+// would have passed any test that only compared the two.
+
+/// As [`run_both_backends`], with arguments handed to the program itself.
+fn run_both_backends_with_args(
+    name: &str,
+    source: &str,
+    args: &[&str],
+) -> ((i32, String), (i32, String)) {
+    let path = write_source(name, source);
+    let stem = temp_dir().join(name.trim_end_matches(".mt"));
+
+    let t3_out = stem.with_extension("t3out");
+    let (ok, so, se) = run_manitc(&[
+        "compile", "--target", "t3", path.to_str().unwrap(), "-o", t3_out.to_str().unwrap(),
+    ]);
+    assert!(ok, "{}: t3 compile failed:\n{}{}", name, so, se);
+    let t3b = t3_out.with_extension("t3b");
+    let t3 = Command::new(get_manitc())
+        .arg("run-t3")
+        .arg(t3b.to_str().unwrap())
+        .args(args)
+        .output()
+        .expect("run-t3");
+    // Drop the "[T3ISA] running ..." banner line.
+    let t3_text: String = String::from_utf8_lossy(&t3.stdout)
+        .lines()
+        .skip(1)
+        .map(|l| format!("{}\n", l))
+        .collect();
+
+    let bin = stem.with_extension("bin");
+    let (ok, so, se) = run_manitc(&[
+        "compile", "--target", "llvm", path.to_str().unwrap(), "-o", bin.to_str().unwrap(),
+    ]);
+    assert!(ok, "{}: llvm compile failed:\n{}{}", name, so, se);
+    let ll = Command::new(&bin).args(args).output().expect("run llvm binary");
+    let ll_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ll.stdout),
+        String::from_utf8_lossy(&ll.stderr),
+    );
+
+    (
+        (t3.status.code().unwrap_or(-1), t3_text),
+        (ll.status.code().unwrap_or(-1), ll_text),
+    )
+}
+
+// The program prints, in order: argc, arg(1) or "-", arg(2) or "-", the
+// out-of-range arg(99), args().len(), and whether arg(0) is non-empty.
+//
+// arg(0)'s CONTENT is deliberately not pinned and must not be: on LLVM it is
+// the binary's path out of /proc/self/cmdline and on T3 it is the .t3b handed
+// to the emulator. Those are different files by construction. What has to
+// match is that both have one — argv[0] exists, so `argc() > 1` means the same
+// thing to a program on either backend, which is precisely what editor.mt asks.
+const ARGV_PROBE: &str = "\
+use std::env;
+
+fn main() {
+    io::println_int(env::argc());
+    if env::argc() > 1 { io::println(env::arg(1)); } else { io::println(\"-\"); }
+    if env::argc() > 2 { io::println(env::arg(2)); } else { io::println(\"-\"); }
+    io::println(env::arg(99));
+    let a = env::args();
+    io::println_int(a.len());
+    if str::len(env::arg(0)) > 0 { io::println(\"argv0\"); } else { io::println(\"EMPTY\"); }
+}
+";
+
+#[test]
+fn s52_the_argument_trio_agrees_on_both_backends_with_no_args() {
+    let ((t3_code, t3), (ll_code, ll)) =
+        run_both_backends_with_args("s52_argv_none.mt", ARGV_PROBE, &[]);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    // argc is 1 (argv[0] alone), both optional args print "-", arg(99) is the
+    // empty line, args() has one element, and arg(0) is non-empty.
+    assert_eq!(t3.trim_end(), "1\n-\n-\n\n1\nargv0", "t3 got {:?}", t3);
+    assert_eq!(t3.trim_end(), ll.trim_end(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+#[test]
+fn s52_the_argument_trio_carries_real_arguments() {
+    let ((t3_code, t3), (ll_code, ll)) =
+        run_both_backends_with_args("s52_argv_two.mt", ARGV_PROBE, &["hello", "world"]);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    // This is the assertion the old T3 stub could never have passed: it
+    // answered "no arguments" whatever it was given, so args().len() was 0.
+    assert_eq!(t3.trim_end(), "3\nhello\nworld\n\n3\nargv0", "t3 got {:?}", t3);
+    assert_eq!(t3.trim_end(), ll.trim_end(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+// An out-of-range index returns "" on both, and does NOT trap. The two
+// implementations — runtime/system.c's env_arg and emulator syscall 553 — are
+// the hand-written pair for this call, exactly like manit_check_result_ok and
+// syscall 561, so the behaviour they share is pinned rather than assumed.
+#[test]
+fn s52_an_out_of_range_argument_is_empty_not_a_trap() {
+    let src = "\
+use std::env;
+
+fn main() {
+    io::println_int(str::len(env::arg(5)));
+    io::println_int(str::len(env::arg(0 - 1)));
+    io::println(\"survived\");
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("s52_argv_oob.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {} (70 is a TRAP): {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(t3.trim_end(), "0\n0\nsurvived", "t3 got {:?}", t3);
+    assert_eq!(t3.trim_end(), ll.trim_end(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+// The caller that started this. It compiled on NEITHER backend before §52;
+// it must now at least get through the type checker, which is where
+// `env::argv` stopped it. It still does not build on T3, for an unrelated
+// reason recorded in §52 — a flat terminal layer (io_move_cursor,
+// terminal_set_raw, …) that lives only in the C runtime.
+#[test]
+fn s52_the_editor_type_checks() {
+    let editor = PathBuf::from("/home/manish/oss/thatteos/userspace/editor.mt");
+    if !editor.exists() {
+        return; // thatteOS is a separate repo; skip when it is not checked out.
+    }
+    let (ok, so, se) = run_manitc(&["check", editor.to_str().unwrap()]);
+    assert!(ok, "thatteos/userspace/editor.mt must check:\n{}{}", so, se);
+}
+
+// ---------------------------------------------------------------------------
+// §53 — `sext i1 true` is -1, and four widening sites did it
+// ---------------------------------------------------------------------------
+//
+// `io::println_int(5 > 0)` printed **-1** on LLVM and **1** on T3. The
+// comparison yields an `i1`, the declared parameter is `int`, and the LLVM
+// backend's argument-coercion path SIGN-extended it: `sext i1 true to i64` is
+// -1, not 1.
+//
+// The rule was already written out correctly at three of this backend's seven
+// widening sites — including the vararg branch eleven lines above the broken
+// one — and at the typed `pick_cast_op`, which is why an EXPLICIT `(5 > 0) as
+// int` was always right. It is now `helpers::widen_op`, called by all of them.
+//
+// Why it survived: `sext i1 false` is 0, which is the correct answer. Only
+// `true` was wrong, so every test that happened to check a false condition
+// passed. This pins both polarities, on both backends, in every position a
+// widening can happen: argument, return, store and comparison.
+
+#[test]
+fn s53_an_i1_widens_by_zero_extension_not_sign_extension() {
+    let src = "\
+fn ret_bool(n: int) -> int {
+    return n > 0;
+}
+
+fn main() {
+    // Argument position — the site that was found broken.
+    io::println_int(5 > 0);
+    io::println_int(1 > 5);
+    io::println_int(true);
+    io::println_int(false);
+    // Return position: an i1 returned through an `int` slot.
+    io::println_int(ret_bool(7));
+    io::println_int(ret_bool(0 - 7));
+    // Store position is NOT exercised here and cannot be: a let of an int
+    // from a bool is a type error, and correctly so. That asymmetry is itself
+    // the finding -- see s53_a_bool_is_rejected_by_let_and_accepted_by_a_native.
+    // Comparison position is likewise unreachable from source: (9 > 2) == 1 is
+    // rejected, == cannot be applied to a bool and an int. The icmp widening
+    // sites are fixed anyway, defensively -- an i1 can still reach them
+    // through lowering.
+    // The explicit cast, which was never wrong, must not have changed.
+    io::println_int((5 > 0) as int);
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("s53_i1_widen.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(
+        t3.trim_end(),
+        "1\n0\n1\n0\n1\n0\n1",
+        "true must widen to 1, never -1; t3 got {:?}",
+        t3
+    );
+    assert_eq!(t3.trim_end(), ll.trim_end(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+// The backend must not reason the rule out a fourth time. Any NEW widening
+// site written as a bare `if aw < dw { "sext" }` reintroduces the defect, so
+// the source is checked for the literal pattern rather than the behaviour.
+#[test]
+fn s53_every_widening_site_goes_through_widen_op() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/codegen_llvm");
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(&root).expect("read codegen_llvm") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source");
+        for (i, line) in text.lines().enumerate() {
+            // A widening that names "sext" directly, rather than asking
+            // widen_op, is only safe where i1 provably cannot arrive — and the
+            // one such site (main's return, which is i64/i16/i8 by match) does
+            // not use this shape.
+            // The exact broken idiom: a WIDTH-driven widening whose widening
+            // arm names "sext" directly. `widen_op`'s own definition tests
+            // `== "i1"` and main's return-value coercion tests `== "i64"`, so
+            // neither matches — and neither should, one being the rule itself
+            // and the other a site i1 cannot reach (its match arms are
+            // i64/i16/i8).
+            let width_driven = line.contains("aw < dw") || line.contains("aw < tw");
+            if width_driven && line.contains("\"sext\"") {
+                offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these widening sites bypass helpers::widen_op, so `true` will widen to -1:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+// The asymmetry §53 ran into, recorded rather than changed.
+//
+// `let s: int = 5 > 0;` is a type error. `io::println_int(5 > 0)` is not, and
+// `manitc check` reports it clean with no warning — the same bool arriving in
+// the same `int` slot, rejected in one position and silently coerced in the
+// other. The coercion is deliberate (`native_param_manitys` exists to feed
+// declared parameter types into lowering for natives, which have no body), but
+// it happens WITHOUT a type check, so a native's declared signature does not
+// constrain its callers the way a maniT function's does.
+//
+// This is left as-is on purpose: tightening it is §3.2's job — the checker-hole
+// triage — not a change to smuggle in beside a codegen fix, and 771 known
+// mutations already turn on how that leniency is narrowed. What §53 guarantees
+// is only that while the coercion is permitted, it produces the RIGHT VALUE.
+// The test pins the asymmetry so that closing it is a deliberate act that
+// updates this test, rather than a silent change of behaviour.
+#[test]
+fn s53_a_bool_is_rejected_by_let_and_accepted_by_a_native() {
+    assert_check_error(
+        "s53_bool_let.mt",
+        "fn main() { let s: int = 5 > 0; io::println_int(s); }\n",
+        "type mismatch",
+    );
+    assert_checks(
+        "s53_bool_native_arg.mt",
+        "fn main() { io::println_int(5 > 0); }\n",
+    );
+}

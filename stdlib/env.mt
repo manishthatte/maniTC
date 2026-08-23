@@ -13,16 +13,34 @@
 // Command-line arguments
 // ---------------------------------------------------------------------------
 
-// Return the command-line arguments as a Vec of strings.
-// Index 0 is the program name; subsequent indices are the arguments passed
-// by the user.
-fn args() -> Vec<str> ;  // native
-
 // Return the number of command-line arguments (including argv[0]).
 fn argc() -> int ;  // native
 
-// Return argument at position `i`.  Panics if i >= argc().
+// Return argument at position `i`.
+// Returns "" if `i` is outside 0 .. argc()-1.
 fn arg(i: int) -> str ;  // native
+
+// `args` is maniT, not a native, and deliberately so.  A native would have to
+// build a Vec, and the two backends build Vecs by completely different means —
+// LLVM through the C runtime, T3 through an emulator heap object — so it would
+// need writing twice and could drift.  It had ZERO implementations on LLVM and
+// on T3 a syscall that returned an empty Vec to every caller, which the census
+// scored as working.  Written over `argc` and `arg`, which are scalar natives
+// on both, it is one implementation and the two cannot disagree.
+//
+// Return the command-line arguments as a Vec of strings.
+// Index 0 is the program name; subsequent indices are the arguments passed
+// by the user.
+fn args() -> Vec<str> {
+    let out: Vec<str> = Vec::new();
+    let n = argc();
+    let mut i = 0;
+    while i < n {
+        out.push(arg(i));
+        i = i + 1;
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // Environment variables

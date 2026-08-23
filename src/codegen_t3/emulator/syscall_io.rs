@@ -544,7 +544,7 @@ impl Emulator {
             }
 
             // ----------------------------------------------------------------
-            // Time (540) and env (550-551)
+            // Time (540) and env (550, 552-553)
             // ----------------------------------------------------------------
             540 => {
                 // time_now() -> R1 (Unix timestamp as milliseconds, i64)
@@ -561,11 +561,29 @@ impl Emulator {
                 // run-t3 propagates R1 as the process status.)
                 self.halted = true;
             }
-            #[allow(unreachable_patterns)]
-            551 => {
-                // env_args() -> R1 — returns a Vec handle (empty for now)
-                let h = self.heap_alloc_obj(HeapObj::Vec(Vec::new()));
-                self.regs[1] = h as i64;
+            552 => {
+                // env_argc() -> R1
+                //
+                // `argv[0]` is the .t3b the emulator was handed, so argc is
+                // never 0 — it matches the LLVM backend, where env_argc reads
+                // /proc/self/cmdline and counts the binary path itself.
+                self.regs[1] = self.argv.len() as i64;
+            }
+            553 => {
+                // env_arg(R1) -> R1
+                //
+                // Out of range returns "", not a trap, byte-for-byte with
+                // runtime/system.c's env_arg. The two implementations are the
+                // one hand-written pair for this call, so they are kept
+                // deliberately boring and identical.
+                let idx = self.regs[1];
+                let s = if idx < 0 || idx as usize >= self.argv.len() {
+                    String::new()
+                } else {
+                    self.argv[idx as usize].clone()
+                };
+                let addr = self.heap_alloc_str(s);
+                self.regs[1] = addr as i64;
             }
 
             // Unassigned numbers inside the claimed ranges (e.g. 218) take the

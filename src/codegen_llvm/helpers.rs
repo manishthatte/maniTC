@@ -119,6 +119,26 @@ pub(crate) fn int_width(ty_str: &str) -> u32 {
     }
 }
 
+/// The widening opcode for an integer coercion written in LLVM type STRINGS.
+///
+/// `i1` must ZERO-extend: it holds a logical 0/1, and `sext i1 true to i64` is
+/// **-1**. Every wider integer type carries a signed value — a `trit` is an i8
+/// holding -1/0/+1, and -1 must stay -1 — so those sign-extend.
+///
+/// This exists because that one rule was written out at three of the seven
+/// widening sites in this backend and forgotten at the other four, and the
+/// omission is close to invisible: `sext i1 false` is 0, which is the right
+/// answer, so only `true` is wrong and only in the paths that skip
+/// [`pick_cast_op`]. It surfaced on 23 August 2026 as
+/// `io::println_int(5 > 0)` printing **-1** on LLVM and **1** on T3.
+///
+/// The typed path ([`pick_cast_op`]) has always had this right. Anything that
+/// works in LLVM type strings instead of `IRType` must call this rather than
+/// reason it out again.
+pub(crate) fn widen_op(actual_ty: &str) -> &'static str {
+    if actual_ty == "i1" { "zext" } else { "sext" }
+}
+
 // ---------------------------------------------------------------------------
 // Type-inference helpers
 // ---------------------------------------------------------------------------
@@ -670,7 +690,7 @@ declare void @env_set_env(ptr, ptr)
 declare void @env_unset_env(ptr)
 declare i1 @env_has_env(ptr)
 declare i64 @env_argc()
-declare ptr @env_argv(i64)
+declare ptr @env_arg(i64)
 declare ptr @env_cwd()
 declare void @env_set_cwd(ptr)
 declare i64 @env_pid()

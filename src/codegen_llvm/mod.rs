@@ -617,7 +617,7 @@ impl LLVMEmitter {
             let tw = int_width(&cmp_ty);
             if aw != tw {
                 let ext_name = format!("{}__lext", dst_name);
-                let op = if aw < tw { "sext" } else { "trunc" };
+                let op = if aw < tw { widen_op(&l_actual) } else { "trunc" };
                 prefix.push_str(&format!("{} = {} {} {} to {}\n  ", ext_name, op, l_actual, l_str, cmp_ty));
                 ext_name
             } else {
@@ -639,7 +639,7 @@ impl LLVMEmitter {
             let tw = int_width(&cmp_ty);
             if aw != tw {
                 let ext_name = format!("{}__rext", dst_name);
-                let op = if aw < tw { "sext" } else { "trunc" };
+                let op = if aw < tw { widen_op(&r_actual) } else { "trunc" };
                 prefix.push_str(&format!("{} = {} {} {} to {}\n  ", ext_name, op, r_actual, r_str, cmp_ty));
                 ext_name
             } else {

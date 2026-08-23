@@ -80,7 +80,16 @@ MODULE_BLURB = {
     "crypto":  "Ternary cipher, hash and TRNG primitives.",
     "t27f":    "The 27-trit floating-point format, implemented in ManiT over `word`.",
     "time":    "Clocks and sleeping.",
-    "env":     "Process environment, arguments, and exit. **Twenty-five of the twenty-six do not work on at least one backend** — most are present on LLVM and absent from the T3 emulator, so a program using them compiles for one target and fails to assemble for the other.",
+    # No count in this blurb, deliberately. It used to open "Twenty-five of the
+    # twenty-six do not work on at least one backend", and on 23 August 2026
+    # that became twenty-two without the sentence changing — the whole point of
+    # generating this file is that the Works column cannot go stale, and a
+    # frozen number in the prose beside it can.
+    "env":     "Process environment, arguments, and exit. Largely one-sided: most entries are "
+               "present on LLVM and absent from the T3 emulator, so a program using them "
+               "compiles for one target and fails to assemble for the other. The argument trio "
+               "— `argc`, `arg`, `args` — is the exception and works on both. Read the Works "
+               "column before relying on an entry.",
     "fs":      "File system access. Like `env::`, largely one-sided — see the Works column before relying on an entry.",
     "net":     "Sockets. Two separate things are true here. On LLVM this runtime is built "
                "with `-DMANIT_NO_GUI`, which compiles network support out and raises a "

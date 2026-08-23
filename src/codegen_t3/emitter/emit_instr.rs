@@ -1387,18 +1387,30 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 // ------------------------------------------------------------------
-                // Env syscalls (550-551)
+                // Env syscalls (550, 552-553)
                 // ------------------------------------------------------------------
+                //
+                // `env::args` is NOT here, and its absence is the fix rather than
+                // an omission. It used to be syscall 551, which returned an empty
+                // Vec unconditionally — a stub that answered "no arguments" to
+                // every question and could not be caught by the differential
+                // oracle, because the LLVM side had no `env_args` symbol at all
+                // and so never got far enough to disagree. It is now ordinary
+                // maniT in stdlib/env.mt, built over the two scalar natives
+                // below, and falls through to the general-call path.
                 "env::exit" => {
                     emit_syscall_1arg(em, args, dst, 550, "env::exit");
                 }
-                "env::args" => {
+                "env::argc" => {
                     em.rescue_reg(1);
-                    em.emit("    SYSCALL #551  ; env::args".to_string());
+                    em.emit("    SYSCALL #552  ; env::argc".to_string());
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
-                        if rd != 1 { em.emit(format!("    MOV   {}, R1  ; env::args result", AsmEmitter::rn(rd))); }
+                        if rd != 1 { em.emit(format!("    MOV   {}, R1  ; env::argc result", AsmEmitter::rn(rd))); }
                     }
+                }
+                "env::arg" => {
+                    emit_syscall_1arg_ret(em, args, dst, 553, "env::arg");
                 }
                 _ => {
                     // General call — full caller-save convention.

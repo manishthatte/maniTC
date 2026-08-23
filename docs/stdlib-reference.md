@@ -543,15 +543,15 @@ Clocks and sleeping.
 
 ## std::env
 
-Process environment, arguments, and exit. **Twenty-five of the twenty-six do not work on at least one backend** — most are present on LLVM and absent from the T3 emulator, so a program using them compiles for one target and fails to assemble for the other.
+Process environment, arguments, and exit. Largely one-sided: most entries are present on LLVM and absent from the T3 emulator, so a program using them compiles for one target and fails to assemble for the other. The argument trio — `argc`, `arg`, `args` — is the exception and works on both. Read the Works column before relying on an entry.
 
 | Function | Signature | Body | Works | Description |
 |---|---|---|---|---|
 | `env::abort` | `(message: str)` | native | **LLVM only** | Abort the process with a non-zero exit code and a message on stderr. |
 | `env::arch` | `() -> str` | native | **LLVM only** | Return the CPU architecture ("x86_64", "aarch64", "ternary", …). |
-| `env::arg` | `(i: int) -> str` | native | **neither** | Return argument at position `i`.  Panics if i >= argc(). |
-| `env::argc` | `() -> int` | native | **LLVM only** | Return the number of command-line arguments (including argv[0]). |
-| `env::args` | `() -> Vec<str>` | native | **T3 only** | Return the command-line arguments as a Vec of strings. Index 0 is the program name; subsequent indices are the arguments passed by the user. |
+| `env::arg` | `(i: int) -> str` | native | yes | Return argument at position `i`. Returns "" if `i` is outside 0 .. argc()-1. |
+| `env::argc` | `() -> int` | native | yes | Return the number of command-line arguments (including argv[0]). |
+| `env::args` | `() -> Vec<str>` | ManiT | yes | Return the command-line arguments as a Vec of strings. Index 0 is the program name; subsequent indices are the arguments passed by the user. |
 | `env::cache_dir` | `() -> str` | native | **neither** | Return the path to the maniT package cache (where trit downloads packages). |
 | `env::config_dir` | `() -> str` | native | **neither** | Return the path to the user's config directory. |
 | `env::cpu_count` | `() -> int` | native | **LLVM only** | Return the number of logical CPU cores available to this process. |
@@ -638,7 +638,7 @@ Assertions. Pure ManiT over `io::println` and `env::exit`, so it needs nothing f
 
 ## Census
 
-**325 declarations** across 13 modules: **222 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **66 do not work on at least one backend**.
+**325 declarations** across 13 modules: **225 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **63 do not work on at least one backend**.
 
 The *Works* column records whether a one-line program calling the function compiles and links on each backend. It is a test of existence, not of correctness: a function marked `yes` has a body on both sides, which is exactly what `fmt::`'s twenty-five documented-but-undefined entries did not. A `not probed` row is an admission, not a pass.
 

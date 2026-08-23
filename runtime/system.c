@@ -238,7 +238,12 @@ int64_t env_argc(void) {
     return (int64_t)g_argc_val;
 }
 
-char* env_argv(int64_t idx) {
+/* Named for the maniT function it backs — `env::arg(i)`, not C's argv.  It was
+   `env_argv` until 23 Aug 2026, which no maniT program could ever reach: the
+   symbol the LLVM backend emits is the mangled maniT path, and stdlib/env.mt
+   spells the function `arg`.  So the runtime had the implementation, the
+   backend declared it, and the one name that mattered did not match either. */
+char* env_arg(int64_t idx) {
     parse_cmdline_once();
     if (idx < 0 || idx >= g_argc_val) return strdup("");
     return strdup(g_argv_ptrs[idx]);

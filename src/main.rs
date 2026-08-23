@@ -95,6 +95,14 @@ enum Commands {
         /// raise it for a benchmark that legitimately runs long.
         #[arg(long, value_name = "N", default_value_t = codegen_t3::DEFAULT_MAX_STEPS)]
         max_steps: usize,
+
+        /// Arguments passed on to the program, readable with `env::arg(i)`.
+        ///
+        /// Everything after the binary is the program's, not ours: put
+        /// `--debug` or `--max-steps` BEFORE the file, or `--` in front of an
+        /// argument that would otherwise look like a flag of ours.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "ARGS")]
+        args: Vec<String>,
     },
 
     /// Benchmark: compile to both LLVM and T3ISA, run both, compare metrics
@@ -481,7 +489,7 @@ fn compile_t3_in_memory(file: &PathBuf) -> CompileResult<(
         Diagnostic::unknown(format!("T3ISA assembler error: {}", e))))
 }
 
-fn run_t3(file: &PathBuf, debug: bool, max_steps: usize) -> CompileResult<()> {
+fn run_t3(file: &PathBuf, debug: bool, max_steps: usize, prog_args: &[String]) -> CompileResult<()> {
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     let (words, str_data, float_data) = if ext == "mt" {
@@ -535,11 +543,20 @@ fn run_t3(file: &PathBuf, debug: bool, max_steps: usize) -> CompileResult<()> {
         (words, str_data, float_data)
     };
 
+    // argv[0] is the file the emulator was handed, mirroring the LLVM backend,
+    // where env_argc/env_arg read /proc/self/cmdline and argv[0] is the binary
+    // path. A program that asks `argc() > 1` therefore gets the same answer on
+    // both backends when it is run with no arguments — which is how the
+    // shipped-corpus survey runs everything.
+    let argv: Vec<String> = std::iter::once(file.display().to_string())
+        .chain(prog_args.iter().cloned())
+        .collect();
+
     pipe_safe_print(&format!("[T3ISA] running {} ({} words)\n", file.display(), words.len()));
     let (output_lines, exit_code) = if debug {
-        (codegen_t3::run_emulator_debug(words, str_data, float_data), 0)
+        (codegen_t3::run_emulator_debug_argv(words, str_data, float_data, argv), 0)
     } else {
-        codegen_t3::run_emulator_with_exit_capped(words, str_data, float_data, max_steps)
+        codegen_t3::run_emulator_with_exit_capped_argv(words, str_data, float_data, max_steps, argv)
     };
     for piece in &output_lines {
         pipe_safe_print(piece);
@@ -597,7 +614,7 @@ fn run() {
         Commands::Check { file, warn_as_error } => run_check(file, *warn_as_error),
         Commands::Lex { file } => run_lex(file),
         Commands::Parse { file } => run_parse(file),
-        Commands::RunT3 { file, debug, max_steps } => run_t3(file, *debug, *max_steps),
+        Commands::RunT3 { file, debug, max_steps, args } => run_t3(file, *debug, *max_steps, args),
         Commands::Bench { file, iterations } => run_bench(file, *iterations),
         Commands::Lsp => {
             tokio::runtime::Runtime::new()

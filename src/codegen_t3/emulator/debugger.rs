@@ -268,11 +268,25 @@ pub fn run_emulator_with_exit_capped(
     float_data: HashMap<usize, i64>,
     max_steps: usize,
 ) -> (Vec<String>, i64) {
+    run_emulator_with_exit_capped_argv(words, string_data, float_data, max_steps,
+                                       Emulator::new().argv)
+}
+
+/// As [`run_emulator_with_exit_capped`], with the program's command-line
+/// arguments — `argv[0]` first — for `env::argc` and `env::arg` to report.
+pub fn run_emulator_with_exit_capped_argv(
+    words: Vec<i64>,
+    string_data: HashMap<usize, String>,
+    float_data: HashMap<usize, i64>,
+    max_steps: usize,
+    argv: Vec<String>,
+) -> (Vec<String>, i64) {
     let mut emu = Emulator::new();
     emu.load_program(words);
     emu.string_data = string_data;
     emu.float_data = float_data;
     emu.max_steps = max_steps;
+    emu.argv = argv;
     let out = emu.run_with_output();
     // A5: the exit status normally comes from main's return value in R1, but a
     // program stopped by a TRAP never returned, so R1 holds whatever the
@@ -334,11 +348,22 @@ pub fn run_emulator_debug(
     string_data: HashMap<usize, String>,
     float_data: HashMap<usize, i64>,
 ) -> Vec<String> {
+    run_emulator_debug_argv(words, string_data, float_data, Emulator::new().argv)
+}
+
+/// As [`run_emulator_debug`], with the program's command-line arguments.
+pub fn run_emulator_debug_argv(
+    words: Vec<i64>,
+    string_data: HashMap<usize, String>,
+    float_data: HashMap<usize, i64>,
+    argv: Vec<String>,
+) -> Vec<String> {
     let mut emu = Emulator::new();
     emu.load_program(words);
     emu.string_data = string_data;
     emu.float_data = float_data;
     emu.debug = true;
+    emu.argv = argv;
     emu.run_with_output()
 }
 

@@ -6,8 +6,10 @@ pub use profiler::ExecProfile;
 pub(crate) use profiler::{Task, DebugAction};
 
 pub mod debugger;
-pub use debugger::{run_emulator, run_emulator_debug, run_emulator_profiled, run_emulator_with_exit,
-                   run_emulator_with_exit_capped, DEFAULT_MAX_STEPS, T3_STEP_LIMIT_EXIT};
+pub use debugger::{run_emulator, run_emulator_debug, run_emulator_debug_argv,
+                   run_emulator_profiled, run_emulator_with_exit,
+                   run_emulator_with_exit_capped, run_emulator_with_exit_capped_argv,
+                   DEFAULT_MAX_STEPS, T3_STEP_LIMIT_EXIT};
 
 mod execute;
 mod syscalls;
@@ -118,6 +120,16 @@ pub struct Emulator {
     /// [`debugger::DEFAULT_MAX_STEPS`]; `manitc run-t3 --max-steps N` overrides
     /// it. This is a runaway guard, NOT a correctness limit — see the constant.
     pub max_steps: usize,
+    /// The program's command-line arguments, `argv[0]` first, as `env::argc`
+    /// and `env::arg` see them (syscalls 552/553).
+    ///
+    /// A public field set after `new()`, like `debug` and `max_steps`, so that
+    /// none of the five `run_emulator*` entry points change signature. Default
+    /// is a single empty element rather than an empty vector: every real
+    /// process has an `argv[0]`, and a program asking `argc() > 1` must get the
+    /// same answer here as it does on LLVM, where `env_argc` counts the binary
+    /// path out of /proc/self/cmdline.
+    pub argv: Vec<String>,
     /// Set when execution stopped because `max_steps` was reached.
     ///
     /// Kept separate from `trapped` because the two mean opposite things to a
@@ -159,6 +171,7 @@ impl Emulator {
             debug: false,
             breakpoints: HashSet::new(),
             max_steps: debugger::DEFAULT_MAX_STEPS,
+            argv: vec![String::new()],
             step_limited: false,
         }
     }

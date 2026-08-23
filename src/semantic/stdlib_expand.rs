@@ -1,16 +1,22 @@
 //! Expansion of ManiT-source standard library modules.
 //!
-//! Most stdlib modules (io, math, sync, …) are *native*: their `.mt` files
-//! carry only documented signatures, and the implementations live in the C
-//! runtime (LLVM backend) or in emulator syscalls / emitter intrinsics (T3
-//! backend). Three modules, however, are implemented *in ManiT itself*:
+//! Many stdlib modules (io, sync, fs, …) are *native*: their `.mt` files carry
+//! only documented signatures, and the implementations live in the C runtime
+//! (LLVM backend) or in emulator syscalls / emitter intrinsics (T3 backend).
+//! Others are implemented *in ManiT itself*, wholly or in part — see
+//! `SOURCE_MODULES` below, which is the authority and carries the reason each
+//! one is there. Three were wholly ManiT from the start:
 //!
 //!   * `std::bridge` — binary/ternary conversion (Claim 17)
 //!   * `std::crypto` — ternary hash / HMAC / TRNG / cipher (Thatte5)
 //!   * `std::t27f`   — balanced ternary floating point
 //!
-//! Neither backend has native implementations for these, so their function
-//! bodies must be compiled into the program that uses them. This pass runs
+//! and `ternary`, `str`, `fmt`, `math`, `test` and `env` are *mixed*: natives
+//! where a backend lowers the primitive directly, ManiT source for everything
+//! derivable from those primitives, so one body serves both backends.
+//!
+//! Neither backend has native implementations for these bodies, so they
+//! must be compiled into the program that uses them. This pass runs
 //! on the AST before semantic analysis and, for every `use std::<m>` of a
 //! source-implemented module:
 //!
@@ -77,6 +83,16 @@ const SOURCE_MODULES: &[(&str, &str)] = &[
     // It is ManiT source for the same reason the others are: `io::println` and
     // `env::exit` are all an assertion needs, and both already work on T3.
     ("test", include_str!("../../stdlib/test.mt")),
+    // `env` joined them on 23 August 2026, for one function out of 27:
+    // `args()`. It is mixed in the `str`/`ternary` sense — everything else in
+    // the module is a scalar native the backends lower directly — but `args()`
+    // returns a `Vec<str>`, and a Vec is the one return type the two backends
+    // build by completely unrelated means: the C runtime on one side, an
+    // emulator heap object on the other. Written as a native it needed two
+    // implementations; it had ZERO on LLVM (no `env_args` symbol) and on T3 a
+    // syscall that returned an empty Vec to every caller. Written in ManiT over
+    // `argc()` and `arg(i)` it needs none, and the backends cannot disagree.
+    ("env", include_str!("../../stdlib/env.mt")),
 ];
 
 /// Expand any used source-implemented stdlib modules into `program`.

@@ -405,7 +405,7 @@ impl LLVMEmitter {
                         // does return something out of range, a truncated value
                         // is a bug confined to one variable rather than a
                         // corrupted return address.
-                        let op = if aw < dw { "sext" } else { "trunc" };
+                        let op = if aw < dw { widen_op(&actual_ty) } else { "trunc" };
                         let ext_name = format!("%__store_{}_{}", op, self.fresh_anon("sx"));
                         let ptr_s2 = self.resolve_ptr_val(ptr);
                         return format!(
@@ -509,7 +509,7 @@ impl LLVMEmitter {
                             if matches!(actual.as_str(), "i1" | "i8" | "i16" | "i32") {
                                 let uid = self.fresh_anon("argv");
                                 let coerce_name = format!("%{}", uid);
-                                let op = if actual == "i1" { "zext" } else { "sext" };
+                                let op = widen_op(&actual);
                                 call_prefix.push_str(&format!(
                                     "{} = {} {} {} to i64\n  ",
                                     coerce_name, op, actual, val_s
@@ -526,7 +526,7 @@ impl LLVMEmitter {
                             if dw > 0 && aw > 0 && dw != aw {
                                 let uid = self.fresh_anon("argc");
                                 let coerce_name = format!("%{}", uid);
-                                let op = if aw < dw { "sext" } else { "trunc" };
+                                let op = if aw < dw { widen_op(&actual) } else { "trunc" };
                                 call_prefix.push_str(&format!(
                                     "{} = {} {} {} to {}\n  ",
                                     coerce_name, op, actual, val_s, declared
@@ -970,7 +970,7 @@ impl LLVMEmitter {
                         let aw = int_width(&actual);
                         let tw = int_width(&ty_str);
                         if aw != tw && aw > 0 && tw > 0 {
-                            let op = if aw < tw { "sext" } else { "trunc" };
+                            let op = if aw < tw { widen_op(&actual) } else { "trunc" };
                             let ext_name = format!("%{}", self.fresh_anon("__ret_coerce"));
                             return vec![
                                 format!("{} = {} {} {} to {}", ext_name, op, actual, vs, ty_str),
@@ -1138,13 +1138,7 @@ impl LLVMEmitter {
         }
 
         let ext_name = format!("%__coerce_{}", suffix);
-        // i1 holds a logical 0/1 — widening it must zero-extend (sext would
-        // turn `true` into -1). All wider integer types are signed values.
-        let op = if aw < tw {
-            if actual == "i1" { "zext" } else { "sext" }
-        } else {
-            "trunc"
-        };
+        let op = if aw < tw { widen_op(&actual) } else { "trunc" };
         let prefix = format!(
             "{} = {} {} {} to {}\n  ",
             ext_name, op, actual, resolved, target_ty
@@ -1173,7 +1167,7 @@ impl LLVMEmitter {
             return (String::new(), operand.to_string());
         }
         let ext_name = format!("%__w64_{}", suffix);
-        let op = if operand_ty == "i1" { "zext" } else { "sext" };
+        let op = widen_op(&operand_ty);
         (
             format!("{} = {} {} {} to i64\n  ", ext_name, op, operand_ty, operand),
             ext_name,
