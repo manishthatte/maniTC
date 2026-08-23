@@ -68,6 +68,15 @@ const SOURCE_MODULES: &[(&str, &str)] = &[
     // (`INT_MIN = -9223372036854775808`) was not even LEXABLE, which is why
     // this entry could not have been added before that line was fixed.
     ("math", include_str!("../../stdlib/math.mt")),
+    // `test` joined them on 23 August 2026, and unlike the others it was never
+    // native and never half-written: it did not exist at all. Three of maniTC's
+    // own shipped tests -- 18_short_circuit, 19_bridge, 20_t27f_float -- called
+    // `assert(...)` a combined 57 times against a function defined in no
+    // stdlib module, no C runtime and no emitter intrinsic, so all three failed
+    // to build on BOTH backends and had therefore never once been executed.
+    // It is ManiT source for the same reason the others are: `io::println` and
+    // `env::exit` are all an assertion needs, and both already work on T3.
+    ("test", include_str!("../../stdlib/test.mt")),
 ];
 
 /// Expand any used source-implemented stdlib modules into `program`.

@@ -122,6 +122,7 @@ const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("sync",        include_str!("../../../stdlib/sync.mt")),
     ("t27f",        include_str!("../../../stdlib/t27f.mt")),
     ("ternary",     include_str!("../../../stdlib/ternary.mt")),
+    ("test",        include_str!("../../../stdlib/test.mt")),
     ("time",        include_str!("../../../stdlib/time.mt")),
     ("tritfs",      include_str!("../../../stdlib/tritfs.mt")),
 ];
@@ -916,10 +917,19 @@ impl SemanticAnalyzer {
     // ---------------------------------------------------------------------------
 
     /// Known standard library module names (matching stdlib/ directory)
+    ///
+    /// THIS IS THE THIRD OF THREE LISTS a new stdlib module must be added to,
+    /// and it is the one that fails loudest when forgotten -- `use std::test;`
+    /// reports "unknown standard library module" even though the module file
+    /// exists and is embedded. The other two are STDLIB_SOURCES above (for
+    /// `::`-path diagnostics) and, for modules implemented in ManiT rather than
+    /// natively, SOURCE_MODULES in semantic/stdlib_expand.rs (which compiles
+    /// the bodies into the program). Miss that last one and the module resolves,
+    /// type-checks, and then fails at link or assembly with an undefined symbol.
     pub(crate) const STDLIB_MODULES: &'static [&'static str] = &[
         "io", "math", "ternary", "collections", "fmt", "str",
         "sync", "async", "env", "time", "fs", "net",
-        "t27f", "crypto", "bridge", "tritfs",
+        "t27f", "crypto", "bridge", "tritfs", "test",
     ];
 
     fn resolve_use(&mut self, decl: &UseDecl) -> CompileResult<()> {

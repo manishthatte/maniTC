@@ -529,6 +529,7 @@ The 27-trit floating-point format, implemented in ManiT over `word`.
 | `t27f::tdiv` | `(a: word, b: word) -> word` | ManiT | yes | Balanced ternary integer division (round to nearest; ties cannot occur for the odd divisors used in this module). Dropping low trits of a balanced ternary number IS round-to-nearest division, and the from_parts/exponent/mantissa packing relies on exactly that. Requires b > 0 (this module divides only by 3 and 19683). |
 | `t27f::tmod` | `(x: word, base: word) -> t9` | ManiT | yes | Balanced ternary modulo (trit extraction). |
 | `t27f::to_float` | `(x: T27F) -> float` | ManiT | not probed | Convert T27F to approximate host float. |
+| `t27f::to_int` | `(x: T27F) -> word` | ManiT | not probed | Reconstruct the EXACT integer value of `x`, for values that are integers: multiply the mantissa when the exponent is non-negative, divide when it is negative. The division is exact whenever `x` really does hold an integer, because normalize scaled the mantissa up by that same power of three. |
 
 ## std::time
 
@@ -614,11 +615,23 @@ Sockets. Two separate things are true here. On LLVM this runtime is built with `
 | `net::post` | `(url: str, body: str) -> str` | native | **T3 missing**, needs net build | Perform a quick one-off POST and return the response body. |
 | `net::resolve` | `(host: str) -> Vec<str>` | native | **T3 missing**, needs net build | Resolve a hostname to its IP addresses. |
 
+## std::test
+
+Assertions. Pure ManiT over `io::println` and `env::exit`, so it needs nothing from the C runtime and works identically on both backends. The condition is `bool3`, not `bool`: `tand`, `tor` and comparisons against `unknown` produce a genuine three-valued answer, and an assertion that cannot tell `false` from `unknown` reports a verdict it does not have. Hence three entry points — `assert`, `assert_unknown`, `assert_false` — one per trit.
+
+| Function | Signature | Body | Works | Description |
+|---|---|---|---|---|
+| `test::assert` | `(cond: bool3, msg: str)` | ManiT | yes | Assert that `cond` is TRUE (+1). `unknown` and `false` both fail, and are reported separately. |
+| `test::assert_false` | `(cond: bool3, msg: str)` | ManiT | yes | Assert that `cond` is FALSE (-1) -- definitely false, not merely not-true. |
+| `test::assert_unknown` | `(cond: bool3, msg: str)` | ManiT | yes | Assert that `cond` is UNKNOWN (0) -- that the question is genuinely undecided. There is no binary equivalent of this assertion; it is the one that makes a three-valued logic testable at all. |
+| `test::fail` | `(kind: str, msg: str)` | ManiT | yes | Print an assertion failure and terminate with a non-zero exit status. Separated from `assert` so every entry point below reports identically. |
+| `test::pass` | `()` | ManiT | yes | The passing arm. `tif` arms are expressions, so each of the three needs something to evaluate; this is the nothing. |
+
 ---
 
 ## Census
 
-**312 declarations** across 12 modules: **216 call cleanly on both backends**; 36 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **60 do not work on at least one backend**.
+**318 declarations** across 13 modules: **221 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **60 do not work on at least one backend**.
 
 The *Works* column records whether a one-line program calling the function compiles and links on each backend. It is a test of existence, not of correctness: a function marked `yes` has a body on both sides, which is exactly what `fmt::`'s twenty-five documented-but-undefined entries did not. A `not probed` row is an admission, not a pass.
 

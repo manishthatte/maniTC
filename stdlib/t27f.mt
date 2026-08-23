@@ -103,6 +103,37 @@ fn to_float(x: T27F) -> float {
     int_to_float(m) * pow3_float(e)
 }
 
+// WHY THIS EXISTS (23 August 2026). `to_float` is lossy in a way that is easy
+// to miss: it reconstructs through binary `float`, and a normalized T27F has a
+// negative exponent, so it divides by 3.0 repeatedly. One third is not
+// representable in binary, and 100 + 200 comes back as 300.00000000000006 on
+// BOTH backends. Every exact comparison against a T27F result therefore fails,
+// which is not a rounding subtlety anyone should have to rediscover.
+//
+// The obvious hand-rolled alternative is worse. Writing
+//
+//     mantissa(x) * pow3(exponent(x))
+//
+// looks right and is silently, totally wrong for every normalized value:
+// `normalize` maximises mantissa precision (it shifts up while the mantissa
+// fits, exactly as IEEE keeps an implicit leading 1), so a normalized
+// exponent is NEGATIVE -- and integer `pow3` returns 0 for a negative
+// argument. The product is 0, not the value. maniTC's own test
+// 20_t27f_float.mt was written that way and asserted `== 300` against 0.
+//
+// Reconstruct the EXACT integer value of `x`, for values that are integers:
+// multiply the mantissa when the exponent is non-negative, divide when it is
+// negative. The division is exact whenever `x` really does hold an integer,
+// because normalize scaled the mantissa up by that same power of three.
+fn to_int(x: T27F) -> word {
+    let e = exponent(x);
+    let m = mantissa(x);
+    if e >= 0 {
+        return m * pow3(e);
+    }
+    tdiv(m, pow3(0 - e))
+}
+
 // ---------------------------------------------------------------------------
 // Arithmetic operations
 // ---------------------------------------------------------------------------

@@ -55,7 +55,7 @@ END = "<!-- END GENERATED: stdlib_census.py -->"
 # rather than in stdlib source — so their tables stay hand-written above.
 MODULE_ORDER = [
     "io", "fmt", "str", "math", "ternary", "bridge", "crypto",
-    "t27f", "time", "env", "fs", "net",
+    "t27f", "time", "env", "fs", "net", "test",
 ]
 
 # `async` and `collections` and `sync` declare no free functions — their surface
@@ -86,6 +86,12 @@ MODULE_BLURB = {
                "with `-DMANIT_NO_GUI`, which compiles network support out and raises a "
                "deliberate diagnostic — a gate, not a missing symbol. On T3 there is no "
                "definition at all.",
+    "test":    "Assertions. Pure ManiT over `io::println` and `env::exit`, so it needs nothing "
+               "from the C runtime and works identically on both backends. The condition is "
+               "`bool3`, not `bool`: `tand`, `tor` and comparisons against `unknown` produce a "
+               "genuine three-valued answer, and an assertion that cannot tell `false` from "
+               "`unknown` reports a verdict it does not have. Hence three entry points — "
+               "`assert`, `assert_unknown`, `assert_false` — one per trit.",
 }
 
 # A value of each type that a probe can pass. Types absent here cannot be
