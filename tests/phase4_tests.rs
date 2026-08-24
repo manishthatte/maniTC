@@ -637,3 +637,53 @@ fn main() {
         assert!(!out.contains("survived"), "LLVM ran past the write: {}", out);
     }
 }
+
+/// report.txt P22/F-2 — multiply and divide by a power of three become the
+/// single ternary-shift instruction T3ISA has for them.
+///
+/// The two EXCLUSIONS are the correctness argument, and both are checked here:
+///
+///   * `x * 6` is not a power of three and must stay a multiply;
+///   * `x / 3` under v1 is `Div`, which TRUNCATES, and `TSHR` ROUNDS. They
+///     differ for every negative operand that does not divide exactly, which
+///     is what `d3(-5)` pins: -1 truncating, -2 rounding.
+#[test]
+fn f2_ternary_strength_reduction_agrees_across_backends() {
+    let src = write(
+        "f2_tsr",
+        r#"
+use std::io;
+use std::fmt;
+fn m3(x: int) -> int { return x * 3; }
+fn m9(x: int) -> int { return x * 9; }
+fn m27(x: int) -> int { return x * 27; }
+fn m6(x: int) -> int { return x * 6; }
+fn d3(x: int) -> int { return x / 3; }
+fn main() {
+    io::println(fmt::show_int(m3(7)));
+    io::println(fmt::show_int(m9(-7)));
+    io::println(fmt::show_int(m27(2)));
+    io::println(fmt::show_int(m6(7)));
+    io::println(fmt::show_int(d3(-5)));
+}
+"#,
+    );
+    // d3(-5) is -1: v1 division truncates. A TSHR here would give -2.
+    let expected = "21\n-63\n54\n42\n-1\n";
+    let (code, out) = run_t3(&src, &[]);
+    assert_eq!(code, 0, "T3: {}", out);
+    assert_eq!(out, expected, "T3 ternary strength reduction");
+    if let Some((code, out)) = run_llvm(&src, &[]) {
+        assert_eq!(code, 0, "LLVM: {}", out);
+        assert_eq!(out, expected, "LLVM must agree");
+    }
+
+    // …and under v2, where `/` is DivNear, the answers still agree — TSHR is
+    // reachable there and is round-to-nearest, so d3(-5) becomes -2 on BOTH.
+    let (c2, o2) = run_t3(&src, &["--lang", "v2"]);
+    assert_eq!(c2, 0, "T3 v2: {}", o2);
+    if let Some((c3, o3)) = run_llvm(&src, &["--lang", "v2"]) {
+        assert_eq!(c3, 0, "LLVM v2: {}", o3);
+        assert_eq!(o2, o3, "the backends must agree under v2 too");
+    }
+}

@@ -231,6 +231,28 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 IRBinOp::Or  => em.emit(format!("    BOR   {}, {}, {}", d, l, r)),
                 IRBinOp::Xor => em.emit(format!("    BXOR  {}, {}, {}", d, l, r)),
 
+                // F-2: the ternary shifts, which is what these exist for.
+                // TSHI is `x * 3^k` with the same `checked27` trap TMUL has;
+                // TSHR drops k low trits, which IS round-to-nearest division
+                // by 3^k (ties impossible, 3^k being odd).
+                IRBinOp::TShl | IRBinOp::TShr => {
+                    let mn = if matches!(op, IRBinOp::TShl) { "TSHI" } else { "TSHR" };
+                    if let IRValue::Const(IRConst::Int(n)) = rhs {
+                        // The immediate field is THREE TRITS and holds -13..=13,
+                        // not the 0..=26 a 27-trit word can be shifted by. A
+                        // multiply by 3^18 exists in the stdlib's ternary
+                        // conversions and produced "Immediate out of range for
+                        // TSHI"; the register form is the same fallback the
+                        // binary shifts below already use.
+                        if (0..=13).contains(n) {
+                            em.emit(format!("    {}  {}, {}, #{}  ; ternary shift", mn, d, l, n));
+                        } else {
+                            em.emit(format!("    {}  {}, {}, {}  ; ternary shift (wide)", mn, d, l, r));
+                        }
+                    } else {
+                        em.emit(format!("    {}  {}, {}, {}  ; ternary shift (dyn)", mn, d, l, r));
+                    }
+                }
                 IRBinOp::LShift => {
                     // The balanced 3-trit imm field holds -13..13; larger shift
                     // constants go through the register form (rhs is already

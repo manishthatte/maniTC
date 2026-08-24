@@ -3,6 +3,27 @@ use super::*;
 
 impl LLVMEmitter {
     pub(super) fn emit_instr(&mut self, instr: &IRInstr) -> String {
+        // F-2: the ternary shifts exist so the T3 backend can reach TSHI/TSHR,
+        // which are one instruction there. LLVM has no ternary shift, so they
+        // are rewritten into the very operations they were reduced FROM and
+        // handed to the normal path. Parity is then by construction rather
+        // than by a second implementation kept in step with the first — which
+        // matters most for TShr, whose partner `DivNear` is a twenty-line
+        // round-to-nearest sequence.
+        if let IRInstr::BinOp { dst, op: op @ (IRBinOp::TShl | IRBinOp::TShr), lhs, rhs, ty } = instr
+        {
+            if let IRValue::Const(IRConst::Int(k)) = rhs {
+                let pow = 3i64.checked_pow((*k).clamp(0, 38) as u32).unwrap_or(i64::MAX);
+                let equivalent = IRInstr::BinOp {
+                    dst: dst.clone(),
+                    op: if matches!(op, IRBinOp::TShl) { IRBinOp::Mul } else { IRBinOp::DivNear },
+                    lhs: lhs.clone(),
+                    rhs: IRValue::Const(IRConst::Int(pow)),
+                    ty: ty.clone(),
+                };
+                return self.emit_instr(&equivalent);
+            }
+        }
         match instr {
             // ---- BinOp ------------------------------------------------------
             IRInstr::BinOp { dst, op, lhs, rhs, ty } => {
@@ -266,6 +287,14 @@ impl LLVMEmitter {
                         let (l, r) = self.resolve_pair(lhs, rhs, ty);
                         format!("{} = ashr {} {}, {}", dst_name, llvm_type(ty), l, r)
                     }
+                    // Handled by the rewrite at the top of `emit_instr`, which
+                    // only fires for a CONSTANT shift amount — the only kind
+                    // `strength_reduce` produces. A dynamic one would need
+                    // 3^k computed at runtime and has no source form.
+                    IRBinOp::TShl | IRBinOp::TShr => unreachable!(
+                        "ternary shift with a non-constant amount reached the \
+                         LLVM emitter: {:?}", instr
+                    ),
                     IRBinOp::StrEq => {
                         // String equality: call strcmp and check result == 0
                         let mut prefix = String::new();

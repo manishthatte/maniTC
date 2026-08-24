@@ -455,6 +455,30 @@ pub enum IRBinOp {
     RShift,
     StrEq,
     StrNe,
+    /// F-2: multiply by 3^k — one instruction on a balanced-ternary machine.
+    ///
+    /// The rhs is the SHIFT AMOUNT k, not the multiplier. T3ISA has `TSHI` for
+    /// exactly this and the compiler could not reach it: the IR's `LShift`
+    /// maps to `BSHL`, the BINARY shift, and `TSHI`/`TSHR` were emitted only
+    /// from an explicit `trit::` intrinsic. Measured before adding these: 118
+    /// of 1,708 multiplies across the 17 examples are by a power of three, and
+    /// `ternary_sort` emitted 33 `TMUL` and zero `TSHI`.
+    ///
+    /// UNCHECKED, matching plain `Mul`: `TSHI` traps on 27-trit overflow via
+    /// `checked27` exactly as `TMUL` does, and on LLVM both are a wrapping
+    /// `mul i64`. `MulT27` is deliberately NOT reduced to this — on LLVM it
+    /// emits N5's overflow guard, and dropping that would be a silent
+    /// behaviour change under `--lang v2`.
+    TShl,
+    /// F-2: divide by 3^k, ROUNDING TO NEAREST.
+    ///
+    /// The rhs is the shift amount k. Dropping k low trits of a balanced
+    /// ternary number IS round-to-nearest division by 3^k — ties are
+    /// impossible because 3^k is odd — which is why this pairs with `DivNear`
+    /// and NOT with `Div`. `Div` truncates, so reducing it to a `TSHR` would
+    /// change the answer for every negative operand that does not divide
+    /// exactly.
+    TShr,
 }
 
 #[derive(Debug, Clone)]

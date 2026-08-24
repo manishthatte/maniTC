@@ -870,6 +870,28 @@ fn cse_key(instr: &IRInstr) -> Option<String> {
 /// - x * 1 → x
 /// - x + 0 → x
 /// - x - 0 → x
+/// The shift amount k when `op` is reducible to a ternary shift by 3^k.
+///
+/// Only `Mul` and `DivNear` — see the note at the call site for why `MulT27`
+/// and `Div` are excluded. k >= 1, so `x * 1` stays for the identity rule
+/// above; k <= 26, the widest shift a 27-trit word can take.
+fn pow3_shift(op: &IRBinOp, rhs: &IRValue) -> Option<i64> {
+    if !matches!(op, IRBinOp::Mul | IRBinOp::DivNear) {
+        return None;
+    }
+    let IRValue::Const(IRConst::Int(v)) = rhs else { return None };
+    if *v < 3 {
+        return None;
+    }
+    let mut n = *v;
+    let mut k = 0i64;
+    while n % 3 == 0 {
+        n /= 3;
+        k += 1;
+    }
+    (n == 1 && (1..=26).contains(&k)).then_some(k)
+}
+
 fn strength_reduce(func: &mut IRFunction) {
     for block in &mut func.blocks {
         for instr in &mut block.instrs {
@@ -902,6 +924,49 @@ fn strength_reduce(func: &mut IRFunction) {
                     }
                     _ => None,
                 };
+
+                // F-2: the reduction this pass is NAMED for, which it did not
+                // do. Everything above is an algebraic identity needing a
+                // literal `* 1` or `+ 0` that nobody writes; measured across
+                // the 17 examples this pass fired ZERO times (report.txt P22).
+                //
+                // On a balanced-ternary machine the reduction that pays is
+                // multiply and divide by a power of THREE, and T3ISA has
+                // `TSHI`/`TSHR` for exactly that — one instruction. 118 of
+                // 1,708 multiplies in the examples are by a power of three,
+                // and `ternary_sort` emitted 33 `TMUL` and no `TSHI` at all.
+                //
+                // WHICH OPERATIONS, and the two exclusions are the whole
+                // correctness argument:
+                //
+                //   Mul      -> TShl.  `TSHI` traps on 27-trit overflow via
+                //                      `checked27` exactly as `TMUL` does, and
+                //                      on LLVM both are a wrapping `mul i64`.
+                //   DivNear  -> TShr.  Dropping k low trits IS round-to-nearest
+                //                      division by 3^k.
+                //   MulT27   -> NO.    On LLVM it emits N5's overflow guard;
+                //                      dropping that would silently weaken
+                //                      `--lang v2`.
+                //   Div      -> NO.    `Div` TRUNCATES and `TSHR` ROUNDS. They
+                //                      differ for every negative operand that
+                //                      does not divide exactly: -5/3 is -1
+                //                      truncating and -2 rounding.
+                if replacement.is_none() {
+                    if let Some(k) = pow3_shift(op, rhs) {
+                        *instr = IRInstr::BinOp {
+                            dst: IRTemp::new(dst.0.clone()),
+                            op: if matches!(op, IRBinOp::Mul) {
+                                IRBinOp::TShl
+                            } else {
+                                IRBinOp::TShr
+                            },
+                            lhs: lhs.clone(),
+                            rhs: IRValue::Const(IRConst::Int(k)),
+                            ty: ty.clone(),
+                        };
+                        continue;
+                    }
+                }
                 if let Some(val) = replacement {
                     *instr = IRInstr::Assign {
                         dst: IRTemp::new(dst.0.clone()),
