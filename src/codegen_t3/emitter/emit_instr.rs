@@ -235,8 +235,11 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // TSHI is `x * 3^k` with the same `checked27` trap TMUL has;
                 // TSHR drops k low trits, which IS round-to-nearest division
                 // by 3^k (ties impossible, 3^k being odd).
-                IRBinOp::TShl | IRBinOp::TShr => {
-                    let mn = if matches!(op, IRBinOp::TShl) { "TSHI" } else { "TSHR" };
+                IRBinOp::TShl | IRBinOp::TShlT27 | IRBinOp::TShr => {
+                    // TShl and TShlT27 are the SAME instruction here: TSHI
+                    // traps on 27-trit overflow via `checked27` whether or not
+                    // the IR asked for a check. The distinction is LLVM's.
+                    let mn = if matches!(op, IRBinOp::TShr) { "TSHR" } else { "TSHI" };
                     if let IRValue::Const(IRConst::Int(n)) = rhs {
                         // The immediate field is THREE TRITS and holds -13..=13,
                         // not the 0..=26 a 27-trit word can be shifted by. A

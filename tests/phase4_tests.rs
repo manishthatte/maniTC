@@ -687,3 +687,48 @@ fn main() {
         assert_eq!(o2, o3, "the backends must agree under v2 too");
     }
 }
+
+/// report.txt P22/F-2 — the CHECKED ternary shift keeps N5's overflow guard.
+///
+/// This is the whole reason `TShlT27` exists as a separate operation. On T3
+/// there is no difference: `TSHI` traps via `checked27` whether or not the IR
+/// asked. On LLVM `TShl` is a wrapping `mul i64` and `TShlT27` carries the
+/// guard, so reducing `MulT27` to the UNCHECKED shift would have silently
+/// removed the check that `--lang v2` exists to provide — and nothing else in
+/// the suite would have noticed, because the answers agree right up until the
+/// moment one of them is supposed to trap.
+#[test]
+fn f2_the_checked_ternary_shift_still_traps_on_overflow() {
+    let src = write(
+        "f2_tsr_overflow",
+        r#"
+use std::io;
+use std::fmt;
+fn m3(x: int) -> int { return x * 3; }
+fn main() {
+    io::println("before");
+    io::println(fmt::show_int(m3(1270932914165)));
+    io::println("after");
+}
+"#,
+    );
+    // 1270932914165 * 3 is 3812798742495, one past the 27-trit maximum.
+
+    // Under v2 BOTH backends must trap: T3 through `checked27`, LLVM through
+    // N5's guard call.
+    let (code, out) = run_t3(&src, &["--lang", "v2"]);
+    assert_ne!(code, 0, "T3 v2 must trap: {}", out);
+    assert!(out.contains("overflow"), "T3 v2 message: {}", out);
+    assert!(!out.contains("after"), "T3 v2 ran past the overflow: {}", out);
+    if let Some((code, out)) = run_llvm(&src, &["--lang", "v2"]) {
+        assert_ne!(code, 0, "LLVM v2 must trap — the N5 guard was dropped: {}", out);
+        assert!(out.contains("overflow"), "LLVM v2 message: {}", out);
+        assert!(!out.contains("after"), "LLVM v2 ran past the overflow: {}", out);
+    }
+
+    // Under v1 the guard does not exist by design, and T3 traps anyway because
+    // its word IS 27 trits. That asymmetry is report.txt P21 cluster 1 and is
+    // pinned here so the reduction is not blamed for it later.
+    let (code, out) = run_t3(&src, &[]);
+    assert_ne!(code, 0, "T3 v1 traps on its own word width: {}", out);
+}

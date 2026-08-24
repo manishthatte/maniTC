@@ -872,11 +872,11 @@ fn cse_key(instr: &IRInstr) -> Option<String> {
 /// - x - 0 → x
 /// The shift amount k when `op` is reducible to a ternary shift by 3^k.
 ///
-/// Only `Mul` and `DivNear` — see the note at the call site for why `MulT27`
-/// and `Div` are excluded. k >= 1, so `x * 1` stays for the identity rule
-/// above; k <= 26, the widest shift a 27-trit word can take.
+/// Only `Mul`, `MulT27` and `DivNear` — see the note at the call site for why
+/// `Div` is excluded. k >= 1, so `x * 1` stays for the identity rule above;
+/// k <= 26, the widest shift a 27-trit word can take.
 fn pow3_shift(op: &IRBinOp, rhs: &IRValue) -> Option<i64> {
-    if !matches!(op, IRBinOp::Mul | IRBinOp::DivNear) {
+    if !matches!(op, IRBinOp::Mul | IRBinOp::MulT27 | IRBinOp::DivNear) {
         return None;
     }
     let IRValue::Const(IRConst::Int(v)) = rhs else { return None };
@@ -944,9 +944,11 @@ fn strength_reduce(func: &mut IRFunction) {
                 //                      on LLVM both are a wrapping `mul i64`.
                 //   DivNear  -> TShr.  Dropping k low trits IS round-to-nearest
                 //                      division by 3^k.
-                //   MulT27   -> NO.    On LLVM it emits N5's overflow guard;
-                //                      dropping that would silently weaken
-                //                      `--lang v2`.
+                //   MulT27   -> TShlT27. The CHECKED shift. On T3 it is the
+                //                      same `TSHI` — `checked27` traps either
+                //                      way — and on LLVM it carries N5's
+                //                      overflow guard, so `--lang v2` keeps
+                //                      the check it exists to provide.
                 //   Div      -> NO.    `Div` TRUNCATES and `TSHR` ROUNDS. They
                 //                      differ for every negative operand that
                 //                      does not divide exactly: -5/3 is -1
@@ -955,10 +957,10 @@ fn strength_reduce(func: &mut IRFunction) {
                     if let Some(k) = pow3_shift(op, rhs) {
                         *instr = IRInstr::BinOp {
                             dst: IRTemp::new(dst.0.clone()),
-                            op: if matches!(op, IRBinOp::Mul) {
-                                IRBinOp::TShl
-                            } else {
-                                IRBinOp::TShr
+                            op: match op {
+                                IRBinOp::Mul => IRBinOp::TShl,
+                                IRBinOp::MulT27 => IRBinOp::TShlT27,
+                                _ => IRBinOp::TShr,
                             },
                             lhs: lhs.clone(),
                             rhs: IRValue::Const(IRConst::Int(k)),

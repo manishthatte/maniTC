@@ -470,6 +470,16 @@ pub enum IRBinOp {
     /// emits N5's overflow guard, and dropping that would be a silent
     /// behaviour change under `--lang v2`.
     TShl,
+    /// F-2: multiply by 3^k, CHECKED — the N5 partner of `TShl`.
+    ///
+    /// Same instruction as `TShl` on T3, where `TSHI` already traps on 27-trit
+    /// overflow via `checked27`. The pair exists for the OTHER backend: on
+    /// LLVM `TShl` is a wrapping `mul i64` and this one carries N5's overflow
+    /// guard, exactly as `Mul` and `MulT27` do. Reducing `MulT27` to the
+    /// unchecked shift would have silently dropped the check that `--lang v2`
+    /// exists to provide, which is why the reduction refused it until this
+    /// variant existed.
+    TShlT27,
     /// F-2: divide by 3^k, ROUNDING TO NEAREST.
     ///
     /// The rhs is the shift amount k. Dropping k low trits of a balanced

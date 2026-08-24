@@ -10,13 +10,23 @@ impl LLVMEmitter {
         // than by a second implementation kept in step with the first — which
         // matters most for TShr, whose partner `DivNear` is a twenty-line
         // round-to-nearest sequence.
-        if let IRInstr::BinOp { dst, op: op @ (IRBinOp::TShl | IRBinOp::TShr), lhs, rhs, ty } = instr
+        if let IRInstr::BinOp {
+            dst,
+            op: op @ (IRBinOp::TShl | IRBinOp::TShlT27 | IRBinOp::TShr),
+            lhs,
+            rhs,
+            ty,
+        } = instr
         {
             if let IRValue::Const(IRConst::Int(k)) = rhs {
                 let pow = 3i64.checked_pow((*k).clamp(0, 38) as u32).unwrap_or(i64::MAX);
                 let equivalent = IRInstr::BinOp {
                     dst: dst.clone(),
-                    op: if matches!(op, IRBinOp::TShl) { IRBinOp::Mul } else { IRBinOp::DivNear },
+                    op: match op {
+                        IRBinOp::TShl => IRBinOp::Mul,
+                        IRBinOp::TShlT27 => IRBinOp::MulT27,
+                        _ => IRBinOp::DivNear,
+                    },
                     lhs: lhs.clone(),
                     rhs: IRValue::Const(IRConst::Int(pow)),
                     ty: ty.clone(),
@@ -291,7 +301,7 @@ impl LLVMEmitter {
                     // only fires for a CONSTANT shift amount — the only kind
                     // `strength_reduce` produces. A dynamic one would need
                     // 3^k computed at runtime and has no source form.
-                    IRBinOp::TShl | IRBinOp::TShr => unreachable!(
+                    IRBinOp::TShl | IRBinOp::TShlT27 | IRBinOp::TShr => unreachable!(
                         "ternary shift with a non-constant amount reached the \
                          LLVM emitter: {:?}", instr
                     ),
