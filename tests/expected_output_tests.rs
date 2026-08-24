@@ -56,6 +56,15 @@ fn get_t3_output(test_file: &str) -> String {
         .output()
         .expect("failed to run T3");
 
+    assert!(
+        run.status.success(),
+        "T3 run failed for {} (exit {:?}):\nstdout:\n{}\nstderr:\n{}",
+        test_file,
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
     // Strip the "[T3ISA] running ..." header line from stdout
     let raw = String::from_utf8_lossy(&run.stdout).to_string();
     raw.lines()
@@ -91,13 +100,25 @@ fn get_llvm_output(test_file: &str) -> Option<String> {
         .output()
         .expect("failed to compile");
 
-    if !compile.status.success() {
-        return None;
-    }
+    assert!(
+        compile.status.success(),
+        "LLVM compile failed for {}:\nstdout:\n{}\nstderr:\n{}",
+        test_file,
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
 
     let run = Command::new(&output_base)
         .output()
-        .ok()?;
+        .expect("failed to run LLVM output");
+    assert!(
+        run.status.success(),
+        "LLVM run failed for {} (exit {:?}):\nstdout:\n{}\nstderr:\n{}",
+        test_file,
+        run.status.code(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
 
     Some(String::from_utf8_lossy(&run.stdout).to_string())
 }

@@ -84,6 +84,14 @@ fn t3_output(name: &str) -> String {
 
     let stdout = String::from_utf8_lossy(&run.stdout).to_string();
     assert!(
+        run.status.success(),
+        "examples/{}.mt exited {:?}:\nstdout:\n{}\nstderr:\n{}",
+        name,
+        run.status.code(),
+        stdout,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
         !stdout.contains("TRAP:"),
         "examples/{}.mt trapped:\n{}",
         name,
