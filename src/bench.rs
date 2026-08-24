@@ -14,7 +14,11 @@ pub fn read_source(path: &PathBuf) -> Result<String, String> {
         .map_err(|e| format!("cannot read '{}': {}", path.display(), e))
 }
 
-pub fn run_bench(file: &PathBuf, iterations: usize) -> CompileResult<()> {
+pub fn run_bench(
+    file: &PathBuf,
+    iterations: usize,
+    lang: manitc::lang::LangVersion,
+) -> CompileResult<()> {
     use std::time::Instant;
 
     let source = read_source(file).map_err(|e| CompileError::Lex(
@@ -36,7 +40,7 @@ pub fn run_bench(file: &PathBuf, iterations: usize) -> CompileResult<()> {
     // Borrow / move checking
     manitc::borrow::check_borrows(&typed_program)?;
 
-    let mut ir_module = IRLowerer::lower(&typed_program);
+    let mut ir_module = IRLowerer::lower_with(&typed_program, lang);
     ir::optimize::run_passes(&mut ir_module);
 
     println!("===============================================================================");

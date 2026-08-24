@@ -43,7 +43,20 @@ impl ManiTLanguageServer {
 
     /// Run lexer → parser → semantic analysis and collect all errors as
     /// LSP `Diagnostic` objects.
+    ///
+    /// On a reserved stack. The language server runs on tokio worker threads,
+    /// which get the default stack, and the parser's depth guard is only
+    /// enforceable on a stack deep enough to reach it — so deeply nested
+    /// source in an open editor buffer used to abort the whole server process
+    /// rather than produce the diagnostic. The same defect as the one the F-8
+    /// corpus harness hit, in the place a user would actually meet it: the
+    /// editor is exactly where half-written, deeply-nested code lives.
     fn check_source(&self, source: &str) -> Vec<Diagnostic> {
+        let owned = source.to_string();
+        crate::with_compiler_stack(move || Self::check_source_inner(&owned))
+    }
+
+    fn check_source_inner(source: &str) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
 
         // Lex
@@ -319,6 +332,28 @@ impl LanguageServer for ManiTLanguageServer {
             "tand" => Some("**tand** — ternary AND (Kleene strong conjunction): min(a, b)"),
             "tor" => Some("**tor** — ternary OR (Kleene strong disjunction): max(a, b)"),
             "tnot" => Some("**tnot** — ternary NOT (negation): -a"),
+            // C1: the Lukasiewicz family. These landed in the language before
+            // they landed here, so hover was silent on them.
+            "timp" => Some("**timp** — Lukasiewicz implication: min(+1, 1 - a + b). \
+                            `a timp a` is +1 even for unknown — the deduction \
+                            theorem, and what makes this L3 rather than K3"),
+            "teq" => Some("**teq** — Lukasiewicz equivalence: (a timp b) tand (b timp a)"),
+            "tposs" => Some("**tposs** — possibility (M): +1 if a >= 0, else -1. \
+                             Two-valued whatever it is given"),
+            "tnec" => Some("**tnec** — necessity (L): +1 only if a = +1, else -1. \
+                            Dual to tposs: `tnec a == tnot tposs tnot a`"),
+            // C2 / T3ISA v1.5: the lane-wise family — 27 trits at once.
+            "tandw" => Some("**tandw** — lane-wise AND: per-trit min across all \
+                             27 lanes of a word. One T3 instruction"),
+            "torw" => Some("**torw** — lane-wise OR: per-trit max across 27 lanes"),
+            "txorw" => Some("**txorw** — lane-wise balanced sum mod 3. Not an \
+                             involution: THREE applications recover the original"),
+            "timpw" => Some("**timpw** — lane-wise Lukasiewicz implication, per lane"),
+            "tcmpw" => Some("**tcmpw** — lane-wise three-way compare: sign(a_i - b_i) \
+                             per lane"),
+            "tnotw" => Some("**tnotw** — lane-wise NOT: negates all 27 lanes. \
+                             Compiles to TNEG — negating a balanced-ternary \
+                             number already flips every trit"),
             _ => None,
         };
 
@@ -399,6 +434,18 @@ impl LanguageServer for ManiTLanguageServer {
             ("tand", CompletionItemKind::OPERATOR, "Ternary AND: min(a,b)"),
             ("tor", CompletionItemKind::OPERATOR, "Ternary OR: max(a,b)"),
             ("tnot", CompletionItemKind::OPERATOR, "Ternary NOT: -a"),
+            // C1: Lukasiewicz family
+            ("timp", CompletionItemKind::OPERATOR, "Lukasiewicz implication: min(+1, 1-a+b)"),
+            ("teq", CompletionItemKind::OPERATOR, "Lukasiewicz equivalence"),
+            ("tposs", CompletionItemKind::OPERATOR, "Possibility (M): +1 if a >= 0"),
+            ("tnec", CompletionItemKind::OPERATOR, "Necessity (L): +1 only if a = +1"),
+            // C2: lane-wise family — 27 trits at once
+            ("tandw", CompletionItemKind::OPERATOR, "Lane-wise AND: per-trit min, 27 lanes"),
+            ("torw", CompletionItemKind::OPERATOR, "Lane-wise OR: per-trit max, 27 lanes"),
+            ("txorw", CompletionItemKind::OPERATOR, "Lane-wise sum mod 3, 27 lanes"),
+            ("timpw", CompletionItemKind::OPERATOR, "Lane-wise implication, 27 lanes"),
+            ("tcmpw", CompletionItemKind::OPERATOR, "Lane-wise compare: sign(a_i - b_i)"),
+            ("tnotw", CompletionItemKind::OPERATOR, "Lane-wise NOT: negates all 27 lanes"),
             ("true", CompletionItemKind::CONSTANT, "Boolean true"),
             ("false", CompletionItemKind::CONSTANT, "Boolean false"),
             ("unknown", CompletionItemKind::CONSTANT, "Ternary unknown (0)"),
@@ -435,6 +482,13 @@ impl ManiTLanguageServer {
     /// Try to resolve an identifier's type by running the semantic analyzer.
     /// Returns a string representation of the type, or None.
     fn get_identifier_type(&self, source: &str, _name: &str, _line: usize) -> Option<String> {
+        // Reserved stack, for the same reason as `check_source`.
+        let owned = source.to_string();
+        let name = _name.to_string();
+        crate::with_compiler_stack(move || Self::get_identifier_type_inner(&owned, &name))
+    }
+
+    fn get_identifier_type_inner(source: &str, _name: &str) -> Option<String> {
         let mut lexer = Lexer::with_file(source, "<lsp>");
         let tokens = lexer.tokenize().ok()?;
         let mut parser = ManiParser::with_file(tokens, "<lsp>");

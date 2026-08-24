@@ -115,6 +115,90 @@ pub struct SemanticAnalyzer {
     /// body and so never reach `TypedProgram::functions` — still get their
     /// arguments coerced to the declared parameter type.
     pub(crate) native_param_manitys: HashMap<String, Vec<ManiType>>,
+    /// A1: explicit `extern` declarations, keyed by qualified name.
+    ///
+    /// Authoritative where present. A native with an entry here has a
+    /// signature in the language's own type system, so its call sites are
+    /// checked like any other call instead of going through the unchecked
+    /// coercion that made `io::println_int(5 > 0)` a silent conversion.
+    pub(crate) externs: HashMap<String, ExternSig>,
+    /// Natives called with no `extern` declaration, in source order and
+    /// deduplicated. This IS the A1 migration backlog: generated from what the
+    /// program actually reaches rather than hand-listed, so it cannot drift
+    /// from the code the way a checked-in list would.
+    pub undeclared_natives: Vec<String>,
+    /// The backend being compiled for ("llvm" / "t3"), when one is selected.
+    ///
+    /// `None` for `manitc check`, which is backend-agnostic by design — a
+    /// check that silently assumed a backend would report an availability
+    /// problem the invocation never asked about. A1 step 3 makes this the
+    /// input to the availability decision.
+    pub backend: Option<String>,
+    /// Qualified names of every function that has a ManiT body in the program
+    /// being checked, including the stdlib source modules `stdlib_expand`
+    /// merges in. The complement of this set, within the stdlib namespace, is
+    /// what "native" means: a name a backend must supply as a symbol or a
+    /// syscall because no ManiT code was compiled for it.
+    pub(crate) bodied_fns: std::collections::HashSet<String>,
+    /// A2: the name of the function whose body is being checked, if any.
+    ///
+    /// Only used to attribute call-graph edges to a caller. `None` while
+    /// checking anything that is not inside a function body (a global
+    /// initialiser, say), and edges found there are dropped rather than
+    /// attributed to whatever was checked last.
+    pub(crate) current_fn: Option<String>,
+    /// A2: availability clauses WRITTEN on ordinary functions, keyed by name.
+    ///
+    /// Kept apart from `externs` because the two mean different things. An
+    /// extern's clause is a FACT the compiler has no way to verify — nobody
+    /// can see inside a C symbol. A function's clause is an ASSERTION about
+    /// code the compiler can read, so it is checked.
+    pub(crate) declared_fn_avail: HashMap<String, (Vec<String>, crate::ast::Span)>,
+    /// A2: the call graph, caller → (callee, call site).
+    ///
+    /// Built during checking rather than by a separate traversal, so it cannot
+    /// disagree with what the checker actually saw. The span is kept per EDGE,
+    /// not per callee, because the diagnostic's job is to name a chain and a
+    /// chain is a sequence of call sites.
+    pub(crate) call_graph: HashMap<String, Vec<(String, crate::ast::Span)>>,
+    /// B1: the generic signature of every function that declares a bound,
+    /// keyed by name.
+    ///
+    /// Only functions WITH bounds are recorded. A generic parameter erases to
+    /// `Unknown` in `self.functions`, so by the time a call site is checked
+    /// there is nothing left to say which parameter was `T` — this keeps the
+    /// declaration around for exactly the functions where it matters.
+    pub(crate) fn_generic_sigs: HashMap<String, GenericSig>,
+    /// R2: the language version being checked against.
+    ///
+    /// The checker's only use of it is the `division-semantics` lint, whose
+    /// message names the meaning `/` has RIGHT NOW and the function that pins
+    /// that meaning in both versions. Everything else the version changes is
+    /// downstream of here, in the lowerer and the backends.
+    pub lang: crate::lang::LangVersion,
+}
+
+/// B1: what a bounded generic function declared, preserved for its call sites.
+#[derive(Debug, Clone)]
+pub struct GenericSig {
+    pub generics: Vec<String>,
+    pub bounds: Vec<crate::ast::GenericBound>,
+    /// The declared type of each parameter, kept in AST form because the
+    /// resolved `ManiType` has already erased the generic names.
+    pub param_tys: Vec<crate::ast::Type>,
+}
+
+/// A1: one recorded `extern` declaration.
+#[derive(Debug, Clone)]
+pub struct ExternSig {
+    pub abi: String,
+    pub params: Vec<ManiType>,
+    pub ret: ManiType,
+    /// `None` = no `available` clause was written. Distinct from `Some(vec![])`,
+    /// which would say "available on no backend at all".
+    pub available: Option<Vec<String>>,
+    pub deprecated: Option<String>,
+    pub span: crate::ast::Span,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +223,7 @@ const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("t27f",        include_str!("../../../stdlib/t27f.mt")),
     ("ternary",     include_str!("../../../stdlib/ternary.mt")),
     ("test",        include_str!("../../../stdlib/test.mt")),
+    ("trit",        include_str!("../../../stdlib/trit.mt")),
     ("time",        include_str!("../../../stdlib/time.mt")),
     ("tritfs",      include_str!("../../../stdlib/tritfs.mt")),
 ];
@@ -266,6 +351,15 @@ impl SemanticAnalyzer {
             loaded_module_prefixes: std::collections::HashSet::new(),
             module_private_items: HashMap::new(),
             native_param_manitys: HashMap::new(),
+            externs: HashMap::new(),
+            undeclared_natives: Vec::new(),
+            backend: None,
+            current_fn: None,
+            call_graph: HashMap::new(),
+            declared_fn_avail: HashMap::new(),
+            bodied_fns: std::collections::HashSet::new(),
+            fn_generic_sigs: HashMap::new(),
+            lang: crate::lang::LangVersion::default(),
         };
         analyzer.register_builtins();
         analyzer
@@ -279,6 +373,76 @@ impl SemanticAnalyzer {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         a
+    }
+
+    /// C4/R2: record a `/` or `%` whose meaning depends on the language
+    /// version, for the `division-semantics` migration backlog.
+    ///
+    /// `ty` is the type the LOWERER will look at when it chooses between
+    /// `Div` and `DivNear` — the left operand for an expression, the assigned
+    /// value for a compound assignment. Taking it from anywhere else would let
+    /// the backlog and the code generator disagree about which sites are
+    /// affected, which is the one thing a migration list must not do.
+    ///
+    /// Float division is not reported: IEEE division already rounds, and C4
+    /// does not touch it.
+    pub(crate) fn note_division_semantics(
+        &mut self,
+        op: &crate::ast::BinOpKind,
+        ty: &ManiType,
+        span: crate::ast::Span,
+    ) {
+        use crate::ast::BinOpKind;
+        if !matches!(op, BinOpKind::Div | BinOpKind::Rem) {
+            return;
+        }
+        if matches!(ty, ManiType::Float | ManiType::Tfloat) {
+            return;
+        }
+        if self.warnings.effective_level(&WarningKind::DivisionSemantics)
+            == crate::lint::LintLevel::Allow
+        {
+            return;
+        }
+        let is_div = matches!(op, BinOpKind::Div);
+        let symbol = if is_div { "/" } else { "%" };
+        let (now, other, pin) = if self.lang.division_rounds_to_nearest() {
+            (
+                "rounds to nearest (ties away from zero)",
+                "truncates under v1",
+                if is_div { "math::div_near" } else { "math::rem_near" },
+            )
+        } else {
+            (
+                "truncates",
+                "rounds to nearest under v2",
+                if is_div { "math::div_trunc" } else { "math::rem_trunc" },
+            )
+        };
+        // Name the enclosing function. The span alone is not enough to find
+        // the site: `stdlib_expand` parses each merged module with its OWN
+        // line numbers and the analyzer reports them under the user's file
+        // name, so a site inside `math::` is reported as
+        // `hello.mt:135` — right line, wrong file. That is a pre-existing
+        // defect in span provenance (report.txt P8) which this lint is simply
+        // the first diagnostic to fire inside merged stdlib source; the
+        // function name is what makes the backlog a LIST rather than a count
+        // until it is fixed.
+        let where_ = match &self.current_fn {
+            Some(f) => format!(" in `{}`", f),
+            None => String::new(),
+        };
+        let msg = format!(
+            "`{}`{} on an integer {} under --lang {}, and {}; write `{}(a, b)` to mean this in both",
+            symbol, where_, now, self.lang, other, pin,
+        );
+        self.warnings.push(CompileWarning::new(
+            WarningKind::DivisionSemantics,
+            &self.file,
+            span.line,
+            span.col,
+            msg,
+        ));
     }
 
     fn register_builtins(&mut self) {
@@ -622,6 +786,352 @@ impl SemanticAnalyzer {
     /// type exists nowhere else, since a body-less function never reaches
     /// `TypedProgram::functions`. Missing it made `io::println_bool3(false)`
     /// print `unknown` on BOTH backends (S45).
+    /// A5: apply one `lint <level>(<names>);` item.
+    ///
+    /// An unknown level or an unknown lint name is an ERROR, not a warning.
+    /// The whole point of the item is to control diagnostics, so a typo that
+    /// quietly did nothing would silently leave the compilation at a
+    /// strictness the author did not choose — which is the failure mode A5
+    /// exists to remove, reintroduced one layer up.
+    fn apply_lint_decl(&mut self, decl: &ast::LintDecl) -> CompileResult<()> {
+        let Some(level) = crate::lint::LintLevel::from_name(&decl.level) else {
+            return Err(CompileError::Type(crate::error::Diagnostic::new(
+                &self.file,
+                decl.span.line,
+                decl.span.col,
+                format!(
+                    "unknown lint level '{}'; expected allow, warn, deny or forbid",
+                    decl.level
+                ),
+            )));
+        };
+        for name in &decl.lints {
+            self.warnings.lints.set(name, level).map_err(|e| {
+                CompileError::Type(crate::error::Diagnostic::new(
+                    &self.file,
+                    decl.span.line,
+                    decl.span.col,
+                    e,
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A1: record one `extern` declaration.
+    ///
+    /// The declaration is registered in three places, and all three matter:
+    /// `externs` for call-site checking, `functions` so the return type is
+    /// inferred at every call, and `native_param_manitys` so the lowerer
+    /// coerces arguments the same way it does for a user function. Registering
+    /// only the first would type-check the call and then lower it wrongly,
+    /// which is the shape of S45.
+    fn collect_extern_decl(&mut self, decl: &ast::ExternDecl) -> CompileResult<()> {
+        if let Some(prev) = self.externs.get(&decl.name) {
+            return Err(CompileError::Type(crate::error::Diagnostic::new(
+                &self.file,
+                decl.span.line,
+                decl.span.col,
+                format!(
+                    "extern '{}' is already declared at line {}; a native may be \
+                     declared once, so that the declaration is the authority on \
+                     its signature",
+                    decl.name, prev.span.line
+                ),
+            )));
+        }
+
+        let mut params = Vec::with_capacity(decl.params.len());
+        for p in &decl.params {
+            params.push(self.resolve_type(&p.ty)?);
+        }
+        let ret = match &decl.ret_ty {
+            Some(t) => self.resolve_type(t)?,
+            None => ManiType::Void,
+        };
+
+        // A backend name that is not one the compiler has is a typo, and a
+        // typo in `available(llmv)` would make step 3 refuse the call on every
+        // backend for a reason the source does not show.
+        if let Some(backends) = &decl.available {
+            for b in backends {
+                if !matches!(b.as_str(), "llvm" | "t3") {
+                    return Err(CompileError::Type(crate::error::Diagnostic::new(
+                        &self.file,
+                        decl.span.line,
+                        decl.span.col,
+                        format!(
+                            "unknown backend '{}' in `available(...)`; the backends \
+                             are llvm and t3",
+                            b
+                        ),
+                    )));
+                }
+            }
+        }
+
+        self.externs.insert(
+            decl.name.clone(),
+            ExternSig {
+                abi: decl.abi.clone(),
+                params: params.clone(),
+                ret: ret.clone(),
+                available: decl.available.clone(),
+                deprecated: decl.deprecated.clone(),
+                span: decl.span,
+            },
+        );
+
+        // Authoritative over the signature derived by scanning the stdlib
+        // sources: that scan infers, this one is written down.
+        self.native_param_manitys.insert(decl.name.clone(), params.clone());
+        self.functions.insert(decl.name.clone(), (params, ret));
+        Ok(())
+    }
+
+    /// B1: traits every primitive satisfies without an `impl`.
+    ///
+    /// A bound is only useful if the ordinary types satisfy the ordinary
+    /// traits: requiring `impl Ord for int` before `max<T: Ord>(1, 2)` would
+    /// compile is a tax with no safety return, since the compiler already
+    /// knows how to compare an int. Structs and enums are NOT covered — they
+    /// are exactly the case A4 is about, where the comparison silently became
+    /// a pointer comparison.
+    pub(crate) const BUILTIN_TRAITS: &'static [&'static str] = &[
+        "Ord", "PartialOrd", "Eq", "PartialEq", "Display", "Debug", "Clone", "Copy", "Hash",
+    ];
+
+    /// Whether a concrete type satisfies one trait.
+    fn type_satisfies(&self, ty: &ManiType, trait_name: &str) -> bool {
+        // A user impl always satisfies, for any type including a primitive.
+        let base = Self::type_impl_key(ty);
+        if let Some(base) = &base {
+            if self.trait_impls.contains(&(base.clone(), trait_name.to_string())) {
+                return true;
+            }
+        }
+        // Primitives satisfy the structural traits intrinsically.
+        let is_primitive = !matches!(
+            ty,
+            ManiType::Struct(_) | ManiType::Enum(_) | ManiType::Unknown | ManiType::Fn(_, _)
+        );
+        is_primitive && Self::BUILTIN_TRAITS.contains(&trait_name)
+    }
+
+    /// The name a type is keyed under in `trait_impls`, if it has one.
+    fn type_impl_key(ty: &ManiType) -> Option<String> {
+        match ty {
+            ManiType::Struct(n) | ManiType::Enum(n) => Some(n.clone()),
+            ManiType::Generic(n, _) => Some(n.clone()),
+            ManiType::Int => Some("int".to_string()),
+            ManiType::Float => Some("float".to_string()),
+            ManiType::Str => Some("str".to_string()),
+            ManiType::Char => Some("char".to_string()),
+            ManiType::Bool => Some("bool".to_string()),
+            ManiType::Bool3 => Some("bool3".to_string()),
+            ManiType::Trit => Some("trit".to_string()),
+            ManiType::Tryte => Some("tryte".to_string()),
+            ManiType::T9 => Some("t9".to_string()),
+            ManiType::T27 => Some("t27".to_string()),
+            ManiType::T54 => Some("t54".to_string()),
+            ManiType::Tfloat => Some("tfloat".to_string()),
+            _ => None,
+        }
+    }
+
+    /// B1: bind generic parameter names to the concrete types an argument
+    /// supplied, structurally.
+    ///
+    /// Handles the two forms the bound examples use: a bare `T`, and a `T`
+    /// inside a constructor such as `Vec<T>`. A parameter that binds twice
+    /// keeps the FIRST binding — reporting a conflict is a different check
+    /// (and a different diagnostic) from reporting an unsatisfied bound, and
+    /// conflating them would make the bound error fire for the wrong reason.
+    fn bind_generics(
+        declared: &crate::ast::Type,
+        actual: &ManiType,
+        generics: &[String],
+        out: &mut HashMap<String, ManiType>,
+    ) {
+        use crate::ast::Type as AT;
+        match declared {
+            AT::Named(n, _) => {
+                if generics.iter().any(|g| g == n) && !out.contains_key(n) {
+                    out.insert(n.clone(), actual.clone());
+                }
+            }
+            AT::Generic(_, args, _) => {
+                if let ManiType::Generic(_, actual_args) = actual {
+                    for (d, a) in args.iter().zip(actual_args.iter()) {
+                        Self::bind_generics(d, a, generics, out);
+                    }
+                }
+            }
+            AT::Array(inner, _, _) => {
+                if let ManiType::Array(a, _) = actual {
+                    Self::bind_generics(inner, a, generics, out);
+                }
+            }
+            AT::Ref(inner, _, _) | AT::Ptr(inner, _, _) => {
+                Self::bind_generics(inner, actual, generics, out);
+            }
+            AT::Tuple(items, _) => {
+                if let ManiType::Tuple(actuals) = actual {
+                    for (d, a) in items.iter().zip(actuals.iter()) {
+                        Self::bind_generics(d, a, generics, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// B1/A4: check a call against the callee's declared bounds.
+    ///
+    /// This is the A4 soundness hole closing. Before bounds existed,
+    /// `max<T>(a, b)` on a struct with no ordering compiled clean, checked
+    /// clean, and returned the wrong value on BOTH backends — it compared the
+    /// two allocation addresses, so `max(P{9}, P{1})` returned `P{1}`. The two
+    /// backends agreed, which is why the differential oracle never saw it.
+    pub(crate) fn check_generic_bounds(
+        &mut self,
+        callee: &str,
+        arg_tys: &[ManiType],
+        span: crate::ast::Span,
+    ) {
+        let Some(sig) = self.fn_generic_sigs.get(callee).cloned() else {
+            return;
+        };
+        let mut binding: HashMap<String, ManiType> = HashMap::new();
+        for (declared, actual) in sig.param_tys.iter().zip(arg_tys.iter()) {
+            Self::bind_generics(declared, actual, &sig.generics, &mut binding);
+        }
+
+        for bound in &sig.bounds {
+            let Some(ty) = binding.get(&bound.param) else {
+                // The parameter appears in no argument position, so nothing
+                // pins it. Silent by design: reporting here would fire on
+                // return-position-only generics, which the bound cannot be
+                // checked against at the call site at all.
+                continue;
+            };
+            if !ty.is_known() {
+                // Inference did not reach a concrete type. Reporting an
+                // unsatisfied bound for a type we could not determine would be
+                // a false positive, and A4 is about a REAL wrong answer.
+                continue;
+            }
+            for trait_name in &bound.traits {
+                if self.type_satisfies(ty, trait_name) {
+                    continue;
+                }
+                let known_trait = self.trait_defs.contains_key(trait_name)
+                    || Self::BUILTIN_TRAITS.contains(&trait_name.as_str());
+                let msg = if known_trait {
+                    format!(
+                        "`{}` does not satisfy the bound `{}: {}` required by '{}'; \
+                         add `impl {} for {}`",
+                        ty.display(), bound.param, trait_name, callee,
+                        trait_name, ty.display()
+                    )
+                } else {
+                    format!(
+                        "'{}' requires the bound `{}: {}`, but no trait named `{}` \
+                         is declared",
+                        callee, bound.param, trait_name, trait_name
+                    )
+                };
+                self.warnings.push(CompileWarning::new(
+                    WarningKind::UnsatisfiedBound,
+                    &self.file,
+                    span.line,
+                    span.col,
+                    msg,
+                ));
+            }
+        }
+    }
+
+    /// A1: whether a callee reaches a backend as a native rather than as
+    /// compiled ManiT.
+    ///
+    /// The test is "qualified by a standard library module, and has no body in
+    /// this program". The second half is what keeps the source modules —
+    /// bridge, crypto, t27f, and anything `stdlib_expand` merges — out of the
+    /// backlog: they are ManiT, they are compiled, and declaring them `extern`
+    /// would be a lie.
+    pub(crate) fn is_native(&self, name: &str) -> bool {
+        let Some((prefix, _)) = name.split_once("::") else {
+            return false;
+        };
+        Self::STDLIB_MODULES.contains(&prefix) && !self.bodied_fns.contains(name)
+    }
+
+    /// A1: record that a native was called with no `extern` declaration.
+    ///
+    /// Deduplicated by name — the backlog is a list of natives to declare, not
+    /// a list of call sites, and one entry per call would make a program that
+    /// prints in a loop dominate its own migration report.
+    pub(crate) fn note_undeclared_native(&mut self, name: &str, span: crate::ast::Span) {
+        if self.externs.contains_key(name) {
+            return;
+        }
+        if !self.undeclared_natives.iter().any(|n| n == name) {
+            self.undeclared_natives.push(name.to_string());
+        }
+        self.warnings.push(CompileWarning::new(
+            WarningKind::UndeclaredNative,
+            &self.file,
+            span.line,
+            span.col,
+            format!(
+                "native '{}' is called with no `extern` declaration; its signature \
+                 is inferred, so its arguments are not checked",
+                name
+            ),
+        ));
+    }
+
+    /// A1: diagnostics that depend on a native's declaration, at the call site.
+    pub(crate) fn check_extern_call_site(&mut self, name: &str, span: crate::ast::Span) {
+        let Some(sig) = self.externs.get(name) else {
+            return;
+        };
+        if let Some(msg) = sig.deprecated.clone() {
+            self.warnings.push(CompileWarning::new(
+                WarningKind::DeprecatedNative,
+                &self.file,
+                span.line,
+                span.col,
+                format!("'{}' is deprecated: {}", name, msg),
+            ));
+        }
+        // A1 step 3 is not enforced here — the level defaults to `allow` — but
+        // the diagnostic is produced so that `--warn backend-unavailable`
+        // reports the step-3 backlog the same way `--warn undeclared-native`
+        // reports the step-1 one.
+        if let Some(avail) = sig.available.clone() {
+            let target = self.backend.clone();
+            if let Some(target) = target {
+                if !avail.contains(&target) {
+                    self.warnings.push(CompileWarning::new(
+                        WarningKind::BackendUnavailable,
+                        &self.file,
+                        span.line,
+                        span.col,
+                        format!(
+                            "'{}' is not available on the {} backend (declared \
+                             available on: {})",
+                            name,
+                            target,
+                            if avail.is_empty() { "no backend".to_string() } else { avail.join(", ") }
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     fn register_native_module_sigs(&mut self) {
         // Modules whose RETURN types are registered in `self.functions`.
         // Narrower than the parameter scan below, deliberately: adding a return
@@ -802,11 +1312,18 @@ impl SemanticAnalyzer {
                 Item::UseDecl(_) => {
                     // No type checking needed for use declarations
                 }
+                // Both were fully handled in collect_declarations. They carry
+                // no body to check and produce no typed item.
+                Item::ExternDecl(_) | Item::LintDecl(_) => {}
             }
         }
 
         // Append any lambdas discovered during type-checking
         typed_fns.append(&mut self.lambda_fns);
+
+        // A2: infer backend availability over the call graph now that every
+        // body has been checked and every edge recorded.
+        self.infer_availability();
 
         Ok(TypedProgram {
             functions: typed_fns,
@@ -818,10 +1335,325 @@ impl SemanticAnalyzer {
         })
     }
 
+    // ---------------------------------------------------------------------------
+    // A2: backend availability, inferred over the call graph
+    // ---------------------------------------------------------------------------
+
+    /// The backends this compiler knows about.
+    ///
+    /// Availability is represented as a SET of these rather than as a boolean
+    /// per backend, so "no `available` clause was written" and "available
+    /// everywhere" are the same value and need no special case downstream.
+    pub(crate) const KNOWN_BACKENDS: &'static [&'static str] = &["llvm", "t3"];
+
+    /// A2. Infer, for every function with a body, which backends it can run on,
+    /// and report any function that cannot run on the one being compiled for.
+    ///
+    /// A maniT function is available on backend B exactly when every function
+    /// it calls is. That makes availability a backwards dataflow over the call
+    /// graph, and the lattice is finite and tiny — subsets of two backends —
+    /// so a fixpoint iteration converges immediately and handles recursion
+    /// without a separate SCC pass: mutually recursive functions simply settle
+    /// at the meet over their cycle, which is what the specification asks for.
+    ///
+    /// Only externs with an explicit `available(...)` clause constrain
+    /// anything. Everything else starts unconstrained, which keeps this from
+    /// becoming a second undeclared-native backlog: A2 reports contradictions
+    /// between what someone WROTE and what the program actually calls, not the
+    /// absence of annotations.
+    fn infer_availability(&mut self) {
+        use std::collections::HashSet;
+
+        let all: HashSet<String> =
+            Self::KNOWN_BACKENDS.iter().map(|s| s.to_string()).collect();
+
+        // Seed. An extern with a written clause is the only source of a
+        // constraint; every other name is unconstrained until propagation
+        // narrows it.
+        let mut avail: HashMap<String, HashSet<String>> = HashMap::new();
+        for (name, sig) in &self.externs {
+            if let Some(list) = &sig.available {
+                avail.insert(name.clone(), list.iter().cloned().collect());
+            }
+        }
+        // A written clause on an ordinary function seeds the lattice too, so
+        // its callers inherit the restriction. Propagation can only NARROW it
+        // from here, and a narrowing is exactly what makes the assertion false
+        // — which is what the check after the fixpoint looks for.
+        for (name, (list, _)) in &self.declared_fn_avail {
+            avail.insert(name.clone(), list.iter().cloned().collect());
+        }
+
+        // Propagate. Iterate to a fixpoint; the lattice height is the number
+        // of backends, so this terminates in a handful of rounds even for a
+        // deeply recursive graph.
+        let callers: Vec<String> = self.call_graph.keys().cloned().collect();
+        loop {
+            let mut changed = false;
+            for caller in &callers {
+                let mut acc = avail.get(caller).cloned().unwrap_or_else(|| all.clone());
+                if let Some(edges) = self.call_graph.get(caller) {
+                    for (callee, _) in edges {
+                        if let Some(callee_av) = avail.get(callee) {
+                            acc = acc.intersection(callee_av).cloned().collect();
+                        }
+                    }
+                }
+                let prev = avail.get(caller);
+                if prev.map(|p| p != &acc).unwrap_or(acc.len() < all.len()) {
+                    avail.insert(caller.clone(), acc);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // A2, the assertion half. A function that WROTE `available(B)` and
+        // whose body reaches something unavailable on B has made a claim the
+        // call graph contradicts. This is checked whatever backend is being
+        // compiled for, and even when none is — it is a statement about the
+        // program, not about this invocation, so `manitc check` reports it.
+        let mut asserted: Vec<(&String, &(Vec<String>, crate::ast::Span))> =
+            self.declared_fn_avail.iter().collect();
+        asserted.sort_by(|a, b| a.0.cmp(b.0));
+        let mut assertion_failures = Vec::new();
+        for (name, (claimed, span)) in asserted {
+            let Some(actual) = avail.get(name) else { continue };
+            for b in claimed {
+                if actual.contains(b) {
+                    continue;
+                }
+                let chain = self
+                    .availability_witness(name, b, &avail)
+                    .map(|(c, _)| c)
+                    .unwrap_or_else(|| name.clone());
+                assertion_failures.push(CompileWarning::new(
+                    WarningKind::BackendUnavailableChain,
+                    &self.file,
+                    span.line,
+                    span.col,
+                    format!(
+                        "'{}' declares `available({})` but cannot run there: {}",
+                        name, b, chain
+                    ),
+                ));
+            }
+        }
+        let had_assertion_failure = !assertion_failures.is_empty();
+        for w in assertion_failures {
+            self.warnings.push(w);
+        }
+
+        // Report. Backend-agnostic invocations (`manitc check`) ask no
+        // availability question, so they get no availability answer — the same
+        // rule A1 step 3 already follows.
+        let Some(target) = self.backend.clone() else {
+            return;
+        };
+        // A broken assertion already names the same chain; adding the inferred
+        // diagnostic on top would report one mistake twice.
+        if had_assertion_failure {
+            return;
+        }
+
+        // Sorted so the output is deterministic: the call graph is a HashMap
+        // and its iteration order is not.
+        let mut offenders: Vec<&String> = avail
+            .keys()
+            .filter(|f| self.bodied_fns.contains(*f) || self.call_graph.contains_key(*f))
+            .filter(|f| !avail[*f].contains(&target))
+            .filter(|f| !self.externs.contains_key(*f))
+            .collect();
+        offenders.sort();
+        let offenders: Vec<String> = offenders.into_iter().cloned().collect();
+
+        // Report only the OUTERMOST offenders — those no other offender calls.
+        //
+        // A single unavailable extern makes every function above it in the
+        // graph unavailable too, so reporting all of them means N copies of one
+        // fact: a three-deep chain produced three errors that differed only in
+        // where they started. The outermost one's chain already names every hop
+        // including the culprit, and the inner functions are consequences of it
+        // rather than separate problems.
+        //
+        // Reporting the INNERMOST instead would have been the other obvious
+        // choice and is wrong here: the direct call to an unavailable extern is
+        // already A1 step 3's diagnostic (`backend-unavailable`, at the call
+        // site). What A2 knows that A1 cannot is the transitive part.
+        let called_by_offender: std::collections::HashSet<&String> = offenders
+            .iter()
+            .filter_map(|f| self.call_graph.get(f))
+            .flatten()
+            .map(|(callee, _)| callee)
+            .collect();
+        let mut outermost: Vec<String> = offenders
+            .iter()
+            .filter(|f| !called_by_offender.contains(*f))
+            .cloned()
+            .collect();
+        // A cycle of unavailable functions with no caller outside it would
+        // leave nothing outermost, because every member is called by another
+        // member. Fall back to the first offender so a mutually recursive group
+        // still reports rather than passing silently.
+        if outermost.is_empty() {
+            outermost = offenders.iter().take(1).cloned().collect();
+        }
+        let offenders = outermost;
+
+        for f in offenders {
+            // Externs are already reported at their call sites by A1 step 3;
+            // repeating them here would double-report the same fact.
+            if self.externs.contains_key(&f) {
+                continue;
+            }
+            let Some((chain, span)) = self.availability_witness(&f, &target, &avail) else {
+                continue;
+            };
+            self.warnings.push(CompileWarning::new(
+                WarningKind::BackendUnavailableChain,
+                &self.file,
+                span.line,
+                span.col,
+                format!(
+                    "'{}' cannot be compiled for the {} backend: {}",
+                    f, target, chain
+                ),
+            ));
+        }
+    }
+
+    /// Find a shortest call chain from `from` to something not available on
+    /// `target`, and render it.
+    ///
+    /// Breadth-first, so the chain reported is the shortest one rather than
+    /// whichever the recursion happened to reach first — a 12-deep path to the
+    /// same extern explains less than a 2-deep one. The span returned is the
+    /// FIRST call site in the chain, because that is the line the programmer
+    /// has to change.
+    fn availability_witness(
+        &self,
+        from: &str,
+        target: &str,
+        avail: &HashMap<String, std::collections::HashSet<String>>,
+    ) -> Option<(String, crate::ast::Span)> {
+        use std::collections::{HashSet, VecDeque};
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, Vec<String>, Option<crate::ast::Span>)> = VecDeque::new();
+        seen.insert(from.to_string());
+        queue.push_back((from.to_string(), vec![from.to_string()], None));
+
+        while let Some((node, path, first_span)) = queue.pop_front() {
+            // A leaf that is itself unavailable ends the chain — but only if
+            // its unavailability was DECLARED rather than inferred.
+            //
+            // The distinction is the whole point of the chain: an inferred
+            // unavailability is a consequence of something further down, so
+            // stopping there would report "f is unavailable because g is"
+            // without ever naming the reason. A declared one is the reason.
+            //
+            // Both kinds of declaration count. Checking only `externs` here
+            // meant a written `available(...)` clause on an ordinary function
+            // constrained nothing: its callers came out unavailable in the
+            // lattice, the search for a witness then ran off the end of the
+            // graph and found none, and the diagnostic was silently dropped.
+            let declared_here = self
+                .externs
+                .get(&node)
+                .and_then(|s| s.available.clone())
+                .or_else(|| self.declared_fn_avail.get(&node).map(|(l, _)| l.clone()));
+            if node != from
+                && avail.get(&node).map(|a| !a.contains(target)).unwrap_or(false)
+                && declared_here.is_some()
+            {
+                let declared = declared_here.unwrap_or_default();
+                let where_ = if declared.is_empty() {
+                    "no backend".to_string()
+                } else {
+                    declared.join(", ")
+                };
+                return Some((
+                    format!(
+                        "{} — and '{}' is declared available only on: {}",
+                        path.join(" -> "),
+                        node,
+                        where_
+                    ),
+                    first_span.unwrap_or_else(|| crate::ast::Span { line: 1, col: 1 }),
+                ));
+            }
+            let Some(edges) = self.call_graph.get(&node) else {
+                continue;
+            };
+            for (callee, span) in edges {
+                // Only follow edges that are themselves unavailable — any other
+                // branch cannot lead to the reason this function is unavailable.
+                if avail.get(callee).map(|a| a.contains(target)).unwrap_or(true) {
+                    continue;
+                }
+                if !seen.insert(callee.clone()) {
+                    continue;
+                }
+                let mut p = path.clone();
+                p.push(callee.clone());
+                queue.push_back((callee.clone(), p, first_span.or(Some(*span))));
+            }
+        }
+        None
+    }
+
     fn collect_declarations(&mut self, program: &Program) -> CompileResult<()> {
         // Pass 1: collect structs, enums, functions, traits, globals, use-decls.
         // ImplBlocks are deferred to pass 2 so that trait validation always sees
         // fully populated trait_defs regardless of source order.
+        // A5: module lint levels are applied BEFORE anything else is collected,
+        // so a `lint allow(...)` at the top of a file governs the diagnostics
+        // this very pass produces. Applying them later would make the level
+        // depend on where in the file the item sits, which is exactly the kind
+        // of order-dependence a recorded manifest is supposed to rule out.
+        for item in &program.items {
+            if let Item::LintDecl(l) = item {
+                self.apply_lint_decl(l)?;
+            }
+        }
+
+        // A1: extern declarations, before functions, so a call anywhere in the
+        // program sees the declaration regardless of source order.
+        for item in &program.items {
+            if let Item::ExternDecl(e) = item {
+                self.collect_extern_decl(e)?;
+            }
+        }
+
+        // Everything that has a body, so `is_native` can tell a stdlib module
+        // written in ManiT from one the backend has to supply.
+        for item in &program.items {
+            match item {
+                Item::FnDef(f) if f.body.is_some() => {
+                    self.bodied_fns.insert(f.name.clone());
+                    if !f.bounds.is_empty() {
+                        self.fn_generic_sigs.insert(
+                            f.name.clone(),
+                            GenericSig {
+                                generics: f.generics.clone(),
+                                bounds: f.bounds.clone(),
+                                param_tys: f.params.iter().map(|p| p.ty.clone()).collect(),
+                            },
+                        );
+                    }
+                }
+                Item::ImplBlock(imp) => {
+                    for m in &imp.methods {
+                        if m.body.is_some() {
+                            self.bodied_fns.insert(format!("{}::{}", imp.ty, m.name));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for item in &program.items {
             match item {
                 Item::StructDef(s) => {
@@ -883,6 +1715,9 @@ impl SemanticAnalyzer {
                     self.resolve_use(u)?;
                 }
                 Item::ImplBlock(_) => {} // deferred to pass 2
+                // Collected in the dedicated passes above this match, which run
+                // first so that ordering cannot affect either one.
+                Item::ExternDecl(_) | Item::LintDecl(_) => {}
             }
         }
 
@@ -963,7 +1798,7 @@ impl SemanticAnalyzer {
     pub(crate) const STDLIB_MODULES: &'static [&'static str] = &[
         "io", "math", "ternary", "collections", "fmt", "str",
         "sync", "async", "env", "time", "fs", "net",
-        "t27f", "crypto", "bridge", "tritfs", "test",
+        "t27f", "crypto", "bridge", "tritfs", "test", "trit",
     ];
 
     fn resolve_use(&mut self, decl: &UseDecl) -> CompileResult<()> {
@@ -1144,6 +1979,12 @@ impl SemanticAnalyzer {
         };
         let old_ret = self.current_fn_ret.clone();
         self.current_fn_ret = ret_ty.clone();
+        // A2: attribute every call in this body to this function.
+        let old_fn = self.current_fn.replace(f.name.clone());
+        if let Some(list) = &f.available {
+            self.declared_fn_avail
+                .insert(f.name.clone(), (list.clone(), f.span));
+        }
 
         self.symbols.push_scope();
         let mut typed_params = Vec::new();
@@ -1198,6 +2039,7 @@ impl SemanticAnalyzer {
         };
         self.symbols.pop_scope();
         self.current_fn_ret = old_ret;
+        self.current_fn = old_fn;
         self.type_params = saved_type_params;
 
         Ok(TypedFnDef {

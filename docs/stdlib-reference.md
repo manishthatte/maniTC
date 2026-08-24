@@ -373,6 +373,8 @@ Arithmetic. Every float function is implemented in ManiT — T3 is ternary hardw
 | `math::clamp` | `(n: int, lo: int, hi: int) -> int` | ManiT | yes | Clamp n to the inclusive range [lo, hi]. |
 | `math::cos` | `(f: float) -> float` | ManiT | yes | — |
 | `math::cosh` | `(f: float) -> float` | ManiT | yes | — |
+| `math::div_near` | `(a: int, b: int) -> int` | native | yes | Ties go away from zero rather than to even because the balanced system is symmetric about zero and `div_near(-a, b) == -div_near(a, b)` is the property worth keeping; the unbiasedness balanced ternary claims comes from the representation, not from the tie-break. |
+| `math::div_trunc` | `(a: int, b: int) -> int` | native | yes | Truncating division — the quotient rounded towards zero. v1's `/`. |
 | `math::exp` | `(f: float) -> float` | ManiT | yes | e^f. e^f. |
 | `math::exp2` | `(f: float) -> float` | ManiT | yes | 2^f. 2^f. |
 | `math::exp3` | `(f: float) -> float` | ManiT | yes | 3^f — ternary exponential, exact for integer f. 3^f - ternary exponential, exact for integer f. |
@@ -399,6 +401,8 @@ Arithmetic. Every float function is implemented in ManiT — T3 is ternary hardw
 | `math::min` | `(a: int, b: int) -> int` | ManiT | yes | Smaller of two integers. |
 | `math::pow` | `(base: int, exp: int) -> int` | ManiT | yes | The `if e > 0` guard on the squaring is load-bearing, not an optimisation. A T3 int is 27 trits and TRAPS on overflow, so squaring `b` one last time after the final multiply — which the textbook loop does — can trap on an input whose answer is perfectly representable. The guard keeps \|b\| <= \|result\| at every step, so pow overflows only when its own result does. |
 | `math::pow3` | `(n: int) -> int` | ManiT | yes | Raise 3 to integer exponent — trivially cheap in balanced ternary. pow3(n) == 3^n. |
+| `math::rem_near` | `(a: int, b: int) -> int` | native | yes | The balanced remainder pairing with div_near — `a - div_near(a, b) * b`. Lies in [-\|b\|/2, +\|b\|/2], so unlike rem_trunc it can be negative for a positive `a`: `div_near(7, 2)` is 4 and `rem_near(7, 2)` is -1. v2's `%`. |
+| `math::rem_trunc` | `(a: int, b: int) -> int` | native | yes | The remainder pairing with div_trunc. Takes the sign of `a`. v1's `%`. |
 | `math::round` | `(f: float) -> float` | ManiT | yes | Round to nearest integer, half-away-from-zero. Round to nearest integer, half-away-from-zero. |
 | `math::sign` | `(n: int) -> int` | ManiT | yes | Sign of n: returns +1, 0, or -1 as an int. Note: the trit equivalent is trit_sign in std::ternary. |
 | `math::sin` | `(f: float) -> float` | ManiT | yes | — |
@@ -638,7 +642,7 @@ Assertions. Pure ManiT over `io::println` and `env::exit`, so it needs nothing f
 
 ## Census
 
-**325 declarations** across 13 modules: **225 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **63 do not work on at least one backend**.
+**329 declarations** across 13 modules: **229 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **63 do not work on at least one backend**.
 
 The *Works* column records whether a one-line program calling the function compiles and links on each backend. It is a test of existence, not of correctness: a function marked `yes` has a body on both sides, which is exactly what `fmt::`'s twenty-five documented-but-undefined entries did not. A `not probed` row is an admission, not a pass.
 

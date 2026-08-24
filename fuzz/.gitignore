@@ -1,0 +1,14 @@
+# cargo-fuzz build output.
+target/
+
+# The working corpus. libFuzzer writes every coverage-increasing input here,
+# which after a short campaign is thousands of mutated files — memory for the
+# fuzzer, noise in a repository. Regenerate the seeds with ./seed_corpus.sh;
+# the coverage memory is worth keeping on the machine that does the soaking,
+# not in the history.
+corpus/
+
+# artifacts/ is deliberately NOT ignored. A crash reproducer is the most
+# valuable thing a fuzz run produces, and tests/fuzz_corpus_tests.rs replays
+# every file in it on STABLE — so a finding outlives the nightly toolchain
+# that found it, and comes back as an ordinary test failure if it regresses.

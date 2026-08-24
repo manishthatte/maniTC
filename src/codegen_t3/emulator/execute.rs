@@ -118,7 +118,17 @@ impl Emulator {
         let sr2 = (r2 as usize).min(26);
         let sr3 = (r3 as usize).min(26);
         // Effective rhs: regs[r3] + imm. This lets r3=0 with imm=n encode immediates.
-        let rhs_eff = self.regs[sr3] + imm;
+        //
+        // Saturating, not plain `+`. Every arithmetic opcode below already
+        // routes its result through `saturating_*` and then `checked27`, which
+        // turns an out-of-range value into a diagnosed T3 fault; this one line
+        // was the exception, and in a debug build it aborted the whole process
+        // with "attempt to add with overflow" and no file:line in the ManiT
+        // source. Found by the math::float surface (s23), where an intermediate
+        // reaches i64::MAX before checked27 ever sees it. Saturating here
+        // changes no in-range result — it only lets the existing fault path do
+        // its job instead of being pre-empted by a panic.
+        let rhs_eff = self.regs[sr3].saturating_add(imm);
 
         match op {
             Opcode::Nop => {}
@@ -159,6 +169,42 @@ impl Emulator {
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
+            // ---- T3ISA v1.6: round-to-nearest division (C4) --------------
+            //
+            // The rule is `crate::lang::div_nearest`, the same function the
+            // constant folder uses and the same one `docs/semantics.md`
+            // states. The emulator does not restate it: a machine and a folder
+            // that each implement "round to nearest" from the prose would
+            // agree on the seven obvious cases and diverge somewhere in the
+            // negatives, and nothing in the test suite would be looking there.
+            //
+            // Neither can overflow the word. |q| <= |a| for every divisor of
+            // magnitude >= 2, and for |b| == 1 the quotient is exactly ±a; the
+            // rounding adjustment moves q by one only when it does not (r == 0
+            // when |b| == 1, so the adjustment is not taken). checked27 is
+            // still applied rather than assumed, on the principle that the
+            // machine reports what it cannot represent instead of clamping —
+            // the defect that made `fib_safe(70)` return a plausible T3_MAX.
+            Opcode::Tdivn => {
+                if rhs_eff == 0 {
+                    self.trap("TRAP: division by zero");
+                    return;
+                }
+                let raw = crate::lang::div_nearest(self.regs[sr2], rhs_eff);
+                let Some(v) = self.checked27(raw, "TDIVN") else { return };
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            Opcode::Tmodn => {
+                if rhs_eff == 0 {
+                    self.trap("TRAP: modulo by zero");
+                    return;
+                }
+                let raw = crate::lang::rem_balanced(self.regs[sr2], rhs_eff);
+                let Some(v) = self.checked27(raw, "TMODN") else { return };
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
             Opcode::Tneg => {
                 let v = clamp27(-self.regs[sr2]);
                 self.flags = sign_i64(v);
@@ -177,6 +223,87 @@ impl Emulator {
             Opcode::Tnot => {
                 // same as tneg for a word value
                 let v = clamp27(-self.regs[sr2]);
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            // ---- T3ISA v1.5: lane-wise ternary logic (C2) ----------------
+            //
+            // Each of these does in one instruction what the standard library
+            // currently does with 27 iterations of divide-by-3^i, operate,
+            // multiply-back. The emulator pays a 27-iteration loop in Rust;
+            // the COMPILED program does not, which is where the win lives.
+            //
+            // None of them can trap: every lane result is in {-1, 0, +1} by
+            // construction, so the reassembled word is in range by
+            // construction. That is a property of the balanced representation,
+            // not a bound we are choosing to enforce.
+            Opcode::Tandw => {
+                let v = lanewise2(self.regs[sr2], rhs_eff, |a, b| a.min(b));
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            Opcode::Torw => {
+                let v = lanewise2(self.regs[sr2], rhs_eff, |a, b| a.max(b));
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            Opcode::Txorw => {
+                let v = lanewise2(self.regs[sr2], rhs_eff, trit_xor);
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            Opcode::Timpw => {
+                let v = lanewise2(self.regs[sr2], rhs_eff, trit_imp);
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            Opcode::Tcmpw => {
+                // Per-lane three-way compare. TCMP already returns -1/0/+1 for
+                // whole words in one instruction; this is the same answer for
+                // all 27 lanes at once.
+                let v = lanewise2(self.regs[sr2], rhs_eff, |a, b| {
+                    if a > b { 1 } else if a < b { -1 } else { 0 }
+                });
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            Opcode::Tpopc => {
+                // Count lanes of Ra equal to the trit k. `k` comes from r3 or
+                // the immediate, clamped into {-1, 0, +1}: a "count of lanes
+                // equal to 7" has no meaning, and silently counting zero would
+                // hide the mistake.
+                let k = rhs_eff.clamp(-1, 1) as i8;
+                let lanes = trits27(self.regs[sr2]);
+                let v = lanes.iter().filter(|&&t| t == k).count() as i64;
+                self.flags = sign_i64(v);
+                wreg!(r1, v);
+            }
+            Opcode::Tselw => {
+                // TSELW Rd, Rs, Ra, Rb — per-lane select on a mask word. This
+                // is the branchless conditional the lane-wise set needs to be
+                // useful, and it is genuinely THREE-way: the zero lane selects
+                // zero, it does not pick one of two arms. A binary select has
+                // no such case to make.
+                //
+                // Four registers in a three-register encoding. The 3-trit
+                // immediate field holds 3^3 = 27 raw values and the register
+                // file is R0..R26 — exactly 27. So Rb rides in the immediate
+                // field read as UNSIGNED, which costs nothing and needs no new
+                // instruction format. That the two numbers coincide is not a
+                // coincidence: both are "what three trits address".
+                let rb = imm.rem_euclid(P3) as usize;
+                let sel = trits27(self.regs[sr2]);
+                let a = trits27(self.regs[sr3]);
+                let b = trits27(self.regs[rb.min(26)]);
+                let mut out = [0i8; T3_LANES];
+                for i in 0..T3_LANES {
+                    out[i] = match sel[i] {
+                        1 => a[i],
+                        -1 => b[i],
+                        _ => 0,
+                    };
+                }
+                let v = from_trits27(&out);
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }

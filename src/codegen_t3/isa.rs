@@ -65,6 +65,133 @@ pub enum Opcode {
     Bshr    = 33,   // binary right shift (arithmetic)
     Loadt   = 34,   // load single trit: Rd = clamp(mem[Ra+imm], -1, 1)
     Storet  = 35,   // store single trit: mem[Ra+imm] = clamp(Rs, -1, 1)
+
+    // ---- T3ISA v1.5: lane-wise ternary logic (C2) ------------------------
+    //
+    // TAND/TOR/TNOT are NUMERIC min/max/negate on a whole 27-trit word. That
+    // is a useful operation and it is not three-valued logic across the word:
+    // it compares two 27-trit NUMBERS. These treat the same word as 27
+    // independent trit lanes, which is what a 27-trit register actually holds
+    // when it holds data rather than a magnitude.
+    //
+    // The distinction is the point of the language. A binary word gives 64
+    // lanes of one-valued data — a bit is not a datum, it is half of one. A
+    // ternary word gives 27 lanes of genuinely three-valued data, and every
+    // lane-wise instruction below replaces 27 extract-operate-insert cycles
+    // (each a division and a multiply by a power of three) with one.
+    Tandw   = 36,   // lane-wise min
+    Torw    = 37,   // lane-wise max
+    Txorw   = 38,   // lane-wise sum mod 3, balanced
+    Timpw   = 39,   // lane-wise Lukasiewicz implication
+    Tcmpw   = 40,   // lane-wise sign compare: sign(a_i - b_i) per lane
+    Tpopc   = 41,   // count lanes of Ra equal to the trit in Rb (or imm)
+    Tselw   = 42,   // per-lane select: s_i > 0 -> a_i, s_i < 0 -> b_i, else 0
+
+    // ---- T3ISA v1.6: round-to-nearest division (C4) ----------------------
+    //
+    // TDIV and TMOD truncate, which is C's rule imported wholesale. On this
+    // machine that is doubly wrong: dropping low trits IS rounding to nearest
+    // — TSHR has always rounded correctly — so truncation is extra work done
+    // to imitate a representation the machine does not use.
+    //
+    // These two round to nearest with ties away from zero, and they move
+    // together: TMODN is defined as `a - TDIVN(a, b) * b`, so
+    // `(a / b) * b + (a % b) == a` holds for this pair exactly as it does for
+    // TDIV/TMOD. Rounding one and truncating the other would break it.
+    //
+    // The compiler emits them for the surface `/` and `%` only under
+    // `--lang v2`; TDIV and TMOD remain, are still emitted for `math::div_trunc`
+    // and `math::rem_trunc`, and are what the compiler's own lowerings use.
+    Tdivn   = 43,   // divide, rounding to nearest (ties away from zero)
+    Tmodn   = 44,   // the balanced remainder pairing with TDIVN
+}
+
+/// One past the highest assigned opcode — the number of distinct opcodes
+/// T3ISA v1.6 defines (0..=44).
+///
+/// Anything indexed by opcode must be sized from this rather than from a
+/// literal. The profiler's histogram was a hard-coded `[usize; 36]` when the
+/// lane-wise group landed at 36–42, so every `TANDW` executed was counted in
+/// the totals and then dropped from the per-opcode breakdown — the instrument
+/// could not see the instructions the architecture had just added.
+pub const T3_OPCODE_COUNT: usize = 45;
+
+// ---------------------------------------------------------------------------
+// Lane decomposition (T3ISA v1.5)
+// ---------------------------------------------------------------------------
+
+/// Number of trit lanes in a word.
+pub const T3_LANES: usize = 27;
+
+/// Split a word into its 27 balanced-ternary trits, least significant first.
+///
+/// This is the operation every lane-wise instruction is defined in terms of,
+/// and it is exact for the whole word range: the balanced representation of a
+/// value in [T3_MIN, T3_MAX] needs at most 27 trits and has no sign bit to
+/// special-case, which is why there is no asymmetric-minimum wart here.
+#[inline]
+pub fn trits27(v: i64) -> [i8; T3_LANES] {
+    let mut out = [0i8; T3_LANES];
+    let mut n = clamp27(v);
+    for lane in out.iter_mut() {
+        // rem_euclid then re-centre: 2 becomes -1 with a carry, which is what
+        // makes the representation balanced rather than merely base-3.
+        //
+        // `div_euclid`, NOT `/`. Rust's `/` truncates toward zero, which
+        // disagrees with `rem_euclid` for negative operands and silently
+        // produced the wrong digits for every negative word: -8 decomposed to
+        // +4. The two must be the same division or the digit and the carry
+        // describe different quotients.
+        let mut r = n.rem_euclid(3);
+        n = n.div_euclid(3);
+        if r == 2 {
+            r = -1;
+            n += 1;
+        }
+        *lane = r as i8;
+    }
+    out
+}
+
+/// Reassemble 27 trits, least significant first, into a word.
+#[inline]
+pub fn from_trits27(lanes: &[i8; T3_LANES]) -> i64 {
+    let mut v: i64 = 0;
+    for &t in lanes.iter().rev() {
+        v = v * 3 + t as i64;
+    }
+    clamp27(v)
+}
+
+/// Apply a binary function to every lane pair.
+#[inline]
+pub fn lanewise2(a: i64, b: i64, f: impl Fn(i8, i8) -> i8) -> i64 {
+    let (la, lb) = (trits27(a), trits27(b));
+    let mut out = [0i8; T3_LANES];
+    for i in 0..T3_LANES {
+        out[i] = f(la[i], lb[i]);
+    }
+    from_trits27(&out)
+}
+
+/// Lukasiewicz implication on one trit: `min(+1, 1 - a + b)`.
+///
+/// The same connective the language's `timp` computes, per lane. See
+/// `BinOpKind::Timp` for why the a = b = 0 cell is the one that matters.
+#[inline]
+pub fn trit_imp(a: i8, b: i8) -> i8 {
+    (1 - a + b).min(1)
+}
+
+/// Balanced sum mod 3 on one trit — the lane-wise `txor`.
+///
+/// Not an involution: `x txor k txor k` is not `x`, because 3k = 0 (mod 3)
+/// needs THREE applications. The language reference already documents this for
+/// the word-level operator and it is inherited unchanged here.
+#[inline]
+pub fn trit_xor(a: i8, b: i8) -> i8 {
+    let s = (a as i32 + b as i32).rem_euclid(3);
+    (if s == 2 { -1 } else { s }) as i8
 }
 
 impl Opcode {
@@ -106,6 +233,17 @@ impl Opcode {
             33 => Some(Opcode::Bshr),
             34 => Some(Opcode::Loadt),
             35 => Some(Opcode::Storet),
+            // T3ISA v1.5 (C2)
+            36 => Some(Opcode::Tandw),
+            37 => Some(Opcode::Torw),
+            38 => Some(Opcode::Txorw),
+            39 => Some(Opcode::Timpw),
+            40 => Some(Opcode::Tcmpw),
+            41 => Some(Opcode::Tpopc),
+            42 => Some(Opcode::Tselw),
+            // T3ISA v1.6 (C4)
+            43 => Some(Opcode::Tdivn),
+            44 => Some(Opcode::Tmodn),
             _  => None,
         }
     }

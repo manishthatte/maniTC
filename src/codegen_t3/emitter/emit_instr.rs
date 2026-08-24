@@ -10,8 +10,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             // 61), never integer TADD on the two handles (which produced a
             // meaningless address). Mirrors the LLVM backend's @str_concat.
             if matches!(op, IRBinOp::Add) && matches!(binop_ty, IRType::Ptr(_)) {
-                em.rescue_reg_inclusive(1);
-                em.rescue_reg_inclusive(2);
                 let rd = em.dst_reg(dst);
                 let rl = em.val_reg(lhs);
                 let rr = em.val_reg(rhs);
@@ -41,14 +39,18 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             let is_float_syscall = (is_float && matches!(op, IRBinOp::Add | IRBinOp::Sub | IRBinOp::Mul | IRBinOp::Div))
                 || matches!(op, IRBinOp::FEq | IRBinOp::FNe | IRBinOp::FLt | IRBinOp::FGt | IRBinOp::FLe | IRBinOp::FGe);
 
-            // For ALL float ops that use syscalls, rescue R1/R2 BEFORE
-            // allocating any registers.  Use rescue_reg_inclusive so that
-            // temps whose last use IS this instruction are also moved out
-            // of R1/R2 — otherwise float-literal loading (which uses R1
-            // via SYSCALL #219) would silently overwrite them.
+            // The float syscalls write R1 while setting up, BEFORE the operands
+            // are read. Nothing is rescued here any more — `rescue_reg` is gone
+            // with the rest of F-3's predecessor — so the guarantee comes from
+            // the allocator instead: `regalloc::abi_clobber_sites` lists these
+            // same conditions, and a parameter whose live range REACHES one
+            // (last use included, not just crossed) is refused R1–R3 and given
+            // a frame slot. Inclusive is the point: `x * K` loads K into R1 via
+            // SYSCALL #219 and only then multiplies, so a parameter whose final
+            // use is this instruction is still destroyed by it. That is what
+            // made `math::to_radians` return (PI/180)^2.
             if is_float_syscall
             {
-                em.rescue_reg_inclusive(1); em.rescue_reg_inclusive(2);
                 let rd = em.dst_reg(dst);
                 let rl = em.val_reg(lhs);
                 let rr = em.val_reg(rhs);
@@ -143,17 +145,43 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 return;
             }
 
+            // C4/N5: the version-dependent operators are integer-only by
+            // construction — `binop_to_ir` never produces one for a float type
+            // — and there is no float encoding for them below, so a mismatch
+            // would emit a TDIVN on a double bit pattern and answer garbage
+            // rather than fail. Loud in the test suite, free in release.
+            debug_assert!(
+                !(is_float && matches!(op,
+                    IRBinOp::DivNear | IRBinOp::RemNear
+                    | IRBinOp::AddT27 | IRBinOp::SubT27 | IRBinOp::MulT27)),
+                "a version-dependent integer op reached the T3 emitter with a \
+                 float type: {:?}", op
+            );
+
             let rd = em.dst_reg(dst);
             let rl = em.val_reg(lhs);
             let rr = em.val_reg(rhs);
             let (d, l, r) = (AsmEmitter::rn(rd), AsmEmitter::rn(rl), AsmEmitter::rn(rr));
 
             match op {
-                IRBinOp::Add => em.emit(format!("    TADD  {}, {}, {}", d, l, r)),
-                IRBinOp::Sub => em.emit(format!("    TSUB  {}, {}, {}", d, l, r)),
-                IRBinOp::Mul => em.emit(format!("    TMUL  {}, {}, {}", d, l, r)),
+                // N5: the checked variants are the SAME instructions here.
+                // A T3 register is a 27-trit word and `checked27` already
+                // traps on anything that does not fit, so `--lang v2` costs
+                // this backend nothing at all — the whole cost of N5 falls on
+                // LLVM, which is the backend that was disagreeing.
+                IRBinOp::Add | IRBinOp::AddT27 => em.emit(format!("    TADD  {}, {}, {}", d, l, r)),
+                IRBinOp::Sub | IRBinOp::SubT27 => em.emit(format!("    TSUB  {}, {}, {}", d, l, r)),
+                IRBinOp::Mul | IRBinOp::MulT27 => em.emit(format!("    TMUL  {}, {}, {}", d, l, r)),
                 IRBinOp::Div => em.emit(format!("    TDIV  {}, {}, {}", d, l, r)),
                 IRBinOp::Rem => em.emit(format!("    TMOD  {}, {}, {}", d, l, r)),
+                // C4. One instruction, because T3ISA v1.6 has the operation.
+                // The LLVM backend needs seven to say the same thing (see
+                // codegen_llvm/emit_instr.rs), which is the measurement C4
+                // predicted: rounding to nearest is what dropping low trits
+                // already does in this representation, and it costs nothing
+                // extra to ask for it.
+                IRBinOp::DivNear => em.emit(format!("    TDIVN {}, {}, {}", d, l, r)),
+                IRBinOp::RemNear => em.emit(format!("    TMODN {}, {}, {}", d, l, r)),
                 IRBinOp::And => em.emit(format!("    BAND  {}, {}, {}", d, l, r)),
                 IRBinOp::Or  => em.emit(format!("    BOR   {}, {}, {}", d, l, r)),
                 IRBinOp::Xor => em.emit(format!("    BXOR  {}, {}, {}", d, l, r)),
@@ -202,8 +230,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     // cross-block phi conventions stay valid (B24).  The dst
                     // register is excluded: the restore must not clobber the
                     // result when the allocator hands out R1/R2 as the dst.
-                    let save_regs: Vec<usize> = [1usize, 2].into_iter().filter(|&x| x != rd).collect();
-                    let saved = em.emit_reg_save(&save_regs, "str_eq");
                     if l == "R2" && r == "R1" {
                         em.emit("    MOV   R25, R1        ; str_eq: save rhs(R1)".to_string());
                         em.emit("    MOV   R1, R2         ; str_eq: lhs(R2)→R1".to_string());
@@ -217,13 +243,10 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                     em.emit(format!("    SYSCALL #200         ; str_eq → R1"));
                     em.emit(format!("    MOV   {}, R1         ; str_eq result", d));
-                    em.emit_reg_restore(&saved, "str_eq");
                 }
 
                 IRBinOp::StrNe => {
                     // Same clobber handling as StrEq (B24).
-                    let save_regs: Vec<usize> = [1usize, 2].into_iter().filter(|&x| x != rd).collect();
-                    let saved = em.emit_reg_save(&save_regs, "str_ne");
                     if l == "R2" && r == "R1" {
                         em.emit("    MOV   R25, R1        ; str_ne: save rhs(R1)".to_string());
                         em.emit("    MOV   R1, R2         ; str_ne: lhs(R2)→R1".to_string());
@@ -238,7 +261,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     em.emit(format!("    SYSCALL #200         ; str_eq → R1 (1=eq, 0=ne)"));
                     em.emit(format!("    TLIT  R2, #1         ; R2 = 1"));
                     em.emit(format!("    TSUB  {}, R2, R1     ; d = 1-eq = ne result", d));
-                    em.emit_reg_restore(&saved, "str_ne");
                 }
 
                 IRBinOp::INe => {
@@ -302,7 +324,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 IRUnOp::Neg => em.emit(format!("    TNEG  {}, {}", d, s)),
                 IRUnOp::FNeg => {
                     // Float negate: XOR sign bit (bit 63) via syscall 220
-                    em.rescue_reg(1);
                     let rd2 = em.dst_reg(dst);
                     let rs2 = em.val_reg(operand);
                     let (d2, s2) = (AsmEmitter::rn(rd2), AsmEmitter::rn(rs2));
@@ -361,7 +382,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     .or_else(|| crate::ir::types::tuple_arity_from_name(name));
                 if let Some(n) = n {
                     let n = n.max(1);
-                    em.rescue_reg_inclusive(1);
                     em.emit(format!("    TLIT  R1, #{}  ; heap alloca {} ({} words)", n, name, n));
                     em.emit("    SYSCALL #218  ; heap_alloc_words".to_string());
                     let rd = em.dst_reg(dst);
@@ -402,42 +422,43 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }),
                 _ => 1,
             };
-            // Update sp_depth BEFORE dst_reg so that if dest is spilled,
-            // its slot depth accounts for the alloca words already pushed.
-            em.reg_alloc.sp_depth += words;
-            // Record this alloca slot: sp_depth after push = current sp_depth.
-            // This lets Load lowering use SP-relative addressing [R26+offset].
-            em.alloca_slots.insert(dst.0.clone(), em.reg_alloc.sp_depth);
+            // F-3: the storage is a REGION OF THE FRAME at a constant offset,
+            // reserved once in the prologue. The old code pushed the stack here
+            // and never popped it, so an alloca inside a loop grew the frame by
+            // `words` every iteration and each iteration's spill offsets were
+            // measured against a different R26. Now the address is simply
+            // `R26 + off`, the same on every path and every iteration.
+            //
+            // Reusing the storage across iterations is a change, and the right
+            // one: it is what a stack local means, and it is what the LLVM
+            // backend already did.
+            let _ = words;
+            let off = em.alloca_off.get(&dst.0).copied().unwrap_or(0);
             let rd = em.dst_reg(dst);
-            // The balanced 3-trit imm field holds -13..13; larger allocations
-            // materialize the size in a register (emit_sp_adj handles both).
-            if words <= 13 {
-                em.emit(format!("    TSUB  R26, R26, #{}         ; alloca {:?}", words, ty));
+            let d = AsmEmitter::rn(rd);
+            if off == 0 {
+                em.emit(format!("    MOV   {}, R26  ; alloca {:?} @0", d, ty));
+            } else if off <= 13 {
+                em.emit(format!("    TADD  {}, R26, #{}  ; alloca {:?}", d, off, ty));
             } else {
-                em.emit(format!("    TLIT  R21, #{}  ; alloca size", words));
-                em.emit(format!("    TSUB  R26, R26, R21         ; alloca {:?}", ty));
+                em.emit_lit_cur(rd, off as i64);
+                em.emit(format!("    TADD  {0}, R26, {0}  ; alloca {1:?}", d, ty));
             }
-            em.emit(format!("    MOV   {}, R26", AsmEmitter::rn(rd)));
         }
 
         // ------------------------------------------------------------------ Store
         IRInstr::Store { ptr, val, .. } => {
             // Use SP-relative addressing for alloca slots (same reason as Load above).
             if let IRValue::Temp(t) = ptr {
-                if let Some(&slot_depth) = em.alloca_slots.get(&t.0) {
+                if let Some(&off) = em.alloca_off.get(&t.0) {
                     let rv = em.val_reg(val);
-                    let offset = em.reg_alloc.sp_depth as i64 - slot_depth as i64;
-                    if offset >= 0 && offset <= 13 {
-                        em.emit(format!("    STORE {}, [R26+#{}]  ; sp-rel store {}", AsmEmitter::rn(rv), offset, t.0));
-                    } else if offset > 13 {
-                        let tmp = em.scratch();
-                        em.emit(format!("    TLIT  {}, #{}  ; sp-rel offset", AsmEmitter::rn(tmp), offset));
-                        em.emit(format!("    TADD  {0}, R26, {0}  ; sp-rel addr", AsmEmitter::rn(tmp)));
-                        em.emit(format!("    STORE {}, [{}+#0]  ; sp-rel store {}", AsmEmitter::rn(rv), AsmEmitter::rn(tmp), t.0));
+                    if off <= 13 {
+                        em.emit(format!("    STORE {}, [R26+#{}]  ; frame store {}", AsmEmitter::rn(rv), off, t.0));
                     } else {
-                        let rp = em.val_reg(ptr);
-                        let rv = em.val_reg(val);
-                        em.emit(format!("    STORE {}, [{}+#0]", AsmEmitter::rn(rv), AsmEmitter::rn(rp)));
+                        let tmp = em.scratch();
+                        em.emit(format!("    TLIT  {}, #{}  ; frame offset", AsmEmitter::rn(tmp), off));
+                        em.emit(format!("    TADD  {0}, R26, {0}  ; frame addr", AsmEmitter::rn(tmp)));
+                        em.emit(format!("    STORE {}, [{}+#0]  ; frame store {}", AsmEmitter::rn(rv), AsmEmitter::rn(tmp), t.0));
                     }
                     return;
                 }
@@ -455,19 +476,14 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             // gets overwritten inside a loop body (e.g., by syscall arg setup or
             // scratch register reuse in the loop header's comparison).
             if let IRValue::Temp(t) = ptr {
-                if let Some(&slot_depth) = em.alloca_slots.get(&t.0) {
-                    let offset = em.reg_alloc.sp_depth as i64 - slot_depth as i64;
-                    if offset >= 0 && offset <= 13 {
-                        em.emit(format!("    LOAD  {}, [R26+#{}]  ; sp-rel load {}", AsmEmitter::rn(rd), offset, t.0));
-                    } else if offset > 13 {
-                        let tmp = em.scratch();
-                        em.emit(format!("    TLIT  {}, #{}  ; sp-rel offset", AsmEmitter::rn(tmp), offset));
-                        em.emit(format!("    TADD  {0}, R26, {0}  ; sp-rel addr", AsmEmitter::rn(tmp)));
-                        em.emit(format!("    LOAD  {}, [{}+#0]  ; sp-rel load {}", AsmEmitter::rn(rd), AsmEmitter::rn(tmp), t.0));
+                if let Some(&off) = em.alloca_off.get(&t.0) {
+                    if off <= 13 {
+                        em.emit(format!("    LOAD  {}, [R26+#{}]  ; frame load {}", AsmEmitter::rn(rd), off, t.0));
                     } else {
-                        // Negative offset should not happen for well-formed IR; fall back
-                        let rp = em.val_reg(ptr);
-                        em.emit(format!("    LOAD  {}, [{}+#0]", AsmEmitter::rn(rd), AsmEmitter::rn(rp)));
+                        let tmp = em.scratch();
+                        em.emit(format!("    TLIT  {}, #{}  ; frame offset", AsmEmitter::rn(tmp), off));
+                        em.emit(format!("    TADD  {0}, R26, {0}  ; frame addr", AsmEmitter::rn(tmp)));
+                        em.emit(format!("    LOAD  {}, [{}+#0]  ; frame load {}", AsmEmitter::rn(rd), AsmEmitter::rn(tmp), t.0));
                     }
                     return;
                 }
@@ -507,7 +523,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 "io::println" | "io::print" => {
                     // Syscall writes R1; rescue any live temp that lives there.
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         match arg {
                             IRValue::Const(IRConst::Str(lbl)) => {
@@ -530,7 +545,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 "io::print_int" | "io::println_int" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -541,7 +555,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 "io::print_trit" | "io::println_trit" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -552,7 +565,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 "io::print_bool" | "io::println_bool" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -565,7 +577,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "io::print_bool3" | "io::println_bool3" => {
                     // Syscall #217 prints true/false/unknown — same format as
                     // the LLVM backend's __manit_print_bool3 helper.
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -577,7 +588,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 "io::print_float" | "io::println_float" => {
                     // Syscall #2 prints the f64 (R1 holds the bit pattern).
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -591,7 +601,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     // Trytes print as their decimal value (the LLVM backend's
                     // io_print_tryte does the same); the trit syscall would
                     // print only the sign.
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -677,7 +686,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // io::println_ternary / io::print_ternary — print t27 as balanced ternary string
                 // SYSCALL #7 formats to string, then SYSCALL #3 prints it.
                 "io::println_ternary" | "io::print_ternary" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -814,7 +822,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // unpadded string on T3 while failing to compile on LLVM. Both
                 // are ManiT source in stdlib/ternary.mt now.
                 "ternary::t27_to_str" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -828,7 +835,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // ternary::trits_to_str — syscall #8: R1=length-prefixed array ptr → R1=str ptr
                 // Uses only R1 (no R2/R3 clobber so loop counters are safe).
                 "ternary::trits_to_str" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -842,7 +848,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // math:: functions
                 // math::trit_count(n) — number of balanced-ternary digits in n (syscall #9)
                 "math::trit_count" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -855,7 +860,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 // math::to_balanced_ternary(n) — convert int to [trit] array (syscall #10)
                 "math::to_balanced_ternary" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -869,7 +873,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // math::from_balanced_ternary([trit]) — convert [trit] to int (syscall #11)
                 // R1 = length-prefixed array ptr; no R2 clobber.
                 "math::from_balanced_ternary" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -882,7 +885,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 // ternary::pack_trits — R1=length-prefixed array ptr → R1=t27
                 "ternary::pack_trits" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -905,7 +907,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // fmt:: string formatting functions
                 // fmt::show_int(n) — format int as string, returns str ptr (syscall #14)
                 "fmt::show_int" | "fmt::int_to_str" => {
-                    em.rescue_reg(1);
                     if let Some(arg) = args.first() {
                         let ra = em.val_reg(arg);
                         if ra != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(ra))); }
@@ -921,7 +922,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // Uses R21/R22 (dedicated scratch) instead of R2/R3 to avoid clobbering
                 // general-purpose temps that might be live loop counters.
                 "fmt::align_right" | "fmt::pad_left" => {
-                    em.rescue_reg(1);
                     // Parallel moves: a later arg materialized into scratch R1
                     // must not be clobbered by the R1 target move.
                     let targets = [1usize, 21, 22];
@@ -937,7 +937,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 // fmt::align_left(s, width, fill) — left-align string (syscall #132)
                 "fmt::align_left" | "fmt::pad_right" => {
-                    em.rescue_reg(1);
                     let targets = [1usize, 21, 22];
                     let moves: Vec<(usize, usize)> = args.iter().take(3).enumerate()
                         .map(|(i, a)| (targets[i], em.val_reg(a)))
@@ -953,7 +952,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // Collection / String / Channel / FS / Async syscall dispatch
                 // ------------------------------------------------------------------
                 "Vec::new" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #17  ; Vec::new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
@@ -985,7 +983,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     emit_syscall_2arg_ret(em, args, dst, 25, "Vec::contains");
                 }
                 "Map::new" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #30  ; Map::new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
@@ -1011,7 +1008,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     emit_syscall_1arg_ret(em, args, dst, 36, "Map::is_empty");
                 }
                 "Set::new" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #40  ; Set::new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
@@ -1028,7 +1024,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     emit_syscall_1arg_ret(em, args, dst, 44, "Set::len");
                 }
                 "Deque::new" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #50  ; Deque::new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
@@ -1104,7 +1099,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     emit_syscall_2arg_ret(em, args, dst, 135, "ternary_int_to_trits");
                 }
                 "channel" | "channel_new" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #70  ; channel_new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
@@ -1296,7 +1290,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 // TernaryTrie
                 "TernaryTrie::new" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #93  ; TernaryTrie::new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
@@ -1379,7 +1372,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // Time syscall (540)
                 // ------------------------------------------------------------------
                 "time::now" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #540  ; time::now".to_string());
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
@@ -1402,7 +1394,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     emit_syscall_1arg(em, args, dst, 550, "env::exit");
                 }
                 "env::argc" => {
-                    em.rescue_reg(1);
                     em.emit("    SYSCALL #552  ; env::argc".to_string());
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
@@ -1413,111 +1404,36 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     emit_syscall_1arg_ret(em, args, dst, 553, "env::arg");
                 }
                 _ => {
-                    // General call — full caller-save convention.
+                    // F-3: no caller-save, and that is the invariant rather
+                    // than an optimisation.
                     //
-                    // The T3ISA has no callee-save registers: the callee may freely use
-                    // R1-R20.  We therefore save every live temp in R1-R20 to the stack
-                    // before the call and restore them afterward.
+                    // A CALL may destroy every register — the callee allocates
+                    // from the same pool — so the allocator refuses to put
+                    // anything live across a call in one (see
+                    // `codegen_t3::regalloc`). Whatever the callee clobbers was
+                    // already dead or already in the frame.
                     //
-                    // Saving convention: for each saved temp, emit
-                    //   TSUB R26, R26, #1
-                    //   STORE Rk, [R26+#0]
-                    // and record spill_slots[name] = new sp_depth.
-                    // We do NOT add the register back to free_regs, so dst_reg cannot
-                    // steal it before the restore.
-                    //
-                    // After the call, reload each saved temp back into its original
-                    // register, then pop all saved slots.
-
-                    let cur_instr = em.reg_alloc.current_instr;
-
-                    // Resolve where each argument lives, but emit nothing yet: the
-                    // values are materialised into R1..Rn after the caller-saves,
-                    // when the pool registers are free.  See emit_call_operands.
-                    let arg_srcs: Vec<CallSrc> =
-                        args.iter().map(|a| em.resolve_call_src(a)).collect();
-
-                    // Collect all live temps in the general-purpose pool (R1-R20) that
-                    // survive past this instruction.
-                    let to_save: Vec<(String, usize)> = {
-                        em.reg_alloc.temp_to_reg
-                            .iter()
-                            .filter(|(name, &reg)| {
-                                reg >= 1 && reg <= 20
-                                    && em.reg_alloc.last_use
-                                        .get(*name)
-                                        .map_or(false, |&lu| lu > cur_instr)
-                            })
-                            .map(|(n, &r)| (n.clone(), r))
-                            .collect()
-                    };
-
-                    // Save each to the stack (sorted for determinism).
-                    let mut to_save_sorted = to_save.clone();
-                    to_save_sorted.sort_by_key(|(n, _)| n.clone());
-
-                    for (name, reg) in &to_save_sorted {
-                        let slot = em.reg_alloc.sp_depth + 1;
-                        em.reg_alloc.spill_slots.insert(name.clone(), slot);
-                        em.reg_alloc.temp_to_reg.remove(name);
-                        em.reg_alloc.spill_count += 1;
-                        em.emit(format!("    TSUB  R26, R26, #1  ; caller-save {}", name));
-                        em.emit(format!("    STORE R{}, [R26+#0]  ; caller-save {}", reg, name));
-                        em.reg_alloc.sp_depth += 1;
-                    }
-
-                    // Materialise the arguments into R1..Rn now that every live
-                    // pool register is safely on the stack.
-                    let targets: Vec<(usize, CallSrc)> = arg_srcs
-                        .into_iter()
+                    // What this replaces was fifty lines of pushing live temps,
+                    // renaming them into ad-hoc spill slots, calling, reloading
+                    // and popping — the machinery `KNOWN_ISSUES` issue 2 records
+                    // two silently-wrong-answer defects in.
+                    let targets: Vec<(usize, CallSrc)> = args
+                        .iter()
+                        .map(|a| em.resolve_call_src(a))
                         .enumerate()
                         .map(|(i, s)| (i + 1, s))
                         .collect();
-                    em.emit_call_operands(&targets, 9);  // parameters are R1..R8
+                    em.emit_call_operands(&targets, 9); // parameters are R1..R8
 
                     em.emit(format!("    CALL  {}", func));
 
-                    // Stash the return value in R24 (outside R1-R20 pool, never allocated)
-                    // so the caller-restore LOADs (which may write R1) don't clobber it.
-                    let has_dst = dst.is_some();
-                    if has_dst {
-                        em.emit("    MOV   R24, R1  ; stash return value".to_string());
-                    }
-
-                    // Restore saved temps from the stack (reverse order for clarity).
-                    for (name, orig_reg) in to_save_sorted.iter().rev() {
-                        let slot = *em.reg_alloc.spill_slots.get(name)
-                            .expect("caller-save slot missing at restore");
-                        let offset = em.reg_alloc.sp_depth as i64 - slot as i64;
-                        if offset >= 0 && offset <= 13 {
-                            em.emit(format!(
-                                "    LOAD  R{}, [R26+#{}]  ; caller-restore {}",
-                                orig_reg, offset, name
-                            ));
-                        } else if offset > 13 {
-                            em.emit(format!("    TLIT  R{0}, #{1}", orig_reg, offset));
-                            em.emit(format!("    TADD  R{0}, R26, R{0}", orig_reg));
-                            em.emit(format!("    LOAD  R{0}, [R{0}+#0]  ; caller-restore {1}", orig_reg, name));
-                        } else {
-                            em.emit(format!("    ; BUG: negative restore offset {} for {}", offset, name));
-                        }
-                        em.reg_alloc.spill_slots.remove(name);
-                        em.reg_alloc.temp_to_reg.insert(name.clone(), *orig_reg);
-                    }
-
-                    // Pop all caller-save slots.
-                    let n_saved = to_save_sorted.len();
-                    if n_saved > 0 {
-                        em.emit_sp_adj(n_saved as i64);
-                        em.reg_alloc.sp_depth -= n_saved;
-                    }
-
-                    // Allocate dst AFTER the pop so sp_depth is at its final post-call value.
-                    // This ensures any spill slot for dst gets the correct stack offset.
                     if let Some(d) = dst {
                         let rd = em.dst_reg(d);
-                        if rd != 24 {
-                            em.emit(format!("    MOV   {}, R24  ; unstash return value", AsmEmitter::rn(rd)));
+                        if rd != 1 {
+                            em.emit(format!(
+                                "    MOV   {}, R1  ; call result",
+                                AsmEmitter::rn(rd)
+                            ));
                         }
                     }
                 }
@@ -1526,85 +1442,24 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
 
         // ------------------------------------------------------------------ Indirect Call
         IRInstr::CallIndirect { dst, fn_ptr, args, .. } => {
-            // Same caller-save convention as direct Call, but use CALLR Rx.
-            let cur_instr = em.reg_alloc.current_instr;
-
-            // Resolve fn_ptr and the arguments without emitting: they are
-            // materialised into R25 and R1..Rn after the caller-saves.
-            let fp_src = em.resolve_call_src(fn_ptr);
-            let arg_srcs: Vec<CallSrc> = args.iter().map(|a| em.resolve_call_src(a)).collect();
-
-            let to_save: Vec<(String, usize)> = {
-                em.reg_alloc.temp_to_reg
-                    .iter()
-                    .filter(|(name, &reg)| {
-                        reg >= 1 && reg <= 20
-                            && em.reg_alloc.last_use
-                                .get(*name)
-                                .map_or(false, |&lu| lu > cur_instr)
-                    })
-                    .map(|(n, &r)| (n.clone(), r))
-                    .collect()
-            };
-
-            let mut to_save_sorted = to_save.clone();
-            to_save_sorted.sort_by_key(|(n, _)| n.clone());
-
-            for (name, reg) in &to_save_sorted {
-                let slot = em.reg_alloc.sp_depth + 1;
-                em.reg_alloc.spill_slots.insert(name.clone(), slot);
-                em.reg_alloc.temp_to_reg.remove(name);
-                em.reg_alloc.spill_count += 1;
-                em.emit(format!("    TSUB  R26, R26, #1  ; caller-save {}", name));
-                em.emit(format!("    STORE R{}, [R26+#0]  ; caller-save {}", reg, name));
-                em.reg_alloc.sp_depth += 1;
-            }
-
-            // Materialise the arguments into R1..Rn and the callee address into
-            // R25.  Treating the fn_ptr as just another target is what keeps it
-            // from overwriting an argument that happens to share its register.
-            let mut targets: Vec<(usize, CallSrc)> = arg_srcs
-                .into_iter()
+            // As above: nothing to save. The callee address is materialised
+            // into R25 as just another operand target, which is what keeps it
+            // from overwriting an argument that shares its register.
+            let mut targets: Vec<(usize, CallSrc)> = args
+                .iter()
+                .map(|a| em.resolve_call_src(a))
                 .enumerate()
                 .map(|(i, s)| (i + 1, s))
                 .collect();
-            targets.push((25, fp_src));
-            em.emit_call_operands(&targets, 9);  // parameters are R1..R8
+            targets.push((25, em.resolve_call_src(fn_ptr)));
+            em.emit_call_operands(&targets, 9);
 
             em.emit("    CALLR R25  ; indirect call through fn_ptr".to_string());
 
-            let has_dst = dst.is_some();
-            if has_dst {
-                em.emit("    MOV   R24, R1  ; stash return value".to_string());
-            }
-
-            for (name, orig_reg) in to_save_sorted.iter().rev() {
-                let slot = *em.reg_alloc.spill_slots.get(name)
-                    .expect("caller-save slot missing at restore");
-                let offset = em.reg_alloc.sp_depth as i64 - slot as i64;
-                if offset >= 0 && offset <= 13 {
-                    em.emit(format!("    LOAD  R{}, [R26+#{}]  ; caller-restore {}", orig_reg, offset, name));
-                } else if offset > 13 {
-                    em.emit(format!("    TLIT  R{0}, #{1}", orig_reg, offset));
-                    em.emit(format!("    TADD  R{0}, R26, R{0}", orig_reg));
-                    em.emit(format!("    LOAD  R{0}, [R{0}+#0]  ; caller-restore {1}", orig_reg, name));
-                } else {
-                    em.emit(format!("    ; BUG: negative restore offset {} for {}", offset, name));
-                }
-                em.reg_alloc.spill_slots.remove(name);
-                em.reg_alloc.temp_to_reg.insert(name.clone(), *orig_reg);
-            }
-
-            let n_saved = to_save_sorted.len();
-            if n_saved > 0 {
-                em.emit_sp_adj(n_saved as i64);
-                em.reg_alloc.sp_depth -= n_saved;
-            }
-
             if let Some(d) = dst {
                 let rd = em.dst_reg(d);
-                if rd != 24 {
-                    em.emit(format!("    MOV   {}, R24  ; unstash return value", AsmEmitter::rn(rd)));
+                if rd != 1 {
+                    em.emit(format!("    MOV   {}, R1  ; call result", AsmEmitter::rn(rd)));
                 }
             }
         }
@@ -1622,27 +1477,51 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             let rb = em.val_reg(b);
             em.emit(format!("    TMAX  {}, {}, {}", AsmEmitter::rn(rd), AsmEmitter::rn(ra), AsmEmitter::rn(rb)));
         }
+        // C2 / T3ISA v1.5. One instruction each — this is the entire point:
+        // what the standard library writes as 27 iterations of
+        // divide-by-3^i, operate, multiply-back becomes a single opcode.
+        IRInstr::TritLane { dst, op, a, b } => {
+            let rd = em.dst_reg(dst);
+            let ra = em.val_reg(a);
+            let rb = em.val_reg(b);
+            let mnemonic = match op {
+                IRLaneOp::And => "TANDW",
+                IRLaneOp::Or => "TORW",
+                IRLaneOp::Xor => "TXORW",
+                IRLaneOp::Imp => "TIMPW",
+                IRLaneOp::Cmp => "TCMPW",
+                IRLaneOp::Popcount => "TPOPC",
+            };
+            em.emit(format!("    {:<5} {}, {}, {}", mnemonic,
+                AsmEmitter::rn(rd), AsmEmitter::rn(ra), AsmEmitter::rn(rb)));
+        }
         IRInstr::TritNeg { dst, a } => {
             let rd = em.dst_reg(dst);
             let ra = em.val_reg(a);
             em.emit(format!("    TNEG  {}, {}", AsmEmitter::rn(rd), AsmEmitter::rn(ra)));
         }
+        // C7: sign(x) in ONE instruction. R0 always reads as zero, so
+        // `TCMP Rd, Ra, R0` is sign(Ra - 0) = sign(Ra). This is the operation
+        // the recommendations single out — a branch in two's complement, a
+        // single compare here.
+        IRInstr::TritSign { dst, a } => {
+            let rd = em.dst_reg(dst);
+            let ra = em.val_reg(a);
+            em.emit(format!("    TCMP  {}, {}, R0  ; sign", AsmEmitter::rn(rd), AsmEmitter::rn(ra)));
+        }
 
         // ------------------------------------------------------------------ Print
         IRInstr::PrintInt(val) => {
-            em.rescue_reg(1);
             let rv = em.val_reg(val);
             if rv != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(rv))); }
             em.emit("    SYSCALL #1                  ; print_int".to_string());
         }
         IRInstr::PrintFloat(val) => {
-            em.rescue_reg(1);
             let rv = em.val_reg(val);
             if rv != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(rv))); }
             em.emit("    SYSCALL #2                  ; print_float".to_string());
         }
         IRInstr::PrintStr(val) => {
-            em.rescue_reg(1);
             match val {
                 IRValue::Const(IRConst::Str(lbl)) => {
                     let clean = lbl.trim_start_matches('@');
@@ -1656,7 +1535,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             em.emit("    SYSCALL #3                  ; print_str".to_string());
         }
         IRInstr::PrintTrit(val) => {
-            em.rescue_reg(1);
             let rv = em.val_reg(val);
             if rv != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(rv))); }
             em.emit("    SYSCALL #0                  ; print_trit".to_string());
@@ -1666,7 +1544,6 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             // lowering emits one explicit trailing newline per call, so
             // no Print* instruction may add its own (matches the LLVM
             // backend's __manit_print_bool3 helper).
-            em.rescue_reg(1);
             let rv = em.val_reg(val);
             if rv != 1 { em.emit(format!("    MOV   R1, {}", AsmEmitter::rn(rv))); }
             em.emit("    SYSCALL #217                ; print_bool3".to_string());
@@ -1674,11 +1551,18 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
 
         // ------------------------------------------------------------------ Phi
         IRInstr::Phi { dst, incoming, .. } => {
-            // Value was already copied into dst's register by each predecessor block
-            // (via phi_copies in emit_term::Jump). Just ensure dst_reg is allocated.
-            let _rd = em.dst_reg(dst);
+            // A phi emits NOTHING. Every predecessor has already written the
+            // value to this phi's location on its own edge, so there is nothing
+            // left to do here — and doing something is actively wrong.
+            //
+            // Calling `dst_reg` for it, as this arm used to, schedules a store
+            // of the destination scratch into the phi's frame slot for a phi
+            // that lives in one. That store runs AFTER the predecessors' copies
+            // and overwrites the value with whatever R23 last held: a function
+            // whose body is a tail expression — `if n <= 1 { 1 } else { … }`,
+            // which is a phi at the merge — returned a frame address.
             em.emit(format!(
-                "    ; PHI {} ← [{}]  (value set by predecessor)",
+                "    ; PHI {} ← [{}]  (value placed by each predecessor)",
                 dst.0,
                 incoming.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(", ")
             ));
@@ -1690,16 +1574,37 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 (IRType::I64, IRType::F64) | (IRType::I32, IRType::F64) => {
                     // int→float: syscall 210
                     // IMPORTANT: rescue BEFORE dst_reg so rescue doesn't move dst after rd is captured
-                    em.rescue_reg(1);
                     let rd = em.dst_reg(dst);   // re-query after rescue
                     let rs = em.val_reg(src);
                     if rs != 1 { em.emit(format!("    MOV   R1, {}  ; itof input", AsmEmitter::rn(rs))); }
                     em.emit("    SYSCALL #210  ; itof (int→float_bits)".to_string());
                     if rd != 1 { em.emit(format!("    MOV   {}, R1  ; itof result", AsmEmitter::rn(rd))); }
                 }
+                // A3: integer → trit CLAMPS to {-1, 0, +1}.
+                //
+                // The language reference has always said so ("`let t = i as
+                // trit;  // clamps to {-1, 0, +1}`") and the LLVM backend has
+                // always done it. T3 fell through to the bare `MOV` below, so
+                // `5 as trit` evaluated to **5 on T3 and 1 on LLVM** — a value
+                // outside the type's own carrier set, on the backend whose
+                // whole point is that the carrier set is the hardware's.
+                //
+                // Found by writing the normative semantics (A3) rather than by
+                // either backend failing: each is internally consistent, and
+                // nothing in the corpus casts a wide int to a trit.
+                //
+                // Two instructions, no branch. TMIN/TMAX are NUMERIC min/max
+                // on a whole register here, and both take a 3-trit immediate,
+                // so ±1 encode directly.
+                (IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64, IRType::Trit) => {
+                    let rd = em.dst_reg(dst);
+                    let rs = em.val_reg(src);
+                    let (d, s) = (AsmEmitter::rn(rd), AsmEmitter::rn(rs));
+                    em.emit(format!("    TMIN  {}, {}, #1   ; int->trit clamp (upper)", d, s));
+                    em.emit(format!("    TMAX  {}, {}, #-1  ; int->trit clamp (lower)", d, d));
+                }
                 (IRType::F64, IRType::I64) | (IRType::F64, IRType::I32) => {
                     // float→int truncating: syscall 211
-                    em.rescue_reg(1);
                     let rd = em.dst_reg(dst);
                     let rs = em.val_reg(src);
                     if rs != 1 { em.emit(format!("    MOV   R1, {}  ; ftoi input", AsmEmitter::rn(rs))); }
@@ -1718,6 +1623,188 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
     }
 }
 
+/// Emit a parallel copy between LOCATIONS.
+///
+/// The copies on one control-flow edge are simultaneous: every source is read
+/// as it was before any destination is written. Emitting them in list order is
+/// correct only while no copy's destination is another's source — which is rare
+/// while locals live in memory, and stops being rare the moment they do not.
+/// `a, b = b, a + b`, the iterative Fibonacci loop, is two phis whose homes are
+/// each other's sources; copying them one after the other made `fib(4)` come out
+/// as 4 (report.txt P11).
+///
+/// So: emit a copy only when nothing still pending READS its destination, and
+/// when everything left is blocked — a cycle — park one source in R23 and read
+/// it from there. Slots never block anything: a store to a frame slot cannot
+/// disturb a register another copy still has to read.
+fn emit_phi_copies(em: &mut AsmEmitter, copies: &[(IRTemp, IRValue)]) {
+    /// Holds a source parked to break a cycle, from the break until that
+    /// copy is emitted — possibly several copies later.
+    const CYCLE: usize = 23;
+    /// Moves a value into a frame slot. Must differ from CYCLE, which may be
+    /// occupied, and from R21, the address scratch of the wide-offset store.
+    const XFER: usize = 22;
+
+    // Resolve every copy to (destination location, source) without emitting.
+    let plan: Vec<(Loc, CallSrc)> = copies
+        .iter()
+        .filter_map(|(d, v)| em.alloc.loc(&d.0).map(|dl| (dl, em.resolve_call_src(v))))
+        .collect();
+
+    let mut pending: Vec<usize> = (0..plan.len()).collect();
+    // Copies whose source has been parked in the scratch register.
+    let mut staged: Vec<bool> = vec![false; plan.len()];
+
+    // Does `src` read the location `loc` is about to be written?
+    //
+    // A frame slot interferes exactly as a register does, and saying otherwise
+    // is what made `fib` return a power of two under `--mem2reg`. The back-edge
+    // of `a, b = b, a + b` carries three copies, one of which has a slot for
+    // its home:
+    //
+    //     i' ← R7      b'(slot0) ← R6      a'(R5) ← slot0
+    //
+    // A slot destination used to be declared unconditionally ready, so the
+    // store to slot0 was emitted before the load from it and `a'` read the
+    // value `b'` had just overwritten. Nothing here is a cycle — it is a plain
+    // ordering constraint that the interference test could not see.
+    let reads = |src: &CallSrc, loc: Loc| match (src, loc) {
+        (CallSrc::Reg(s), Loc::Reg(d)) => *s == d,
+        (CallSrc::Slot(s), Loc::Slot(d)) => *s == d,
+        _ => false,
+    };
+
+    while !pending.is_empty() {
+        // Ready = writing this destination destroys nobody's unread source.
+        // A staged copy no longer reads its original location, so it is skipped.
+        let ready = pending.iter().position(|&i| {
+            let writes = plan[i].0;
+            !pending
+                .iter()
+                .any(|&j| j != i && !staged[j] && reads(&plan[j].1, writes))
+        });
+        let idx = match ready {
+            Some(k) => pending.remove(k),
+            None => {
+                // A genuine cycle. Park one member's source in the scratch and
+                // let the copy it was blocking proceed; that member reads the
+                // scratch when its turn comes.
+                //
+                // Only ONE cycle is ever open at a time: after a break, the
+                // rest of that cycle is a chain, and the ready-first policy
+                // drains it — the staged copy included — before anything can
+                // stall again. That is what makes a single scratch enough.
+                //
+                // Slot sources are eligible victims too. A cycle living wholly
+                // in the frame is expressible, and when only register sources
+                // could be picked it fell through to the `remove(0)` arm below
+                // and emitted the copies in a silently wrong order.
+                let victim = pending
+                    .iter()
+                    .copied()
+                    .find(|&j| !staged[j] && matches!(plan[j].1, CallSrc::Reg(_) | CallSrc::Slot(_)));
+                match victim {
+                    Some(j) => {
+                        match plan[j].1 {
+                            CallSrc::Reg(sr) => {
+                                em.emit(format!("    MOV   R{}, R{}  ; break phi cycle", CYCLE, sr))
+                            }
+                            CallSrc::Slot(sl) => {
+                                em.emit_slot_load(CYCLE, sl, "break phi cycle (from frame)")
+                            }
+                            _ => unreachable!("victim is a register or slot source"),
+                        }
+                        staged[j] = true;
+                        continue;
+                    }
+                    // Unreachable: only a register or slot source can block
+                    // anything, and a stall means something is blocked.
+                    None => {
+                        em.emit("    ; BUG: phi cycle with no breakable source".to_string());
+                        pending.remove(0)
+                    }
+                }
+            }
+        };
+
+        let (dst_loc, src) = (plan[idx].0, plan[idx].1.clone());
+        let src = if staged[idx] { CallSrc::Reg(CYCLE) } else { src };
+        match dst_loc {
+            Loc::Reg(d) => match src {
+                CallSrc::Reg(s) => {
+                    if s != d {
+                        em.emit(format!("    MOV   R{}, R{}  ; phi-copy", d, s));
+                    }
+                }
+                CallSrc::Slot(sl) => em.emit_slot_load(d, sl, "phi-copy from frame"),
+                CallSrc::Lit(v) => em.emit_lit_cur(d, v),
+                CallSrc::Label(l) => em.emit(format!("    TLIT  R{}, #{}  ; phi-copy", d, l)),
+                CallSrc::Float(f) => {
+                    let bits = f.to_bits() as i64;
+                    let label = format!("@float_{}_{}", em.fn_name, em.float_literals.len());
+                    let clean = label.trim_start_matches('@').to_string();
+                    em.float_literals.push((label, bits));
+                    em.emit(format!("    TLIT  R1, #{}  ; float-lit addr", clean));
+                    em.emit(format!("    SYSCALL #219  ; float_load bits for {}", f));
+                    if d != 1 {
+                        em.emit(format!("    MOV   R{}, R1  ; phi-copy float", d));
+                    }
+                }
+                CallSrc::Missing(n) => {
+                    em.emit(format!("    ; BUG: phi operand {} has no location", n));
+                    em.emit(format!("    TLIT  R{}, #0", d));
+                }
+            },
+            Loc::Slot(ds) => {
+                // Into the frame: bring the value into a scratch first.
+                //
+                // XFER, not CYCLE. A cycle may be open — CYCLE holding a source
+                // that a later copy in this same parallel assignment still has
+                // to read — and staging through it here would destroy that
+                // value. R21 is not available either: it is the address scratch
+                // the `ds > 13` store below uses.
+                let sr = match src {
+                    CallSrc::Reg(s) => s,
+                    CallSrc::Slot(sl) => {
+                        em.emit_slot_load(XFER, sl, "phi-copy via frame");
+                        XFER
+                    }
+                    CallSrc::Lit(v) => {
+                        em.emit_lit_cur(XFER, v);
+                        XFER
+                    }
+                    CallSrc::Label(l) => {
+                        em.emit(format!("    TLIT  R{}, #{}  ; phi-copy", XFER, l));
+                        XFER
+                    }
+                    CallSrc::Float(f) => {
+                        let bits = f.to_bits() as i64;
+                        let label = format!("@float_{}_{}", em.fn_name, em.float_literals.len());
+                        let clean = label.trim_start_matches('@').to_string();
+                        em.float_literals.push((label, bits));
+                        em.emit(format!("    TLIT  R1, #{}  ; float-lit addr", clean));
+                        em.emit(format!("    SYSCALL #219  ; float_load bits for {}", f));
+                        em.emit(format!("    MOV   R{}, R1  ; phi-copy float", XFER));
+                        XFER
+                    }
+                    CallSrc::Missing(n) => {
+                        em.emit(format!("    ; BUG: phi operand {} has no location", n));
+                        em.emit(format!("    TLIT  R{}, #0", XFER));
+                        XFER
+                    }
+                };
+                if ds <= 13 {
+                    em.emit(format!("    STORE R{}, [R26+#{}]  ; phi-copy to frame", sr, ds));
+                } else {
+                    em.emit(format!("    TLIT  R21, #{}", ds));
+                    em.emit("    TADD  R21, R26, R21  ; frame addr".to_string());
+                    em.emit(format!("    STORE R{}, [R21+#0]  ; phi-copy to frame", sr));
+                }
+            }
+        }
+    }
+}
+
 pub(super) fn emit_term(em: &mut AsmEmitter, term: &IRTerminator) {
     match term {
         IRTerminator::Return(None) => {
@@ -1726,160 +1813,32 @@ pub(super) fn emit_term(em: &mut AsmEmitter, term: &IRTerminator) {
             if em.fn_name == "main" {
                 em.emit("    MOV   R1, R0  ; void main → exit status 0".to_string());
             }
-            // Epilogue: restore SP to the callee entry point so the caller's stack is intact.
-            let depth = em.reg_alloc.sp_depth;
-            if depth > 0 {
-                em.emit_sp_adj(depth as i64);
-            }
+            em.emit_epilogue();
             em.emit("    RET".to_string());
         }
         IRTerminator::Return(Some(val)) => {
-            // Load the return value first (may read from spill slot relative to current sp).
+            // The value first: it may come from a frame slot, and the epilogue
+            // is what makes those addresses stop being valid.
             let rv = em.val_reg(val);
             if rv != 1 {
                 em.emit(format!("    MOV   R1, {}  ; return value", AsmEmitter::rn(rv)));
             }
-            // Epilogue: pop all allocas/spills so caller's SP is unchanged after CALL+RET.
-            let depth = em.reg_alloc.sp_depth;
-            if depth > 0 {
-                em.emit_sp_adj(depth as i64);
-            }
+            em.emit_epilogue();
             em.emit("    RET".to_string());
         }
         IRTerminator::Jump(label) => {
-            // Emit phi copies for this predecessor → target edge before jumping.
             let src = em.current_block_label.clone();
-            let dst = label.clone();
-            if let Some(copies) = em.phi_copies.get(&(src, dst)).cloned() {
-                for (phi_dst, incoming_val) in &copies {
-                    let rv = em.val_reg(incoming_val);
-                    // Re-install the destination this phi was given by whichever
-                    // predecessor got here first, so `dst_reg` below reproduces
-                    // that choice instead of allocating a fresh one.  Every
-                    // predecessor has to write the value where the merge block
-                    // reads it (see `PhiHome`).
-                    em.pin_phi_home(&phi_dst.0);
-                    let rd = em.dst_reg(phi_dst);
-                    em.record_phi_home(&phi_dst.0);
-                    if rv != rd {
-                        em.emit(format!("    MOV   {}, {}  ; phi-copy {}", AsmEmitter::rn(rd), AsmEmitter::rn(rv), phi_dst.0));
-                    }
-                    em.flush_instr();
-                }
+            if let Some(copies) = em.phi_copies.get(&(src, label.clone())).cloned() {
+                emit_phi_copies(em, &copies);
             }
-            // Normalize sp to the canonical depth expected at the target block.
-            // First predecessor sets the canonical depth; subsequent jumps adjust.
-            let canonical = em.register_target(label);
-            let cur = em.reg_alloc.sp_depth;
-            let delta = cur as i64 - canonical as i64;
-            if delta != 0 {
-                em.emit_sp_adj(delta);
-            }
-            // Register reconciliation: a jump must leave every live temp in the
-            // register the TARGET block's code is emitted against — its
-            // canonical assignment.  Rescue moves earlier in this block may
-            // have relocated temps (e.g. the loop's array base out of a
-            // syscall-clobbered R1-R3); without these fix-up moves the target
-            // reads stale registers.
-            //
-            // This is not only for back-edges.  A merge block's canonical state
-            // is fixed by whichever arm jumps to it first, so the OTHER arm has
-            // to reconcile to it as well — and that arm is typically not yet
-            // emitted when it jumps.  Gating on "already emitted" left exactly
-            // that edge unreconciled.  The first predecessor costs nothing: its
-            // own state is the canonical one, so the loop below finds no moves.
-            if let Some(canon) = em.block_canonical_regs.get(label).cloned() {
-                {
-                    let canon_regs = canon.temp_to_reg;
-                    // (dst_reg, src_reg) register moves and spill reloads.
-                    // Restrict to temps a rescue actually displaced, and never
-                    // clobber a canonical register that another live temp
-                    // currently occupies (that temp's value takes priority —
-                    // the target block reads it from that register).
-                    let mut moves: Vec<(usize, usize)> = Vec::new();
-                    let mut reloads: Vec<(usize, usize, String)> = Vec::new();
-                    for (name, &creg) in &canon_regs {
-                        if !em.rescued_temps.contains(name) {
-                            continue;
-                        }
-                        let occupied = em
-                            .reg_alloc
-                            .temp_to_reg
-                            .iter()
-                            .any(|(other, &r)| r == creg && other != name);
-                        if occupied {
-                            continue;
-                        }
-                        if let Some(&cur_reg) = em.reg_alloc.temp_to_reg.get(name) {
-                            if cur_reg != creg {
-                                moves.push((creg, cur_reg));
-                            }
-                        } else if let Some(&slot) = em.reg_alloc.spill_slots.get(name) {
-                            reloads.push((creg, slot, name.clone()));
-                        }
-                    }
-                    // Emit register moves in a conflict-safe order: pick moves
-                    // whose destination is not a pending source; break cycles
-                    // through the R21 scratch register.
-                    while !moves.is_empty() {
-                        let ready = moves
-                            .iter()
-                            .position(|&(dst, _)| !moves.iter().any(|&(_, src)| src == dst));
-                        match ready {
-                            Some(i) => {
-                                let (dst, src) = moves.remove(i);
-                                em.emit(format!(
-                                    "    MOV   R{}, R{}  ; backedge reconcile",
-                                    dst, src
-                                ));
-                            }
-                            None => {
-                                let (dst, src) = moves.remove(0);
-                                em.emit(format!(
-                                    "    MOV   R21, R{}  ; backedge cycle break",
-                                    src
-                                ));
-                                for m in moves.iter_mut() {
-                                    if m.1 == src {
-                                        m.1 = 21;
-                                    }
-                                }
-                                em.emit(format!(
-                                    "    MOV   R{}, R21  ; backedge reconcile",
-                                    dst
-                                ));
-                            }
-                        }
-                    }
-                    for (creg, slot, name) in reloads {
-                        let offset = em.reg_alloc.sp_depth as i64 - slot as i64;
-                        if offset >= 0 && offset <= 13 {
-                            em.emit(format!(
-                                "    LOAD  R{}, [R26+#{}]  ; backedge reload {}",
-                                creg, offset, name
-                            ));
-                        } else if offset > 13 {
-                            em.emit(format!("    TLIT  R21, #{}", offset));
-                            em.emit("    TADD  R21, R26, R21  ; backedge spill addr".to_string());
-                            em.emit(format!(
-                                "    LOAD  R{}, [R21+#0]  ; backedge reload {}",
-                                creg, name
-                            ));
-                        }
-                    }
-                }
-            }
-            let ql = em.qlabel(label);
-            em.emit(format!("    JUMP  {}", ql));
+            em.emit(format!("    JUMP  {}", em.qlabel(label)));
         }
         IRTerminator::BinBranch { cond, true_label, false_label } => {
+            // A conditional branch carries no phi copies: `ssa::split_critical_edges`
+            // puts a block on any edge that would need them, and that block's
+            // jump does the copying. Without it, an edge from a branch into a
+            // merge has nowhere to put the value (report.txt P12).
             let rc = em.val_reg(cond);
-            // Register canonical sp for both targets (first occurrence wins).
-            // For conditional branches the delta is always 0 on first occurrence,
-            // so no sp adjustment is needed before the TBRANCH.
-            em.register_target(true_label);
-            em.register_target(false_label);
-            // cond is 0 or 1 (bool).  1→pos, 0→false, -1→false.
             let (qt, qf) = (em.qlabel(true_label), em.qlabel(false_label));
             em.emit(format!(
                 "    TBRANCH {}, {}, {}, {}",
@@ -1888,9 +1847,6 @@ pub(super) fn emit_term(em: &mut AsmEmitter, term: &IRTerminator) {
         }
         IRTerminator::TritBranch { cond, pos_label, zero_label, neg_label } => {
             let rc = em.val_reg(cond);
-            em.register_target(pos_label);
-            em.register_target(zero_label);
-            em.register_target(neg_label);
             let (qp, qz, qn) = (em.qlabel(pos_label), em.qlabel(zero_label), em.qlabel(neg_label));
             em.emit(format!(
                 "    TBRANCH {}, {}, {}, {}",

@@ -30,6 +30,7 @@ fn add_module() -> IRModule {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     }
 }
 
@@ -67,6 +68,7 @@ fn test_extern_function() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     assert!(ir.contains("declare void @ext_fn(i64)"));
@@ -86,6 +88,7 @@ fn test_global_variable() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     assert!(ir.contains("@counter = global i64 42"));
@@ -101,6 +104,7 @@ fn test_string_literal() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     // "hello" has 5 bytes + 1 null = 6
@@ -152,6 +156,7 @@ fn test_float_operations() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     assert!(ir.contains("fadd double %param_x,"));
@@ -191,6 +196,7 @@ fn test_alloca_and_store_load() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     assert!(ir.contains("%slot = alloca i64"));
@@ -337,6 +343,7 @@ fn test_vararg_call_emits_full_function_type() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     assert!(
@@ -374,6 +381,7 @@ fn test_main_wrapper_emitted() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     assert!(ir.contains("define void @__manit_main()"), "user main must be renamed");
@@ -479,6 +487,7 @@ fn test_call_uses_declared_types() {
         float_literals: vec![],
         static_structs: vec![],
         struct_sizes: std::collections::HashMap::new(),
+        lang: Default::default(),
     };
     let ir = emit_llvm_ir(&m, None);
     // Must use void return and ptr param, not i64.

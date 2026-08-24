@@ -26,6 +26,9 @@ construct the compiler currently accepts.
 16. [Use declarations](#16-use-declarations)
 17. [Global variables](#17-global-variables)
 18. [Operators quick reference](#18-operators-quick-reference)
+19. [External declarations](#19-external-declarations)
+20. [Lint levels](#20-lint-levels)
+21. [Language versions](#21-language-versions)
 
 ---
 
@@ -48,7 +51,9 @@ if  elif  else  tif  match  for  in  while  loop
 struct  enum  impl  trait  use  self
 spawn  await
 true  false  unknown
-tand  tor  tnot  txor
+tand  tor  tnot  txor  tcon  tany
+timp  teq  tposs  tnec
+tandw  torw  txorw  timpw  tcmpw  tnotw
 as
 ```
 
@@ -278,8 +283,28 @@ a + b    a - b    a * b    a / b    a % b
 -a                // unary negation
 ```
 
-Integer division truncates toward zero. Division by zero is undefined behaviour
-in the current emulator (returns 0).
+**Integer division depends on the language version** (§21). Under `v1`, the
+default, `/` truncates toward zero and `%` takes the sign of the dividend.
+Under `--lang v2`, `/` rounds to the nearest integer with ties away from zero
+and `%` is the balanced remainder that pairs with it:
+
+```
+             v1              v2
+  7 / 2       3               4
+  7 % 2       1              -1
+ -7 / 2      -3              -4
+  2 / 3       0               1
+```
+
+`(a / b) * b + (a % b) == a` holds under both. `math::div_trunc`,
+`math::rem_trunc`, `math::div_near` and `math::rem_near` name the two
+behaviours explicitly and mean the same thing under both versions.
+
+Division by zero **traps** — a named runtime fault and exit status 70 on both
+backends, not a wrong answer. A division by a literal `0` is rejected at
+compile time instead, since it cannot be intentional. (Earlier revisions of
+this document said it was undefined and returned 0; that stopped being true
+with the A7 fault-reporting work.)
 
 ### Comparison
 
@@ -342,6 +367,203 @@ Two properties follow, and both differ from binary XOR:
 > return `-`, so a third of the digit set was unreachable, and it is not a
 > bijection — for any fixed `b`, two of the three inputs map to `+` — so it
 > could not be undone at all.
+
+#### Consensus and any
+
+| Op | Meaning | Result |
+|----|---------|--------|
+| `a tcon b` | consensus | `+` only if both are `+`; `-` only if both are `-`; otherwise `0` |
+| `a tany b` | any | `+` if either is `+`; else `-` if either is `-`; else `0` |
+
+|  | `b = -` | `b = 0` | `b = +` |
+|---|---|---|---|
+| **`a = -`** `tcon` | `-` | `0` | `0` |
+| **`a = 0`** `tcon` | `0` | `0` | `0` |
+| **`a = +`** `tcon` | `0` | `0` | `+` |
+| **`a = -`** `tany` | `-` | `-` | `+` |
+| **`a = 0`** `tany` | `-` | `0` | `+` |
+| **`a = +`** `tany` | `+` | `+` | `+` |
+
+Note `tany` is not symmetric with `tcon` under negation: `+` wins over `-`
+wherever both appear, so `- tany +` is `+`.
+
+#### Implication, equivalence, and the modal operators
+
+These are what make the language's logic **Łukasiewicz L3** rather than
+Kleene's K3. The two systems agree exactly on `tand`, `tor` and `tnot`; they
+differ in one cell of implication.
+
+| Op | Meaning | Formula | Result type |
+|----|---------|---------|-------------|
+| `a timp b` | implication | `min(+1, 1 - a + b)` | `trit` |
+| `a teq b` | equivalence | `(a timp b) tand (b timp a)` | `trit` |
+| `tposs a` | possibility (M) | `+` if `a >= 0` | `bool` |
+| `tnec a` | necessity (L) | `+` only if `a = +` | `bool` |
+
+|  | `b = -` | `b = 0` | `b = +` |
+|---|---|---|---|
+| **`a = -`** `timp` | `+` | `+` | `+` |
+| **`a = 0`** `timp` | `0` | **`+`** | `+` |
+| **`a = +`** `timp` | `-` | `0` | `+` |
+
+The bolded cell is the whole difference. Kleene's `max(-a, b)` gives `0`
+there; Łukasiewicz gives `+`. That single cell is the **deduction theorem**:
+
+```
+let u: trit = 0;
+let t = u timp u;   // + — a tautology, even though u is unknown
+```
+
+In K3 that expression is `0` and `a timp a` is not a tautology. With only
+`tand`, `tor` and `tnot` the language could not even express the question.
+
+`tposs` and `tnec` are the bridge back out of three-valued logic: both return
+`bool`, not `trit`, because "might this be true?" and "is this definitely
+true?" have no unknown answer. They are duals — `tnec a` equals
+`tnot tposs tnot a` — and either can be used directly in an `if`.
+
+```
+let s: trit = 0;         // a sensor we have not heard from
+if tposs s { /* not ruled out */ }
+if tnec s  { /* confirmed — not taken here */ }
+```
+
+### Lane-wise ternary logic
+
+Everything above operates on ONE three-valued value. The lane-wise operators
+apply the same connectives to all **27 trits of a word at once**, in a single
+T3 instruction.
+
+This is the one place the language is doing something a binary language cannot
+copy cheaply. A 64-bit word holds 64 lanes of *half* a datum each — a bit
+cannot carry a three-valued answer — while a 27-trit word holds 27 lanes of a
+genuinely three-valued one.
+
+| Op | Meaning | Per lane `i` |
+|----|---------|--------------|
+| `a tandw b` | lane-wise conjunction | `min(a_i, b_i)` |
+| `a torw b` | lane-wise disjunction | `max(a_i, b_i)` |
+| `a txorw b` | lane-wise sum mod 3 | balanced `(a_i + b_i) mod 3` |
+| `a timpw b` | lane-wise implication | `min(+1, 1 - a_i + b_i)` |
+| `a tcmpw b` | lane-wise compare | `sign(a_i - b_i)` |
+| `tnotw a` | lane-wise negation | `-a_i` |
+
+Lane `i` is the balanced-ternary digit `d_i` in `a = Σ d_i · 3^i`. The
+decomposition is unique, so lanes are well defined without reference to any
+storage layout.
+
+```
+let x: int = 5;
+let y: int = -7;
+let a = x tandw y;    // -13
+let b = x torw y;     //  11
+let c = tnotw x;      //  -5
+let d = 121 tandw 40; //  40
+```
+
+**These take words, not trits.** Operands must be integer types (`int`,
+`tryte`, `t9`, `t27`, `t54`); `float`, `tfloat`, `bool` and `bool3` are
+rejected. A `bool` is one three-valued answer, so asking for 27 lanes of it is
+far more likely to be a typo for `tand` than an intention:
+
+```
+let p: bool = true;
+let q = p tandw false;
+// error: invalid operands: operator `tandw` cannot be applied to `bool` and `bool`
+```
+
+The result keeps the operand's type, and the value is always in range: every
+lane result is in `{-1, 0, +1}`, so the reassembled word cannot overflow.
+
+**`tnotw` is `tnot` done 27 times, and costs nothing extra.** Negating a
+balanced-ternary number flips the sign of every trit in it, so lane-wise NOT is
+already ordinary negation. It compiles to `TNEG` — the instruction T3ISA has
+had since v1.0 — and the ISA deliberately does *not* define a `TNOTW`.
+
+**`txorw` inherits `txor`'s surprise.** It is not self-inverse: recovering the
+original word takes **three** applications of the same key, not two.
+
+```
+let k: int = 121;
+let once   = 5 txorw k;                 //   99
+let twice  = 5 txorw k txorw k;         // -104  — not 5
+let thrice = 5 txorw k txorw k txorw k; //    5  — recovered
+```
+
+**`timpw` is Łukasiewicz per lane**, so the deduction theorem holds 27 lanes at
+a time. `a timpw a` is the all-`+` word — `3812798742493` — for *every* `a`,
+including words with zero lanes, where Kleene's rule would leave `0`:
+
+```
+let t = 0 timpw 0;    // 3812798742493 — every lane +
+let u = 9841 timpw 9841;  // 3812798742493
+```
+
+That is the cheapest way to check a backend implements L3 and not K3.
+
+> **Cost.** On the T3 backend each of these is one instruction. Written out by
+> hand — extract lane, operate, re-insert, 27 times — the same operation
+> measures 3,034 instructions against 2. See §5 of the T3ISA reference, which
+> reports the measurement and its method. On the LLVM backend they become calls
+> into the C runtime (`manit_lane_*`), because a 27-lane balanced-ternary loop
+> is not something binary hardware expresses inline; results are identical on
+> both backends.
+
+### Trit intrinsics (`trit::`)
+
+Operations balanced ternary does cheaply and binary does not, named so you can
+reach for them. `use std::trit;`
+
+| Function | Meaning |
+|----------|---------|
+| `trit::sign(x)` | `-1`, `0` or `+1` — the sign of `x`, as a `trit` |
+| `trit::abs(x)` | absolute value, exact for every input |
+| `trit::count(x, k)` | how many of the 27 lanes of `x` equal the trit `k` |
+| `trit::shift3(x, n)` | `x * 3^n` — the machine's native shift |
+| `trit::leading_zeros(x)` | leading zero-trits, out of 27 |
+| `trit::trailing_zeros(x)` | trailing zero-trits, out of 27 |
+
+```
+use std::trit;
+
+let s = trit::sign(-256);        // -1
+let a = trit::abs(-256);         // 256
+let c = trit::count(9841, +);    // 9  — 9841 is nine +1 lanes
+let t = trit::shift3(7, 5);      // 1701 = 7 * 3^5
+let z = trit::leading_zeros(9);  // 24
+```
+
+**`sign` is the one to notice.** In two's complement it is a branch or a
+shift-and-or. Here it is a single instruction: T3ISA's `R0` always reads as
+zero, so `TCMP Rd, Ra, R0` *is* the sign. Measured against the same function
+written out by hand — `if x > 0 { 1 } elif x < 0 { -1 } else { 0 }` — it costs
+**2 instructions per call against 11.5**, a 5.8× difference, and it never
+branches.
+
+**`abs` needs no special case.** The 27-trit range is symmetric
+(±3,812,798,742,493), so there is no value whose negation overflows. Two's
+complement has `abs(INT_MIN)` as undefined behaviour or a wrap to itself; that
+question does not arise here. It compiles to `sign` and a multiply.
+
+**`trit::count(x, k)` is not `math::trit_count(x)`.** The `math` one is the
+trit *length* of `x` — how many digits it occupies. This one counts lanes
+*equal to* `k`, and the three counts always sum to 27. They are different
+questions with the same obvious name, which is why the new family has its own
+namespace rather than overloading the old one.
+
+```
+let n = math::trit_count(9841);   // 9  — 9841 occupies nine trits
+let p = trit::count(9841, +);     // 9  — nine of its 27 lanes are +1
+let z = trit::count(9841, 0);     // 18 — the other eighteen are 0
+```
+
+**`shift3` is the ternary shift.** `x << n` is the binary one and multiplies by
+`2^n`; `trit::shift3(x, n)` multiplies by `3^n` and is one instruction (`TSHI`).
+
+> `sign`, `abs`, `count` and `shift3` are lowered to IR directly, so both
+> backends get them from one definition. `leading_zeros` and `trailing_zeros`
+> are ordinary ManiT — they are not single instructions and there is nothing to
+> gain by pretending otherwise.
 
 ### Bitwise
 
@@ -428,10 +650,23 @@ let result = double(21);   // 42
 ### Spawn
 
 ```
-let task = spawn { some_work() };
+spawn { some_work(); }
 ```
 
-Creates a cooperative task. Returns `Task<T>` where `T` is the block's type.
+**Runs the block, in place, to completion.** It is sequential: the statement
+after the `spawn` does not begin until the block has finished.
+
+> **This description replaced a false one.** Until 24 August 2026 this section
+> read "Creates a cooperative task. Returns `Task<T>` where `T` is the block's
+> type." None of that was true of either backend: the lowering inlines the
+> block, and the value form `let t = spawn { 42 };` binds 0 on T3 and emits
+> invalid LLVM IR that clang rejects. `await` on the result does not
+> type-check.
+>
+> ManiT has no concurrency today. `docs/memory-model.md` is the normative
+> statement of what the concurrency primitives do and do not guarantee, and
+> report.txt P5 records the defects. Do not write code against the old
+> description.
 
 ### Await
 
@@ -613,6 +848,82 @@ fn io::println(s: str);
 ```
 
 These are typically declared implicitly by `use` statements.
+
+An `extern` declaration gives one a real signature, and can say which backends
+provide it:
+
+```
+extern "c" fn gui::set_color(r: int, g: int, b: int) -> void
+    available(llvm) deprecated("use gfx::color");
+```
+
+`available(...)` lists the backends that have an implementation. Omitting it
+means *unstated*, which is not the same as "available nowhere".
+
+### Backend availability
+
+ManiT infers, for every function, which backends it can run on: **a function is
+available on backend B exactly when every function it calls is.** Compiling for
+a backend that something in the reachable call graph cannot reach is an error,
+and the error names the chain:
+
+```
+extern "c" fn gui::set_color(r: int, g: int, b: int) -> void available(llvm);
+
+fn paint()      { gui::set_color(1, 2, 3); }
+fn draw_frame() { paint(); }
+fn main()       { draw_frame(); }
+```
+
+```
+$ manitc compile --target t3 demo.mt
+error: demo.mt:8:19: 'main' cannot be compiled for the t3 backend:
+       main -> draw_frame -> paint -> gui::set_color
+       — and 'gui::set_color' is declared available only on: llvm
+```
+
+The same program compiles for `llvm` without complaint. Availability is a
+static property of the call graph, so this is decided at compile time rather
+than discovered by running the program on both backends and diffing the output.
+Without it, the failure above surfaces as `Undefined label: gui::set_color`
+from the assembler, with no source location and no indication of which function
+is responsible.
+
+Only the **outermost** affected function is reported. One unavailable extern
+makes everything above it unavailable too, and its chain already names every
+hop including the culprit, so reporting each link would be the same fact N
+times.
+
+`manitc check` selects no backend and so reports nothing here — it cannot
+answer a question that was not asked.
+
+Recursion needs no special handling: mutually recursive functions settle at the
+meet over their cycle, so a function that never names an unavailable symbol is
+still reported if its cycle reaches one.
+
+#### Writing it down
+
+Availability is inferred, not declared — writing it on every function would be
+unbearable. But it can be written on the functions where it matters, and then
+it is an **assertion the compiler checks**:
+
+```
+fn render() available(llvm, t3) { gui::flush(); }
+// error: 'render' declares `available(t3)` but cannot run there:
+//        render -> gui::flush — and 'gui::flush' is declared available only on: llvm
+```
+
+This is the relationship Rust has between inferred lifetimes and written ones.
+A written clause also constrains callers, so `fn f() available(llvm)` makes
+everything that calls `f` llvm-only too — with no extern involved anywhere.
+
+A contradicted assertion is reported whatever backend is selected, and by
+`manitc check` as well, because it is a statement about the program rather than
+about one invocation.
+
+> This is the `backend-unavailable-chain` lint, and it denies by default. Turn
+> it off with `-A backend-unavailable-chain` if you know better — but the build
+> will still fail, further down, with a worse message.
 
 ---
 
@@ -921,6 +1232,48 @@ fn max<T>(a: T, b: T) -> T {
 
 Call as `max(3, 7)` — the type parameter is inferred.
 
+### Trait bounds
+
+A bare `<T>` places no requirement on `T`. The function above compares two
+values of it, so calling it with a type that has no ordering is meaningless —
+and it used to compile clean and return the wrong answer, comparing the two
+values' addresses rather than the values. Constrain the parameter instead:
+
+```
+fn max<T: Ord>(a: T, b: T) -> T {
+    if a > b { a } else { b }
+}
+```
+
+Several bounds on one parameter are joined with `+`:
+
+```
+fn show_max<T: Ord + Display>(a: T, b: T) -> str { ... }
+```
+
+A `where` clause says the same thing after the signature, which reads better
+when the list is long:
+
+```
+fn show_all<T>(v: Vec<T>) -> str where T: Display { ... }
+```
+
+The two forms accumulate rather than compete: `fn f<T: Ord>(..) where T: Display`
+constrains `T` by both.
+
+A bound is satisfied if the concrete type has an `impl` of that trait, or if it
+is a primitive and the trait is one of the structural traits every primitive
+has: `Ord`, `PartialOrd`, `Eq`, `PartialEq`, `Display`, `Debug`, `Clone`,
+`Copy`, `Hash`. Structs and enums are not covered by that rule — write the
+`impl`:
+
+```
+impl Ord for Point { fn cmp(self, other: Point) -> int { ... } }
+```
+
+An unsatisfied bound is reported under the `unsatisfied-bound` lint, which is
+`deny` by default (see [Lint levels](#20-lint-levels)).
+
 ### Generic structs
 
 ```
@@ -1092,3 +1445,223 @@ functions in the same file and to other files if `pub`.
 | `&` `\|` `^` `<<` `>>` | `int` |
 | `<` `>` `<=` `>=` | `int`, `float`, `trit` and other comparables |
 | `==` `!=` | any type |
+
+---
+
+## 19. External declarations
+
+`extern` declares a native — a function the backend supplies as a C symbol or
+a T3ISA syscall rather than one compiled from maniT source.
+
+```
+extern "c"  fn gui::set_color(r: int, g: int, b: int) -> void
+    available(llvm);
+
+extern "t3" fn io::read_key() -> int
+    available(t3, llvm);
+
+extern "c"  fn str::to_lower(s: str) -> str
+    available(llvm) deprecated("use str::to_lower");
+```
+
+The ABI string and the full signature are mandatory. Two optional clauses may
+follow, in either order:
+
+| clause | meaning |
+|---|---|
+| `available(llvm, t3)` | the backends that provide an implementation |
+| `deprecated("...")`   | calling it warns, with this message |
+
+**What a declaration buys.** Without one, a native's parameter types are
+inferred and its arguments are not checked, so `io::println_int(5 > 0)` was a
+silent coercion — printing `-1` on one backend and `1` on the other. With one,
+the signature is in maniT's own type system and the call is checked like any
+other:
+
+```
+error: argument 1 to 'io::println_int': expected `int`, found `bool`
+```
+
+**Names.** The declared name is written qualified, exactly as it is called:
+`io::println`, not `println`. A native may be declared once; a second
+declaration of the same name is an error, because the point of the form is that
+the declaration is the authority on the signature.
+
+**Availability.** Omitting `available(...)` means *unstated*, which is not the
+same as "available nowhere". Calling something declared unavailable on the
+selected backend is reported under the `backend-unavailable` lint.
+
+**Migration.** The standard library's 413 natives are not yet declared. Calls
+to an undeclared native behave exactly as they always have. To list the ones a
+program reaches — the migration backlog — turn the lint on:
+
+```
+manitc check prog.mt --warn undeclared-native
+```
+
+---
+
+## 20. Lint levels
+
+Every diagnostic the compiler can emit has a name and a level. Levels are
+`allow` (silent), `warn` (reported), `deny` (reported, fails the build) and
+`forbid` (deny, and cannot be lowered afterwards).
+
+The name appears in the diagnostic itself, so it is always visible:
+
+```
+warning: prog.mt:2:5: unused variable `x`; prefix with `_` if intentional [unused-variable]
+```
+
+Set a level for one compilation:
+
+```
+manitc check prog.mt --allow unused-variable --deny shadowing
+manitc compile prog.mt -W undeclared-native -D unknown-type
+```
+
+`-A`, `-W`, `-D` and `-F` are the short forms. An unknown lint name is an
+error, not a no-op — a silently ignored `--deny unusd-variable` would leave the
+compilation at a strictness nobody chose.
+
+Set a level for one module, at item position:
+
+```
+lint allow(unused-variable);
+lint deny(shadowing, unknown-type);
+```
+
+### The lints
+
+| name | default | reports |
+|---|---|---|
+| `unused-variable`     | warn  | a binding that is never read |
+| `unused-function`     | warn  | a function that is never called |
+| `shadowing`           | warn  | a binding that hides an outer one |
+| `unreachable-code`    | warn  | statements after a diverging expression |
+| `integer-overflow`    | warn  | a constant expression that overflows |
+| `division-by-zero`    | warn  | a constant division by zero |
+| `unknown-type`        | warn  | an unresolved module, type or item path |
+| `undeclared-native`   | allow | a native called with no `extern` declaration |
+| `deprecated-native`   | warn  | a call to an extern marked `deprecated` |
+| `backend-unavailable` | allow | an extern not `available` on this backend |
+| `division-semantics`  | allow | a `/` or `%` whose meaning depends on the language version |
+| `unsatisfied-bound`   | deny  | a generic argument that fails a trait bound |
+
+`--warn-as-error` still means "raise everything to deny".
+
+### The manifest
+
+The effective levels are recorded **in the artifact**, so a compiled program
+says what it was checked for:
+
+```
+$ strings a.out | grep manitc-lints
+manitc-lints v1 compiler=0.1.0 backend-unavailable=allow ... unused-variable=warn
+```
+
+On the LLVM backend it is a comment in the `.ll` and a `@manitc.lints`
+constant that survives linking. On T3 it is a comment in the `.t3s` and a
+`.t3l` sidecar, alongside the existing `.t3d` and `.t3f`. `--print-lints`
+prints the same set before compiling.
+
+This exists because strictness used to be a property of the compiler binary
+rather than the invocation: changing it invalidated every earlier measurement,
+and the only way to keep results comparable was to archive the exact binary
+that produced them. A recorded manifest makes a result self-describing instead.
+
+---
+
+## 21. Language versions
+
+A program is compiled under a **language version**, chosen with `--lang` and
+defaulting to `v1`:
+
+```
+manitc compile prog.mt                 # v1 — the default
+manitc compile prog.mt --lang v2       # v2
+manitc check prog.mt --lang v2
+manitc run-t3 prog.mt --lang v2
+```
+
+An unrecognised version is an error, not a fallback to the default: a typo that
+quietly selected `v1` would compile the program under arithmetic its author did
+not ask for and nothing downstream would say so.
+
+### What v2 changes
+
+**C4 — `/` and `%` round to nearest, ties away from zero.**
+
+```
+  7 / 2 == 4     7 % 2 == -1
+ -7 / 2 == -4   -7 % 2 ==  1
+  2 / 3 == 1     2 % 3 == -1
+```
+
+Truncation is C's rule, and this is not a two's-complement machine: in balanced
+ternary, dropping low trits *is* rounding to nearest, so truncating is extra
+work done to imitate a representation the machine does not use. On T3 the
+rounding division is a single instruction (`TDIVN`, T3ISA v1.6); the LLVM
+backend needs sixteen to say the same thing.
+
+Ties go away from zero because the balanced range is symmetric and
+`(-a) / b == -(a / b)` is worth keeping. Round-half-to-even was the alternative
+and was rejected: balanced ternary's unbiasedness comes from the
+representation, not from the tie-break.
+
+`%` changes with `/` and not separately — it is *defined* as
+`a - (a / b) * b`, which is what keeps `(a / b) * b + (a % b) == a` true. The
+practical consequence is that the balanced remainder can be **negative for a
+positive dividend**, so `x % 2 == 0` is still an evenness test but
+`x % 2 == 1` is not an oddness test.
+
+**N5 — `int` is 27 trits on every backend.**
+
+Under `v1`, `int` is a 27-trit word on T3 and a 64-bit integer on LLVM, so a
+value in `(3812798742493, 2^63-1]` exists on one backend and not the other:
+
+```
+let m: int = 3812798742493;
+m + 1        // v1:  T3 traps,  LLVM gives 3812798742494
+             // v2:  both trap
+```
+
+Under `v2` the LLVM backend range-checks `int` addition, subtraction and
+multiplication and both backends agree. The cost is a guard call before each of
+those three operations on LLVM — the same cost the divisor guard has always
+paid on every integer division — and it is paid only by code compiled `--lang
+v2`. On T3 it costs nothing: the machine's word already *is* 27 trits.
+
+`trint` is the wider type for code that wants the machine word and is **not**
+range-checked. Note that a T3 register is 27 trits, so a `trint` still cannot
+hold more than that on T3; the wider range is an LLVM-only escape hatch.
+
+Not covered: `int` literals, casts, `<<`, and values returned by natives are
+not range-checked. N5's claim is about the three arithmetic operators.
+
+### Migrating
+
+`--warn division-semantics` lists every `/` and `%` whose meaning depends on
+the version, with the enclosing function named:
+
+```
+$ manitc check prog.mt --warn division-semantics
+warning: prog.mt:4:21: `/` in `main` on an integer truncates under --lang v1,
+  and rounds to nearest under v2; write `math::div_trunc(a, b)` to mean this in
+  both [division-semantics]
+```
+
+That list is the migration backlog, generated from the program rather than kept
+by hand. Rewriting a site onto `math::div_trunc` / `math::rem_trunc` (or
+`div_near` / `rem_near`) pins its meaning, and it then means the same thing
+under both versions — those four are the only division spellings that do.
+
+Compile the same source both ways and compare the output; the compiler makes no
+attempt to guess which sites were meant to change.
+
+### Why v1 stays the default
+
+Recommendation R2 holds that delay is preferable to making a change of this
+kind casually, and moving the default in the same release that introduces the
+behaviour would be making it casually. When the default moves, it moves as its
+own change, with the backlog already generated.

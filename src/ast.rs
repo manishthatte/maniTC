@@ -36,6 +36,10 @@ pub enum Item {
     TraitDef(TraitDef),
     UseDecl(UseDecl),
     GlobalVar(GlobalVar),
+    /// A1: an explicit native declaration.
+    ExternDecl(ExternDecl),
+    /// A5: a module-level lint level setting.
+    LintDecl(LintDecl),
 }
 
 // ---------------------------------------------------------------------------
@@ -46,11 +50,89 @@ pub enum Item {
 pub struct FnDef {
     pub name: String,
     pub generics: Vec<String>,
+    /// B1: declared bounds on the generic parameters, from either the angle
+    /// brackets (`<T: Ord>`) or a `where` clause. Kept beside `generics`
+    /// rather than inside it because every existing consumer keys on the bare
+    /// name, and a bound is a constraint ON a parameter, not part of its
+    /// identity.
+    pub bounds: Vec<GenericBound>,
     pub params: Vec<Param>,
     pub ret_ty: Option<Type>,
     pub body: Option<Block>, // None = extern / trait method without body
+    /// A2: a WRITTEN availability assertion, `fn f() available(t3) { .. }`.
+    ///
+    /// This is not how availability is determined — that is inferred from the
+    /// call graph. It is an assertion the compiler checks against the
+    /// inference, the same relationship Rust has between inferred lifetimes
+    /// and written ones: writing it on every function would be unbearable, but
+    /// writing it on the few that matter pins them, so a later edit that
+    /// quietly reaches an unavailable native is caught at the function that
+    /// promised not to.
+    ///
+    /// `None` = unstated, which is NOT "available nowhere" — the same
+    /// distinction `ExternDecl::available` makes.
+    pub available: Option<Vec<String>>,
     pub is_pub: bool,
     pub is_async: bool,
+    pub span: Span,
+}
+
+/// A declared constraint on one generic parameter: the `T: Ord` in
+/// `fn max<T: Ord>(a: T, b: T) -> T`, or one clause of a `where`.
+///
+/// Several bounds on the same parameter accumulate rather than replace, so
+/// `fn f<T: Ord>(..) where T: Display` constrains `T` by both.
+#[derive(Debug, Clone)]
+pub struct GenericBound {
+    pub param: String,
+    pub traits: Vec<String>,
+    pub span: Span,
+}
+
+/// A1: an explicit native declaration.
+///
+/// ```text
+/// extern "c" fn gui::set_color(r: int, g: int, b: int) -> void
+///     available(llvm);
+/// extern "c" fn str::to_lower(s: str) -> str
+///     available(llvm) deprecated("use str::to_lower");
+/// ```
+///
+/// The point of the form is that all three of section 52's defects become
+/// inexpressible. A name that is not declared cannot be called; a declaration
+/// with no implementation on the selected backend is a diagnostic at the CALL
+/// SITE with a source span, not an undefined label out of the assembler; and
+/// the signature is in the language's own type system, so passing a `bool`
+/// where a `bool3` was declared is a type error like any other rather than a
+/// silent coercion.
+#[derive(Debug, Clone)]
+pub struct ExternDecl {
+    /// The ABI string: `"c"` for a C-runtime symbol, `"t3"` for a T3ISA
+    /// syscall. Recorded rather than checked — the backends already know how
+    /// to reach their own natives, and an ABI the compiler cannot honour is a
+    /// backend error, not a parse error.
+    pub abi: String,
+    /// The declared name, qualified as it is called: `io::println`.
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret_ty: Option<Type>,
+    /// Backends that provide an implementation. `None` = no `available`
+    /// clause was written, which is NOT the same as "available nowhere": it
+    /// means unstated, and A1 step 3 is what turns unstated into an error.
+    pub available: Option<Vec<String>>,
+    pub deprecated: Option<String>,
+    pub is_pub: bool,
+    pub span: Span,
+}
+
+/// A5: `lint deny(unused-variable);` at item position.
+///
+/// Module-level rather than compilation-level, so a file can pin its own
+/// strictness. Names are the same strings `--deny` takes.
+#[derive(Debug, Clone)]
+pub struct LintDecl {
+    pub level: String,
+    pub lints: Vec<String>,
     pub span: Span,
 }
 
@@ -328,6 +410,41 @@ pub enum BinOpKind {
     Txor,
     Tcon, // consensus: +1 if both +1, -1 if both -1, else 0
     Tany, // any: +1 if either +1, -1 if either -1, else 0
+    /// C1: Lukasiewicz implication, `min(+1, 1 - a + b)` on -1/0/+1.
+    ///
+    /// The connective that decides WHICH three-valued logic this is. Kleene's
+    /// K3 and Lukasiewicz's L3 share conjunction (min), disjunction (max) and
+    /// negation exactly; they differ in one cell of implication — `a = b = 0`,
+    /// where Kleene gives unknown and Lukasiewicz gives TRUE. That cell is the
+    /// deduction theorem: in L3 `a timp a` is a tautology, in K3 it is not.
+    /// With only min/max/negation the language could not express the question.
+    Timp,
+    /// C1: Lukasiewicz equivalence, `(a timp b) tand (b timp a)`.
+    Teq,
+    /// C2 / T3ISA v1.5: lane-wise conjunction — per-trit `min` across all 27
+    /// lanes of a word.
+    ///
+    /// The lane-wise family is the same six connectives as the scalar ones,
+    /// but reading a word as 27 independent trits rather than as a magnitude.
+    /// `a tand b` asks one three-valued question; `a tandw b` asks 27 of them
+    /// in a single T3 instruction. That is the 27-way SIMD a balanced-ternary
+    /// word already pays for and a binary machine cannot copy without a loop.
+    ///
+    /// Operands are words, not trits, and are read as exactly 27 lanes: a
+    /// value outside the 27-trit range is clamped, not wrapped.
+    Tandw,
+    /// C2: lane-wise disjunction — per-trit `max`.
+    Torw,
+    /// C2: lane-wise balanced sum mod 3. Inherits the scalar operator's
+    /// surprise: it is not an involution, since 3k = 0 (mod 3) takes THREE
+    /// applications to recover the original, not two.
+    Txorw,
+    /// C2: lane-wise Lukasiewicz implication, `min(+1, 1 - a + b)` per lane.
+    /// The a = b = 0 cell is +1 here for the same reason it is in `Timp`.
+    Timpw,
+    /// C2: lane-wise three-way compare, `sign(a_i - b_i)` per lane. No scalar
+    /// spelling — the word-level comparison operators already cover that case.
+    Tcmpw,
     Range,
     RangeInclusive,
 }
@@ -337,6 +454,22 @@ pub enum UnOpKind {
     Neg,
     Not,
     Tnot,
+    /// C1: possibility (Lukasiewicz M) — `+1` if a >= 0, else `-1`.
+    /// "might be true".
+    Tposs,
+    /// C1: necessity (Lukasiewicz L) — `+1` only if a = +1, else `-1`.
+    /// "is definitely true". Dual to Tposs: `tnec a == tnot tposs tnot a`.
+    Tnec,
+    /// C2: lane-wise negation.
+    ///
+    /// Lowers to `TritNeg` — the SAME instruction `tnot` uses, and that is the
+    /// point rather than an oversight. Negating a balanced-ternary number
+    /// flips the sign of every trit in it, so lane-wise NOT already IS `TNEG`;
+    /// adding a `TNOTW` opcode to a published ISA would have bought a second
+    /// encoding of an instruction that exists. This variant is a SURFACE
+    /// spelling only: it differs from `Tnot` in the type rule (it takes a
+    /// word, not a trit) and in what it tells the reader.
+    Tnotw,
     Deref,
     Ref,
     TritNeg,

@@ -12,6 +12,7 @@ mod lower_stmt;
 use helpers::*;
 
 use super::types::*;
+use crate::lang::LangVersion;
 use crate::semantic::{ManiType, TypedBlock, TypedExpr, TypedExprKind, TypedFnDef, TypedProgram};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,10 @@ pub struct IRLowerer {
     static_structs: Vec<IRStaticStruct>,
     // declared return ManiType of the function currently being lowered
     current_fn_ret: ManiType,
+    // R2: the language version being lowered for. Read by lower_expr to pick
+    // `DivNear`/`RemNear` over `Div`/`Rem`, and copied onto the IRModule so
+    // the backends see the same answer the lowerer did.
+    lang: LangVersion,
 }
 
 impl IRLowerer {
@@ -295,6 +300,7 @@ impl IRLowerer {
             struct_field_manitys: std::collections::HashMap::new(),
             static_structs: Vec::new(),
             current_fn_ret: ManiType::Void,
+            lang: LangVersion::default(),
         }
     }
 
@@ -368,6 +374,62 @@ impl IRLowerer {
     /// becomes -1 and `true` becomes +1 and the three-valued operators see a
     /// genuine trit. `unknown` simply never arises from a bool operand, which is
     /// correct: a two-valued input cannot produce a third outcome.
+    /// C1: emit `a timp b` and return the destination temp.
+    ///
+    /// Shared by `Timp` and by `Teq`, which needs it twice in opposite
+    /// directions. Taking already-lowered values rather than expressions is
+    /// what lets `teq` evaluate each operand once.
+    pub(super) fn lower_timp(&mut self, a: IRValue, b: IRValue) -> IRTemp {
+        // 1 - a
+        let one_minus_a = self.fresh_temp();
+        self.emit(IRInstr::BinOp {
+            dst: one_minus_a.clone(),
+            op: IRBinOp::Sub,
+            lhs: IRValue::Const(IRConst::Int(1)),
+            rhs: a,
+            ty: IRType::I8,
+        });
+        // (1 - a) + b
+        let sum = self.fresh_temp();
+        self.emit(IRInstr::BinOp {
+            dst: sum.clone(),
+            op: IRBinOp::Add,
+            lhs: IRValue::Temp(one_minus_a),
+            rhs: b,
+            ty: IRType::I8,
+        });
+        // min(that, +1)
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::TritMin {
+            dst: dst.clone(),
+            a: IRValue::Temp(sum),
+            b: IRValue::Const(IRConst::Int(1)),
+        });
+        dst
+    }
+
+    /// P3: map a `{-1, +1}` bool3 carrier onto the `{0, 1}` a `bool` must hold.
+    ///
+    /// `TritMax(v, 0)` does it in one instruction, exactly because the input is
+    /// two-valued: -1 becomes 0 and +1 stays 1.
+    ///
+    /// Needed wherever an operator's RESULT TYPE is `bool` but its computation
+    /// happens in the three-valued carrier — `tposs`, `tnec`, and `timp`/`teq`
+    /// on two `bool` operands. Without it the value -1 was returned as a
+    /// `bool`, and the two backends then disagreed about what that means: T3's
+    /// `if` dispatches on SIGN and read it as false, LLVM's tests NONZERO and
+    /// read it as true. `tnec x` was true for every x on LLVM — the modal
+    /// operator inverted on one backend and correct on the other.
+    pub(super) fn normalize_to_bool(&mut self, v: IRValue) -> IRTemp {
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::TritMax {
+            dst: dst.clone(),
+            a: v,
+            b: IRValue::Const(IRConst::Int(0)),
+        });
+        dst
+    }
+
     pub(super) fn lower_ternary_operand(&mut self, e: &TypedExpr) -> IRValue {
         let v = self.lower_expr(e);
         self.coerce_value(v, &e.ty, &ManiType::Bool3)
@@ -427,8 +489,20 @@ impl IRLowerer {
     // Public entry point
     // ---------------------------------------------------------------------------
 
+    /// Lower a checked program under the DEFAULT language version.
+    ///
+    /// Kept as the V1 entry point so that its four callers — `src/bench.rs`,
+    /// `src/main.rs` twice, and `tests/fuzz_corpus_tests.rs` — do not have to
+    /// change to say what they already meant. `lower_with` is the one that
+    /// takes a version.
     pub fn lower(typed_program: &TypedProgram) -> IRModule {
+        Self::lower_with(typed_program, LangVersion::default())
+    }
+
+    /// Lower a checked program under an explicit language version (R2).
+    pub fn lower_with(typed_program: &TypedProgram, lang: LangVersion) -> IRModule {
         let mut lowerer = IRLowerer::new();
+        lowerer.lang = lang;
         let mut functions = Vec::new();
         let mut globals = Vec::new();
 
@@ -534,6 +608,7 @@ impl IRLowerer {
             float_literals: Vec::new(),
             static_structs: lowerer.static_structs.clone(),
             struct_sizes,
+            lang,
         }
     }
 
@@ -768,11 +843,38 @@ impl IRLowerer {
     // Block lowering
     // ---------------------------------------------------------------------------
 
+    /// P4: a block is a SCOPE, and `locals` has to be restored on the way out.
+    ///
+    /// `locals` is a flat `HashMap<String, ..>`, so an inner `let x` overwrote
+    /// the outer `x` and nothing ever put it back:
+    ///
+    /// ```text
+    /// let x: int = 1;
+    /// { let x: int = 2; io::println_int(x); }   // 2
+    /// io::println_int(x);                       // printed 2, want 1
+    /// ```
+    ///
+    /// The semantic analyser scopes correctly — it has a real scope stack, the
+    /// `shadowing` lint calls the inner one "a binding that hides an outer
+    /// one", and the outer type is restored after the block — so this was the
+    /// LOWERING losing information the checker had right.
+    ///
+    /// Both backends were wrong identically, which is why neither the example
+    /// matrix nor any cross-backend test could see it: they are fed by this one
+    /// front end. The reference interpreter found it on its first run.
+    ///
+    /// Snapshot-and-restore rather than a scope stack: discarding every binding
+    /// the block introduced and reinstating every one it hid is exactly what
+    /// leaving a scope means, and it is five lines against threading a stack
+    /// through ten call sites. The allocas the block emitted stay in the IR, as
+    /// they must — going out of scope is not deallocation.
     fn lower_block(&mut self, block: &TypedBlock) -> IRValue {
+        let saved = self.locals.clone();
         let mut last = IRValue::Void;
         for stmt in &block.stmts {
             last = self.lower_stmt(stmt);
         }
+        self.locals = saved;
         last
     }
 }

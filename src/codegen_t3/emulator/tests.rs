@@ -1152,3 +1152,228 @@ HALT
     emu.run();
     assert_eq!(emu.regs[1] as usize, addr);
 }
+
+// ---------------------------------------------------------------------------
+// T3ISA v1.5 — lane-wise ternary logic (C2)
+// ---------------------------------------------------------------------------
+
+/// Build a word from trits given LEAST-significant-first.
+///
+/// Lane order matters and is easy to get backwards: `trits27` is lsb-first, so
+/// the tests speak the same order the instruction does. An msb-first helper
+/// read more naturally and produced tests that passed for the wrong reason.
+fn lanes(lsb_first: &[i8]) -> i64 {
+    let mut arr = [0i8; T3_LANES];
+    arr[..lsb_first.len()].copy_from_slice(lsb_first);
+    from_trits27(&arr)
+}
+
+/// Run one three-operand lane-wise instruction and return Rd.
+fn run_lane_op(op: Opcode, a: i64, b: i64) -> i64 {
+    let mut emu = Emulator::new();
+    emu.load_program(vec![
+        encode(op, 3, 1, 2, 0),
+        encode(Opcode::Halt, 0, 0, 0, 0),
+    ]);
+    emu.regs[1] = a;
+    emu.regs[2] = b;
+    emu.run();
+    assert!(!emu.trapped, "{:?} trapped unexpectedly", op);
+    emu.regs[3]
+}
+
+#[test]
+fn v15_lane_decomposition_round_trips() {
+    for v in [0i64, 1, -1, 8, -8, 13, -13, 1_000_000, -1_000_000, T3_MAX, T3_MIN] {
+        assert_eq!(from_trits27(&trits27(v)), v, "round trip failed for {}", v);
+    }
+}
+
+#[test]
+fn v15_decomposition_is_balanced_every_digit_in_minus_one_to_one() {
+    for v in [-1_000_000i64, -8, -1, 0, 1, 8, 1_000_000, T3_MAX, T3_MIN] {
+        for (i, t) in trits27(v).iter().enumerate() {
+            assert!((-1..=1).contains(t), "lane {} of {} is {}, not a trit", i, v, t);
+        }
+    }
+}
+
+#[test]
+fn v15_tandw_is_lane_wise_min_not_numeric_min() {
+    // a = (+ 0 -) lsb-first, b = (- 0 +). Lane-wise min is (- 0 -).
+    let a = lanes(&[1, 0, -1]);
+    let b = lanes(&[-1, 0, 1]);
+    let got = run_lane_op(Opcode::Tandw, a, b);
+    assert_eq!(got, lanes(&[-1, 0, -1]), "TANDW must be lane-wise min");
+
+    // Finding F2, as an assertion: the answer differs from the NUMERIC min
+    // that TAND computes. If these ever coincide the instruction is pointless.
+    assert_ne!(got, a.min(b), "TANDW must differ from numeric TAND here");
+}
+
+#[test]
+fn v15_torw_is_lane_wise_max() {
+    let a = lanes(&[1, 0, -1]);
+    let b = lanes(&[-1, 0, 1]);
+    let got = run_lane_op(Opcode::Torw, a, b);
+    assert_eq!(got, lanes(&[1, 0, 1]));
+    assert_ne!(got, a.max(b), "TORW must differ from numeric TOR here");
+}
+
+#[test]
+fn v15_timpw_computes_all_nine_cells_in_one_instruction() {
+    // The truth table, laid across nine lanes — which is the point of the
+    // instruction, so the test should exercise it that way rather than nine
+    // times over one lane.
+    //
+    //         b=-1  b=0  b=+1
+    //  a=-1    +1   +1    +1
+    //  a= 0     0   +1    +1
+    //  a=+1    -1    0    +1
+    let a = lanes(&[-1, -1, -1, 0, 0, 0, 1, 1, 1]);
+    let b = lanes(&[-1, 0, 1, -1, 0, 1, -1, 0, 1]);
+    let got = trits27(run_lane_op(Opcode::Timpw, a, b));
+    assert_eq!(&got[..9], &[1, 1, 1, 0, 1, 1, -1, 0, 1]);
+
+    // The eighteen lanes past the table are `0 timp 0`, and they come back
+    // +1 — not 0. That is not padding noise, it IS the Lukasiewicz cell,
+    // showing up eighteen more times because every unused lane of a word is
+    // an `unknown`. Asserting it is what stops the test passing on a
+    // Kleene implementation.
+    assert_eq!(&got[9..], &[1i8; T3_LANES - 9]);
+}
+
+#[test]
+fn v15_timpw_gives_the_lukasiewicz_cell_not_the_kleene_one() {
+    // a = b = unknown in every lane. Lukasiewicz: TRUE. Kleene max(-a, b):
+    // unknown. This one cell is what makes the logic L3 and is the whole
+    // justification for the connective existing.
+    let got = run_lane_op(Opcode::Timpw, 0, 0);
+    assert_eq!(
+        trits27(got),
+        [1i8; T3_LANES],
+        "unknown timp unknown must be TRUE in every lane"
+    );
+    // What Kleene would have said, for contrast: max(-0, 0) = 0 everywhere.
+    assert_ne!(got, 0, "the Kleene answer would be zero; L3's is not");
+}
+
+#[test]
+fn v15_txorw_needs_three_applications_not_two() {
+    // 3k = 0 (mod 3), so txor is not an involution. The language reference
+    // documents this for the word-level operator; the lane-wise one inherits
+    // it, and a test is the only thing that keeps it true.
+    let x = lanes(&[1, 0, -1, 1, 0]);
+    let k = lanes(&[0, 1, 1, -1, 1]);
+    let once = run_lane_op(Opcode::Txorw, x, k);
+    let twice = run_lane_op(Opcode::Txorw, once, k);
+    assert_ne!(twice, x, "two applications must NOT recover x");
+    let thrice = run_lane_op(Opcode::Txorw, twice, k);
+    assert_eq!(thrice, x, "three applications must recover x");
+}
+
+#[test]
+fn v15_tcmpw_is_a_three_way_compare_per_lane() {
+    let a = lanes(&[1, 0, -1, 1]);
+    let b = lanes(&[0, 0, 1, -1]);
+    // 1>0 → +1 ; 0==0 → 0 ; -1<1 → -1 ; 1>-1 → +1
+    assert_eq!(run_lane_op(Opcode::Tcmpw, a, b), lanes(&[1, 0, -1, 1]));
+}
+
+#[test]
+fn v15_tpopc_counts_lanes_equal_to_k() {
+    // Low five lanes (+ + 0 - 0); the other 22 are 0, so k=0 counts 24.
+    let x = lanes(&[1, 1, 0, -1, 0]);
+    for &(k, want) in &[(1i64, 2i64), (-1, 1), (0, 24)] {
+        let mut emu = Emulator::new();
+        emu.load_program(vec![
+            encode(Opcode::Tpopc, 3, 1, 0, k),
+            encode(Opcode::Halt, 0, 0, 0, 0),
+        ]);
+        emu.regs[1] = x;
+        emu.run();
+        assert_eq!(emu.regs[3], want, "TPOPC for k={} should be {}", k, want);
+    }
+    // The three counts partition the word: every lane is exactly one of them.
+    let total: i64 = [1i64, 0, -1]
+        .iter()
+        .map(|&k| {
+            let mut emu = Emulator::new();
+            emu.load_program(vec![
+                encode(Opcode::Tpopc, 3, 1, 0, k),
+                encode(Opcode::Halt, 0, 0, 0, 0),
+            ]);
+            emu.regs[1] = x;
+            emu.run();
+            emu.regs[3]
+        })
+        .sum();
+    assert_eq!(total, T3_LANES as i64, "the three counts must sum to 27");
+}
+
+#[test]
+fn v15_tselw_selects_three_ways_and_zero_is_its_own_case() {
+    // sel = (+ 0 -) picks a, then ZERO, then b. A binary select has no middle
+    // case to express — that is the whole difference.
+    let mut emu = Emulator::new();
+    emu.load_program(vec![
+        // TSELW Rd=4, Rs=1, Ra=2, Rb=3
+        encode(Opcode::Tselw, 4, 1, 2, 3),
+        encode(Opcode::Halt, 0, 0, 0, 0),
+    ]);
+    emu.regs[1] = lanes(&[1, 0, -1]);
+    emu.regs[2] = lanes(&[1, 1, 1]);
+    emu.regs[3] = lanes(&[-1, -1, -1]);
+    emu.run();
+    assert!(!emu.trapped);
+    assert_eq!(emu.regs[4], lanes(&[1, 0, -1]));
+}
+
+#[test]
+fn v15_lane_ops_cannot_trap() {
+    // Every lane result is in {-1,0,+1} by construction, so the reassembled
+    // word is in range by construction — a property of the representation,
+    // not a bound anyone is enforcing. Drive the extremes to prove it.
+    for op in [Opcode::Tandw, Opcode::Torw, Opcode::Txorw, Opcode::Timpw, Opcode::Tcmpw] {
+        let got = run_lane_op(op, T3_MAX, T3_MIN);
+        assert!(got >= T3_MIN && got <= T3_MAX, "{:?} left the word range", op);
+    }
+}
+
+/// The profiler must SEE the v1.5 lane-wise group, not merely total it.
+///
+/// `opcode_counts` was a hard-coded `[usize; 36]` and the summary's name table
+/// stopped at `STORET`, so opcodes 36-42 were dropped from the per-opcode
+/// histogram while still landing in `total_instructions` and in
+/// `ternary_native_ops`. A benchmark of `TANDW` therefore showed the work
+/// happening and no `TANDW` anywhere in the breakdown — the instrument could
+/// not see the instructions the architecture had just added, which is exactly
+/// what C2's R4 ("measure it before it is quoted") needs it to do.
+#[test]
+fn v15_profiler_sees_every_lane_opcode() {
+    for op in [Opcode::Tandw, Opcode::Torw, Opcode::Txorw, Opcode::Timpw,
+               Opcode::Tcmpw, Opcode::Tpopc, Opcode::Tselw] {
+        let mut emu = Emulator::new();
+        emu.load_program(vec![
+            encode(op, 3, 1, 2, 0),
+            encode(Opcode::Halt, 0, 0, 0, 0),
+        ]);
+        emu.regs[1] = 9841;
+        emu.regs[2] = -7;
+        emu.run();
+        assert!(!emu.trapped, "{:?} trapped", op);
+
+        let idx = op as usize;
+        assert!(idx < emu.profile.opcode_counts.len(),
+            "{:?} (opcode {}) is outside the histogram", op, idx);
+        assert_eq!(emu.profile.opcode_counts[idx], 1,
+            "{:?} was executed but not counted", op);
+
+        // And it must be NAMED in the summary, not just counted: a histogram
+        // slot with no name is invisible in exactly the same way.
+        let mnemonic = format!("{:?}", op).to_uppercase();
+        let summary = emu.profile.summary();
+        assert!(summary.contains(&mnemonic),
+            "{:?} missing from profile summary:\n{}", op, summary);
+    }
+}

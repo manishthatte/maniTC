@@ -1,8 +1,65 @@
 use std::collections::{HashMap, HashSet};
 use super::types::*;
 
-/// Run all optimization passes on every non-extern function in the module.
+/// Which optional passes to run.
+#[derive(Debug, Clone, Copy)]
+pub struct PassOptions {
+    /// F-1: split critical edges, then lift local variables out of memory into
+    /// SSA values.
+    ///
+    /// **On by default since F-3 landed.** It removes about half of the IR —
+    /// 42,008 of 79,953 instructions across the shipped examples are loads and
+    /// stores of locals, and 8,660 of 9,455 allocas (91.5 %) are promotable —
+    /// and until those locals are values rather than memory, none of the passes
+    /// below can see them at all.
+    ///
+    /// It was off by default for as long as the T3 register allocator could not
+    /// survive the volume of phi nodes promotion produces: at its worst, 14 of
+    /// 17 examples ran and 9 of 17 agreed with LLVM. That allocator was
+    /// rewritten (F-3) and the phi defects behind those numbers fixed
+    /// (report.txt P11, P12, P14, P16); it is now 17/17 running and 17/17
+    /// agreeing, on both language versions.
+    ///
+    /// Turn it OFF with `--no-mem2reg`. That is the switch that reproduces the
+    /// pre-F-1 compiler's output byte for byte, which is what dates a defect as
+    /// pre-existing rather than newly introduced — keep it working.
+    pub mem2reg: bool,
+}
+
+impl Default for PassOptions {
+    fn default() -> Self {
+        Self { mem2reg: true }
+    }
+}
+
+/// Run the optimisation passes with the defaults.
 pub fn run_passes(module: &mut IRModule) {
+    run_passes_with(module, PassOptions::default())
+}
+
+/// Run all optimization passes on every non-extern function in the module.
+///
+/// `mem2reg` (F-1) runs FIRST when enabled, and the ordering is the point of
+/// it. Every other pass here reasons about temps: constant propagation keys a
+/// `HashMap` on temp names, CSE keys on operand names, strength reduction
+/// matches on a constant operand. A local variable in an `Alloca` is invisible
+/// to all of them, because its value is in memory and only its address is a
+/// temp. Lifting it out first is what gives the passes below something to see.
+///
+/// `dead_block_eliminate` runs first as well as last. `mem2reg` skips any
+/// variable used in an unreachable block — it would otherwise leave a load
+/// referring to an alloca it had deleted — so removing those blocks before it
+/// runs is what keeps that conservatism from costing anything in practice.
+pub fn run_passes_with(module: &mut IRModule, opts: PassOptions) {
+    dead_block_eliminate(module);
+    if opts.mem2reg {
+        // A phi's value has to be placed ON the edge it came from, and a
+        // critical edge has nowhere to put it. Split before promoting, so every
+        // phi `mem2reg` inserts already has a predecessor that ends in a plain
+        // jump — which is the only shape the T3 backend emits copies for.
+        super::ssa::split_critical_edges_module(module);
+        super::mem2reg::run(module);
+    }
     for func in &mut module.functions {
         if func.is_extern {
             continue;
@@ -104,16 +161,46 @@ fn try_fold_binop(op: &IRBinOp, lhs: &IRValue, rhs: &IRValue) -> Option<IRConst>
     }
 }
 
+/// N5: a folded result, or `None` when it does not fit a 27-trit word.
+fn fold_in_word(v: i128) -> Option<IRConst> {
+    if v > crate::lang::T27_MAX as i128 || v < crate::lang::T27_MIN as i128 {
+        None
+    } else {
+        Some(IRConst::Int(v as i64))
+    }
+}
+
 fn fold_int_binop(op: &IRBinOp, a: i64, b: i64) -> Option<IRConst> {
     match op {
         IRBinOp::Add => Some(IRConst::Int(a.wrapping_add(b))),
         IRBinOp::Sub => Some(IRConst::Int(a.wrapping_sub(b))),
         IRBinOp::Mul => Some(IRConst::Int(a.wrapping_mul(b))),
+        // N5. Folded only when the answer FITS. An out-of-range constant
+        // expression must reach the backend and trap there, exactly as the
+        // same expression would if its operands were variables — folding it to
+        // a wrapped value would turn a fault into a wrong answer, which is the
+        // defect `checked27` replaced clamping to fix. Returning None leaves
+        // the instruction in place and the guard runs.
+        IRBinOp::AddT27 => fold_in_word((a as i128) + (b as i128)),
+        IRBinOp::SubT27 => fold_in_word((a as i128) - (b as i128)),
+        IRBinOp::MulT27 => fold_in_word((a as i128) * (b as i128)),
         IRBinOp::Div => {
             if b == 0 { None } else { Some(IRConst::Int(a.wrapping_div(b))) }
         }
         IRBinOp::Rem => {
             if b == 0 { None } else { Some(IRConst::Int(a.wrapping_rem(b))) }
+        }
+        // C4. Folded through the same `lang::div_nearest` the emulator and the
+        // LLVM sequence are defined by, so a constant-folded division and a
+        // run-time one cannot answer differently. A second implementation of
+        // the rounding rule here would be a second thing to get wrong, and the
+        // difference would only ever show up as a program whose behaviour
+        // depended on whether its operands happened to be constants.
+        IRBinOp::DivNear => {
+            if b == 0 { None } else { Some(IRConst::Int(crate::lang::div_nearest(a, b))) }
+        }
+        IRBinOp::RemNear => {
+            if b == 0 { None } else { Some(IRConst::Int(crate::lang::rem_balanced(a, b))) }
         }
         IRBinOp::IEq => Some(IRConst::Bool(a == b)),
         IRBinOp::INe => Some(IRConst::Bool(a != b)),
@@ -203,6 +290,10 @@ fn propagate_value(val: &mut IRValue, const_map: &HashMap<String, IRConst>) {
 
 fn propagate_in_instruction(instr: &mut IRInstr, const_map: &HashMap<String, IRConst>) {
     match instr {
+        IRInstr::TritLane { a, b, .. } => {
+            propagate_value(a, const_map);
+            propagate_value(b, const_map);
+        }
         IRInstr::BinOp { lhs, rhs, .. } => {
             propagate_value(lhs, const_map);
             propagate_value(rhs, const_map);
@@ -246,7 +337,7 @@ fn propagate_in_instruction(instr: &mut IRInstr, const_map: &HashMap<String, IRC
             propagate_value(a, const_map);
             propagate_value(b, const_map);
         }
-        IRInstr::TritNeg { a, .. } => {
+        IRInstr::TritNeg { a, .. } | IRInstr::TritSign { a, .. } => {
             propagate_value(a, const_map);
         }
         IRInstr::PrintStr(v) | IRInstr::PrintInt(v) | IRInstr::PrintFloat(v)
@@ -329,6 +420,10 @@ fn collect_used_from_value(val: &IRValue, used: &mut HashSet<String>) {
 
 fn collect_used_in_instruction(instr: &IRInstr, used: &mut HashSet<String>) {
     match instr {
+        IRInstr::TritLane { a, b, .. } => {
+            collect_used_from_value(a, used);
+            collect_used_from_value(b, used);
+        }
         IRInstr::BinOp { lhs, rhs, .. } => {
             collect_used_from_value(lhs, used);
             collect_used_from_value(rhs, used);
@@ -372,7 +467,7 @@ fn collect_used_in_instruction(instr: &IRInstr, used: &mut HashSet<String>) {
             collect_used_from_value(a, used);
             collect_used_from_value(b, used);
         }
-        IRInstr::TritNeg { a, .. } => {
+        IRInstr::TritNeg { a, .. } | IRInstr::TritSign { a, .. } => {
             collect_used_from_value(a, used);
         }
         IRInstr::PrintStr(v) | IRInstr::PrintInt(v) | IRInstr::PrintFloat(v)
@@ -433,6 +528,7 @@ fn instr_dst_name(instr: &IRInstr) -> Option<&str> {
         IRInstr::TritMin { dst, .. } => Some(&dst.0),
         IRInstr::TritMax { dst, .. } => Some(&dst.0),
         IRInstr::TritNeg { dst, .. } => Some(&dst.0),
+        IRInstr::TritSign { dst, .. } => Some(&dst.0),
         IRInstr::Phi { dst, .. } => Some(&dst.0),
         IRInstr::Cast { dst, .. } => Some(&dst.0),
         // Call/CallIndirect have optional dst but are side-effecting — handled separately
@@ -449,7 +545,10 @@ fn instr_ty(instr: &IRInstr) -> IRType {
         IRInstr::Alloca { ty, .. } => IRType::Ptr(Box::new(ty.clone())),
         IRInstr::Load { ty, .. } => ty.clone(),
         IRInstr::GetPtr { ty, .. } => IRType::Ptr(Box::new(ty.clone())),
-        IRInstr::TritMin { .. } | IRInstr::TritMax { .. } | IRInstr::TritNeg { .. } => IRType::Trit,
+        IRInstr::TritMin { .. } | IRInstr::TritMax { .. } | IRInstr::TritNeg { .. }
+        // C7: the OPERAND is a word, but the RESULT is a trit -- it is always
+        // in {-1, 0, +1}. Typing the result is what this function does.
+        | IRInstr::TritSign { .. } => IRType::Trit,
         IRInstr::Phi { ty, .. } => ty.clone(),
         IRInstr::Cast { to_ty, .. } => to_ty.clone(),
         IRInstr::Call { ret_ty, .. } => ret_ty.clone(),
@@ -613,6 +712,7 @@ fn cse_key(instr: &IRInstr) -> Option<String> {
         IRInstr::TritMin { a, b, .. } => Some(format!("tmin:{:?}:{:?}", a, b)),
         IRInstr::TritMax { a, b, .. } => Some(format!("tmax:{:?}:{:?}", a, b)),
         IRInstr::TritNeg { a, .. } => Some(format!("tneg:{:?}", a)),
+        IRInstr::TritSign { a, .. } => Some(format!("tsign:{:?}", a)),
         _ => None,
     }
 }

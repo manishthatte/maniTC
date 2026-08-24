@@ -165,6 +165,8 @@ expected_test!(expected_17_tcon_tany, "17_tcon_tany.mt");
 expected_test!(expected_27_ir_regressions, "27_ir_regressions.mt");
 expected_test!(expected_28_regalloc, "28_regalloc.mt");
 expected_test!(expected_29_struct_escape, "29_struct_escape.mt");
+expected_test!(expected_30_lanewise, "30_lanewise.mt");
+expected_test!(expected_31_trit_intrinsics, "31_trit_intrinsics.mt");
 
 // Cross-target consistency (T3 vs LLVM — tests that pass on both)
 // 05_ternary_types is excluded: T3 and LLVM print a char-typed value
@@ -189,3 +191,13 @@ cross_target_test!(cross_17_tcon_tany, "17_tcon_tany.mt");
 cross_target_test!(cross_27_ir_regressions, "27_ir_regressions.mt");
 cross_target_test!(cross_28_regalloc, "28_regalloc.mt");
 cross_target_test!(cross_29_struct_escape, "29_struct_escape.mt");
+// C2: the lane-wise family. This one is load-bearing rather than routine —
+// LLVM reaches these operators through C runtime calls (manit_lane_*) and T3
+// through real instructions, so it is the only test that checks the two
+// implementations against each other. It caught an i8 truncation in `tnotw`
+// that neither backend revealed alone.
+cross_target_test!(cross_30_lanewise, "30_lanewise.mt");
+// C7: `trit::sign`/`trit::abs` lower to `IRInstr::TritSign`, which is one TCMP
+// on T3 and two comparisons plus a subtract on LLVM — two unrelated
+// implementations of one operation, checked against each other here.
+cross_target_test!(cross_31_trit_intrinsics, "31_trit_intrinsics.mt");

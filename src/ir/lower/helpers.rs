@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::ast::{BinOpKind, Lit, Span, UnOpKind};
+use crate::lang::LangVersion;
 use crate::semantic::ManiType;
 
 impl Default for IRLowerer {
@@ -29,15 +30,26 @@ pub(crate) fn lit_to_irvalue(lit: &Lit) -> IRValue {
     }
 }
 
-pub(crate) fn binop_to_ir(op: &BinOpKind, ty: &ManiType) -> IRBinOp {
+pub(crate) fn binop_to_ir(op: &BinOpKind, ty: &ManiType, lang: LangVersion) -> IRBinOp {
     // Tfloat lowers to F64 just like Float, so both must use float compares.
     let is_float = matches!(ty, ManiType::Float | ManiType::Tfloat);
+    // C4. Float division is untouched: IEEE division already rounds, and
+    // `frem` is not a truncating integer remainder in the first place, so
+    // there is nothing for the new rule to correct there.
+    let round_to_nearest = lang.division_rounds_to_nearest() && !is_float;
+    // N5. `int` and `t27` are the 27-trit types; `trint` is deliberately not
+    // one of them — it is the wider type v2 provides for code that wants the
+    // machine word, so checking it would remove the escape hatch. `tryte` and
+    // `t9` are narrower than their IR type too, but N5 is about `int`, and
+    // widening the change to them would be a separate decision made silently.
+    let checked_word = lang.int_is_27_trits()
+        && matches!(ty, ManiType::Int | ManiType::T27);
     match op {
-        BinOpKind::Add => IRBinOp::Add,
-        BinOpKind::Sub => IRBinOp::Sub,
-        BinOpKind::Mul => IRBinOp::Mul,
-        BinOpKind::Div => IRBinOp::Div,
-        BinOpKind::Rem => IRBinOp::Rem,
+        BinOpKind::Add => if checked_word { IRBinOp::AddT27 } else { IRBinOp::Add },
+        BinOpKind::Sub => if checked_word { IRBinOp::SubT27 } else { IRBinOp::Sub },
+        BinOpKind::Mul => if checked_word { IRBinOp::MulT27 } else { IRBinOp::Mul },
+        BinOpKind::Div => if round_to_nearest { IRBinOp::DivNear } else { IRBinOp::Div },
+        BinOpKind::Rem => if round_to_nearest { IRBinOp::RemNear } else { IRBinOp::Rem },
         BinOpKind::Eq => if is_float { IRBinOp::FEq } else if matches!(ty, ManiType::Str) { IRBinOp::StrEq } else { IRBinOp::IEq },
         BinOpKind::Ne => if is_float { IRBinOp::FNe } else if matches!(ty, ManiType::Str) { IRBinOp::StrNe } else { IRBinOp::INe },
         BinOpKind::Lt => if is_float { IRBinOp::FLt } else { IRBinOp::ILt },
@@ -52,7 +64,10 @@ pub(crate) fn binop_to_ir(op: &BinOpKind, ty: &ManiType) -> IRBinOp {
         BinOpKind::LShift => IRBinOp::LShift,
         BinOpKind::RShift => IRBinOp::RShift,
         BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Txor
-        | BinOpKind::Tcon | BinOpKind::Tany => IRBinOp::And, // all handled elsewhere
+        | BinOpKind::Tcon | BinOpKind::Tany
+        | BinOpKind::Timp | BinOpKind::Teq
+        | BinOpKind::Tandw | BinOpKind::Torw | BinOpKind::Txorw
+        | BinOpKind::Timpw | BinOpKind::Tcmpw => IRBinOp::And, // all handled elsewhere
         BinOpKind::Range | BinOpKind::RangeInclusive => IRBinOp::Add,       // handled elsewhere
     }
 }
@@ -119,6 +134,14 @@ pub(crate) fn unop_to_ir(op: &UnOpKind) -> IRUnOp {
         UnOpKind::Not => IRUnOp::Not,
         UnOpKind::TritNeg => IRUnOp::Neg,
         UnOpKind::Tnot => IRUnOp::Neg, // handled before this call
+        // C2: lane-wise NOT. Also handled before this call, and unlike the
+        // arms below this one is not a placeholder — `TritNeg` really is what
+        // `tnotw` lowers to, because negating a balanced-ternary word flips
+        // every trit in it.
+        UnOpKind::Tnotw => IRUnOp::Neg,
+        // C1. Also handled before this call, in lower_expr — each expands to
+        // a clamp against a constant rather than to one IR unary op.
+        UnOpKind::Tposs | UnOpKind::Tnec => IRUnOp::Neg,
         UnOpKind::Deref | UnOpKind::Ref => IRUnOp::Not, // placeholder
     }
 }

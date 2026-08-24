@@ -26,6 +26,7 @@ pub enum TokenKind {
     Enum,
     Impl,
     Trait,
+    Extern,
     If,
     Elif,
     Else,
@@ -76,6 +77,23 @@ pub enum TokenKind {
     Txor,
     Tcon,
     Tany,
+    // C1: the Lukasiewicz family. `timp` is what makes the logic L3 rather
+    // than Kleene's K3 — the two agree on min/max/negation and differ in
+    // exactly one cell of implication.
+    Timp,
+    Teq,
+    Tposs,
+    Tnec,
+    // C2 / T3ISA v1.5: the lane-wise family. Same connectives as above,
+    // applied to all 27 trits of a word at once rather than to one trit.
+    // `tnotw` is deliberately absent from the ISA: negating a balanced-ternary
+    // number flips every trit, so lane-wise NOT already IS `TNEG`.
+    Tandw,
+    Torw,
+    Txorw,
+    Timpw,
+    Tcmpw,
+    Tnotw,
 
     // --- Operators ---
     Plus,
@@ -162,6 +180,10 @@ fn keyword_or_ident(s: &str) -> TokenKind {
         "enum" => TokenKind::Enum,
         "impl" => TokenKind::Impl,
         "trait" => TokenKind::Trait,
+        // A1. `lint` is deliberately NOT a keyword: it is a pragma, recognised
+        // contextually at item position, and reserving a common English word
+        // for it would cost every program that wants it as an identifier.
+        "extern" => TokenKind::Extern,
         "if" => TokenKind::If,
         "elif" => TokenKind::Elif,
         "else" => TokenKind::Else,
@@ -212,6 +234,16 @@ fn keyword_or_ident(s: &str) -> TokenKind {
         "txor" => TokenKind::Txor,
         "tcon" => TokenKind::Tcon,
         "tany" => TokenKind::Tany,
+        "timp" => TokenKind::Timp,
+        "teq" => TokenKind::Teq,
+        "tposs" => TokenKind::Tposs,
+        "tnec" => TokenKind::Tnec,
+        "tandw" => TokenKind::Tandw,
+        "torw" => TokenKind::Torw,
+        "txorw" => TokenKind::Txorw,
+        "timpw" => TokenKind::Timpw,
+        "tcmpw" => TokenKind::Tcmpw,
+        "tnotw" => TokenKind::Tnotw,
         _ => TokenKind::Ident(s.to_string()),
     }
 }

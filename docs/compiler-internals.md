@@ -689,8 +689,21 @@ All stdlib functions are pre-registered with their signatures:
 
 ### ir/types.rs — IR data structures
 
-The IR is a simple three-address code with basic blocks. It is not full SSA;
-variables are stored in stack slots (via `Alloca`) and loaded/stored explicitly.
+The IR is a three-address code with basic blocks, and it **is** in SSA form —
+measured, not assumed. `ir/ssa.rs::verify` checks three properties separately
+(every temp defined once, every use dominated by its definition, every phi
+well formed) and reports zero violations across the 17 examples and thatteOS:
+1,806 function lowerings, 18,828 blocks, 79,953 instructions, before and after
+the optimiser.
+
+What it is not is SSA over **variables**. Every local is a stack slot reached
+by `Alloca` / `Load` / `Store`, so a variable's value never flows through a
+temp and no optimiser pass can see it — 9,455 allocas and 42,008 loads and
+stores, **52.5 %** of all IR instructions, in that same corpus. Recommendation
+F-1 diagnoses this as "not SSA"; the accurate statement is "SSA, but with
+every variable in memory", and the fix is `mem2reg` rather than an SSA
+construction. See `ir/mem2reg.rs` and
+`enhance/phase4-performance/IMPLEMENTED.md`.
 
 **`IRModule`:**
 
@@ -753,7 +766,7 @@ pub enum IRInstr {
     GetField { dst, ptr, field_idx, ty },       // struct field pointer
     SetField { ptr, field_idx, val, ty },       // struct field store
     Cast    { dst, val, from_ty, to_ty },
-    Phi     { dst, inputs, ty },                // SSA φ-node (rarely used)
+    Phi     { dst, inputs, ty },                // SSA φ-node
     Nop,
 }
 ```
@@ -848,6 +861,47 @@ fn intern_string(&mut self, s: &str) -> String {
     lbl
 }
 ```
+
+### ir/ssa.rs — dominance, and the SSA verifier
+
+The control-flow graph, immediate dominators (Cooper–Harvey–Kennedy),
+dominance frontiers, and `verify`. Nothing here changes the IR; it answers
+questions about it.
+
+`verify(func)` returns a list of `Violation`s, each naming which of the three
+SSA properties failed and where. Two cases are worth knowing because a naive
+implementation gets them wrong:
+
+- **A phi operand is used at the end of its INCOMING block, not at the phi.**
+  Checking it at the phi would report every loop-carried value as a use before
+  its definition.
+- **An unreachable block is not checked at all.** A use in code that cannot
+  execute is not a dominance failure.
+
+Also here: `promotable_allocas` (the safety argument for `mem2reg`),
+`split_critical_edges`, and a `Stats` counter used by
+`manitc compile --verify-ssa`, which reports after lowering AND after the
+optimiser — whether the lowerer produces SSA and whether the passes preserve it
+are different questions.
+
+### ir/mem2reg.rs — lifting locals out of memory
+
+Cytron et al.: phi placement at the iterated dominance frontier of each
+variable's stores, then renaming down the dominator tree. **Off by default**;
+`manitc compile --mem2reg` turns it on.
+
+It is off because the evidence differs by backend. On LLVM the pass is
+byte-identical to the compiler without it across all 17 examples. On T3, 15 of
+17 run and 10 of 17 agree — the register allocator does not yet survive the phi
+volume promotion produces, which is recommendation F-3's subject. See
+`enhance/phase4-performance/IMPLEMENTED.md` for the numbers and
+`report.txt` P11–P13 for the defects it exposed.
+
+One property of this IR that the pass had to learn the hard way, and that
+nothing else documents: **`Load` and `Store` are not type-neutral.** They carry
+a `ty` and the backends coerce to it, so `store i8 %v` where `%v` is an `i64`
+is a narrowing. Removing the memory operation removes the coercion with it, so
+`promotable_allocas` checks the stored value's own type before promoting.
 
 ---
 

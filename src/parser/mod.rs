@@ -115,10 +115,23 @@ impl Parser {
     }
 
     pub(super) fn peek2(&self) -> &TokenKind {
+        self.peek_at(1)
+    }
+
+    /// The token `n` positions ahead of the cursor, counting the pending `>`
+    /// of a split `>>` as position 0 so lookahead agrees with `peek()`.
+    pub(super) fn peek_at(&self, n: usize) -> &TokenKind {
         if self.pending_gt {
-            return self.tokens.get(self.pos).map(|t| &t.kind).unwrap_or(&TokenKind::Eof);
+            if n == 0 {
+                return &TokenKind::Gt;
+            }
+            return self
+                .tokens
+                .get(self.pos + n - 1)
+                .map(|t| &t.kind)
+                .unwrap_or(&TokenKind::Eof);
         }
-        self.tokens.get(self.pos + 1).map(|t| &t.kind).unwrap_or(&TokenKind::Eof)
+        self.tokens.get(self.pos + n).map(|t| &t.kind).unwrap_or(&TokenKind::Eof)
     }
 
     /// Consume a `>` token. Also handles `>>` (RShift) split: consumes the
@@ -256,6 +269,17 @@ impl Parser {
                 let t = self.parse_trait_def(is_pub)?;
                 Ok(Item::TraitDef(t))
             }
+            TokenKind::Extern => {
+                let e = self.parse_extern_decl(is_pub)?;
+                Ok(Item::ExternDecl(e))
+            }
+            // A5: `lint deny(shadowing);`. Recognised contextually — `lint` is
+            // an identifier everywhere else, and only the shape `lint <level>(`
+            // is claimed, so a variable or function called `lint` is unaffected.
+            TokenKind::Ident(ref w) if w == "lint" && self.lint_item_ahead() => {
+                let l = self.parse_lint_decl()?;
+                Ok(Item::LintDecl(l))
+            }
             TokenKind::Use => {
                 let u = self.parse_use_decl()?;
                 Ok(Item::UseDecl(u))
@@ -298,7 +322,7 @@ impl Parser {
         // A keyword is a legal name here — nothing else can follow `fn`.
         let name = self.expect_name("function name")?;
 
-        let generics = self.parse_generic_params();
+        let (generics, mut bounds) = self.parse_generic_params_bounded();
 
         self.expect(&TokenKind::LParen)?;
 
@@ -331,6 +355,17 @@ impl Parser {
             None
         };
 
+        // B1: a `where` clause sits between the return type and the body, and
+        // adds to whatever the angle brackets already said rather than
+        // replacing it.
+        bounds.extend(self.parse_where_clause());
+
+        // A2: an optional `available(...)` assertion, in the same position and
+        // with the same spelling as the one `extern` already takes. Contextual,
+        // not a keyword: `available` stays usable as an identifier, which it
+        // has to be — stdlib/sync.mt declares a method called exactly that.
+        let available = self.parse_available_clause()?;
+
         let body = if self.peek() == &TokenKind::LBrace {
             Some(self.parse_block()?)
         } else {
@@ -338,7 +373,7 @@ impl Parser {
             None
         };
 
-        Ok(FnDef { name, generics, params, ret_ty, body, is_pub, is_async, span })
+        Ok(FnDef { name, generics, bounds, params, ret_ty, body, available, is_pub, is_async, span })
     }
 
     // --- struct ---
@@ -409,19 +444,277 @@ impl Parser {
     /// came to be missing: there was no single place that adding a declaration
     /// form would have made you look at.
     fn parse_generic_params(&mut self) -> Vec<String> {
+        self.parse_generic_params_bounded().0
+    }
+
+    /// Generic parameters and any bounds written in the angle brackets.
+    ///
+    /// B1. Before this, `fn max<T: Ord>` was a parse error at the colon — the
+    /// bound could not be written at all, which is why A4's soundness hole had
+    /// no expressible fix. The two results are returned separately because
+    /// every existing caller wants only the names.
+    fn parse_generic_params_bounded(&mut self) -> (Vec<String>, Vec<GenericBound>) {
         let mut generics = Vec::new();
+        let mut bounds = Vec::new();
         if *self.peek() == TokenKind::Lt {
             self.advance(); // consume <
             loop {
+                let bspan = self.span();
                 if let TokenKind::Ident(gname) = self.peek().clone() {
                     generics.push(gname.clone());
                     self.advance();
+                    if self.eat(&TokenKind::Colon) {
+                        let traits = self.parse_bound_list();
+                        if !traits.is_empty() {
+                            bounds.push(GenericBound { param: gname, traits, span: bspan });
+                        }
+                    }
                 }
                 if !self.eat(&TokenKind::Comma) { break; }
             }
             self.eat_gt(); // consume >
         }
-        generics
+        (generics, bounds)
+    }
+
+    /// One bound list: `Ord`, or `Ord + Display`.
+    fn parse_bound_list(&mut self) -> Vec<String> {
+        let mut traits = Vec::new();
+        loop {
+            match self.peek().clone() {
+                TokenKind::Ident(t) => {
+                    traits.push(t);
+                    self.advance();
+                }
+                _ => break,
+            }
+            if !self.eat(&TokenKind::Plus) { break; }
+        }
+        traits
+    }
+
+    /// A `where` clause: `where T: Ord, U: Display`.
+    ///
+    /// `where` is contextual, like `lint`. It is claimed only in the one
+    /// position a clause can appear — between the return type and the body —
+    /// so it stays usable as an identifier everywhere else.
+    /// A2/A1: parse an optional `available(backend, ...)` clause.
+    ///
+    /// Shared by `extern` declarations and by ordinary functions so the two
+    /// spellings cannot drift. `available` is matched as a CONTEXTUAL word, not
+    /// a keyword: making it a keyword would have broken `stdlib/sync.mt`, which
+    /// declares a method named `available`, and an identifier that stops being
+    /// usable is too high a price for a clause this narrow.
+    ///
+    /// Returns `None` when no clause is present — unstated, which is not the
+    /// same as "available on no backend".
+    fn parse_available_clause(&mut self) -> CompileResult<Option<Vec<String>>> {
+        match self.peek() {
+            TokenKind::Ident(w) if w == "available" => {}
+            _ => return Ok(None),
+        }
+        self.advance();
+        self.expect(&TokenKind::LParen)?;
+        let mut backends = Vec::new();
+        while self.peek() != &TokenKind::RParen {
+            let (b, _) = self.expect_ident()?;
+            if !backends.contains(&b) {
+                backends.push(b);
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(Some(backends))
+    }
+
+    fn parse_where_clause(&mut self) -> Vec<GenericBound> {
+        let mut bounds = Vec::new();
+        let is_where = matches!(self.peek(), TokenKind::Ident(w) if w == "where");
+        if !is_where {
+            return bounds;
+        }
+        self.advance(); // eat `where`
+        loop {
+            let bspan = self.span();
+            let TokenKind::Ident(param) = self.peek().clone() else { break };
+            self.advance();
+            if !self.eat(&TokenKind::Colon) {
+                break;
+            }
+            let traits = self.parse_bound_list();
+            if !traits.is_empty() {
+                bounds.push(GenericBound { param, traits, span: bspan });
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        bounds
+    }
+
+    /// Whether the `lint` identifier at the cursor starts a lint item.
+    ///
+    /// The shape claimed is exactly `lint <ident> (`. Anything else — a
+    /// function called `lint`, a global named `lint` — parses as it always did.
+    fn lint_item_ahead(&self) -> bool {
+        matches!(self.peek_at(1), TokenKind::Ident(_))
+            && matches!(self.peek_at(2), TokenKind::LParen)
+    }
+
+    /// A5: `lint deny(unused-variable, shadowing);`
+    ///
+    /// Lint names contain hyphens, which the lexer sees as `Ident Minus Ident`.
+    /// They are re-joined here rather than lexed specially, so the hyphen stays
+    /// out of the token grammar.
+    fn parse_lint_decl(&mut self) -> CompileResult<LintDecl> {
+        let span = self.span();
+        self.advance(); // eat `lint`
+        let (level, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LParen)?;
+        let mut lints = Vec::new();
+        while self.peek() != &TokenKind::RParen {
+            lints.push(self.parse_lint_name()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        self.expect_stmt_semi("lint declaration")?;
+        Ok(LintDecl { level, lints, span })
+    }
+
+    /// A hyphenated lint name, re-joined from `Ident (- Ident)*`.
+    fn parse_lint_name(&mut self) -> CompileResult<String> {
+        let (mut name, _) = self.expect_ident()?;
+        while self.eat(&TokenKind::Minus) {
+            let (part, _) = self.expect_ident()?;
+            name.push('-');
+            name.push_str(&part);
+        }
+        Ok(name)
+    }
+
+    /// A1: an explicit native declaration.
+    ///
+    /// ```text
+    /// extern "c" fn io::println(s: str) -> void
+    ///     available(llvm, t3) deprecated("use fmt::print");
+    /// ```
+    ///
+    /// The ABI string is mandatory and the signature is mandatory; the two
+    /// clauses are optional and may be written in either order. A missing
+    /// `available` means UNSTATED, not "available nowhere" — see `ExternDecl`.
+    fn parse_extern_decl(&mut self, is_pub: bool) -> CompileResult<ExternDecl> {
+        let span = self.span();
+        self.expect(&TokenKind::Extern)?;
+
+        // The ABI. Required, and required to be a string: `extern fn` with no
+        // ABI is the implicit registration A1 exists to replace, so accepting
+        // it here would leave the old hole open under the new syntax.
+        let abi = match self.peek().clone() {
+            TokenKind::Str(a) => {
+                self.advance();
+                a
+            }
+            other => {
+                return Err(self.err(format!(
+                    "expected an ABI string after `extern` (for example \
+                     `extern \"c\"`), found {:?}",
+                    other
+                )));
+            }
+        };
+
+        self.expect(&TokenKind::Fn)?;
+
+        // The name, qualified as it is called: `io::println`.
+        let mut name = self.expect_name("extern function name")?;
+        while self.eat(&TokenKind::ColonColon) {
+            let part = self.expect_name("extern function name")?;
+            name.push_str("::");
+            name.push_str(&part);
+        }
+
+        self.expect(&TokenKind::LParen)?;
+        let mut params = Vec::new();
+        while self.peek() != &TokenKind::RParen {
+            let pspan = self.span();
+            let (pname, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            params.push(Param { name: pname, ty, span: pspan });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+
+        let ret_ty = if self.eat(&TokenKind::Arrow) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        let mut available: Option<Vec<String>> = self.parse_available_clause()?;
+        let mut deprecated: Option<String> = None;
+        loop {
+            let clause = match self.peek().clone() {
+                TokenKind::Ident(w) if w == "available" || w == "deprecated" => w,
+                _ => break,
+            };
+            self.advance();
+            self.expect(&TokenKind::LParen)?;
+            if clause == "available" {
+                let mut backends = Vec::new();
+                while self.peek() != &TokenKind::RParen {
+                    let (b, _) = self.expect_ident()?;
+                    backends.push(b);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                // Two `available` clauses union rather than replace: writing
+                // the same backend twice is harmless, and silently dropping
+                // the first list would be the kind of quiet loss A1 is about.
+                let entry = available.get_or_insert_with(Vec::new);
+                for b in backends {
+                    if !entry.contains(&b) {
+                        entry.push(b);
+                    }
+                }
+            } else {
+                let msg = match self.peek().clone() {
+                    TokenKind::Str(m) => {
+                        self.advance();
+                        m
+                    }
+                    other => {
+                        return Err(self.err(format!(
+                            "`deprecated` takes a message string, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                self.expect(&TokenKind::RParen)?;
+                deprecated = Some(msg);
+            }
+        }
+
+        self.expect_stmt_semi("extern declaration")?;
+
+        Ok(ExternDecl {
+            abi,
+            name,
+            params,
+            ret_ty,
+            available,
+            deprecated,
+            is_pub,
+            span,
+        })
     }
 
     /// The base name of a type, for the places that key on it rather than on

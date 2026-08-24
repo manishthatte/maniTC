@@ -1221,10 +1221,10 @@ use std::str;
 use std::fmt;
 
 fn shows(r: Result<int, str>) -> str {
-    match r { Ok(v) => { return fmt::show_int(v); }, Err(e) => { return str::concat("Err:", e); } }
+    match r { Ok(v) => { return fmt::show_int(v); }, Unknown(m) => { return str::concat("Unknown:", m); }, Err(e) => { return str::concat("Err:", e); } }
 }
 fn showf(r: Result<float, str>) -> str {
-    match r { Ok(v) => { return fmt::show_float(v); }, Err(e) => { return str::concat("Err:", e); } }
+    match r { Ok(v) => { return fmt::show_float(v); }, Unknown(m) => { return str::concat("Unknown:", m); }, Err(e) => { return str::concat("Err:", e); } }
 }
 
 fn main() {
@@ -1302,9 +1302,9 @@ fn mki() -> Result<int, str> { return Ok(7); }
 fn mke() -> Result<float, str> { return Err("bad"); }
 
 fn main() {
-    match mkf() { Ok(v) => { io::println(fmt::show_float(v)); }, Err(e) => { io::println(e); } }
-    match mki() { Ok(v) => { io::println(fmt::show_int(v)); }, Err(e) => { io::println(e); } }
-    match mke() { Ok(v) => { io::println(fmt::show_float(v)); }, Err(e) => { io::println(e); } }
+    match mkf() { Ok(v) => { io::println(fmt::show_float(v)); }, Unknown(m) => { io::println(m); }, Err(e) => { io::println(e); } }
+    match mki() { Ok(v) => { io::println(fmt::show_int(v)); }, Unknown(m) => { io::println(m); }, Err(e) => { io::println(e); } }
+    match mke() { Ok(v) => { io::println(fmt::show_float(v)); }, Unknown(m) => { io::println(m); }, Err(e) => { io::println(e); } }
 }
 "#;
     let ((t3_code, t3_out), (ll_code, ll_out)) = run_both_backends("s19_okfloat.mt", src);

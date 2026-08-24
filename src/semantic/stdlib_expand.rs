@@ -93,6 +93,13 @@ const SOURCE_MODULES: &[(&str, &str)] = &[
     // syscall that returned an empty Vec to every caller. Written in ManiT over
     // `argc()` and `arg(i)` it needs none, and the backends cannot disagree.
     ("env", include_str!("../../stdlib/env.mt")),
+    // `trit` joined them on 24 August 2026 as C7. It is mixed: four native
+    // intrinsics lowered straight to IR, and two derived functions that are
+    // ordinary ManiT because they are not single instructions. Unlike `math`,
+    // whose natives are intercepted separately in each emitter, the natives
+    // here are lowered ONCE in ir/lower/lower_expr.rs — see the module header
+    // for why that difference matters.
+    ("trit", include_str!("../../stdlib/trit.mt")),
 ];
 
 /// Expand any used source-implemented stdlib modules into `program`.

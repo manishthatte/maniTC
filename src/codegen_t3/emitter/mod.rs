@@ -1,132 +1,113 @@
-// emitter/mod.rs — AsmEmitter struct, register allocation helpers, and assembly emission entry points.
-mod liveness;
-use liveness::{compute_last_use, RegAlloc};
+// emitter/mod.rs — AsmEmitter, and assembly emission over a FIXED allocation.
+//
+// F-3. Register assignment happens in `codegen_t3::regalloc` before a single
+// line is emitted, and every temp has ONE location for the whole function.
+// This file's job is to look locations up, never to choose them.
+//
+// What that deletes, and why each was there:
+//
+//   * `rescue_reg` — moved a live value out of a register a syscall was about
+//     to clobber. Unnecessary: R1–R3 are never allocated.
+//   * the jump reconciliation — moved values back into the registers the
+//     target block was emitted against. Unnecessary: a value does not move.
+//   * `BlockEntryState` / `block_canonical_regs` — a block's entry state, taken
+//     from whichever predecessor was emitted first. Unnecessary: there is one
+//     assignment for the whole function, so every path agrees by construction.
+//   * `PhiHome` — the location every predecessor of a merge had to agree to
+//     write. Unnecessary: the phi's destination has a location like anything
+//     else.
+//   * `sp_depth` and its per-instruction bookkeeping — the stack pointer moved
+//     during a function, so a spill's offset depended on where you were. The
+//     frame is now fixed: one `TSUB` in the prologue, one `TADD` before each
+//     `RET`, and every slot at a constant offset.
+//
+// Between them those five were the whole of `KNOWN_ISSUES` issue 2 and
+// report.txt P11, P12 and P14: five defects, all of the same shape — a local
+// decision about a global question.
+//
+// © Manish Jagdish Thatte
+
 mod emit_instr;
 use emit_instr::{emit_instr, emit_term};
 
+use crate::codegen_t3::regalloc::{self, Allocation, Loc};
 use crate::ir::*;
 use crate::error::{CompileError, CompileResult, Diagnostic};
 use std::collections::HashMap;
 
-/// Where a call operand lives, resolved before the caller-save stores run and
-/// materialised after them by `emit_call_operands`.
+/// Registers emission may use as scratch, in the order they are handed out.
+///
+/// Never allocated to a temp, so taking one cannot destroy a live value. R23 is
+/// absent deliberately: it is reserved for a spilled DESTINATION, and an
+/// instruction that both reads three spilled operands and writes a spilled
+/// result needs the fourth register to still be there.
+const SCRATCH_REGS: [usize; 4] = [21, 22, 24, 25];
+
+/// The register a spilled destination is computed into before being stored.
+const DST_SCRATCH: usize = 23;
+
+/// Where a call operand lives, resolved before the operands are materialised.
 #[derive(Clone)]
 enum CallSrc {
-    Reg(usize),      // live in a pool register
-    Slot(usize),     // spilled, at this absolute stack depth
+    Reg(usize),      // live in a register
+    Slot(usize),     // in frame slot n, at [R26 + n]
     Lit(i64),        // plain immediate
     Label(String),   // string literal or global address, resolved by the assembler
     Float(f64),      // needs the float-load syscall
     Missing(String), // temp with no known location — an SSA hole
 }
 
-/// The register-allocator state that has to agree on every path into a block.
-///
-/// All three parts are needed and the third is the one that is easy to miss.
-/// `temp_to_reg` and `spill_slots` say where each live value is; `free_regs`
-/// says which registers the next allocation may take.  Restore the first two
-/// without the third and two arms of the same branch will rescue the same temp
-/// into DIFFERENT registers, because the second arm still believes the first
-/// arm's choice is taken — which puts the merge block back in the position of
-/// reading a register only one path wrote.
-#[derive(Clone)]
-struct BlockEntryState {
-    temp_to_reg: HashMap<String, usize>,
-    spill_slots: HashMap<String, usize>,
-    free_regs: std::collections::BTreeSet<usize>,
-}
-
-/// Where a phi destination lives — a register, or a spill slot.
-///
-/// This is the one binding that must SURVIVE a block entry-state restore.
-/// Every other temp's location is a fact about one path; a phi destination is
-/// a contract between all of them, because the merge block reads the value
-/// from exactly one place and each predecessor has to write it there.  Restore
-/// the arms to a common entry state without pinning this and each arm picks
-/// its own destination register, so the merge reads whichever one the first
-/// arm chose and the others' values are lost.
-#[derive(Clone, Copy)]
-enum PhiHome {
-    Reg(usize),
-    Slot(usize),
-}
-
 struct AsmEmitter {
     lines:        Vec<String>, // final committed output
     cur_instr:    Vec<String>, // staged body of the current IR instruction
     pending_post: Vec<String>, // post-instruction spill stores
-    pending_sp_increments: usize, // spill stores not yet added to sp_depth
-    reg_alloc:    RegAlloc,
-    spill_read_idx: usize,     // 0 → use R21, 1 → use R22, 2+ → use R25
-    /// Canonical sp_depth for each block label, set by the FIRST predecessor that jumps to it.
-    /// At block entry we reset sp_depth to this value so all paths agree on stack layout.
-    block_canonical_sp: HashMap<String, usize>,
-    /// Canonical allocator state on entry to each block, set by the FIRST
-    /// predecessor that branches to it (see `register_target`).
-    block_canonical_regs: HashMap<String, BlockEntryState>,
-    /// Phi destination → the location every predecessor must write it to.
-    /// Fixed by the first predecessor to emit a copy for it; see `PhiHome`.
-    phi_homes: HashMap<String, PhiHome>,
-    /// Current function name, used to qualify block labels (prevents collisions across fns).
-    fn_name: String,
+    /// The fixed assignment. Read-only during emission.
+    alloc:        Allocation,
+    /// Linear index of the instruction being emitted, in the same numbering
+    /// `regalloc` used. Only `scratch()` needs it, to ask which registers hold
+    /// nothing here.
+    cur_idx:      usize,
+    /// Scratch registers already handed out for this instruction.
+    scratch_taken: Vec<usize>,
+    /// Total words the frame reserves: spill slots first, then alloca storage.
+    frame_size:   usize,
+    /// Current function name, used to qualify block labels.
+    fn_name:      String,
     /// Struct name → number of fields (word size on stack).
     struct_sizes: HashMap<String, usize>,
-    /// Alloca slots: temp name → sp_depth at alloca time.
-    /// Used by Load lowering to emit SP-relative loads ([R26+#offset]) instead of
-    /// register-based loads, which avoids register aliasing bugs across loop back-edges.
-    alloca_slots: HashMap<String, usize>,
+    /// Alloca temp → the frame offset of its storage, in words from R26.
+    ///
+    /// Constant for the whole function, unlike the old sp-relative depth. An
+    /// alloca inside a loop now REUSES its storage every iteration instead of
+    /// pushing a fresh copy and never popping it.
+    alloca_off:   HashMap<String, usize>,
     /// Phi copies: (pred_label, succ_label) → [(phi_dst, incoming_val)].
-    /// Emitted before the JUMP in the predecessor block to properly resolve phi nodes.
-    phi_copies: HashMap<(String, String), Vec<(IRTemp, IRValue)>>,
+    phi_copies:   HashMap<(String, String), Vec<(IRTemp, IRValue)>>,
     /// Current block label, used for phi copy lookup.
     current_block_label: String,
     /// Float literals collected during this function's emit pass.
-    /// Merged into the module's float_literals at the end of emit_function.
     float_literals: Vec<(String, i64)>,
-    /// Set of block labels that have already been emitted (for loop back-edge detection).
-    emitted_blocks: std::collections::HashSet<String>,
-    /// Module global variables: name → absolute memory address (GLOBALS_BASE..).
+    /// Module global variables: name → absolute memory address.
     global_addrs: HashMap<String, i64>,
-    /// Temps relocated by rescue moves since function start. Back-edge jumps
-    /// consult this to restore only genuinely displaced temps to the target
-    /// block's canonical registers (see emit_term's Jump reconciliation).
-    rescued_temps: std::collections::HashSet<String>,
-    /// Stack words pushed by rescue SPILLS during the current instruction.
-    ///
-    /// The rescue paths bump `sp_depth` the moment they decide to spill, but
-    /// stage their `TSUB R26` into `cur_instr`. Spill READS go into `lines`,
-    /// which the flush appends *before* `cur_instr` — so a read executes while
-    /// R26 still holds its pre-rescue value, and must not be measured against
-    /// the post-rescue depth. This counts the difference. Reset every flush.
-    rescue_pushes_this_instr: usize,
 }
 
 impl AsmEmitter {
-    fn new(
-        last_use: HashMap<String, usize>,
-        first_def: HashMap<String, usize>,
-        struct_sizes: HashMap<String, usize>,
-    ) -> Self {
+    fn new(alloc: Allocation, struct_sizes: HashMap<String, usize>, frame_size: usize) -> Self {
         AsmEmitter {
             lines: Vec::new(),
             cur_instr: Vec::new(),
             pending_post: Vec::new(),
-            pending_sp_increments: 0,
-            reg_alloc: RegAlloc::new(last_use, first_def),
-            spill_read_idx: 0,
-            block_canonical_sp: HashMap::new(),
-            block_canonical_regs: HashMap::new(),
-            phi_homes: HashMap::new(),
+            alloc,
+            cur_idx: 0,
+            scratch_taken: Vec::new(),
+            frame_size,
             fn_name: String::new(),
             struct_sizes,
-            alloca_slots: HashMap::new(),
+            alloca_off: HashMap::new(),
             phi_copies: HashMap::new(),
             current_block_label: String::new(),
             float_literals: Vec::new(),
-            emitted_blocks: std::collections::HashSet::new(),
             global_addrs: HashMap::new(),
-            rescued_temps: std::collections::HashSet::new(),
-            rescue_pushes_this_instr: 0,
         }
     }
 
@@ -135,240 +116,62 @@ impl AsmEmitter {
         format!("{}_{}", self.fn_name, label)
     }
 
-    /// Snapshot the allocator state that a block entered here would see.
-    fn entry_state(&self) -> BlockEntryState {
-        BlockEntryState {
-            temp_to_reg: self.reg_alloc.temp_to_reg.clone(),
-            spill_slots: self.reg_alloc.spill_slots.clone(),
-            free_regs: self.reg_alloc.free_regs.clone(),
-        }
-    }
-
-    /// Put the allocator back into a previously snapshotted entry state.
-    fn restore_entry_state(&mut self, st: BlockEntryState) {
-        self.reg_alloc.temp_to_reg = st.temp_to_reg;
-        self.reg_alloc.spill_slots = st.spill_slots;
-        self.reg_alloc.free_regs = st.free_regs;
-    }
-
-    /// Re-bind a phi destination to the location an earlier predecessor gave
-    /// it, if any, so `dst_reg` reproduces that choice rather than allocating
-    /// afresh.  A no-op for a phi no predecessor has written yet.
-    fn pin_phi_home(&mut self, name: &str) {
-        match self.phi_homes.get(name).copied() {
-            Some(PhiHome::Reg(r)) => {
-                // Something else live may be sitting in the home register on
-                // this path; move it out first.  The jump's reconciliation,
-                // which runs after these copies, puts it back where the target
-                // block expects to read it.
-                if self.reg_alloc.temp_to_reg.get(name) != Some(&r) {
-                    self.rescue_reg(r);
-                    self.reg_alloc.reserve(name, r);
-                }
-            }
-            Some(PhiHome::Slot(s)) => {
-                self.reg_alloc.temp_to_reg.remove(name);
-                self.reg_alloc.spill_slots.insert(name.to_string(), s);
-            }
-            None => {}
-        }
-    }
-
-    /// Record where `dst_reg` just put a phi destination, on first sight.
-    fn record_phi_home(&mut self, name: &str) {
-        if self.phi_homes.contains_key(name) {
-            return;
-        }
-        if let Some(&r) = self.reg_alloc.temp_to_reg.get(name) {
-            self.phi_homes.insert(name.to_string(), PhiHome::Reg(r));
-        } else if let Some(&s) = self.reg_alloc.spill_slots.get(name) {
-            self.phi_homes.insert(name.to_string(), PhiHome::Slot(s));
-        }
-    }
-
-    /// Register the canonical sp_depth AND register assignment for a target
-    /// label (first-predecessor wins).  Returns the canonical sp_depth.
-    ///
-    /// Both halves answer the same question — what does the machine look like
-    /// on entry to that block? — and the answer has to come from a PREDECESSOR,
-    /// because that is the only place a path into the block actually passes
-    /// through.  Taking it from whichever block happened to be emitted last is
-    /// wrong for the second arm of an if/else: `else` is emitted after `then`,
-    /// but no execution path runs `then` and then `else`.
-    fn register_target(&mut self, label: &str) -> usize {
-        let cur = self.reg_alloc.sp_depth;
-        if !self.block_canonical_regs.contains_key(label) {
-            let state = self.entry_state();
-            self.block_canonical_regs.insert(label.to_string(), state);
-        }
-        *self.block_canonical_sp.entry(label.to_string()).or_insert(cur)
-    }
-
-    /// Stage a line for the current instruction body.
     fn emit(&mut self, line: impl Into<String>) {
         self.cur_instr.push(line.into());
     }
 
-    /// Like rescue_reg but also rescues temps whose last use IS the current
-    /// instruction (lu == cur).  Use this before float syscall setup so that
-    /// a temp that is consumed by this instruction isn't overwritten by the
-    /// R1-based float literal loading that happens inside val_reg.
-    fn rescue_reg_inclusive(&mut self, reg: usize) {
-        let cur = self.reg_alloc.current_instr;
-        let victim: Option<String> = self.reg_alloc.temp_to_reg
-            .iter()
-            .find(|(name, &r)| {
-                r == reg
-                    && self.reg_alloc.holds_value(name)
-                    && self.reg_alloc.last_use
-                        .get(*name)
-                        .map_or(false, |&lu| lu >= cur)
-            })
-            .map(|(n, _)| n.clone());
-
-        if let Some(name) = victim {
-            // Never rescue INTO R1-R3: they are the syscall argument/return
-            // registers this rescue is protecting against, and a value parked
-            // there would be clobbered by the very sequence that follows.
-            let free_r = self.reg_alloc.free_regs.iter().copied().find(|&r| r != reg && r > 3);
-            if let Some(fr) = free_r {
-                self.reg_alloc.free_regs.remove(&fr);
-                self.reg_alloc.temp_to_reg.insert(name.clone(), fr);
-                self.rescued_temps.insert(name.clone());
-                self.emit(format!(
-                    "    MOV   R{}, R{}  ; rescue-inc {} from R{}",
-                    fr, reg, name, reg
-                ));
-            } else {
-                let slot = self.reg_alloc.sp_depth + 1;
-                self.reg_alloc.spill_slots.insert(name.clone(), slot);
-                self.reg_alloc.temp_to_reg.remove(&name);
-                self.reg_alloc.spill_count += 1;
-                self.rescued_temps.insert(name.clone());
-                self.emit(format!("    TSUB  R26, R26, #1  ; rescue-inc-spill {} from R{}", name, reg));
-                self.emit(format!("    STORE R{}, [R26+#0]  ; rescue-inc-spill {}", reg, name));
-                self.reg_alloc.sp_depth += 1;
-                self.rescue_pushes_this_instr += 1;
-            }
-        }
-    }
-
-    /// If any live temp (last_use > current_instr) is currently in `reg`,
-    /// move it to a free register or spill it.  Call this before any code
-    /// that writes `reg` as a side-effect (syscall arg setup, etc.).
-    fn rescue_reg(&mut self, reg: usize) {
-        let cur = self.reg_alloc.current_instr;
-        let victim: Option<String> = self.reg_alloc.temp_to_reg
-            .iter()
-            .find(|(name, &r)| {
-                r == reg
-                    && self.reg_alloc.holds_value(name)
-                    && self.reg_alloc.last_use
-                        .get(*name)
-                        .map_or(false, |&lu| lu > cur)
-            })
-            .map(|(n, _)| n.clone());
-
-        if let Some(name) = victim {
-            // Try to find a free register different from `reg`.  R1-R3 are
-            // excluded: they are syscall argument/return registers, so parking
-            // a rescued value there would defeat the rescue (see rescue_reg_inclusive).
-            let free_r = self.reg_alloc.free_regs.iter().copied().find(|&r| r != reg && r > 3);
-            if let Some(fr) = free_r {
-                self.reg_alloc.free_regs.remove(&fr);
-                self.reg_alloc.temp_to_reg.insert(name.clone(), fr);
-                self.rescued_temps.insert(name.clone());
-                self.emit(format!(
-                    "    MOV   R{}, R{}  ; rescue {} from R{} (syscall clobber)",
-                    fr, reg, name, reg
-                ));
-            } else {
-                // Pool exhausted — spill to stack.
-                let slot = self.reg_alloc.sp_depth + 1;
-                self.reg_alloc.spill_slots.insert(name.clone(), slot);
-                self.reg_alloc.temp_to_reg.remove(&name);
-                self.reg_alloc.spill_count += 1;
-                self.rescued_temps.insert(name.clone());
-                self.emit(format!("    TSUB  R26, R26, #1  ; rescue-spill {} from R{}", name, reg));
-                self.emit(format!("    STORE R{}, [R26+#0]  ; rescue-spill {}", reg, name));
-                self.reg_alloc.sp_depth += 1;
-                self.rescue_pushes_this_instr += 1;
-            }
-        }
-    }
-
-    /// Save each register in `regs` to the stack IF it currently holds a temp
-    /// that is live past this instruction.  Returns the list of saved registers;
-    /// pass it to `emit_reg_restore` after the clobbering sequence.
-    ///
-    /// Unlike rescue_reg, the allocator mapping is left untouched — the values
-    /// come back into the SAME registers, so cross-block register conventions
-    /// (e.g. phi-copy destinations fixed by an earlier predecessor) survive.
-    /// Used by inline syscall expansions (StrEq/StrNe) that clobber R1/R2
-    /// without going through the caller-save path.
-    fn emit_reg_save(&mut self, regs: &[usize], note: &str) -> Vec<usize> {
-        let cur = self.reg_alloc.current_instr;
-        let to_save: Vec<usize> = regs.iter().copied().filter(|&r| {
-            self.reg_alloc.temp_to_reg.iter().any(|(name, &tr)| {
-                tr == r
-                    && self.reg_alloc.holds_value(name)
-                    && self.reg_alloc.last_use
-                        .get(name)
-                        .map_or(false, |&lu| lu > cur)
-            })
-        }).collect();
-        if !to_save.is_empty() {
-            self.emit(format!("    TSUB  R26, R26, #{}  ; save live regs ({})", to_save.len(), note));
-            for (i, &r) in to_save.iter().enumerate() {
-                self.emit(format!("    STORE R{}, [R26+#{}]  ; save R{} ({})", r, i, r, note));
-            }
-        }
-        to_save
-    }
-
-    /// Restore registers saved by `emit_reg_save` (same order) and pop the slots.
-    fn emit_reg_restore(&mut self, saved: &[usize], note: &str) {
-        if saved.is_empty() { return; }
-        for (i, &r) in saved.iter().enumerate() {
-            self.emit(format!("    LOAD  R{}, [R26+#{}]  ; restore R{} ({})", r, i, r, note));
-        }
-        self.emit(format!("    TADD  R26, R26, #{}  ; pop saved regs ({})", saved.len(), note));
-    }
-
-    /// Commit current instruction: move cur_instr + pending_post to lines.
+    /// Commit the current instruction: body first, then any spill stores it
+    /// scheduled, then reset the per-instruction scratch pool.
     fn flush_instr(&mut self) {
         self.lines.extend(self.cur_instr.drain(..));
         self.lines.extend(self.pending_post.drain(..));
-        self.reg_alloc.sp_depth += self.pending_sp_increments;
-        self.pending_sp_increments = 0;
-        self.rescue_pushes_this_instr = 0;
-        self.spill_read_idx = 0;
-        self.reg_alloc.scratch_fallback_count = 0;
+        self.scratch_taken.clear();
     }
 
     fn rn(r: usize) -> String { format!("R{}", r) }
 
-    /// Allocate an anonymous scratch register for this instruction.
+    /// A register free to use for the rest of this instruction.
+    ///
+    /// Asks the allocation which registers hold nothing live at this index and
+    /// takes one; falls back to the dedicated scratch registers when the pool
+    /// is fully committed. Both sources are exact rather than hopeful — a pool
+    /// register is offered only when no interval covers this index, and a
+    /// scratch register is never allocated to anything.
+    ///
+    /// It cannot run out in practice: `SCRATCH_REGS` alone covers four
+    /// simultaneous needs and no IR instruction has more than three operands
+    /// plus a materialised constant. If it ever does, it says so in the output
+    /// rather than silently reusing a register.
     fn scratch(&mut self) -> usize {
-        self.reg_alloc.alloc_scratch()
+        for r in self.alloc.free_regs_at(self.cur_idx) {
+            if !self.scratch_taken.contains(&r) {
+                self.scratch_taken.push(r);
+                return r;
+            }
+        }
+        for &r in SCRATCH_REGS.iter() {
+            if !self.scratch_taken.contains(&r) {
+                self.scratch_taken.push(r);
+                return r;
+            }
+        }
+        self.lines.push(
+            "    ; BUG: scratch registers exhausted — reusing R25".to_string(),
+        );
+        25
     }
 
     /// Emit instructions to `self.lines` that load `imm` into register `r`.
     /// Single TLIT when |imm| ≤ 797161 (the balanced 13-trit wide-imm bound).
-    /// Larger values are decomposed recursively as hi*1000 + lo using
-    /// TLIT+TMUL+TLIT+TADD (all register forms — the TADD 3-trit imm field
-    /// can only hold [-13,13]), so the full i64 range is handled.  Note the
-    /// machine clamps arithmetic to the 27-trit range at runtime.
+    /// Larger values are decomposed recursively as hi*1000 + lo.
     fn emit_lit(&mut self, r: usize, imm: i64) {
-        const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX; // 797_161 = (3^13 − 1)/2
+        const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX; // 797_161
         if imm.abs() <= MAX_LIT {
             self.lines.push(format!("    TLIT  {}, #{}", Self::rn(r), imm));
         } else {
             let hi = imm / 1000;
             let lo = imm - hi * 1000;
             let tmp = self.scratch();
-            // Materialize hi first (recursively — hi may itself exceed the
-            // TLIT range for |imm| > ~797 billion), then scale and add lo.
             self.emit_lit(tmp, hi);
             let (rn_r, rn_t) = (Self::rn(r), Self::rn(tmp));
             self.lines.push(format!("    TLIT  {}, #1000  ; large-lit scale", rn_r));
@@ -380,47 +183,18 @@ impl AsmEmitter {
         }
     }
 
-    /// Emit a SP adjustment of `delta` words (positive = TADD = pop, negative = TSUB = push).
-    /// The balanced 3-trit immediate field holds -13..13; for larger values uses R21 as scratch.
-    fn emit_sp_adj(&mut self, delta: i64) {
-        if delta == 0 { return; }
-        if delta > 0 {
-            if delta <= 13 {
-                self.emit(format!("    TADD  R26, R26, #{}  ; sp pop {}", delta, delta));
-            } else {
-                self.emit(format!("    TLIT  R21, #{}  ; sp-adj large", delta));
-                self.emit(format!("    TADD  R26, R26, R21  ; sp pop {}", delta));
-            }
-        } else {
-            let n = -delta;
-            if n <= 13 {
-                self.emit(format!("    TSUB  R26, R26, #{}  ; sp push {}", n, n));
-            } else {
-                self.emit(format!("    TLIT  R21, #{}  ; sp-adj large", n));
-                self.emit(format!("    TSUB  R26, R26, R21  ; sp push {}", n));
-            }
-        }
-    }
-
     /// `emit_lit`, but into the current instruction body rather than `lines`.
-    ///
-    /// Call operands must be materialised *after* the caller-save stores have
-    /// run, so they cannot use `emit_lit` (which writes to `lines`, i.e. ahead of
-    /// the saves).  The decomposition scratch is taken from R23/R21/R22 by
-    /// recursion depth — all three are dead during call operand setup, and a
-    /// depth-indexed choice keeps an inner level from clobbering its caller.
     fn emit_lit_cur(&mut self, r: usize, imm: i64) {
         self.emit_lit_cur_at(r, imm, 0);
     }
 
     fn emit_lit_cur_at(&mut self, r: usize, imm: i64, depth: usize) {
-        const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX; // 797_161
+        const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX;
         const SCRATCH: [usize; 3] = [23, 21, 22];
         if imm.abs() <= MAX_LIT {
             self.emit(format!("    TLIT  R{}, #{}", r, imm));
             return;
         }
-        // |imm| is bounded by the 27-trit clamp, so this recurses at most twice.
         let tmp = SCRATCH[depth.min(SCRATCH.len() - 1)];
         let hi = imm / 1000;
         let lo = imm - hi * 1000;
@@ -433,38 +207,77 @@ impl AsmEmitter {
         }
     }
 
-    /// Load the value spilled at absolute stack depth `slot_depth` into `reg`,
-    /// SP-relative against the *current* sp_depth.
-    fn emit_slot_load(&mut self, reg: usize, slot_depth: usize, note: &str) {
-        let offset = self.reg_alloc.sp_depth as i64 - slot_depth as i64;
-        if offset >= 0 && offset <= 13 {
-            self.emit(format!("    LOAD  R{}, [R26+#{}]  ; {}", reg, offset, note));
-        } else if offset > 13 {
-            self.emit(format!("    TLIT  R{}, #{}", reg, offset));
-            self.emit(format!("    TADD  R{0}, R26, R{0}  ; spill addr", reg));
-            self.emit(format!("    LOAD  R{0}, [R{0}+#0]  ; {1}", reg, note));
+    /// Adjust the stack pointer by `delta` words. Used only for the prologue
+    /// and the epilogue; nothing else moves R26 any more.
+    fn emit_sp_adj(&mut self, delta: i64) {
+        if delta == 0 { return; }
+        if delta > 0 {
+            if delta <= 13 {
+                self.emit(format!("    TADD  R26, R26, #{}  ; frame pop {}", delta, delta));
+            } else {
+                self.emit(format!("    TLIT  R21, #{}  ; frame size", delta));
+                self.emit("    TADD  R26, R26, R21  ; frame pop".to_string());
+            }
         } else {
-            self.emit(format!("    ; BUG: negative spill offset {} for {}", offset, note));
-            self.emit(format!("    TLIT  R{}, #0", reg));
+            let n = -delta;
+            if n <= 13 {
+                self.emit(format!("    TSUB  R26, R26, #{}  ; frame push {}", n, n));
+            } else {
+                self.emit(format!("    TLIT  R21, #{}  ; frame size", n));
+                self.emit("    TSUB  R26, R26, R21  ; frame push".to_string());
+            }
+        }
+    }
+
+    /// Emit `LOAD reg, [R26 + slot]` into the current instruction body.
+    ///
+    /// The offset is a CONSTANT — the frame does not move — so unlike the
+    /// sp-relative version this replaces, it cannot be measured against the
+    /// wrong stack depth. That was where several of the old defects lived.
+    fn emit_slot_load(&mut self, reg: usize, slot: usize, note: &str) {
+        if slot <= 13 {
+            self.emit(format!("    LOAD  R{}, [R26+#{}]  ; {}", reg, slot, note));
+        } else {
+            self.emit(format!("    TLIT  R{}, #{}", reg, slot));
+            self.emit(format!("    TADD  R{0}, R26, R{0}  ; slot addr", reg));
+            self.emit(format!("    LOAD  R{0}, [R{0}+#0]  ; {1}", reg, note));
+        }
+    }
+
+    /// The same, but written ahead of the instruction body (spill reads run
+    /// before the body that consumes them).
+    fn emit_slot_load_pre(&mut self, reg: usize, slot: usize, note: &str) {
+        if slot <= 13 {
+            self.lines.push(format!("    LOAD  R{}, [R26+#{}]  ; {}", reg, slot, note));
+        } else {
+            self.lines.push(format!("    TLIT  R{}, #{}", reg, slot));
+            self.lines.push(format!("    TADD  R{0}, R26, R{0}  ; slot addr", reg));
+            self.lines.push(format!("    LOAD  R{0}, [R{0}+#0]  ; {1}", reg, note));
+        }
+    }
+
+    /// Schedule `STORE reg, [R26 + slot]` for after the instruction body.
+    fn emit_slot_store_post(&mut self, reg: usize, slot: usize, note: &str) {
+        if slot <= 13 {
+            self.pending_post
+                .push(format!("    STORE R{}, [R26+#{}]  ; {}", reg, slot, note));
+        } else {
+            // R21 is free once the body has run: every spill read is done.
+            self.pending_post.push(format!("    TLIT  R21, #{}", slot));
+            self.pending_post.push("    TADD  R21, R26, R21  ; slot addr".to_string());
+            self.pending_post
+                .push(format!("    STORE R{}, [R21+#0]  ; {}", reg, note));
         }
     }
 
     /// Resolve where a call operand lives, without emitting anything.
-    ///
-    /// Must be called before the caller-save stores run: `Reg` names the register
-    /// the value is in right now, which stays valid across the saves because a
-    /// STORE copies a register rather than clearing it.
     fn resolve_call_src(&self, val: &IRValue) -> CallSrc {
         match val {
-            IRValue::Temp(t) => {
-                if let Some(&r) = self.reg_alloc.temp_to_reg.get(&t.0) {
-                    CallSrc::Reg(r)
-                } else if let Some(&d) = self.reg_alloc.spill_slots.get(&t.0) {
-                    CallSrc::Slot(d)
-                } else {
-                    CallSrc::Missing(t.0.clone())
-                }
-            }
+            IRValue::Temp(t) => match self.alloc.loc(&t.0) {
+                Some(Loc::Reg(r)) => CallSrc::Reg(r),
+                Some(Loc::Slot(s)) => CallSrc::Slot(s),
+                None => CallSrc::Missing(t.0.clone()),
+            },
             IRValue::Const(IRConst::Str(label)) => {
                 CallSrc::Label(label.trim_start_matches('@').to_string())
             }
@@ -472,8 +285,6 @@ impl AsmEmitter {
             IRValue::Const(c) => CallSrc::Lit(irconst_to_i64(c)),
             IRValue::Global(name) => match self.global_addrs.get(name) {
                 Some(&addr) => CallSrc::Lit(addr),
-                // Unknown global: keep the symbolic form so the assembler fails
-                // loudly instead of silently reading address 0.
                 None => CallSrc::Label(name.clone()),
             },
             IRValue::Void => CallSrc::Lit(0),
@@ -482,36 +293,21 @@ impl AsmEmitter {
 
     /// Materialise call operands into their target registers.
     ///
-    /// Runs *after* the caller-save stores, when every pool register holding a
-    /// live value is already on the stack and so free to overwrite.  The phase
-    /// order is load-bearing:
+    /// A CALL may destroy every register (see `regalloc`'s invariant), and
+    /// nothing live across it is in one, so this is free to overwrite the whole
+    /// pool. The phases exist only to keep the operands from overwriting EACH
+    /// OTHER:
     ///
     ///   0. float constants, which need R1 and the float-load syscall, so they
-    ///      must run before any argument register has been written;
+    ///      run before any argument register is written;
     ///   1. register→register moves, sequentialised so no move overwrites a
     ///      register another still needs (cycles broken through R23);
-    ///   2. stack reloads and immediates, which read no pool register and so
-    ///      cannot disturb a move that is still pending.
+    ///   2. slot reloads and immediates, which read no allocated register.
     ///
-    /// Operands used to be materialised *before* the saves instead, which forced
-    /// them to be parked in R21/R22/R24/R25 — the very registers the call
-    /// sequence uses for the fn_ptr, the move scratch and the return stash.  From
-    /// the third spilled operand onward `val_reg` handed out R25, and the fn_ptr
-    /// move then overwrote it, passing the callee a silently wrong argument.
-    /// `stage_base` is the first register phase 0 may use to park a float, and
-    /// therefore also the exclusive upper bound on an argument target. It is the
-    /// caller's convention, not a property of this function, and the two callers
-    /// differ:
-    ///
-    /// * A regular CALL passes 9. `emit_function` binds parameters with
-    ///   `(i + 1).min(8)`, so the ninth parameter and every one after it lands
-    ///   in R8 — the callee cannot read a ninth argument however carefully the
-    ///   caller places it. The assertion below is what turns that into a loud
-    ///   failure instead of a silently wrong argument, and it must stay until
-    ///   the convention grows a stack argument area.
-    /// * A SYSCALL passes one past its own highest target. There is no ManiT
-    ///   callee binding registers — the emulator reads R1.. directly — so
-    ///   `fmt::format` legitimately reaches R8 and beyond.
+    /// `stage_base` is the exclusive upper bound on an argument target and the
+    /// first register phase 0 may park a float in. A CALL passes 9 — parameters
+    /// are R1–R8 and there is no stack argument area. A SYSCALL passes one past
+    /// its own highest target, since the emulator reads R1.. directly.
     fn emit_call_operands(&mut self, targets: &[(usize, CallSrc)], stage_base: usize) {
         // R25 is excluded: it is the indirect-call fn_ptr target, not an
         // argument position.
@@ -535,9 +331,6 @@ impl AsmEmitter {
         for (tgt, src) in targets {
             match src {
                 CallSrc::Float(f) => {
-                    // Float bit patterns exceed TLIT's range, so they are stored in
-                    // the .float section and fetched by syscall.  R1 is dead here:
-                    // anything live in it went to the stack in the caller-saves.
                     let bits = f.to_bits() as i64;
                     let label = format!("@float_{}_{}", self.fn_name, self.float_literals.len());
                     let clean = label.trim_start_matches('@').to_string();
@@ -553,7 +346,7 @@ impl AsmEmitter {
         }
 
         // Phase 1: register→register moves.
-        const CYCLE: usize = 23; // spill-write scratch — dead during operand setup
+        const CYCLE: usize = 23;
         let mut pending: Vec<(usize, usize)> = resolved
             .iter()
             .filter_map(|(tgt, src)| match src {
@@ -565,15 +358,10 @@ impl AsmEmitter {
         while !pending.is_empty() {
             let sources: std::collections::HashSet<usize> =
                 pending.iter().map(|&(_, s)| s).collect();
-            // A move is ready once its target is no longer needed as a source.
             if let Some(i) = pending.iter().position(|&(tgt, _)| !sources.contains(&tgt)) {
                 let (tgt, src) = pending.remove(i);
                 self.emit(format!("    MOV   R{}, R{}  ; call operand", tgt, src));
             } else {
-                // Every remaining move is part of a cycle.  Park one target in the
-                // scratch, close its move, and redirect readers of it to the scratch.
-                // Breaking a cycle leaves a chain whose head is immediately ready, so
-                // this branch cannot run again while the scratch is still needed.
                 let (tgt0, src0) = pending.remove(0);
                 self.emit(format!("    MOV   R{}, R{}  ; break move cycle at R{}", CYCLE, tgt0, tgt0));
                 self.emit(format!("    MOV   R{}, R{}  ; call operand", tgt0, src0));
@@ -585,11 +373,11 @@ impl AsmEmitter {
             }
         }
 
-        // Phase 2: everything that reads no pool register.
+        // Phase 2: everything that reads no allocated register.
         for (tgt, src) in &resolved {
             match src {
                 CallSrc::Reg(_) | CallSrc::Float(_) => {}
-                CallSrc::Slot(d) => self.emit_slot_load(*tgt, *d, "call operand from spill"),
+                CallSrc::Slot(s) => self.emit_slot_load(*tgt, *s, "call operand from frame"),
                 CallSrc::Lit(v) => self.emit_lit_cur(*tgt, *v),
                 CallSrc::Label(l) => self.emit(format!("    TLIT  R{}, #{}  ; call operand", tgt, l)),
                 CallSrc::Missing(name) => {
@@ -600,106 +388,51 @@ impl AsmEmitter {
         }
     }
 
-    /// Get or assign a register for an IRTemp destination.
-    /// If the pool is exhausted, schedules a spill: uses R23 as the physical
-    /// destination, and appends TSUB+STORE to pending_post to save R23 to the stack.
+    /// The register an instruction should write its result to.
+    ///
+    /// For a temp in a register, that register. For a spilled temp, the
+    /// dedicated destination scratch, with the store to its frame slot
+    /// scheduled for after the body. There is no third case and no allocation:
+    /// the answer was decided before emission began.
     fn dst_reg(&mut self, t: &IRTemp) -> usize {
-        // Already in a register?
-        if let Some(&r) = self.reg_alloc.temp_to_reg.get(&t.0) {
-            return r;
-        }
-        // Already spilled: reuse R23 as the physical destination, but write the
-        // result back to the slot the value already owns.  Returning R23 with no
-        // store silently dropped the assignment.  It bit phi destinations hardest:
-        // when one predecessor of a join spilled the phi and a later predecessor
-        // reached this branch, that predecessor's copy stayed in R23 and the slot
-        // kept whatever unrelated temp happened to occupy it, so the join read the
-        // wrong value with no trap and no diagnostic.
-        if let Some(&slot) = self.reg_alloc.spill_slots.get(&t.0) {
-            let offset = (self.reg_alloc.sp_depth + self.pending_sp_increments) as i64 - slot as i64;
-            if offset >= 0 && offset <= 13 {
-                self.pending_post.push(format!(
-                    "    STORE R23, [R26+#{}]         ; spill-store {} (existing slot)",
-                    offset, t.0
-                ));
-            } else if offset > 13 {
-                // R21 is free after the instruction body: spill reads are done.
-                self.pending_post.push(format!("    TLIT  R21, #{}", offset));
-                self.pending_post.push("    TADD  R21, R26, R21  ; spill addr".to_string());
-                self.pending_post.push(format!(
-                    "    STORE R23, [R21+#0]         ; spill-store {} (existing slot)",
-                    t.0
-                ));
-            } else {
-                self.pending_post.push(format!(
-                    "    ; BUG: negative spill offset {} for {}",
-                    offset, t.0
-                ));
+        match self.alloc.loc(&t.0) {
+            Some(Loc::Reg(r)) => r,
+            Some(Loc::Slot(s)) => {
+                self.emit_slot_store_post(DST_SCRATCH, s, &format!("spill {}", t.0));
+                DST_SCRATCH
             }
-            return 23;
+            None => {
+                // A destination the allocator never saw. That is a hole in the
+                // IR rather than a shortage of registers, so it is reported
+                // instead of papered over with a fresh register.
+                self.lines
+                    .push(format!("    ; BUG: {} has no allocated location", t.0));
+                DST_SCRATCH
+            }
         }
-        // Try to allocate from pool
-        if let Some(&r) = self.reg_alloc.free_regs.iter().next() {
-            self.reg_alloc.free_regs.remove(&r);
-            self.reg_alloc.temp_to_reg.insert(t.0.clone(), r);
-            return r;
-        }
-        // Pool exhausted: spill.  Use R23 as physical dest; store to stack after instruction.
-        let future_depth = self.reg_alloc.sp_depth + 1;
-        self.reg_alloc.spill_slots.insert(t.0.clone(), future_depth);
-        self.reg_alloc.spill_count += 1;
-        self.pending_sp_increments += 1;
-        self.pending_post.push(format!("    TSUB  R26, R26, #1         ; spill-store {}", t.0));
-        self.pending_post.push(format!("    STORE R23, [R26+#0]         ; spill-store {}", t.0));
-        23
     }
 
-    /// Materialise an IRValue into a register.  Returns the register number.
-    /// For spilled temps, emits a LOAD directly to `lines` (before cur_instr body)
-    /// using R21 / R22 as scratch (R25 as last-resort for 3rd spilled input).
+    /// Materialise a value into a register and return it.
+    ///
+    /// Spilled temps are reloaded into scratch AHEAD of the instruction body,
+    /// which is why this writes to `lines` rather than `cur_instr`.
     fn val_reg(&mut self, val: &IRValue) -> usize {
         match val {
-            IRValue::Temp(t) => {
-                // Already in a register?
-                if let Some(&r) = self.reg_alloc.temp_to_reg.get(&t.0) {
-                    return r;
+            IRValue::Temp(t) => match self.alloc.loc(&t.0) {
+                Some(Loc::Reg(r)) => r,
+                Some(Loc::Slot(s)) => {
+                    let scratch = self.scratch();
+                    self.emit_slot_load_pre(scratch, s, &format!("reload {}", t.0));
+                    scratch
                 }
-                // In a spill slot?
-                if let Some(&slot_depth) = self.reg_alloc.spill_slots.get(&t.0) {
-                    let scratch = match self.spill_read_idx {
-                        0 => 21,
-                        1 => 22,
-                        _ => 25,
-                    };
-                    self.spill_read_idx += 1;
-                    // Measured against the depth R26 will ACTUALLY hold when this
-                    // LOAD runs — the start of the instruction — not against the
-                    // depth after rescues whose TSUB has only been staged.
-                    let read_depth = self.reg_alloc.sp_depth - self.rescue_pushes_this_instr;
-                    let offset = read_depth as i64 - slot_depth as i64;
-                    self.lines.push(format!("    ; reload spill {} (offset {})", t.0, offset));
-                    if offset >= 0 && offset <= 13 {
-                        self.lines.push(format!("    LOAD  R{}, [R26+#{}]", scratch, offset));
-                    } else if offset > 13 {
-                        self.lines.push(format!("    TLIT  R{}, #{}", scratch, offset));
-                        self.lines.push(format!("    TADD  R{0}, R26, R{0}  ; spill addr", scratch));
-                        self.lines.push(format!("    LOAD  R{0}, [R{0}+#0]  ; spill load", scratch));
-                    } else {
-                        // negative offset = logic error, emit zero as fallback
-                        self.lines.push(format!("    ; BUG: negative spill offset {}", offset));
-                        self.lines.push(format!("    TLIT  R{}, #0", scratch));
-                    }
-                    return scratch;
+                None => {
+                    self.lines
+                        .push(format!("    ; BUG: {} has no allocated location", t.0));
+                    let scratch = self.scratch();
+                    self.lines.push(format!("    TLIT  R{}, #0", scratch));
+                    scratch
                 }
-                // Not found — allocate fresh (shouldn't happen in correct SSA)
-                if let Some(&r) = self.reg_alloc.free_regs.iter().next() {
-                    self.reg_alloc.free_regs.remove(&r);
-                    self.reg_alloc.temp_to_reg.insert(t.0.clone(), r);
-                    r
-                } else {
-                    self.reg_alloc.alloc_scratch()
-                }
-            }
+            },
             IRValue::Const(c) => {
                 let r = self.scratch();
                 match c {
@@ -708,17 +441,13 @@ impl AsmEmitter {
                         self.lines.push(format!("    TLIT  {}, #{}", Self::rn(r), clean));
                     }
                     IRConst::Float(f) => {
-                        // Float bit patterns are 64-bit values that cannot be encoded via
-                        // TLIT (limited to ~800K) or built via TMUL (clamps to T27 range).
-                        // Instead, store the bits in the .float section and load via SYSCALL #219.
-                        // IMPORTANT: emit to cur_instr (via self.emit) so these instructions are
-                        // ordered after any rescue_reg_inclusive calls already in cur_instr.
+                        // Float bit patterns exceed TLIT's range: the bits live
+                        // in the .float section and come back through a syscall.
+                        // R1 is never allocated, so nothing needs saving first.
                         let bits = f.to_bits() as i64;
                         let label = format!("@float_{}_{}", self.fn_name, self.float_literals.len());
                         let clean = label.trim_start_matches('@').to_string();
                         self.float_literals.push((label.clone(), bits));
-                        // Rescue R1 if it holds a live value, then use R1 for the syscall.
-                        self.rescue_reg(1);
                         self.emit(format!("    TLIT  R1, #{}  ; float-lit addr", clean));
                         self.emit(format!("    SYSCALL #219  ; float_load bits for {}", f));
                         if r != 1 {
@@ -738,14 +467,18 @@ impl AsmEmitter {
                     self.lines
                         .push(format!("    TLIT  {}, #{}  ; &{}", Self::rn(r), addr, name));
                 } else {
-                    // Unknown global: keep the symbolic form so the assembler
-                    // fails loudly instead of silently reading address 0.
                     self.lines.push(format!("    TLIT  {}, #{}", Self::rn(r), name));
                 }
                 r
             }
             IRValue::Void => 0,
         }
+    }
+
+    /// Emit the function epilogue: give the frame back, then the caller's R26
+    /// is exactly what it was.
+    fn emit_epilogue(&mut self) {
+        self.emit_sp_adj(self.frame_size as i64);
     }
 }
 
@@ -967,55 +700,66 @@ pub fn emit_t3_asm(module: &IRModule) -> CompileResult<String> {
     Ok(out)
 }
 
+/// Words of frame storage one `Alloca` needs.
+fn alloca_words(ty: &IRType, struct_sizes: &HashMap<String, usize>) -> usize {
+    match ty {
+        IRType::Array(_, n) => (*n).max(1),
+        IRType::Struct(name) => {
+            if let Some(k) = crate::ir::types::tuple_arity_from_name(name) {
+                k.max(1)
+            } else {
+                struct_sizes.get(name).copied().unwrap_or(1).max(1)
+            }
+        }
+        _ => 1,
+    }
+}
+
 fn emit_function(
     func: &IRFunction,
     struct_sizes: HashMap<String, usize>,
     global_addrs: HashMap<String, i64>,
 ) -> CompileResult<(String, Vec<(String, i64)>)> {
-    let (last_use, first_def) = compute_last_use(&func.blocks);
-    let mut em = AsmEmitter::new(last_use, first_def, struct_sizes);
-    em.fn_name = func.name.clone();
-    em.global_addrs = global_addrs;
-
-    // Pre-allocate param registers: first param → R1, second → R2, …, max R8.
-    //
-    // `.min(8)` is a CLAMP, not a spill: a ninth parameter is reserved into R8
-    // alongside the eighth, and every parameter after it likewise, so the callee
-    // reads one register for several arguments. There is no stack argument area
-    // in this convention. Refuse the function rather than emit code that quietly
-    // reads the wrong value — `thatteos/src/kernel/context.mt` has a 15-parameter
-    // `context_switch` and a 13-parameter `context_save`, and until this check
-    // existed the only thing that stopped them was an assertion further along in
-    // `emit_call_operands`, phrased in terms of a staging register.
-    //
-    // It refuses through the ERROR channel, not through `assert!` (23 Aug 2026).
-    // The diagnosis here was always right; panicking to deliver it was not. A
-    // panic prints a Rust backtrace notice instead of an `error:` line, cannot
-    // be caught by anything that drives the compiler, and makes a compiler that
-    // is being careful look like a compiler that has crashed. Every other
-    // refusal in maniTC is a CompileError, and this is now one too.
-    //
-    // There is no source span to attach: IRFunction carries none, since the IR
-    // is several passes downstream of the AST. `Diagnostic::unknown` is the same
-    // spanless form the clang-link failure in main.rs already uses, and the
-    // function name in the message is what actually locates it for the reader.
-    if func.params.len() > 8 {
+    // The convention has no stack argument area, so a ninth parameter has
+    // nowhere to arrive. Refused through the error channel rather than an
+    // assertion: a panic prints a Rust backtrace where every other refusal in
+    // this compiler prints an `error:` line.
+    if func.params.len() > regalloc::PARAM_MAX {
         return Err(CompileError::Codegen(Diagnostic::unknown(format!(
             "[T3ISA] `{}` takes {} parameters, but the T3 calling convention \
-             passes arguments only in R1-R8 and has no stack argument area. \
+             passes arguments only in R1-R{} and has no stack argument area. \
              Pass the extra values in a struct, or split the function.",
             func.name,
             func.params.len(),
+            regalloc::PARAM_MAX,
         ))));
     }
-    for (i, (pname, _)) in func.params.iter().enumerate() {
-        let reg_num = (i + 1).min(8);
-        em.reg_alloc.reserve(&format!("param_{}", pname), reg_num);
-        em.reg_alloc.reserve(pname, reg_num);
-    }
 
-    // Precompute phi copies: for each Phi node, record what the predecessor must copy.
-    // phi_copies[(pred_label, phi_block_label)] = [(phi_dst, incoming_val)]
+    // 1. Assign every temp a location, once, before anything is emitted.
+    let alloc = regalloc::allocate_with(func, &struct_sizes);
+
+    // 2. Lay out the frame: spill slots first, then one region per alloca.
+    //    Both are at CONSTANT offsets from R26 — the frame does not move.
+    let mut alloca_off: HashMap<String, usize> = HashMap::new();
+    let mut off = alloc.n_slots;
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let IRInstr::Alloca { dst, ty } = instr {
+                let w = alloca_words(ty, &struct_sizes);
+                alloca_off.insert(dst.0.clone(), off);
+                off += w;
+            }
+        }
+    }
+    let frame_size = off;
+
+    let param_slots = alloc.param_slots.clone();
+    let mut em = AsmEmitter::new(alloc, struct_sizes, frame_size);
+    em.fn_name = func.name.clone();
+    em.global_addrs = global_addrs;
+    em.alloca_off = alloca_off;
+
+    // Phi copies, indexed by the edge they travel on.
     for block in &func.blocks {
         for instr in &block.instrs {
             if let IRInstr::Phi { dst, incoming, .. } = instr {
@@ -1029,71 +773,40 @@ fn emit_function(
         }
     }
 
-    // Function label goes directly to output (not staged)
     em.lines.push(format!("{}:", func.name));
 
-    for block in &func.blocks {
-        emit_block(&mut em, block);
+    // 3. Prologue. One push for the whole frame, and a store for any parameter
+    //    that could not stay in the register it arrived in.
+    em.cur_idx = 0;
+    em.emit_sp_adj(-(frame_size as i64));
+    for (abi, slot) in &param_slots {
+        em.emit_slot_store_post(*abi, *slot, "parameter to frame");
+    }
+    em.flush_instr();
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        emit_block(&mut em, block, bi);
     }
 
     let float_lits = em.float_literals.clone();
     Ok((em.lines.join("\n") + "\n", float_lits))
 }
 
-fn emit_block(em: &mut AsmEmitter, block: &IRBlock) {
-    // Restore sp_depth to the canonical value for this block (set by first predecessor).
-    // This ensures all code-gen within the block uses consistent spill offsets regardless
-    // of which execution path reaches it at runtime.
-    if let Some(&canonical) = em.block_canonical_sp.get(&block.label) {
-        em.reg_alloc.sp_depth = canonical;
-    }
-
-    // Restore the register assignment this block is emitted against, to the
-    // canonical state its FIRST PREDECESSOR recorded (see register_target).
-    //
-    // This is not only about loop back-edges, though it covers them: it is
-    // about emission order never being an execution order.  The two arms of an
-    // if/else are emitted one after the other, so without this the second arm
-    // inherits the first arm's rescue moves — a state no path into it has.  It
-    // then declines to rescue a register the first arm already moved out of,
-    // and the merge block's reconciliation restores that register from one the
-    // second arm never wrote.
-    if let Some(state) = em.block_canonical_regs.get(&block.label).cloned() {
-        em.restore_entry_state(state);
-    }
-
+fn emit_block(em: &mut AsmEmitter, block: &IRBlock, bi: usize) {
     em.current_block_label = block.label.clone();
-
-    // Snapshot the state this block is actually emitted against.  Kept for
-    // return-block isolation below: a block ending in Return has no successor,
-    // so rescue moves inside it must not carry into the next block emitted.
-    let entry_snapshot = em.entry_state();
-
-    // A block with no registered predecessor — the function entry block — has
-    // no canonical state yet.  Its own entry state becomes the canonical one.
-    em.block_canonical_regs
-        .entry(block.label.clone())
-        .or_insert_with(|| entry_snapshot.clone());
-    em.emitted_blocks.insert(block.label.clone());
-
-    // Block label goes directly to output (not staged)
     em.lines.push(format!("  {}:", em.qlabel(&block.label)));
-    for instr in &block.instrs {
+
+    // The same numbering `regalloc` used, so `scratch()` asks about the right
+    // instruction. Nothing else in emission depends on it.
+    let base = em.alloc.block_start.get(bi).copied().unwrap_or(0);
+    for (k, instr) in block.instrs.iter().enumerate() {
+        em.cur_idx = base + k;
         emit_instr(em, instr);
         em.flush_instr();
-        em.reg_alloc.advance();
     }
+    em.cur_idx = em.alloc.block_end.get(bi).copied().unwrap_or(base);
     emit_term(em, &block.term);
     em.flush_instr();
-    em.reg_alloc.advance();
-
-    // If this block ends in Return, the next emitted block is not a control-flow
-    // successor.  Restore the register mapping to the block-entry snapshot so that
-    // rescue moves performed inside this dead-end block do not corrupt the allocator
-    // state for the next block.
-    if matches!(block.term, IRTerminator::Return(_)) {
-        em.restore_entry_state(entry_snapshot);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,7 +842,6 @@ fn emit_parallel_moves(em: &mut AsmEmitter, moves: Vec<(usize, usize)>, note: &s
 
 /// Emit SYSCALL with 1 arg (R1=arg[0]).  No return value.
 fn emit_syscall_1arg(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRTemp>, sc: i64, name: &str) {
-    em.rescue_reg(1);
     if let Some(a) = args.first() {
         let ra = em.val_reg(a);
         if ra != 1 { em.emit(format!("    MOV   R1, {}  ; {}", AsmEmitter::rn(ra), name)); }
@@ -1140,7 +852,6 @@ fn emit_syscall_1arg(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRTemp>
 
 /// Emit SYSCALL with 1 arg (R1=arg[0]), returns R1.
 fn emit_syscall_1arg_ret(em: &mut AsmEmitter, args: &[IRValue], dst: &Option<IRTemp>, sc: i64, name: &str) {
-    em.rescue_reg(1);
     if let Some(a) = args.first() {
         let ra = em.val_reg(a);
         if ra != 1 { em.emit(format!("    MOV   R1, {}  ; {}", AsmEmitter::rn(ra), name)); }
@@ -1210,10 +921,6 @@ fn emit_syscall_args(em: &mut AsmEmitter, args: &[IRValue], name: &str) {
             "    ; BUG: {} takes {} arguments but only R1-R{} are available",
             name, args.len(), MAX_ARG_REGS,
         ));
-    }
-
-    for k in 1..=n {
-        em.rescue_reg(k);
     }
 
     let targets: Vec<(usize, CallSrc)> = args.iter().take(n).enumerate()

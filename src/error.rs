@@ -211,13 +211,33 @@ pub fn render_error(err: &CompileError, source: Option<&str>) -> String {
 
 /// Render a compile warning with source-line context.
 pub fn render_warning(warn: &CompileWarning, source: Option<&str>) -> String {
+    render_lint(warn, source, false)
+}
+
+/// Render one lint diagnostic, as a warning or as an error.
+///
+/// A denied lint is an error, and printing it as "warning" and then AGAIN as
+/// the compilation error was both misleading and duplicated — the reader saw
+/// the same span twice under two severities. It is reported once, at the
+/// severity its level says, and the compilation then aborts with a count.
+pub fn render_lint(warn: &CompileWarning, source: Option<&str>, as_error: bool) -> String {
     let c = Colors::for_stderr();
     let d = &warn.diagnostic;
+    let (word, colour) = if as_error {
+        ("error", c.red)
+    } else {
+        ("warning", c.yellow)
+    };
 
+    // The lint name is part of the diagnostic, not decoration: it is the
+    // string the reader has to type into `--allow` or `--deny` to change what
+    // happens next, and a diagnostic that does not name its own control is a
+    // diagnostic you cannot act on.
     let mut out = format!(
-        "{}{}warning{}: {}:{}:{}: {}\n",
-        c.bold, c.yellow, c.reset,
-        d.file, d.line, d.col, d.message
+        "{}{}{}{}: {}:{}:{}: {} {}[{}]{}\n",
+        c.bold, colour, word, c.reset,
+        d.file, d.line, d.col, d.message,
+        c.cyan, crate::lint::lint_name(&warn.kind), c.reset
     );
 
     if let Some(src) = source {
@@ -228,7 +248,7 @@ pub fn render_warning(warn: &CompileWarning, source: Option<&str>) -> String {
                 out.push_str(&format!(" {} {}|{}\n", padding, c.cyan, c.reset));
                 out.push_str(&format!(" {} {}|{} {}\n", line_num, c.cyan, c.reset, line_text));
                 if d.col > 0 {
-                    let carets = format!("{}{}{}", c.yellow, "^", c.reset);
+                    let carets = format!("{}{}{}", colour, "^", c.reset);
                     out.push_str(&format!(
                         " {} {}|{} {}{}\n",
                         padding, c.cyan, c.reset,
@@ -256,6 +276,27 @@ pub enum WarningKind {
     IntegerOverflow,
     DivisionByZero,
     UnknownType,
+    /// A1 step 1: a native called with no `extern` declaration.
+    UndeclaredNative,
+    /// A call to an extern declared `deprecated("...")`.
+    DeprecatedNative,
+    /// A1 step 3 (not yet enforced): an extern not `available` on the
+    /// selected backend.
+    BackendUnavailable,
+    /// B1/A4: a generic argument that does not satisfy a declared bound.
+    UnsatisfiedBound,
+    /// C4/R2: a `/` or `%` on an integer type, whose meaning differs between
+    /// language versions. The migration backlog for the division change.
+    DivisionSemantics,
+    /// A2: a function is unavailable on the selected backend because something
+    /// in its reachable call graph is. Reported with the call chain.
+    ///
+    /// Distinct from `BackendUnavailable`, which fires at the call site of a
+    /// declared extern and says only "this one name is not available". This one
+    /// is the INFERRED, transitive property, and the thing it can tell you that
+    /// the other cannot is WHICH PATH makes an ordinary ManiT function
+    /// uncompilable.
+    BackendUnavailableChain,
 }
 
 /// A compiler warning — non-fatal but indicates likely mistakes.
@@ -281,19 +322,51 @@ impl std::fmt::Display for CompileWarning {
 }
 
 /// Collects warnings produced during compilation.
+///
+/// Since A5 the collector also owns the lint level table, because the level is
+/// what decides whether a diagnostic is recorded at all: an `allow` lint is
+/// dropped at `push`, not filtered at print time. Dropping it early is what
+/// makes `--allow` cost nothing and, more importantly, keeps `count()` — which
+/// `manitc check` prints — honest about what was actually reported.
 #[derive(Debug, Clone, Default)]
 pub struct WarningCollector {
     pub warnings: Vec<CompileWarning>,
+    /// `--warn-as-error`. Retained as the name of "raise every lint to deny",
+    /// which is what section 54's strict binary was built with.
     pub warn_as_error: bool,
+    /// Effective per-lint severity for this compilation (A5).
+    pub lints: crate::lint::LintTable,
 }
 
 impl WarningCollector {
     pub fn new() -> Self {
-        Self { warnings: Vec::new(), warn_as_error: false }
+        Self {
+            warnings: Vec::new(),
+            warn_as_error: false,
+            lints: crate::lint::LintTable::new(),
+        }
     }
 
+    /// Record a warning, unless its lint is set to `allow`.
     pub fn push(&mut self, warning: CompileWarning) {
+        if self.effective_level(&warning.kind) == crate::lint::LintLevel::Allow {
+            return;
+        }
         self.warnings.push(warning);
+    }
+
+    /// The level in force for a lint, with `--warn-as-error` folded in.
+    ///
+    /// `warn_as_error` is applied here rather than by mutating the table so
+    /// that the table keeps saying what the user asked for, and the manifest
+    /// records the request rather than its consequence.
+    pub fn effective_level(&self, kind: &WarningKind) -> crate::lint::LintLevel {
+        let lvl = self.lints.level(kind);
+        if self.warn_as_error && lvl < crate::lint::LintLevel::Deny {
+            crate::lint::LintLevel::Deny
+        } else {
+            lvl
+        }
     }
 
     /// Print all warnings to stderr, with optional source context.
@@ -303,21 +376,63 @@ impl WarningCollector {
         }
     }
 
-    /// Print all warnings with source-line context.
+    /// Print all warnings with source-line context, each at the severity its
+    /// lint level gives it.
     pub fn emit_all_rich(&self, source: &str) {
         for w in &self.warnings {
-            eprint!("{}", render_warning(w, Some(source)));
+            let as_error = self.effective_level(&w.kind).is_error();
+            eprint!("{}", render_lint(w, Some(source), as_error));
         }
     }
 
-    /// If --warn-as-error is set and there are warnings, return the first as an error.
+    /// Fail the compilation if any recorded warning is at `deny` or `forbid`.
+    ///
+    /// The first such warning becomes the error, so the exit status is decided
+    /// by severity rather than by order: a `deny` lint reported after twenty
+    /// `warn`s still fails the build, which was not true when the only control
+    /// was the blanket `--warn-as-error`.
     pub fn check_error(&self) -> CompileResult<()> {
-        if self.warn_as_error {
-            if let Some(w) = self.warnings.first() {
-                return Err(CompileError::Type(w.diagnostic.clone()));
-            }
+        let n = self.error_count();
+        if n == 0 {
+            return Ok(());
         }
-        Ok(())
+        // The individual diagnostics were already printed by `emit_all_rich`,
+        // so this is the summary line, not a repeat of the first one. Callers
+        // that never printed them still get a message that says what happened
+        // and which lints to look at.
+        let mut lints: Vec<&str> = self
+            .warnings
+            .iter()
+            .filter(|w| self.effective_level(&w.kind).is_error())
+            .map(|w| crate::lint::lint_name(&w.kind))
+            .collect();
+        lints.sort_unstable();
+        lints.dedup();
+        let first = self
+            .warnings
+            .iter()
+            .find(|w| self.effective_level(&w.kind).is_error())
+            .map(|w| w.diagnostic.clone())
+            .unwrap_or_else(|| Diagnostic::unknown(""));
+        Err(CompileError::Type(Diagnostic::new(
+            first.file,
+            first.line,
+            first.col,
+            format!(
+                "aborting: {} denied lint{} ({})",
+                n,
+                if n == 1 { "" } else { "s" },
+                lints.join(", ")
+            ),
+        )))
+    }
+
+    /// How many recorded warnings are at `deny` or `forbid`.
+    pub fn error_count(&self) -> usize {
+        self.warnings
+            .iter()
+            .filter(|w| self.effective_level(&w.kind).is_error())
+            .count()
     }
 
     pub fn count(&self) -> usize {

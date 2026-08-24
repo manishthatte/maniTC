@@ -1,0 +1,52 @@
+# Coverage-guided fuzzing of the maniT front end.  (Recommendation F-8)
+#
+# © Manish Jagdish Thatte
+#
+# Not a workspace member: cargo-fuzz builds with `-Zsanitizer=address` on a
+# nightly toolchain, and folding that into the main workspace would put a
+# nightly requirement on every ordinary `cargo build`.  The crashes this finds
+# are replayed on STABLE by tests/fuzz_corpus_tests.rs, so a finding outlives
+# the toolchain that found it.
+
+[package]
+name = "manitc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.manitc]
+path = ".."
+
+[[bin]]
+name = "fuzz_lex"
+path = "fuzz_targets/fuzz_lex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_analyze"
+path = "fuzz_targets/fuzz_analyze.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pipeline"
+path = "fuzz_targets/fuzz_pipeline.rs"
+test = false
+doc = false
+bench = false

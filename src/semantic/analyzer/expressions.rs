@@ -209,7 +209,8 @@ impl SemanticAnalyzer {
                 // (so bare 0/1/-1 literals coerce), logical operators expect bool.
                 let operand_hint = match op {
                     BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Txor
-                    | BinOpKind::Tcon | BinOpKind::Tany => Some(ManiType::Trit),
+                    | BinOpKind::Tcon | BinOpKind::Tany
+                    | BinOpKind::Timp | BinOpKind::Teq => Some(ManiType::Trit),
                     BinOpKind::And | BinOpKind::Or => Some(ManiType::Bool),
                     _ => None,
                 };
@@ -223,6 +224,13 @@ impl SemanticAnalyzer {
                 };
                 let trhs = self.check_expr(rhs, Some(&rhs_hint))?;
                 let ty = self.binop_type(op, &tlhs.ty, &trhs.ty, span)?;
+
+                // C4/R2: the migration backlog. `tlhs.ty` is what
+                // `binop_to_ir` will look at in the lowerer, so the list this
+                // produces is exactly the set of sites the version change
+                // moves — not a superset picked by matching on the operator
+                // alone.
+                self.note_division_semantics(op, &tlhs.ty, span);
 
                 // Division by zero detection
                 if matches!(op, BinOpKind::Div | BinOpKind::Rem) {
@@ -287,6 +295,47 @@ impl SemanticAnalyzer {
                     }
                     _ => match &tcallee.kind {
                         TypedExprKind::Ident(name) => {
+                            // A1. Two things happen for a native callee, and
+                            // which one depends on whether it was declared.
+                            //
+                            // Declared: `collect_extern_decl` put a fully
+                            // resolved signature into `self.functions`, so the
+                            // `all(is_known)` test below turns `enforce` ON and
+                            // the arguments are checked like any other call.
+                            // That is step 2, and it needs no special case here
+                            // — the asymmetry it removes existed only because a
+                            // native's parameters were Unknown.
+                            //
+                            // Undeclared: the name goes into the migration
+                            // backlog and the call stays unchecked, exactly as
+                            // it was before A1.
+                            let n = name.clone();
+                            // A2: record the call-graph edge. Done here, in the
+                            // checker, rather than in a separate traversal —
+                            // a second walk could disagree with this one about
+                            // what is a call, and the whole value of the
+                            // inference is that it describes the program the
+                            // checker actually saw.
+                            if let Some(caller) = self.current_fn.clone() {
+                                self.call_graph
+                                    .entry(caller)
+                                    .or_default()
+                                    .push((n.clone(), span));
+                            }
+                            if self.externs.contains_key(&n) {
+                                // A DECLARATION is the authority on what is
+                                // native — checked before `is_native`, which
+                                // keys on a hardcoded list of standard library
+                                // module names. Asking that list first meant a
+                                // declared `gui::set_color` was invisible to
+                                // every A1 diagnostic, because `gui` is not on
+                                // it: the form could be written and then did
+                                // nothing, which is the failure mode A1 exists
+                                // to remove.
+                                self.check_extern_call_site(&n, span);
+                            } else if self.is_native(&n) {
+                                self.note_undeclared_native(&n, span);
+                            }
                             if let Some((pts, rt)) = self.functions.get(name) {
                                 display_name = name.clone();
                                 enforce = !self.builtin_names.contains(name)
@@ -320,6 +369,17 @@ impl SemanticAnalyzer {
                         )));
                     }
                     typed_args.push(targ);
+                }
+
+                // B1/A4: the declared bounds, checked against what the
+                // arguments actually turned out to be. After the loop, because
+                // it needs every argument's inferred type — a bound on `T` used
+                // in two parameter positions cannot be judged from one of them.
+                if !display_name.is_empty() && display_name != "<fn>" {
+                    let arg_tys: Vec<ManiType> =
+                        typed_args.iter().map(|a| a.ty.clone()).collect();
+                    let name = display_name.clone();
+                    self.check_generic_bounds(&name, &arg_tys, span);
                 }
 
                 Ok(TypedExpr {

@@ -6,6 +6,7 @@
 //   FLAGS: i8 ∈ {−1, 0, +1}
 
 pub mod isa;
+pub mod regalloc;
 pub mod assembler;
 pub mod emulator;
 pub mod emitter;

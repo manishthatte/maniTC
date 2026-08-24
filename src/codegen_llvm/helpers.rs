@@ -477,6 +477,21 @@ declare void @manit_fault(ptr)
 declare void @manit_check_divisor(i64)
 declare void @manit_check_index(i64, i64)
 declare void @manit_check_result_ok(i64)
+; ---- N5 (--lang v2): the 27-trit word guards ----
+; Called on the OPERANDS, before the arithmetic, so the true result can be
+; tested in __int128 rather than after it has wrapped in i64.
+declare void @manit_check_t27_add(i64, i64)
+declare void @manit_check_t27_sub(i64, i64)
+declare void @manit_check_t27_mul(i64, i64)
+; ---- T3ISA v1.5 lane-wise ternary logic (C2) ----
+; One T3 instruction each; on a binary machine, a 27-iteration loop over
+; balanced-ternary digits, so these are runtime calls rather than inline IR.
+declare i64 @manit_lane_and(i64, i64)
+declare i64 @manit_lane_or(i64, i64)
+declare i64 @manit_lane_xor(i64, i64)
+declare i64 @manit_lane_imp(i64, i64)
+declare i64 @manit_lane_cmp(i64, i64)
+declare i64 @manit_lane_popcount(i64, i64)
 ; ---- io ----
 declare void @io_println(ptr)
 declare void @io_print(ptr)

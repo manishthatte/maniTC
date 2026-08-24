@@ -251,7 +251,9 @@ impl IRLowerer {
                             let result_t = self.fresh_temp();
                             self.emit(IRInstr::BinOp {
                                 dst: result_t.clone(),
-                                op: binop_to_ir(op, &a.value.ty),
+                                // Same type the `ty` below is built from — see
+                                // the note at the scalar compound-assign.
+                                op: binop_to_ir(op, &a.value.ty, self.lang),
                                 lhs: IRValue::Temp(cur),
                                 rhs: val,
                                 ty: elem_ty,
@@ -320,7 +322,26 @@ impl IRLowerer {
                         ptr: ptr.clone(),
                         ty: ty.clone(),
                     });
-                    let binop = binop_to_ir(op, &a.value.ty);
+                    // `a.value.ty`, deliberately, because that is what `ty`
+                    // above is built from and the two MUST agree.
+                    //
+                    // From C4 onward the operator is type-dependent: `DivNear`
+                    // and the `*T27` family are integer-only and have no float
+                    // encoding on either backend. Choosing the operator from
+                    // one type while typing the instruction from another gives
+                    // a `DivNear` with `ty = F64`, which is not an instruction
+                    // — the `debug_assert!`s in both emitters exist to say so
+                    // loudly rather than let it become `sdiv double`.
+                    //
+                    // Note what this does NOT fix. A compound assignment types
+                    // itself from the ASSIGNED VALUE rather than the target,
+                    // so `let mut f: float = 7.0; f /= n;` with `n: int` loads
+                    // the double as an i64 and divides it as one. That is
+                    // report.txt P10, it predates all of this (measured on the
+                    // archived pre-C4 release binary), and it is a semantic-
+                    // pass strictness question — which R5 says must not be
+                    // landed incidentally alongside a feature.
+                    let binop = binop_to_ir(op, &a.value.ty, self.lang);
                     let result_t = self.fresh_temp();
                     self.emit(IRInstr::BinOp {
                         dst: result_t.clone(),

@@ -19,7 +19,119 @@ impl LLVMEmitter {
                 };
                 self.record_temp_type(&dst.0, &result_ty);
 
+                // C4/N5: the version-dependent operators are integer-only by
+                // construction — `binop_to_ir` never produces one for a float
+                // type — and the arms below emit `sdiv double` and friends if
+                // one arrives anyway. clang rejects that, so the failure is at
+                // least loud here; this makes it loud in the test suite too,
+                // and names the cause instead of a line of .ll.
+                debug_assert!(
+                    !(is_float && matches!(op,
+                        IRBinOp::DivNear | IRBinOp::RemNear
+                        | IRBinOp::AddT27 | IRBinOp::SubT27 | IRBinOp::MulT27)),
+                    "a version-dependent integer op reached the LLVM emitter \
+                     with a float type: {:?}", op
+                );
+
                 match op {
+                    // --- N5: `int` arithmetic bounded to the 27-trit word ---
+                    //
+                    // The guard is called BEFORE the arithmetic, on the
+                    // OPERANDS, for the same reason `manit_check_divisor` is:
+                    // it is exact that way. `manit_check_t27_mul` computes the
+                    // product in __int128, so a multiplication that overflows
+                    // int64 is caught on its true value; checking the result
+                    // afterwards in i64 would have missed exactly the products
+                    // that overflow hardest, because they wrap into range.
+                    //
+                    // A call, not a compare-and-branch — this emitter produces
+                    // one straight-line sequence per IR instruction and cannot
+                    // open a basic block in the middle of one. It is the cost
+                    // the divisor guard has always paid on every integer
+                    // division, and only code compiled `--lang v2` pays it.
+                    IRBinOp::AddT27 | IRBinOp::SubT27 | IRBinOp::MulT27 => {
+                        let t = llvm_type(ty);
+                        let (lp, l) = self.resolve_with_coerce(lhs, &t, &format!("{}_l", dst.0));
+                        let (rp, r) = self.resolve_with_coerce(rhs, &t, &format!("{}_r", dst.0));
+                        let (lwp, lw) = self.widen_to_i64(&l, &t, &format!("{}_gl", dst.0));
+                        let (rwp, rw) = self.widen_to_i64(&r, &t, &format!("{}_gr", dst.0));
+                        let (guard, op_name) = match op {
+                            IRBinOp::AddT27 => ("manit_check_t27_add", "add"),
+                            IRBinOp::SubT27 => ("manit_check_t27_sub", "sub"),
+                            _ => ("manit_check_t27_mul", "mul"),
+                        };
+                        format!(
+                            "{}{}{}{}  call void @{}(i64 {}, i64 {})\n{} = {} {} {}, {}",
+                            lp, rp, lwp, rwp, guard, lw, rw,
+                            dst_name, op_name, t, l, r,
+                        )
+                    }
+                    // --- C4: round-to-nearest division and its remainder ---
+                    //
+                    // Sixteen instructions here against ONE on T3 (TDIVN,
+                    // T3ISA v1.6). That ratio is the recommendation's point
+                    // rather than an embarrassment: in balanced ternary
+                    // dropping low trits already rounds to nearest, so the
+                    // machine gets this for free and a two's-complement one
+                    // has to build it. Emitted only under `--lang v2`.
+                    //
+                    // Branchless on purpose. A branch here would need new
+                    // basic blocks in the middle of an instruction that the
+                    // rest of this emitter assumes produces a straight line,
+                    // and the select chain is what the T3 side is too — no
+                    // control flow on either backend.
+                    IRBinOp::DivNear | IRBinOp::RemNear => {
+                        let t = llvm_type(ty);
+                        let (lp, l) = self.resolve_with_coerce(lhs, &t, &format!("{}_l", dst.0));
+                        let (rp, r) = self.resolve_with_coerce(rhs, &t, &format!("{}_r", dst.0));
+                        // A7: the same divisor guard the truncating pair uses.
+                        // Without it a zero divisor is SIGFPE — a hard crash
+                        // with no message and no buffered output — where T3
+                        // reports a clean trap.
+                        let (wp, w) = self.widen_to_i64(&r, &t, &format!("{}_dz", dst.0));
+                        let n = &dst.0;
+                        // `nr` and `nb` are NEGATIVE magnitudes: −|r| and −|b|.
+                        // Every i64 has one, including i64::MIN, whose
+                        // positive magnitude is not representable — see
+                        // lang::div_nearest for why the test is written this
+                        // way rather than as `2*abs(r) >= abs(b)`.
+                        let mut out = String::new();
+                        out.push_str(&lp);
+                        out.push_str(&rp);
+                        out.push_str(&wp);
+                        out.push_str(&format!("  call void @manit_check_divisor(i64 {})\n", w));
+                        out.push_str(&format!("  %{n}_q = sdiv {t} {l}, {r}\n"));
+                        out.push_str(&format!("  %{n}_rm = srem {t} {l}, {r}\n"));
+                        out.push_str(&format!("  %{n}_rn = sub {t} 0, %{n}_rm\n"));
+                        out.push_str(&format!("  %{n}_rp = icmp sgt {t} %{n}_rm, 0\n"));
+                        out.push_str(&format!("  %{n}_nr = select i1 %{n}_rp, {t} %{n}_rn, {t} %{n}_rm\n"));
+                        out.push_str(&format!("  %{n}_bn = sub {t} 0, {r}\n"));
+                        out.push_str(&format!("  %{n}_bp = icmp sgt {t} {r}, 0\n"));
+                        out.push_str(&format!("  %{n}_nb = select i1 %{n}_bp, {t} %{n}_bn, {t} {r}\n"));
+                        // nb − nr is −(|b| − |r|), always in [MIN, −1].
+                        out.push_str(&format!("  %{n}_th = sub {t} %{n}_nb, %{n}_nr\n"));
+                        out.push_str(&format!("  %{n}_tie = icmp sle {t} %{n}_nr, %{n}_th\n"));
+                        // Away from zero: the direction is the quotient's own
+                        // sign, i.e. the two operand signs taken together.
+                        out.push_str(&format!("  %{n}_ls = icmp slt {t} {l}, 0\n"));
+                        out.push_str(&format!("  %{n}_bs = icmp slt {t} {r}, 0\n"));
+                        out.push_str(&format!("  %{n}_sm = icmp eq i1 %{n}_ls, %{n}_bs\n"));
+                        out.push_str(&format!("  %{n}_st = select i1 %{n}_sm, {t} 1, {t} -1\n"));
+                        out.push_str(&format!("  %{n}_ad = select i1 %{n}_tie, {t} %{n}_st, {t} 0\n"));
+                        if matches!(op, IRBinOp::DivNear) {
+                            out.push_str(&format!("{dst_name} = add {t} %{n}_q, %{n}_ad"));
+                        } else {
+                            // The balanced remainder is DEFINED as
+                            // a − div_nearest(a, b) * b rather than computed
+                            // by a rule of its own. That is what keeps
+                            // `(a / b) * b + (a % b) == a` true, and it is why
+                            // C4 changes both operators or neither.
+                            out.push_str(&format!("  %{n}_qn = add {t} %{n}_q, %{n}_ad\n"));
+                            out.push_str(&format!("  %{n}_qb = mul {t} %{n}_qn, {r}\n"));
+                            out.push_str(&format!("{dst_name} = sub {t} {l}, %{n}_qb"));
+                        }
+                        out
+                    }
                     // --- Arithmetic ---
                     IRBinOp::Add | IRBinOp::Sub | IRBinOp::Mul | IRBinOp::Div | IRBinOp::Rem => {
                         let ty_str = llvm_type(ty);
@@ -699,6 +811,33 @@ impl LLVMEmitter {
             }
 
             // ---- Ternary ops ------------------------------------------------
+            // C2. A runtime call, not inline IR.
+            //
+            // A lane-wise operation is a loop over 27 balanced-ternary digits,
+            // and balanced ternary is not something binary hardware has a
+            // representation for — there is no i64 bit trick that extracts a
+            // balanced trit. Emitting the loop inline would put twenty-odd
+            // basic blocks at every use site. On T3 this same instruction is
+            // ONE opcode, and that gap is exactly the performance argument for
+            // the ISA: the LLVM backend pays what a binary machine has to pay.
+            IRInstr::TritLane { dst, op, a, b } => {
+                self.record_temp_type(&dst.0, "i64");
+                let (ap, a_s) = self.resolve_with_coerce(a, "i64", &format!("{}_a", dst.0));
+                let (bp, b_s) = self.resolve_with_coerce(b, "i64", &format!("{}_b", dst.0));
+                let func = match op {
+                    IRLaneOp::And => "manit_lane_and",
+                    IRLaneOp::Or => "manit_lane_or",
+                    IRLaneOp::Xor => "manit_lane_xor",
+                    IRLaneOp::Imp => "manit_lane_imp",
+                    IRLaneOp::Cmp => "manit_lane_cmp",
+                    IRLaneOp::Popcount => "manit_lane_popcount",
+                };
+                format!(
+                    "{ap}{bp}%{dst} = call i64 @{func}(i64 {a}, i64 {b})",
+                    ap = ap, bp = bp, dst = dst.0, func = func, a = a_s, b = b_s
+                )
+            }
+
             IRInstr::TritMin { dst, a, b } => {
                 self.record_temp_type(&dst.0, "i8");
                 // ternary AND = min(a, b) — coerce operands to i8
@@ -735,6 +874,29 @@ impl LLVMEmitter {
                 self.record_temp_type(&dst.0, "i8");
                 let (ap, a_s) = self.resolve_with_coerce(a, "i8", &format!("{}_a", dst.0));
                 format!("{}%{} = sub i8 0, {}", ap, dst.0, a_s)
+            }
+
+            // C7: sign of a WORD. The operand is resolved at i64, NOT i8 —
+            // that asymmetry is the whole reason this is its own instruction.
+            // Every other Trit* op here coerces to i8 because its operand
+            // really is a trit; this one's operand is a 27-trit word, and
+            // truncating it would make `sign(256)` report 0. The RESULT is a
+            // trit, so the destination is i8 as usual.
+            //
+            // T3 does this in one instruction (TCMP against R0). Binary has no
+            // three-way compare, so it takes two comparisons and a subtract —
+            // which is exactly the asymmetry C7 exists to point at.
+            IRInstr::TritSign { dst, a } => {
+                self.record_temp_type(&dst.0, "i8");
+                let (ap, a_s) = self.resolve_with_coerce(a, "i64", &format!("{}_a", dst.0));
+                format!(
+                    "{ap}%{d}_pos = icmp sgt i64 {a}, 0\n  \
+                     %{d}_neg = icmp slt i64 {a}, 0\n  \
+                     %{d}_p8 = zext i1 %{d}_pos to i8\n  \
+                     %{d}_n8 = zext i1 %{d}_neg to i8\n  \
+                     %{d} = sub i8 %{d}_p8, %{d}_n8",
+                    ap = ap, d = dst.0, a = a_s
+                )
             }
 
             // ---- Print intrinsics -------------------------------------------

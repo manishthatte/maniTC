@@ -70,7 +70,14 @@ impl Parser {
         Ok(lhs)
     }
 
-    // ternary logic: tor, tand, txor, tcon, tany
+    // ternary logic: tor, tand, txor, tcon, tany, timp, teq
+    // and C2's lane-wise family: torw, tandw, txorw, timpw, tcmpw
+    //
+    // The lane-wise operators sit at the SAME precedence as their scalar
+    // counterparts and are likewise left-associative. They are the same
+    // connectives applied 27 times, so binding them differently would make
+    // `a tandw b torw c` and `a tand b tor c` parse into different shapes for
+    // no reason a reader could predict.
     fn parse_ternary_logic_expr(&mut self) -> CompileResult<Expr> {
         let mut lhs = self.parse_cmp_expr()?;
         loop {
@@ -80,6 +87,13 @@ impl Parser {
                 TokenKind::Txor => BinOpKind::Txor,
                 TokenKind::Tcon => BinOpKind::Tcon,
                 TokenKind::Tany => BinOpKind::Tany,
+                TokenKind::Timp => BinOpKind::Timp,
+                TokenKind::Teq => BinOpKind::Teq,
+                TokenKind::Tandw => BinOpKind::Tandw,
+                TokenKind::Torw => BinOpKind::Torw,
+                TokenKind::Txorw => BinOpKind::Txorw,
+                TokenKind::Timpw => BinOpKind::Timpw,
+                TokenKind::Tcmpw => BinOpKind::Tcmpw,
                 _ => break,
             };
             let span = lhs.span();
@@ -248,10 +262,27 @@ impl Parser {
                 let expr = self.parse_unary_expr()?;
                 Ok(Expr::UnOp(UnOpKind::Not, Box::new(expr), span))
             }
+            TokenKind::Tposs => {
+                let span = self.span();
+                self.advance();
+                let expr = self.parse_unary_expr()?;
+                Ok(Expr::UnOp(UnOpKind::Tposs, Box::new(expr), span))
+            }
+            TokenKind::Tnec => {
+                let span = self.span();
+                self.advance();
+                let expr = self.parse_unary_expr()?;
+                Ok(Expr::UnOp(UnOpKind::Tnec, Box::new(expr), span))
+            }
             TokenKind::Tnot => {
                 self.advance();
                 let expr = self.parse_unary_expr()?;
                 Ok(Expr::UnOp(UnOpKind::Tnot, Box::new(expr), span))
+            }
+            TokenKind::Tnotw => {
+                self.advance();
+                let expr = self.parse_unary_expr()?;
+                Ok(Expr::UnOp(UnOpKind::Tnotw, Box::new(expr), span))
             }
             TokenKind::Ampersand => {
                 self.advance();

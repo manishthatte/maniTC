@@ -355,6 +355,95 @@ impl IRLowerer {
                         });
                         return IRValue::Temp(dst);
                     }
+                    // C1: Lukasiewicz implication.
+                    //
+                    //     a timp b = TritMin(1 - a + b, +1)
+                    //
+                    // Derivation. On {0, 1/2, 1} the connective is
+                    // `min(1, 1 - a + b)`. Substituting s = (v+1)/2 and
+                    // solving back for v gives `min(+1, 1 - v_a + v_b)`
+                    // unchanged in form — the -1/0/+1 encoding is its own
+                    // scaling. The intermediate ranges over [-1, 3], and
+                    // `TritMin` is a numeric min, so the upper clamp is the
+                    // only one needed: the lower bound -1 is already in range.
+                    //
+                    //           b=-1   b=0   b=+1
+                    //   a=-1     +1    +1     +1
+                    //   a= 0      0    +1     +1
+                    //   a=+1     -1     0     +1
+                    //
+                    // The cell that matters is a = b = 0, which is +1 here and
+                    // 0 under Kleene's max(-a, b). That single cell is the
+                    // deduction theorem, and it is why `a timp a` is a
+                    // tautology in this language and would not be in K3.
+                    BinOpKind::Timp => {
+                        let lv = self.lower_ternary_operand(lhs);
+                        let rv = self.lower_ternary_operand(rhs);
+                        let dst = self.lower_timp(lv, rv);
+                        // P3: two `bool` operands make this a `bool` (binop_type
+                        // types it so, because implication is closed on
+                        // {-1,+1}), and a `bool` is {0,1}.
+                        if lhs.ty == ManiType::Bool && rhs.ty == ManiType::Bool {
+                            let b = self.normalize_to_bool(IRValue::Temp(dst));
+                            return IRValue::Temp(b);
+                        }
+                        return IRValue::Temp(dst);
+                    }
+                    // C1: Lukasiewicz equivalence, `(a timp b) tand (b timp a)`.
+                    //
+                    // Written out rather than desugared into two `Timp` nodes
+                    // so each operand is lowered ONCE — `teq` on two calls
+                    // would otherwise evaluate all four of them.
+                    BinOpKind::Teq => {
+                        let lv = self.lower_ternary_operand(lhs);
+                        let rv = self.lower_ternary_operand(rhs);
+                        let fwd = self.lower_timp(lv.clone(), rv.clone());
+                        let back = self.lower_timp(rv, lv);
+                        let dst = self.fresh_temp();
+                        self.emit(IRInstr::TritMin {
+                            dst: dst.clone(),
+                            a: IRValue::Temp(fwd),
+                            b: IRValue::Temp(back),
+                        });
+                        // P3: as for `timp` just above.
+                        if lhs.ty == ManiType::Bool && rhs.ty == ManiType::Bool {
+                            let b = self.normalize_to_bool(IRValue::Temp(dst));
+                            return IRValue::Temp(b);
+                        }
+                        return IRValue::Temp(dst);
+                    }
+                    // C2 / T3ISA v1.5: the lane-wise family.
+                    //
+                    // One IR instruction each, and that is the whole point of
+                    // the phase: on T3 each becomes ONE instruction that does
+                    // 27 three-valued operations at once. Compare `Tcon` just
+                    // below, which spends five instructions on a single trit.
+                    //
+                    // Operands are lowered with plain `lower_expr`, NOT
+                    // `lower_ternary_operand`. That helper coerces its operand
+                    // to `bool3`, which is exactly wrong here: it would flatten
+                    // the 27-lane word these operators exist to read into one
+                    // trit before the instruction ever saw it.
+                    BinOpKind::Tandw | BinOpKind::Torw | BinOpKind::Txorw
+                    | BinOpKind::Timpw | BinOpKind::Tcmpw => {
+                        let lane_op = match op {
+                            BinOpKind::Tandw => IRLaneOp::And,
+                            BinOpKind::Torw => IRLaneOp::Or,
+                            BinOpKind::Txorw => IRLaneOp::Xor,
+                            BinOpKind::Timpw => IRLaneOp::Imp,
+                            _ => IRLaneOp::Cmp,
+                        };
+                        let a = self.lower_expr(lhs);
+                        let b = self.lower_expr(rhs);
+                        let dst = self.fresh_temp();
+                        self.emit(IRInstr::TritLane {
+                            dst: dst.clone(),
+                            op: lane_op,
+                            a,
+                            b,
+                        });
+                        return IRValue::Temp(dst);
+                    }
                     BinOpKind::Tcon => {
                         // tcon(a,b) = consensus: +1 if both +1, -1 if both -1, else 0.
                         // tcon(a,b) = TritMin(TritMax(a,b), 0) + TritMax(TritMin(a,b), 0)
@@ -424,7 +513,7 @@ impl IRLowerer {
 
                 let lv = self.lower_expr(lhs);
                 let rv = self.lower_expr(rhs);
-                let ir_op = binop_to_ir(op, &lhs.ty);
+                let ir_op = binop_to_ir(op, &lhs.ty, self.lang);
                 let dst = self.fresh_temp();
                 self.emit(IRInstr::BinOp {
                     dst: dst.clone(),
@@ -442,6 +531,110 @@ impl IRLowerer {
                         let val = self.lower_expr(operand);
                         let dst = self.fresh_temp();
                         self.emit(IRInstr::TritNeg { dst: dst.clone(), a: val });
+                        return IRValue::Temp(dst);
+                    }
+                    // C2: lane-wise negation. On T3 this is `TNEG` and no new
+                    // opcode — negating a balanced-ternary number flips the
+                    // sign of every trit in it, so TNEG already negates all 27
+                    // lanes, and a `TNOTW` would have been a second spelling of
+                    // an instruction T3ISA has had since v1.0.
+                    //
+                    // But it is emitted as a WORD-WIDTH `UnOp`, not as the
+                    // `TritNeg` one arm above, and that distinction is load-
+                    // bearing rather than stylistic. `IRInstr::TritNeg` is a
+                    // TRIT instruction: the LLVM backend types it `i8` and
+                    // emits `sub i8 0, x`, which is right for a value in
+                    // {-1, 0, +1} and truncates anything wider. Lowering
+                    // `tnotw` to it made `tnotw 9841` produce -113 on LLVM and
+                    // -9841 on T3 — 9841 & 0xFF is 113 — while every lane
+                    // operator around it agreed, because only this one reused a
+                    // trit-width instruction for a word. The differential test
+                    // is what caught it; neither backend is wrong alone.
+                    //
+                    // `UnOp{Neg, I64}` emits `TNEG` on T3 (identical output,
+                    // ISA claim intact) and `sub i64 0, x` on LLVM.
+                    UnOpKind::Tnotw => {
+                        let val = self.lower_expr(operand);
+                        let dst = self.fresh_temp();
+                        self.emit(IRInstr::UnOp {
+                            dst: dst.clone(),
+                            op: IRUnOp::Neg,
+                            operand: val,
+                            ty: IRType::I64,
+                        });
+                        return IRValue::Temp(dst);
+                    }
+                    // C1: possibility, `+1` if a >= 0 else `-1`.
+                    //
+                    //     tposs(a) = TritMin(2a + 1, +1)
+                    //
+                    //     a = -1 → min(-1, 1) = -1
+                    //     a =  0 → min( 1, 1) = +1
+                    //     a = +1 → min( 3, 1) = +1
+                    //
+                    // No branch and no comparison: `TritMin` is the ISA's TAND,
+                    // one instruction, and the doubling is a single add. The
+                    // point of the operator is that "might be true" is cheap on
+                    // this machine and a chain of `tif` is not.
+                    UnOpKind::Tposs => {
+                        let val = self.lower_ternary_operand(operand);
+                        let twice = self.fresh_temp();
+                        self.emit(IRInstr::BinOp {
+                            dst: twice.clone(), op: IRBinOp::Add,
+                            lhs: val.clone(), rhs: val, ty: IRType::I8,
+                        });
+                        let shifted = self.fresh_temp();
+                        self.emit(IRInstr::BinOp {
+                            dst: shifted.clone(), op: IRBinOp::Add,
+                            lhs: IRValue::Temp(twice),
+                            rhs: IRValue::Const(IRConst::Int(1)), ty: IRType::I8,
+                        });
+                        let clamped = self.fresh_temp();
+                        self.emit(IRInstr::TritMin {
+                            dst: clamped.clone(),
+                            a: IRValue::Temp(shifted),
+                            b: IRValue::Const(IRConst::Int(1)),
+                        });
+                        // P3: the declared result type is `bool`, so the
+                        // {-1, +1} answer must become {0, 1}. See
+                        // IRLowerer::normalize_to_bool.
+                        let dst = self.normalize_to_bool(IRValue::Temp(clamped));
+                        return IRValue::Temp(dst);
+                    }
+                    // C1: necessity, `+1` only if a = +1.
+                    //
+                    //     tnec(a) = TritMax(2a - 1, -1)
+                    //
+                    //     a = -1 → max(-3, -1) = -1
+                    //     a =  0 → max(-1, -1) = -1
+                    //     a = +1 → max( 1, -1) = +1
+                    //
+                    // The De Morgan dual of `tposs`, and it holds here:
+                    // `tnec a == tnot tposs tnot a`.
+                    UnOpKind::Tnec => {
+                        let val = self.lower_ternary_operand(operand);
+                        let twice = self.fresh_temp();
+                        self.emit(IRInstr::BinOp {
+                            dst: twice.clone(), op: IRBinOp::Add,
+                            lhs: val.clone(), rhs: val, ty: IRType::I8,
+                        });
+                        let shifted = self.fresh_temp();
+                        self.emit(IRInstr::BinOp {
+                            dst: shifted.clone(), op: IRBinOp::Sub,
+                            lhs: IRValue::Temp(twice),
+                            rhs: IRValue::Const(IRConst::Int(1)), ty: IRType::I8,
+                        });
+                        // P3: clamping against 0 rather than -1 does the job
+                        // of BOTH steps here — 2a-1 is -3, -1 or +1, so a max
+                        // against 0 yields 0, 0, +1, which is already the
+                        // `bool` the declared type promises. One instruction,
+                        // not two.
+                        let dst = self.fresh_temp();
+                        self.emit(IRInstr::TritMax {
+                            dst: dst.clone(),
+                            a: IRValue::Temp(shifted),
+                            b: IRValue::Const(IRConst::Int(0)),
+                        });
                         return IRValue::Temp(dst);
                     }
                     _ => {}
@@ -589,13 +782,120 @@ impl IRLowerer {
                         IRValue::Temp(dst)
                     }
                 } else {
-                    let func_name = match &callee.kind {
+                    let mut func_name = match &callee.kind {
                         TypedExprKind::Ident(n) => n.clone(),
                         _ => {
                             let v = self.lower_expr(callee);
                             format!("__indirect_{:?}", v)
                         }
                     };
+
+                    // C7: the `trit::` intrinsics, lowered to IR HERE rather
+                    // than intercepted separately in each emitter.
+                    //
+                    // `math::` took the other route and a census measured 3 of
+                    // its 52 functions working on both backends: every
+                    // intercept had to be written twice and nothing forced the
+                    // second one, so the T3 arm existed and the LLVM arm
+                    // silently did not. Lowering to IR that both backends
+                    // already implement means there is no second place to
+                    // forget, and no way for the two to disagree.
+                    match func_name.as_str() {
+                        // Lanes of x equal to the trit k. One T3 instruction
+                        // (TPOPC, v1.5); a runtime call on LLVM.
+                        "trit::count" => {
+                            let a = self.lower_expr(&args[0]);
+                            let b = self.lower_expr(&args[1]);
+                            let dst = self.fresh_temp();
+                            self.emit(IRInstr::TritLane {
+                                dst: dst.clone(),
+                                op: IRLaneOp::Popcount,
+                                a,
+                                b,
+                            });
+                            return IRValue::Temp(dst);
+                        }
+                        // sign(x). One T3 instruction; see IRInstr::TritSign
+                        // for why it is not built from TritMin/TritMax.
+                        "trit::sign" => {
+                            let a = self.lower_expr(&args[0]);
+                            let dst = self.fresh_temp();
+                            self.emit(IRInstr::TritSign { dst: dst.clone(), a });
+                            return IRValue::Temp(dst);
+                        }
+                        // abs(x) = x * sign(x).
+                        //
+                        // Two instructions, no branch, and exact for every
+                        // input — the 27-trit range is symmetric, so unlike
+                        // two's complement there is no minimum whose negation
+                        // overflows and no special case to write.
+                        //
+                        // The multiply is word-width (`I64`) deliberately.
+                        // `TritMax(x, -x)` would have been one instruction
+                        // fewer and WRONG: TritMax is trit-width on LLVM, so
+                        // it would truncate x to 8 bits first.
+                        "trit::abs" => {
+                            let a = self.lower_expr(&args[0]);
+                            let s = self.fresh_temp();
+                            self.emit(IRInstr::TritSign { dst: s.clone(), a: a.clone() });
+                            let dst = self.fresh_temp();
+                            self.emit(IRInstr::BinOp {
+                                dst: dst.clone(),
+                                op: IRBinOp::Mul,
+                                lhs: a,
+                                rhs: IRValue::Temp(s),
+                                ty: IRType::I64,
+                            });
+                            return IRValue::Temp(dst);
+                        }
+                        // C4: the four explicitly-named divisions.
+                        //
+                        // Here rather than in the two emitters for the same
+                        // reason the `trit::` family is (see above), and with
+                        // an extra one: these must agree with `/` and `%`
+                        // EXACTLY, in both language versions. Lowering them to
+                        // the very IR operations the operators lower to is the
+                        // only way to guarantee that — a separate
+                        // implementation, however carefully written, is a
+                        // second place for the rounding rule to be stated and
+                        // therefore a second place for it to be stated wrongly.
+                        //
+                        // Note what is NOT here: any dependence on
+                        // `self.lang`. That is the point of them. `/` changes
+                        // meaning at the version boundary and these do not, so
+                        // code that has been migrated onto them compiles to
+                        // the same instructions under both.
+                        "math::div_trunc" | "math::rem_trunc"
+                        | "math::div_near" | "math::rem_near" => {
+                            let ir_op = match func_name.as_str() {
+                                "math::div_trunc" => IRBinOp::Div,
+                                "math::rem_trunc" => IRBinOp::Rem,
+                                "math::div_near" => IRBinOp::DivNear,
+                                _ => IRBinOp::RemNear,
+                            };
+                            let lhs = self.lower_expr(&args[0]);
+                            let rhs = self.lower_expr(&args[1]);
+                            let dst = self.fresh_temp();
+                            self.emit(IRInstr::BinOp {
+                                dst: dst.clone(),
+                                op: ir_op,
+                                lhs,
+                                rhs,
+                                ty: IRType::I64,
+                            });
+                            return IRValue::Temp(dst);
+                        }
+                        // x * 3^n — the machine's native shift. Renamed onto
+                        // the existing primitive rather than reimplemented:
+                        // `ternary::trit_shift_left` is already TSHI on T3 and
+                        // already has an LLVM definition, and both are tested.
+                        // C7 asked for the operation to be NAMED as the shift
+                        // it is, which is a naming change, not a new lowering.
+                        "trit::shift3" => {
+                            func_name = "ternary::trit_shift_left".to_string();
+                        }
+                        _ => {}
+                    }
 
                     // Stdlib functions expecting a length-prefixed [trit] array.
                     //

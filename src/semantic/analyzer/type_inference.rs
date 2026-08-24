@@ -46,6 +46,10 @@ impl SemanticAnalyzer {
             BinOpKind::LShift => "<<", BinOpKind::RShift => ">>",
             BinOpKind::Tand => "tand", BinOpKind::Tor => "tor", BinOpKind::Txor => "txor",
             BinOpKind::Tcon => "tcon", BinOpKind::Tany => "tany",
+            BinOpKind::Timp => "timp", BinOpKind::Teq => "teq",
+            BinOpKind::Tandw => "tandw", BinOpKind::Torw => "torw",
+            BinOpKind::Txorw => "txorw", BinOpKind::Timpw => "timpw",
+            BinOpKind::Tcmpw => "tcmpw",
             BinOpKind::Range => "..", BinOpKind::RangeInclusive => "..=",
         }
     }
@@ -115,7 +119,8 @@ impl SemanticAnalyzer {
                 Ok(lhs.clone())
             }
             BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Txor
-            | BinOpKind::Tcon | BinOpKind::Tany => {
+            | BinOpKind::Tcon | BinOpKind::Tany
+            | BinOpKind::Timp | BinOpKind::Teq => {
                 // Ternary logic operates on ternary-valued types — and on
                 // `bool`, which the lowering converts to `bool3` first (see
                 // IRLowerer::lower_ternary_operand).
@@ -131,6 +136,58 @@ impl SemanticAnalyzer {
                 if !ok(lhs) || !ok(rhs) {
                     return Err(self.binop_operand_err(op, lhs, rhs, span));
                 }
+                // A ternary-logic connective takes ONE three-valued value.
+                // `is_ternary()` is wider than that — it admits `tryte`, `t9`,
+                // `t27`, `t54` and `tfloat`, which are ternary NUMBERS — and
+                // accepting those produced a silent backend divergence rather
+                // than a wrong answer on one backend.
+                //
+                // Measured on `let a: t27 = 9841; let b: t27 = 121`, seven of
+                // the eight operators disagreed:
+                //
+                //     tnot a     T3 -9841   LLVM   -113
+                //     a tand b   T3   121   LLVM    113
+                //     a txor b   T3 -19921  LLVM      1
+                //     a timp b   T3 -9719   LLVM      1
+                //
+                // Both are defensible readings of an ill-defined request. T3
+                // computes a word-width TMIN/TNEG; the LLVM backend types the
+                // whole `Trit*` IR family `i8`, so it truncates to 8 bits
+                // first (9841 & 0xFF = 113). Neither is a `trit`, which is
+                // what this function then claims the result is.
+                //
+                // So the type was never inhabited and the operation was never
+                // defined. Rejecting is the fix, not making the backends
+                // agree: the language reference documents these as operating
+                // "on `trit` and `bool3` values", C2's lane-wise family is the
+                // well-defined thing to do to a whole word, and a caller who
+                // wants the numeric min of two words wants `math::min`.
+                //
+                // Safe to reject: instrumenting `binop_type` and checking all
+                // 268 shipped `.mt` files found ZERO sites. Nothing shipped is
+                // miscompiled today, and nothing shipped stops compiling.
+                let too_wide = |t: &ManiType| matches!(
+                    t,
+                    ManiType::Tryte | ManiType::T9 | ManiType::T27
+                        | ManiType::T54 | ManiType::Tfloat
+                );
+                if too_wide(lhs) || too_wide(rhs) {
+                    let wide = if too_wide(lhs) { lhs } else { rhs };
+                    return Err(self.err(span, format!(
+                        "invalid operands: `{}` is a three-valued logic operator and \
+                         takes `trit` or `bool3`, not `{}`, which is a {}-trit number. \
+                         For the same connective applied to every trit of a word, use \
+                         the lane-wise form `{}w`; for a numeric comparison, use \
+                         `math::min`/`math::max`; to test one trit, narrow it first.",
+                        Self::binop_symbol(op), wide.display(),
+                        match wide {
+                            ManiType::Tryte => "3", ManiType::T9 => "9",
+                            ManiType::T27 => "27", ManiType::T54 => "54",
+                            _ => "multi",
+                        },
+                        Self::binop_symbol(op),
+                    )));
+                }
                 // Two `bool`s under `tand`/`tor`/`tany` give a `bool`, and that
                 // is provable rather than convenient: with false as -1 and true
                 // as +1, min, max and "either +1 wins" are CLOSED on {-1, +1},
@@ -143,8 +200,16 @@ impl SemanticAnalyzer {
                 // `true tcon false` are both `unknown`. They stay `bool3`, and
                 // a caller has to reach for `tif`, which is correct — the value
                 // really does have three outcomes.
+                // `timp` and `teq` join the closed set, and for the same
+                // reason: on {-1, +1} implication is classical material
+                // implication and equivalence is the biconditional, both of
+                // which are two-valued. The one cell where L3 departs from
+                // classical logic — `a = b = 0` — is unreachable when neither
+                // operand can be 0.
                 let closed_on_bools = matches!(
-                    op, BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Tany
+                    op,
+                    BinOpKind::Tand | BinOpKind::Tor | BinOpKind::Tany
+                        | BinOpKind::Timp | BinOpKind::Teq
                 );
                 match (lhs, rhs) {
                     (ManiType::Bool, ManiType::Bool) if closed_on_bools => Ok(ManiType::Bool),
@@ -154,6 +219,40 @@ impl SemanticAnalyzer {
                     | (ManiType::Bool3, ManiType::Bool) => Ok(ManiType::Bool3),
                     _ => Ok(ManiType::Trit),
                 }
+            }
+            BinOpKind::Tandw | BinOpKind::Torw | BinOpKind::Txorw
+            | BinOpKind::Timpw | BinOpKind::Tcmpw => {
+                // C2. The lane-wise family takes WORDS, not trits — the whole
+                // point is the 27 lanes, and a `trit` has one. So the operand
+                // rule is the integer rule, not the ternary-logic rule above:
+                // any balanced-ternary or binary integer, and not a float.
+                //
+                // Both float types are excluded explicitly. `Tfloat` is a
+                // 27-trit float, so it is tempting to think its trits are
+                // lanes — they are not. They are a mantissa and an exponent,
+                // and min-ing them lane-by-lane produces a number that means
+                // nothing. (`is_numeric()` admits `Tfloat`, so leaving it to
+                // that predicate the way the bitwise arm does would have let
+                // `x tandw 1.0t` through.)
+                //
+                // `bool`/`bool3` are excluded too, and deliberately, even
+                // though the scalar operators accept them: a `bool` is one
+                // three-valued answer, and asking for 27 lanes of it is far
+                // more likely to be a typo for `tand` than an intention.
+                let ok = |t: &ManiType| {
+                    !t.is_known()
+                        || (t.is_numeric()
+                            && *t != ManiType::Float
+                            && *t != ManiType::Tfloat)
+                };
+                if !ok(lhs) || !ok(rhs) {
+                    return Err(self.binop_operand_err(op, lhs, rhs, span));
+                }
+                // Result is a word of the same width as the operands. Follows
+                // the bitwise arm: keep the operand type rather than promoting
+                // everything to a single lane-width type, which would make
+                // `t27 x = a tandw b` need a cast it should not need.
+                if lhs.is_known() { Ok(lhs.clone()) } else { Ok(rhs.clone()) }
             }
             BinOpKind::Range | BinOpKind::RangeInclusive => {
                 let ok = |t: &ManiType| !t.is_known() || t.is_numeric();
@@ -165,13 +264,55 @@ impl SemanticAnalyzer {
         }
     }
 
-    pub(super) fn unop_type(&self, op: &UnOpKind, operand: &ManiType, _span: Span) -> CompileResult<ManiType> {
+    pub(super) fn unop_type(&self, op: &UnOpKind, operand: &ManiType, span: Span) -> CompileResult<ManiType> {
+        // The unary half of the same defect. `tnot` on a `t27` was accepted,
+        // typed `trit`, and then computed as a word-width TNEG on T3 and an
+        // i8 negation on LLVM — `tnot 9841` gave -9841 and -113. See the
+        // binary arm above for the full measurement and for why the fix is to
+        // reject rather than to make the two agree.
+        //
+        // `tnotw` is the lane-wise form and is the thing to reach for; it is
+        // word-width on both backends by construction.
+        if matches!(op, UnOpKind::Tnot | UnOpKind::Tposs | UnOpKind::Tnec)
+            && matches!(
+                operand,
+                ManiType::Tryte | ManiType::T9 | ManiType::T27
+                    | ManiType::T54 | ManiType::Tfloat
+            )
+        {
+            let name = match op {
+                UnOpKind::Tnot => "tnot",
+                UnOpKind::Tposs => "tposs",
+                _ => "tnec",
+            };
+            return Err(self.err(span, format!(
+                "invalid operand: `{}` is a three-valued logic operator and takes \
+                 `trit` or `bool3`, not `{}`.{}",
+                name, operand.display(),
+                if matches!(op, UnOpKind::Tnot) {
+                    " To negate every trit of a word, use `tnotw`."
+                } else {
+                    " Narrow the value to a single trit first."
+                },
+            )));
+        }
         match op {
             UnOpKind::Neg | UnOpKind::TritNeg => Ok(operand.clone()),
             UnOpKind::Not => Ok(ManiType::Bool),
             UnOpKind::Tnot => {
                 if *operand == ManiType::Bool3 { Ok(ManiType::Bool3) } else { Ok(ManiType::Trit) }
             }
+            // C1. The modal operators are two-valued whatever they are given:
+            // `tposs` answers "might this be true?" and `tnec` answers "is this
+            // definitely true?", and neither question has an unknown answer.
+            // That is what makes them the bridge out of three-valued logic —
+            // `if tnec x { … }` is exactly the chain of `tif` that real
+            // three-valued code writes by hand today.
+            UnOpKind::Tposs | UnOpKind::Tnec => Ok(ManiType::Bool),
+            // C2: lane-wise negation preserves the word it was given. Unlike
+            // `tnot`, which collapses whatever it is handed to a `trit`, this
+            // one is width-preserving because it operates on all the lanes.
+            UnOpKind::Tnotw => Ok(operand.clone()),
             UnOpKind::Deref | UnOpKind::Ref => Ok(operand.clone()),
         }
     }
@@ -613,6 +754,57 @@ impl SemanticAnalyzer {
                 if !missing.is_empty() {
                     return Err(self.err(span, format!(
                         "non-exhaustive match on trit — missing values: {}. Add the missing arms or a wildcard '_' pattern",
+                        missing.join(", ")
+                    )));
+                }
+            }
+            // P6: `Result<T, E>` is a THREE-variant closed type and must be
+            // matched exhaustively, exactly as an enum, a trit and a bool3
+            // already are. It was the one closed type with no arm here, so
+            // `match r { Ok(v) => .., Err(e) => .. }` compiled — and when `r`
+            // was `Unknown` the third state vanished, differently on each
+            // backend: T3 halted with exit status 24 and lost the rest of the
+            // program, LLVM fell through the match and carried on. Neither said
+            // anything.
+            //
+            // That is the exact failure the type exists to prevent. The
+            // language's own reference puts it plainly: "Err means it failed;
+            // Unknown means we do not know, which is not a failure and must not
+            // be collapsed into one." Here it was collapsed into nothing.
+            //
+            // Safe to enforce, measured not assumed: the checker was
+            // instrumented and every `.mt` file in both repos checked — ZERO
+            // non-exhaustive Result matches. A wildcard `_` arm remains the
+            // escape hatch and is handled above.
+            ManiType::Generic(g, _) if g == "Result" => {
+                let mut covered: Vec<&str> = Vec::new();
+                for arm in &arms {
+                    if let Pattern::Enum(variant, enum_name, _, _) = &arm.pattern {
+                        // The parser encodes bare `Unknown(msg)` as
+                        // Enum("Result", Some("Unknown"), ..); normalise it the
+                        // same way define_pattern_bindings does.
+                        let v: &str = if variant == "Result"
+                            && enum_name.as_deref() == Some("Unknown")
+                        {
+                            "Unknown"
+                        } else {
+                            variant.as_str()
+                        };
+                        covered.push(v);
+                    }
+                }
+                let missing: Vec<&str> = ["Ok", "Unknown", "Err"]
+                    .iter()
+                    .filter(|w| !covered.contains(w))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(self.err(span, format!(
+                        "non-exhaustive match on `Result` — missing: {}. A Result has \
+                         THREE outcomes, and `Unknown` is not a kind of `Err`: it means \
+                         the answer is not known, which is not a failure. Add the \
+                         missing arm(s), use `tresult` (which requires all three), or \
+                         add a wildcard `_` if the omission is deliberate.",
                         missing.join(", ")
                     )));
                 }

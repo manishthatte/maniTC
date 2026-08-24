@@ -24,6 +24,14 @@ pub struct IRModule {
     pub float_literals: Vec<(String, i64)>,    // (label, f64-bits-as-i64)
     pub static_structs: Vec<IRStaticStruct>,   // payloads for struct-valued globals
     pub struct_sizes: std::collections::HashMap<String, usize>, // struct name → number of fields
+    /// R2: the language version this module was lowered under.
+    ///
+    /// The lowerer sets it and the backends read it. It rides on the module
+    /// rather than being threaded separately into codegen because the two
+    /// consumers are the lowerer (which picks `DivNear` over `Div`) and
+    /// `codegen_llvm` (which adds N5's range checks), and a second plumbing
+    /// path for the second consumer is a second thing to forget.
+    pub lang: crate::lang::LangVersion,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +285,40 @@ pub enum IRInstr {
         dst: IRTemp,
         a: IRValue,
     },
+    /// C7: the three-way sign of a WORD — `-1`, `0` or `+1`.
+    ///
+    /// A separate instruction rather than a composition, for two reasons.
+    ///
+    /// The first is that it is genuinely one instruction on the target. T3ISA
+    /// R0 always reads as zero, so `TCMP Rd, Ra, R0` computes the sign
+    /// directly. That is the fact the recommendations single out about this
+    /// operation: in two's complement sign is a branch or a shift-and-or; in
+    /// balanced ternary it is the leading non-zero trit and the machine reads
+    /// it in one step.
+    ///
+    /// The second is that it could NOT have been composed from `TritMin` and
+    /// `TritMax`. Those are trit-width — the LLVM backend types both `i8` —
+    /// so `TritMax(TritMin(x, 1), -1)` truncates its operand to 8 bits before
+    /// clamping it, and `sign(256)` would be `0` rather than `+1`. This
+    /// instruction is word-width on both backends by construction.
+    TritSign {
+        dst: IRTemp,
+        a: IRValue,
+    },
+    /// C2 / T3ISA v1.5: a lane-wise ternary operation on a whole word.
+    ///
+    /// Distinct from `TritMin`/`TritMax`, which are NUMERIC min/max on the
+    /// word as a magnitude. This treats the same word as 27 independent trit
+    /// lanes — the shape a 27-trit register actually has when it holds data
+    /// rather than a number. On T3 it is one instruction; on LLVM it is a
+    /// runtime call, because a 27-lane balanced-ternary loop is not something
+    /// binary hardware expresses inline.
+    TritLane {
+        dst: IRTemp,
+        op: IRLaneOp,
+        a: IRValue,
+        b: IRValue,
+    },
     // Intrinsic print operations
     PrintStr(IRValue),
     PrintInt(IRValue),
@@ -324,13 +366,76 @@ pub enum IRTerminator {
 // Operator enums
 // ---------------------------------------------------------------------------
 
+/// C2: which lane-wise operation `IRInstr::TritLane` performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IRLaneOp {
+    /// Lane-wise min — the lane-wise Lukasiewicz conjunction.
+    And,
+    /// Lane-wise max — the lane-wise disjunction.
+    Or,
+    /// Lane-wise balanced sum mod 3. Not an involution: three applications,
+    /// not two, recover the original.
+    Xor,
+    /// Lane-wise Lukasiewicz implication, `min(+1, 1 - a + b)` per lane.
+    Imp,
+    /// Lane-wise three-way compare, `sign(a_i - b_i)` per lane.
+    Cmp,
+    /// Count the lanes of `a` equal to the trit `b`. The only member whose
+    /// result is a COUNT rather than a word, which is why it is here rather
+    /// than in a separate instruction: it shares every operand rule.
+    Popcount,
+}
+
 #[derive(Debug, Clone)]
 pub enum IRBinOp {
     Add,
     Sub,
     Mul,
+    /// N5: `int` addition that must stay inside the 27-trit word.
+    ///
+    /// The three `*T27` variants exist because `int`, `t27` and `trint` all
+    /// lower to `IRType::I64` and only the first two are 27 trits wide. The
+    /// distinction has to survive to the backends somehow, and an extra
+    /// operation is the cheapest carrier: adding an `IRType::T27` would touch
+    /// every match on `IRType` in both backends, and a flag on
+    /// `IRInstr::BinOp` would touch every construction site.
+    ///
+    /// On T3 these ARE `Add`/`Sub`/`Mul` — the machine's word is 27 trits and
+    /// `checked27` already traps — so they cost nothing there. On LLVM each
+    /// gets a guard call. Emitted only under `--lang v2`, and only for `int`
+    /// and `t27`; `trint` keeps the unchecked machine word, which is the point
+    /// of having it.
+    AddT27,
+    /// N5: `int` subtraction that must stay inside the 27-trit word.
+    SubT27,
+    /// N5: `int` multiplication that must stay inside the 27-trit word.
+    MulT27,
+    /// Truncating division — C's `/`, and what the surface `/` lowers to
+    /// under V1.
+    ///
+    /// C4 does NOT change what this means. It stays truncating because the
+    /// compiler's own lowerings use it — `lower_timp` and its neighbours
+    /// divide by powers of three to reach a lane, and a lane index that
+    /// rounded would be the wrong lane. Under V2 the surface operator lowers
+    /// to `DivNear` instead and this one is reached only from internal
+    /// lowerings and from `math::div_trunc`.
     Div,
+    /// Truncating remainder — the partner of `Div`, unchanged by C4.
     Rem,
+    /// C4: division rounded to nearest, ties away from zero.
+    ///
+    /// Emitted for the surface `/` on an integer type under V2. One
+    /// instruction on T3 (`TDIVN`, T3ISA v1.6); a short branchless sequence on
+    /// LLVM. The rule itself is `lang::div_nearest`, which is also what the
+    /// constant folder and the emulator use, so there is one definition of it
+    /// rather than three.
+    DivNear,
+    /// C4: the balanced remainder, `a - DivNear(a, b) * b`.
+    ///
+    /// Moves with `DivNear` and not separately: the identity
+    /// `(a / b) * b + (a % b) == a` holds in both modes only because the two
+    /// operators change together.
+    RemNear,
     IEq,
     INe,
     ILt,

@@ -394,12 +394,29 @@ fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> 
         "TSUB" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tsub, reg!(0), reg!(1), r2, imv) }
         "TMUL" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmul, reg!(0), reg!(1), r2, imv) }
         "TDIV" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tdiv, reg!(0), reg!(1), r2, imv) }
+        // T3ISA v1.6 (C4): the rounding pair. Same operand shape as TDIV/TMOD.
+        "TDIVN" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tdivn, reg!(0), reg!(1), r2, imv) }
+        "TMODN" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmodn, reg!(0), reg!(1), r2, imv) }
         "TMOD" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmod, reg!(0), reg!(1), r2, imv) }
         "TAND" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tand, reg!(0), reg!(1), r2, imv) }
         "TOR"  => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tor,  reg!(0), reg!(1), r2, imv) }
         "TMIN" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmin, reg!(0), reg!(1), r2, imv) }
         "TMAX" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tmax, reg!(0), reg!(1), r2, imv) }
         "TCMP" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tcmp, reg!(0), reg!(1), r2, imv) }
+
+        // T3ISA v1.5: lane-wise ternary logic (C2). Same three-operand shape
+        // as their word-level counterparts above, so nothing about the
+        // assembler's operand grammar changes.
+        "TANDW" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tandw, reg!(0), reg!(1), r2, imv) }
+        "TORW"  => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Torw,  reg!(0), reg!(1), r2, imv) }
+        "TXORW" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Txorw, reg!(0), reg!(1), r2, imv) }
+        "TIMPW" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Timpw, reg!(0), reg!(1), r2, imv) }
+        "TCMPW" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tcmpw, reg!(0), reg!(1), r2, imv) }
+        "TPOPC" => { let (r2, imv) = reg_or_imm_pair!(2, 2); encode(Opcode::Tpopc, reg!(0), reg!(1), r2, imv) }
+        // TSELW Rd, Rs, Ra, Rb — the fourth register rides in the 3-trit
+        // immediate field, which holds exactly 27 raw values for exactly 27
+        // registers. See the emulator's Tselw arm.
+        "TSELW" => encode(Opcode::Tselw, reg!(0), reg!(1), reg!(2), (reg!(3) as i64) - (if reg!(3) > 13 { 27 } else { 0 })),
 
         "TNEG" => encode(Opcode::Tneg, reg!(0), reg!(1), 0, 0),
         "TNOT" => encode(Opcode::Tnot, reg!(0), reg!(1), 0, 0),

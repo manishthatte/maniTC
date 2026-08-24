@@ -136,7 +136,22 @@ void Vec_sort_str(ManitVec* v) {
 
 typedef int64_t (*ManitFn1)(int64_t);
 typedef int64_t (*ManitFn2)(int64_t, int64_t);
-typedef int     (*ManitPred)(int64_t);
+/* `_Bool`, not `int`. A maniT `bool` is `i1` in the emitted LLVM IR, and the
+ * x86-64 psABI leaves the bits ABOVE bit 0 of the return register UNDEFINED
+ * for an i1 return. Declaring the callback as returning `int` therefore read
+ * 31 bits of whatever the callee happened to leave in EAX.
+ *
+ * It was latent for as long as the generated code happened to leave those bits
+ * clear — a truncating `x % 2` ends in `sub; sete %al` with a small value
+ * already in RAX — and it stopped being latent the moment C4's rounding
+ * sequence left -1 there instead: `sete %al` cleared AL and left
+ * 0xFFFFFFFFFFFFFF00, so `if (f(...))` was true for every element and
+ * `Vec::filter` returned the whole vector. Found by cross-backend parity on
+ * examples/data_structures.mt under --lang v2; the T3 backend, whose syscall
+ * ABI returns a whole word, was right throughout.
+ *
+ * `_Bool` is the type that matches an i1 return: clang reads only AL for it. */
+typedef _Bool   (*ManitPred)(int64_t);
 
 void Vec_for_each(ManitVec* v, ManitFn1 f) {
     if (!v || !f) return;

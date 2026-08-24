@@ -1,6 +1,6 @@
 // emulator/profiler.rs — Task (cooperative scheduler) and ExecProfile.
 // Included as pub mod profiler in emulator/mod.rs.
-use super::super::isa::Opcode;
+use super::super::isa::{Opcode, T3_OPCODE_COUNT};
 
 // ---------------------------------------------------------------------------
 // Cooperative scheduler task
@@ -32,7 +32,7 @@ pub struct ExecProfile {
     /// Total instructions executed.
     pub total_instructions: usize,
     /// Per-opcode instruction counts (indexed by Opcode discriminant, 0..=35).
-    pub opcode_counts: [usize; 36],
+    pub opcode_counts: [usize; T3_OPCODE_COUNT],
     /// Maximum call depth reached.
     pub max_call_depth: usize,
     /// Maximum heap pointer (bytes allocated).
@@ -53,7 +53,7 @@ impl ExecProfile {
     pub fn new() -> Self {
         ExecProfile {
             total_instructions: 0,
-            opcode_counts: [0; 36],
+            opcode_counts: [0; T3_OPCODE_COUNT],
             max_call_depth: 0,
             max_heap_ptr: 0,
             program_words: 0,
@@ -74,11 +74,21 @@ impl ExecProfile {
         match op {
             Opcode::Tand | Opcode::Tor | Opcode::Tnot |
             Opcode::Tbranch | Opcode::Tmin | Opcode::Tmax |
-            Opcode::Tshi | Opcode::Tshr => {
+            Opcode::Tshi | Opcode::Tshr |
+            // v1.5 lane-wise ops are the MOST ternary-native instructions in
+            // the set — each replaces 27 extract-operate-insert cycles — so
+            // they belong in this count rather than outside it.
+            Opcode::Tandw | Opcode::Torw | Opcode::Txorw | Opcode::Timpw |
+            Opcode::Tcmpw | Opcode::Tpopc | Opcode::Tselw => {
                 self.ternary_native_ops += 1;
             }
             Opcode::Tadd | Opcode::Tsub | Opcode::Tmul |
-            Opcode::Tdiv | Opcode::Tmod | Opcode::Tneg => {
+            Opcode::Tdiv | Opcode::Tmod | Opcode::Tneg |
+            // v1.6 (C4). Arithmetic, not ternary-native: rounding to nearest
+            // is what the representation makes CHEAP, but the instruction
+            // computes a quotient, and counting it as ternary-native would
+            // inflate that share for every program that divides.
+            Opcode::Tdivn | Opcode::Tmodn => {
                 self.arithmetic_ops += 1;
             }
             Opcode::Jump | Opcode::Call | Opcode::Ret | Opcode::Callr |
@@ -122,7 +132,13 @@ impl ExecProfile {
             "TCMP","LOAD","STORE","TLIT","MOV","TBRANCH","JUMP",
             "CALL","RET","HALT","SYSCALL","TBRPOS","TBRZERO","TBRNEG",
             "CALLR","BAND","BOR","BXOR","BSHL","BSHR","LOADT","STORET",
+            // v1.5 lane-wise group, opcodes 36-42.
+            "TANDW","TORW","TXORW","TIMPW","TCMPW","TPOPC","TSELW",
+            // v1.6 rounding pair, opcodes 43-44.
+            "TDIVN","TMODN",
         ];
+        debug_assert_eq!(names.len(), T3_OPCODE_COUNT,
+            "opcode name table out of step with the opcode set");
         for (i, &count) in self.opcode_counts.iter().enumerate() {
             if count > 0 && i < names.len() {
                 sorted.push((count, names[i]));

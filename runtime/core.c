@@ -15,6 +15,15 @@
  * Exit status 70 matches T3_TRAP_EXIT on the T3 side. */
 #define MANIT_TRAP_EXIT 70
 
+/* (3^27 - 1) / 2 — the 27-trit word range.
+ *
+ * Defined here rather than beside the lane-wise helpers further down, because
+ * the N5 guards below need it and they come first. There is ONE definition:
+ * two would be two numbers to keep equal, and this file's whole subject is a
+ * representation whose bounds are exact. */
+#define MANIT_T3_MAX   3812798742493LL
+#define MANIT_T3_MIN   (-3812798742493LL)
+
 void manit_fault(const char* msg) {
     fflush(stdout);
     fprintf(stderr, "TRAP: %s\n", msg ? msg : "runtime fault");
@@ -25,6 +34,68 @@ void manit_fault(const char* msg) {
 /* Divisor guard: called immediately before an integer sdiv/srem. */
 void manit_check_divisor(int64_t d) {
     if (d == 0) manit_fault("division by zero");
+}
+
+/* N5 (--lang v2): the 27-trit range guards.
+ *
+ * `int` is 27 trits on the T3 machine and was 64 bits here, so a value in
+ * (3812798742493, 2^63-1] existed on one backend and not the other:
+ * `let m: int = 3812798742493; m + 1` traps on T3 and answered 3812798742494
+ * on LLVM. Under v2 `int` means 27 trits everywhere, which on a 64-bit machine
+ * means checking. `trint` is the wider type for code that wants the machine
+ * word, and is not checked.
+ *
+ * Called BEFORE the arithmetic, on the OPERANDS, which is the same shape as
+ * manit_check_divisor above and is what makes the check exact: the true result
+ * is computed here in __int128, so a product that overflows int64 is caught on
+ * its real value rather than on a wrapped or saturated one. Doing it after the
+ * fact in int64 would have missed exactly the multiplications that overflow
+ * hardest.
+ *
+ * The cost is a call per `int` add/sub/mul, not a compare-and-branch: the LLVM
+ * emitter builds one straight-line sequence per IR instruction and cannot open
+ * a new basic block in the middle of one. It is the same cost the divisor
+ * guard already pays on every integer division, and it is paid only by code
+ * compiled with --lang v2. */
+static void manit_t27_fault(const char* what, __int128 v) {
+    /* No printf length modifier for __int128; the value is rendered by hand.
+     * It is at most 39 digits plus a sign. */
+    char digits[48];
+    int n = 0;
+    int neg = v < 0;
+    unsigned __int128 m = neg ? (unsigned __int128)(-v) : (unsigned __int128)v;
+    if (m == 0) digits[n++] = '0';
+    while (m > 0) { digits[n++] = (char)('0' + (int)(m % 10)); m /= 10; }
+    char num[52];
+    int k = 0;
+    if (neg) num[k++] = '-';
+    while (n > 0) num[k++] = digits[--n];
+    num[k] = '\0';
+
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "%s overflow: result %s is outside the 27-trit range "
+             "[%lld, %lld]",
+             what, num, (long long)MANIT_T3_MIN, (long long)MANIT_T3_MAX);
+    manit_fault(buf);
+}
+
+void manit_check_t27_add(int64_t a, int64_t b) {
+    __int128 r = (__int128)a + (__int128)b;
+    if (r > MANIT_T3_MAX || r < MANIT_T3_MIN)
+        manit_t27_fault("int addition", r);
+}
+
+void manit_check_t27_sub(int64_t a, int64_t b) {
+    __int128 r = (__int128)a - (__int128)b;
+    if (r > MANIT_T3_MAX || r < MANIT_T3_MIN)
+        manit_t27_fault("int subtraction", r);
+}
+
+void manit_check_t27_mul(int64_t a, int64_t b) {
+    __int128 r = (__int128)a * (__int128)b;
+    if (r > MANIT_T3_MAX || r < MANIT_T3_MIN)
+        manit_t27_fault("int multiplication", r);
 }
 
 /* Bounds guard: called before indexing a fixed-length array. */
@@ -524,3 +595,105 @@ char* str_from_char(int64_t c) {
     return out;
 }
 int   str_eq(const char* a, const char* b) { return strcmp(a, b) == 0; }
+
+/* ------------------------------------------------------------------------
+ * T3ISA v1.5 — lane-wise ternary logic (recommendation C2)
+ * ------------------------------------------------------------------------
+ *
+ * On T3ISA each of these is ONE instruction (TANDW, TORW, TXORW, TIMPW,
+ * TCMPW, TPOPC). On a binary machine there is no representation of a
+ * balanced trit to extract with a mask, so each is a loop over 27 digits.
+ * That gap is the performance argument for the ISA rather than a defect in
+ * this file: the binary target pays what binary hardware has to pay.
+ *
+ * Every lane result is in {-1, 0, +1} by construction, so the reassembled
+ * word is always in range and none of these can overflow.
+ */
+
+#define MANIT_T3_LANES 27
+/* MANIT_T3_MAX / MANIT_T3_MIN are defined at the top of this file, beside the
+ * N5 guards that also need them. */
+
+static int64_t manit_clamp27(int64_t v) {
+    if (v > MANIT_T3_MAX) return MANIT_T3_MAX;
+    if (v < MANIT_T3_MIN) return MANIT_T3_MIN;
+    return v;
+}
+
+/* Split a word into balanced-ternary trits, least significant first.
+ *
+ * Floor division throughout. C's `/` truncates toward zero, which disagrees
+ * with a non-negative remainder for negative operands and silently yields the
+ * wrong digits — the Rust side had exactly this defect and -8 decomposed to
+ * +4. The digit and the carry must come from the SAME division. */
+static void manit_trits27(int64_t v, signed char* out) {
+    int64_t n = manit_clamp27(v);
+    for (int i = 0; i < MANIT_T3_LANES; i++) {
+        int64_t r = n % 3;
+        int64_t q = n / 3;
+        if (r < 0) { r += 3; q -= 1; }   /* make it a floor division */
+        if (r == 2) { r = -1; q += 1; }  /* re-centre: balanced, not base-3 */
+        out[i] = (signed char)r;
+        n = q;
+    }
+}
+
+static int64_t manit_from_trits27(const signed char* lanes) {
+    int64_t v = 0;
+    for (int i = MANIT_T3_LANES - 1; i >= 0; i--) {
+        v = v * 3 + lanes[i];
+    }
+    return manit_clamp27(v);
+}
+
+static int64_t manit_lanewise2(int64_t a, int64_t b,
+                               signed char (*f)(signed char, signed char)) {
+    signed char la[MANIT_T3_LANES], lb[MANIT_T3_LANES], out[MANIT_T3_LANES];
+    manit_trits27(a, la);
+    manit_trits27(b, lb);
+    for (int i = 0; i < MANIT_T3_LANES; i++) out[i] = f(la[i], lb[i]);
+    return manit_from_trits27(out);
+}
+
+static signed char manit_trit_min(signed char a, signed char b) { return a < b ? a : b; }
+static signed char manit_trit_max(signed char a, signed char b) { return a > b ? a : b; }
+
+/* Balanced sum mod 3. Not an involution: 3k = 0 (mod 3), so three
+ * applications are needed to recover the original, not two. */
+static signed char manit_trit_xor(signed char a, signed char b) {
+    int s = (a + b) % 3;
+    if (s < 0) s += 3;
+    return (signed char)(s == 2 ? -1 : s);
+}
+
+/* Lukasiewicz implication, min(+1, 1 - a + b). The a = b = 0 cell gives +1
+ * where Kleene's max(-a, b) gives 0, and that single cell is what makes the
+ * logic L3 rather than K3. */
+static signed char manit_trit_imp(signed char a, signed char b) {
+    int v = 1 - a + b;
+    return (signed char)(v > 1 ? 1 : v);
+}
+
+static signed char manit_trit_cmp(signed char a, signed char b) {
+    return (signed char)(a > b ? 1 : (a < b ? -1 : 0));
+}
+
+int64_t manit_lane_and(int64_t a, int64_t b) { return manit_lanewise2(a, b, manit_trit_min); }
+int64_t manit_lane_or(int64_t a, int64_t b)  { return manit_lanewise2(a, b, manit_trit_max); }
+int64_t manit_lane_xor(int64_t a, int64_t b) { return manit_lanewise2(a, b, manit_trit_xor); }
+int64_t manit_lane_imp(int64_t a, int64_t b) { return manit_lanewise2(a, b, manit_trit_imp); }
+int64_t manit_lane_cmp(int64_t a, int64_t b) { return manit_lanewise2(a, b, manit_trit_cmp); }
+
+/* Count the lanes of `x` equal to the trit `k`.
+ *
+ * `k` is clamped into {-1, 0, +1}: a "count of lanes equal to 7" has no
+ * meaning, and silently answering zero would hide the mistake rather than
+ * report it. */
+int64_t manit_lane_popcount(int64_t x, int64_t k) {
+    signed char lanes[MANIT_T3_LANES];
+    signed char want = (signed char)(k > 1 ? 1 : (k < -1 ? -1 : k));
+    int64_t n = 0;
+    manit_trits27(x, lanes);
+    for (int i = 0; i < MANIT_T3_LANES; i++) if (lanes[i] == want) n++;
+    return n;
+}

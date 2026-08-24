@@ -136,6 +136,46 @@ fn sign(n: int) -> int {
 }
 
 // ---------------------------------------------------------------------------
+// Division, named rather than assumed  (recommendation C4)
+// ---------------------------------------------------------------------------
+//
+// `/` and `%` mean different things in the two language versions: they
+// truncate under v1 and round to nearest, ties away from zero, under v2. These
+// four name the two behaviours explicitly, and all four mean the same thing in
+// BOTH versions. Code written over them says which division it wants and keeps
+// saying it across the version boundary; `--warn division-semantics` lists the
+// `/` and `%` sites that have not yet been made to say.
+//
+// The two modes are PAIRS, and mixing them across a pair breaks the identity
+// `(a / b) * b + (a % b) == a`, which holds for `(div_trunc, rem_trunc)` and
+// for `(div_near, rem_near)` and for neither crossing. Pair them.
+//
+// All four are lowered in the IR lowerer (ir/lower/lower_expr.rs) to the IR
+// operations the surface operators use, so they cost exactly what the operator
+// costs — no call, no dispatch — and they cannot drift from it. That is the
+// `trit::` route rather than the per-backend-intercept route `math` took
+// elsewhere in this file; see stdlib/trit.mt for what the difference measured.
+
+// Truncating division — the quotient rounded towards zero. v1's `/`.
+fn div_trunc(a: int, b: int) -> int ;  // native
+
+// The remainder pairing with div_trunc. Takes the sign of `a`. v1's `%`.
+fn rem_trunc(a: int, b: int) -> int ;  // native
+
+// Division rounded to the nearest integer, ties away from zero. v2's `/`.
+//
+// Ties go away from zero rather than to even because the balanced system is
+// symmetric about zero and `div_near(-a, b) == -div_near(a, b)` is the
+// property worth keeping; the unbiasedness balanced ternary claims comes from
+// the representation, not from the tie-break.
+fn div_near(a: int, b: int) -> int ;  // native
+
+// The balanced remainder pairing with div_near — `a - div_near(a, b) * b`.
+// Lies in [-|b|/2, +|b|/2], so unlike rem_trunc it can be negative for a
+// positive `a`: `div_near(7, 2)` is 4 and `rem_near(7, 2)` is -1. v2's `%`.
+fn rem_near(a: int, b: int) -> int ;  // native
+
+// ---------------------------------------------------------------------------
 // Powers and roots
 // ---------------------------------------------------------------------------
 

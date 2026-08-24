@@ -5,13 +5,83 @@ used as the backend for maniT's balanced ternary compilation target. This docume
 specifies the architecture, instruction set, encoding, assembly syntax, and emulator
 behaviour.
 
-**Specification version 1.4** — tagged `t3isa-spec-v1.4` in this repository.
+**Specification version 1.6** — tagged `t3isa-spec-v1.6` in this repository.
 This document is the normative definition of T3ISA; independent implementations
 should cite the tagged version they were written against. Where this document
 and the maniTC emulator disagree, that is a specification bug — please report it.
 
-Change since 1.3, and unlike the 1.3 changes this one **alters the architecture**,
-so implementations written against 1.3 or earlier are not conformant to 1.4:
+Change since 1.5. Like 1.4 and 1.5 this one **alters the architecture**: it ADDS
+INSTRUCTIONS, so an implementation written against 1.5 or earlier will decode a
+conformant 1.6 program as invalid. A 1.6 implementation runs every 1.5 program
+unchanged; the reverse does not hold.
+
+- **§5 Two rounding instructions, opcodes 43–44** — `TDIVN`, `TMODN`. Same
+  operand shape as `TDIV`/`TMOD`: three-address, with the third operand a
+  register or an immediate.
+
+  `TDIVN Rd, Ra, Rb` sets `Rd` to `Ra / Rb` **rounded to the nearest integer,
+  ties away from zero**. `TMODN Rd, Ra, Rb` sets `Rd` to the remainder that
+  pairs with it, `Ra − TDIVN(Ra, Rb) × Rb`. Both trap on a zero divisor,
+  exactly as `TDIV` and `TMOD` do, and both check their result against the
+  27-trit range under the 1.4 rule.
+
+  `TDIV` and `TMOD` are unchanged and remain truncating. The two pairs are
+  alternatives, not a replacement: `(TDIV, TMOD)` and `(TDIVN, TMODN)`, with
+  `(a / b) × b + (a % b) = a` holding for each pair and for neither crossing.
+
+  **Why the ISA has this at all.** Truncation is C's rule, imported from a
+  representation this machine does not use. In balanced ternary, dropping low
+  trits *is* rounding to nearest — `TSHR` has rounded correctly since 1.0 — so
+  truncating is extra work done to imitate two's complement. A binary machine
+  needs sixteen instructions to compute what `TDIVN` computes in one, and the
+  maniTC LLVM backend emits exactly those sixteen; that ratio is the same
+  argument the lane-wise group makes in 1.5, on a different operation.
+
+  Ties go away from zero rather than to even, because the balanced range is
+  symmetric about zero and `TDIVN(−a, b) = −TDIVN(a, b)` should hold. Nothing
+  is asserted here about statistical bias: balanced ternary's unbiasedness is a
+  property of the representation, not of a tie-break.
+
+  Opcodes 43 and 44 previously decoded as invalid; 45 and above still do. The
+  1.5 note reserving 43+ against a `TNOTW` still stands — these are not it, and
+  no implementation may assign a lane-wise negation to any opcode.
+
+Change in 1.5. Like the 1.4 change this one **alters the architecture**, and
+more substantially: it ADDS INSTRUCTIONS, so an implementation written against
+1.4 or earlier will decode a conformant 1.5 program as invalid. A 1.5
+implementation runs every 1.4 program unchanged; the reverse does not hold.
+
+- **§4, §5 Seven lane-wise instructions, opcodes 36–42** — `TANDW`, `TORW`,
+  `TXORW`, `TIMPW`, `TCMPW`, `TPOPC`, `TSELW`. They read a word as 27
+  independent trits rather than as one magnitude, so each performs 27
+  three-valued operations in a single instruction. Opcodes 36 and above
+  previously decoded as invalid; 43 and above still do.
+
+  This is the architectural claim the ISA exists to make. A binary machine has
+  no equivalent: 64 bits are 64 lanes of HALF a datum each — a bit cannot carry
+  a three-valued answer — whereas 27 trits are 27 lanes of genuinely
+  three-valued data. Emulating one `TANDW` on a binary machine costs 27
+  extract-operate-insert cycles, each a division and a multiply by a power of
+  three. That gap is measured, not assumed — see §5, which reports 2
+  instructions against 3,034 for the same operation.
+
+  (The 1.5 text said "43 and above still do" of invalid opcodes. 1.6 assigns 43
+  and 44; 45 and above still decode as invalid.)
+
+  No lane-wise instruction can trap. Every lane result is in {−1, 0, +1} by
+  construction, so the reassembled word is in range by construction — a
+  property of the balanced representation rather than a bound being enforced.
+  This does not weaken the 1.4 overflow rule: nothing here silently clamps a
+  result, because no result can leave the range in the first place.
+
+- **`TNOTW` is deliberately absent, and its absence is normative.** Lane-wise
+  negation is `TNEG` (opcode 6). Negating a balanced-ternary number flips the
+  sign of every trit in it, so `TNEG` already negates all 27 lanes and has done
+  since 1.0. Adding a `TNOTW` would have published a second encoding of an
+  existing instruction. Implementations must not assign opcode 43+ to one.
+
+Change in 1.4, which also **altered the architecture**, so implementations
+written against 1.3 or earlier are not conformant to 1.4:
 
 - **§1 Arithmetic now traps on overflow instead of saturating.** `TADD`, `TSUB`,
   `TMUL` and `TSHI` halt the machine and report the operation and the offending
@@ -163,8 +233,10 @@ Wide immediate fits ±(3^13−1)/2 = ±797,161.
 
 ### Opcode values
 
-The `opcode` field holds one of the following 36 values. Values 36 and above
-are unassigned and decode as an invalid instruction.
+The `opcode` field holds one of the following 43 values. Values 43 and above
+are unassigned and decode as an invalid instruction. (The 9-trit opcode field
+holds ±9,841, so the encoding has room; the limit is what this specification
+assigns, not what the word can express.)
 
 | # | Mnemonic | Operands | Operation |
 |---|----------|----------|-----------|
@@ -204,9 +276,23 @@ are unassigned and decode as an invalid instruction.
 | 33 | `BSHR` | Rd, Ra, Rb\|#imm | Rd = clamp27(Ra >> n), n = rhs clamped to 0..63, arithmetic |
 | 34 | `LOADT` | Rd, [Ra+#imm] | Rd = clamp(memory[Ra + imm], −1, +1) — single trit |
 | 35 | `STORET` | Rs, [Ra+#imm] | memory[Ra + imm] = clamp(Rs, −1, +1) — single trit |
+| 36 | `TANDW` | Rd, Ra, Rb\|#imm | Rd = lane-wise min(a_i, b_i), 27 lanes |
+| 37 | `TORW` | Rd, Ra, Rb\|#imm | Rd = lane-wise max(a_i, b_i), 27 lanes |
+| 38 | `TXORW` | Rd, Ra, Rb\|#imm | Rd = lane-wise balanced sum mod 3, 27 lanes |
+| 39 | `TIMPW` | Rd, Ra, Rb\|#imm | Rd = lane-wise min(+1, 1 − a_i + b_i), 27 lanes |
+| 40 | `TCMPW` | Rd, Ra, Rb\|#imm | Rd = lane-wise sign(a_i − b_i), 27 lanes |
+| 41 | `TPOPC` | Rd, Ra, Rb\|#imm | Rd = count of lanes of Ra equal to trit k = clamp(rhs, −1, +1) |
+| 42 | `TSELW` | Rd, Rs, Ra, Rb | per-lane select: s_i > 0 → a_i, s_i < 0 → b_i, s_i = 0 → 0 |
+| 43 | `TDIVN` | Rd, Ra, Rb\|#imm | Rd = a / b rounded to nearest, ties away from zero |
+| 44 | `TMODN` | Rd, Ra, Rb\|#imm | Rd = a − TDIVN(a, b) × b — the balanced remainder |
 
 Opcodes 29–35 are the binary-interop and single-trit memory group: they let a
 ternary program manipulate packed binary values without leaving the machine.
+
+Opcodes 36–42 are the lane-wise group, new in 1.5. See §5 for their normative
+definition.
+
+Opcodes 43–44 are the rounding pair, new in 1.6. See §5.
 
 ### The effective right-hand operand
 
@@ -218,9 +304,9 @@ rhs = regs[r3] + imm
 
 `R0` reads as zero, so `r3 = 0` with `imm = n` encodes an immediate, and
 `imm = 0` with `r3 = n` encodes a register. Both forms are legal on `TADD`,
-`TSUB`, `TMUL`, `TDIV`, `TMOD`, `TSHI`, `TSHR`, `TMIN`, `TMAX`, `TCMP`,
-`BAND`, `BOR`, `BXOR`, `BSHL` and `BSHR`. An implementation must not assume
-the immediate form is the only one.
+`TSUB`, `TMUL`, `TDIV`, `TMOD`, `TDIVN`, `TMODN`, `TSHI`, `TSHR`, `TMIN`,
+`TMAX`, `TCMP`, `BAND`, `BOR`, `BXOR`, `BSHL` and `BSHR`. An implementation
+must not assume the immediate form is the only one.
 
 ### TBRANCH encoding
 
@@ -238,12 +324,53 @@ the immediate form is the only one.
 
 | Mnemonic | Operands | Operation |
 |----------|----------|-----------|
-| `TADD` | Rd, Ra, Rb | Rd = clamp27(Ra + Rb) |
-| `TSUB` | Rd, Ra, Rb | Rd = clamp27(Ra − Rb) |
-| `TMUL` | Rd, Ra, Rb | Rd = clamp27(Ra × Rb) |
+| `TADD` | Rd, Ra, Rb | Rd = Ra + Rb, trapping if the true result leaves the range |
+| `TSUB` | Rd, Ra, Rb | Rd = Ra − Rb, trapping if the true result leaves the range |
+| `TMUL` | Rd, Ra, Rb | Rd = Ra × Rb, trapping if the true result leaves the range |
 | `TDIV` | Rd, Ra, Rb | Rd = Ra ÷ Rb (truncate toward zero; Rb = 0 traps) |
 | `TMOD` | Rd, Ra, Rb | Rd = Ra rem Rb (truncating remainder, sign of the dividend; Rb = 0 traps) |
+| `TDIVN` | Rd, Ra, Rb | Rd = Ra ÷ Rb rounded to nearest, ties away from zero (v1.6; Rb = 0 traps) |
+| `TMODN` | Rd, Ra, Rb | Rd = Ra − TDIVN(Ra, Rb) × Rb — the balanced remainder (v1.6; Rb = 0 traps) |
 | `TNEG` | Rd, Ra | Rd = −Ra |
+
+The first three rows said `clamp27(...)` until 1.6. That was left over from 1.3
+and contradicted 1.4's own change note in this document: since 1.4 these trap
+rather than clamp, and nothing in T3ISA silently substitutes ±T3_MAX for a
+result it cannot represent. Corrected, not changed — the emulator has trapped
+since 1.4.
+
+### Rounding division (v1.6)
+
+`TDIVN` and `TMODN` are the round-to-nearest pair. They exist because
+truncation is C's rule and this is not a two's-complement machine: dropping low
+trits *is* rounding to nearest here, which is why `TSHR` has always rounded,
+and `TDIV` spends work to imitate a representation the machine does not use.
+
+Normative, not commentary:
+
+- **The two move together.** `TMODN` is defined from `TDIVN`, so
+  `(a ÷ b) × b + (a rem b) = a` holds for `(TDIVN, TMODN)` exactly as it does
+  for `(TDIV, TMOD)`. An implementation that rounds one and truncates the other
+  is not conformant.
+- **Ties go away from zero**, so `TDIVN(−a, b) = −TDIVN(a, b)` for every `a`
+  and every `b ≠ 0`. Round-half-to-even is *not* conformant here, and the
+  reason for the choice is symmetry rather than statistical bias — the latter
+  is a property of the representation, not of the tie-break.
+- **The balanced remainder can be negative for a positive dividend.** `TMODN`
+  yields a value in [−|b|/2, +|b|/2]; `TMODN Rd, 7, 2` is −1, where
+  `TMOD Rd, 7, 2` is +1.
+- **`TDIV` and `TMOD` are unchanged.** 1.6 adds instructions; it retires none.
+
+Worked cases, which double as the smallest conformance test for the pair:
+
+```
+    TDIVN(7, 2)  =  4      TMODN(7, 2)  = -1
+    TDIVN(-7, 2) = -4      TMODN(-7, 2) =  1
+    TDIVN(1, 3)  =  0      TMODN(1, 3)  =  1
+    TDIVN(2, 3)  =  1      TMODN(2, 3)  = -1
+    TDIVN(5, 3)  =  2      TMODN(5, 3)  = -1
+    TDIVN(4, 3)  =  1      TMODN(4, 3)  =  1
+```
 
 ### Logic
 
@@ -256,6 +383,88 @@ the immediate form is the only one.
 | `TSHR` | Rd, Ra, Rb | Rd = Ra ÷ 3^Rb (ternary shift right, round to nearest — drops the low Rb trits) |
 | `TMIN` | Rd, Ra, Rb | Rd = min(Ra, Rb) |
 | `TMAX` | Rd, Ra, Rb | Rd = max(Ra, Rb) |
+
+### Lane-wise logic (v1.5)
+
+Every instruction above treats a word as one number. These treat the same word
+as **27 independent trit lanes** and operate on all of them at once.
+
+Lanes are numbered from the least significant trit. Lane *i* of a word *w* is
+the balanced-ternary digit d_i in w = Σ d_i · 3^i with each d_i ∈ {−1, 0, +1}.
+The decomposition is unique, so "lane *i*" is well defined without reference to
+any storage format.
+
+| Mnemonic | Operands | Operation (for every lane i, 0 ≤ i < 27) |
+|----------|----------|------------------------------------------|
+| `TANDW` | Rd, Ra, Rb\|#imm | d_i = min(a_i, b_i) |
+| `TORW` | Rd, Ra, Rb\|#imm | d_i = max(a_i, b_i) |
+| `TXORW` | Rd, Ra, Rb\|#imm | d_i = balanced sum mod 3 of a_i and b_i |
+| `TIMPW` | Rd, Ra, Rb\|#imm | d_i = min(+1, 1 − a_i + b_i) |
+| `TCMPW` | Rd, Ra, Rb\|#imm | d_i = sign(a_i − b_i) |
+| `TPOPC` | Rd, Ra, Rb\|#imm | Rd = #{ i : a_i = k }, k = clamp(rhs, −1, +1) |
+| `TSELW` | Rd, Rs, Ra, Rb | d_i = a_i if s_i > 0; b_i if s_i < 0; 0 if s_i = 0 |
+
+Notes that are normative, not commentary:
+
+- **`TXORW` is not an involution.** The lane operation is addition mod 3 on a
+  balanced digit set, and 3k ≡ 0 (mod 3), so recovering the original word takes
+  **three** applications of the same key, not two. An implementation that makes
+  it self-inverse is not conformant.
+- **`TIMPW` is Łukasiewicz, not Kleene.** The a_i = b_i = 0 lane yields +1.
+  Kleene's max(−a, b) yields 0 there. The consequence is checkable in one line:
+  `TIMPW Rd, Ra, Ra` must produce the all-+1 word (+3,812,798,742,493) for
+  **every** Ra, including words with zero lanes. This is the deduction theorem
+  holding lane-wise, and it is the cheapest conformance test in this section.
+- **`TPOPC` returns a count, not a word.** Its result is in 0..=27 and is an
+  ordinary magnitude; it is the one member of the group whose output is not
+  read lane-wise.
+- **`TSELW` takes four registers in a three-register encoding.** Rb rides in the
+  3-trit immediate field read as UNSIGNED. That field holds 3^3 = 27 values and
+  the register file is R0..R26 — exactly 27 — so no new instruction format is
+  needed. The coincidence is not one: both numbers are "what three trits
+  address". `TSELW` is genuinely three-way — the zero lane selects zero rather
+  than choosing between two arms, which is a case a binary select does not have.
+- **None of these can trap.** Every lane result is in {−1, 0, +1} by
+  construction, so the reassembled word is in range by construction.
+- **`TSELW` is not emitted by the reference compiler.** It is assembled,
+  implemented and unit-tested like the rest of the group, and maniT has no
+  surface syntax that lowers to it, so on this implementation it is reachable
+  only from hand-written assembly. That is stated because it bears on
+  conformance: the other six instructions are exercised end-to-end by compiled
+  ManiT programs on both backends, and `TSELW`'s only coverage is the
+  emulator's own tests. An independent implementer should treat it as the
+  least-exercised part of v1.5 and test it accordingly.
+
+  The same was true of `TPOPC` until `trit::count(x, k)` landed alongside this
+  revision; it now has an end-to-end path.
+- **Operands are read as exactly 27 lanes.** A conformant machine cannot present
+  a wider value: §1 arithmetic traps on overflow, so a register never holds one.
+
+#### The measured cost of not having them
+
+R4 of the C2 plan requires this figure to be measured before it is quoted, so
+it is measured here rather than argued. Method: lane-wise AND of the same two
+words, 1000 calls, once as `TANDW` and once as the extract-operate-insert loop
+a machine without it must write, both compiled by maniTC and run on this
+emulator; a third run with the operation removed establishes the loop-harness
+baseline, which is subtracted from both.
+
+| | instructions per call, above baseline |
+|---|---|
+| `a tandw b` | **2** |
+| the same thing written out, 27 lanes | **3,034** (112 per lane) |
+
+That is **1,517× fewer instructions**, and the shape of the number is worth
+stating precisely because it is easy to quote wrongly. The 27 in "27-way SIMD"
+is the LANE COUNT — the parallelism — not the instruction ratio. The ratio is
+larger than 27 because each lane costs an extract (a division, a remainder and
+a rebalance) and an insert (a multiply by a power of three and an add), not one
+instruction.
+
+The honest caveat: 3,034 is compiler-generated code from maniT source, not
+hand-tuned assembly. A hand-written expansion would be tighter, so the
+architectural floor is nearer 100–200× than 1,517×. Both bounds are far above
+27, which is the point: the claim in the plan was conservative.
 
 ### Comparison
 

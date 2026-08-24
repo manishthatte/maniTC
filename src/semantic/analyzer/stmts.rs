@@ -242,6 +242,13 @@ impl SemanticAnalyzer {
                 // compound assignments additionally obey the binop rules.
                 if let Some(op) = &a.op {
                     self.binop_type(op, &target.ty, &value.ty, a.span)?;
+                    // C4/R2: `x /= 2` is a division site too, and the lowerer
+                    // routes it through the same `binop_to_ir` over the same
+                    // type — `a.value.ty`. Taking it from the other operand
+                    // here would make the backlog and the code generator
+                    // disagree about which sites the version change moves,
+                    // which is the one thing a migration list must not do.
+                    self.note_division_semantics(op, &value.ty, a.span);
                 } else if target.ty.is_known()
                     && value.ty.is_known()
                     && !types_compatible(&target.ty, &value.ty)
