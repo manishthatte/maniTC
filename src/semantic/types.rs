@@ -48,6 +48,26 @@ impl ManiType {
         !matches!(self, ManiType::Unknown)
     }
 
+    /// The same question asked all the way down.
+    ///
+    /// `is_known` is deliberately shallow, and for most callers that is right.
+    /// It is not right for deciding whether a DECLARED signature is precise
+    /// enough to enforce against: `async::spawn_task` declares
+    /// `Future<<unknown>>`, which is known at the top level and says nothing
+    /// about what it accepts. Enforcing on that rejected
+    /// `examples/concurrency.mt`, which is correct code.
+    pub fn fully_known(&self) -> bool {
+        use ManiType::*;
+        match self {
+            Unknown => false,
+            Array(e, _) => e.fully_known(),
+            Tuple(ts) => ts.iter().all(|t| t.fully_known()),
+            Generic(_, args) => args.iter().all(|t| t.fully_known()),
+            Fn(ps, r) => ps.iter().all(|t| t.fully_known()) && r.fully_known(),
+            _ => true,
+        }
+    }
+
     pub fn display(&self) -> String {
         match self {
             ManiType::Int => "int".to_string(),

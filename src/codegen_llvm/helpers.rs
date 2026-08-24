@@ -255,6 +255,30 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
 ///   * int/float → trit    — `as trit` clamps to {-1, 0, +1} (docs §expr,
 ///                           "Type cast"), so emit compare + two selects.
 ///   * everything else     — a single opcode from pick_cast_op.
+/// `float as <integer>`, SATURATING, via `llvm.fptosi.sat`.
+///
+/// Plain `fptosi` is UNDEFINED BEHAVIOUR when the value does not fit — NaN and
+/// both infinities included — and on x86 it yields the "integer indefinite"
+/// value, `i64::MIN`, for all of them. T3's `ftoi` is Rust's `as`, which
+/// saturates: NaN to 0, and out-of-range to the nearest bound. So the two
+/// backends disagreed on every out-of-range conversion, and the LLVM answer
+/// was not merely different but undefined.
+///
+/// It was not a theoretical divergence. `exp(nan)` in the math census reaches
+/// `n = (q - 0.5) as int`, which became `i64::MIN` on LLVM, and the scaling
+/// loop that follows — `while e < 0 { res = res * 0.5; e = e + 1; }` — then
+/// had 9.2e18 iterations to run. Three of the corpus's five LLVM hangs were
+/// this one cast (report.txt P23).
+///
+/// `llvm.fptosi.sat` has exactly Rust's semantics, so choosing it makes the
+/// backends agree by construction rather than by a second clamp.
+fn fptosi_sat(dst: &str, src: &str, to_s: &str) -> String {
+    format!(
+        "%{} = call {} @llvm.fptosi.sat.{}.f64(double {})",
+        dst, to_s, to_s, src
+    )
+}
+
 pub(crate) fn cast_sequence(dst: &str, src: &str, from: &IRType, to: &IRType) -> String {
     let from_s = llvm_type(from);
     let to_s = llvm_type(to);
@@ -283,18 +307,21 @@ pub(crate) fn cast_sequence(dst: &str, src: &str, from: &IRType, to: &IRType) ->
         (IRType::F64, IRType::Bool) => {
             format!("%{} = fcmp one double {}, 0.0", dst, src)
         }
+        // Float → integer: saturating, never raw `fptosi`. See `fptosi_sat`.
+        (IRType::F64, IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8) => {
+            fptosi_sat(dst, src, &to_s)
+        }
         // Integer → Trit: clamp to {-1, 0, +1} per the language reference.
         (IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64, IRType::Trit) => {
             clamp_to_trit(dst, src, &from_s)
         }
         // Float → Trit: truncate to int, then clamp.
         (IRType::F64, IRType::Trit) => {
-            let itmp = format!("%{}__ftoi", dst);
+            let itmp = format!("{}__ftoi", dst);
             format!(
-                "{} = fptosi double {} to i64\n  {}",
-                itmp,
-                src,
-                clamp_to_trit(dst, &itmp, "i64")
+                "{}\n  {}",
+                fptosi_sat(&itmp, src, "i64"),
+                clamp_to_trit(dst, &format!("%{}", itmp), "i64")
             )
         }
         // Ptr ↔ Bool (rare; keep it legal): nonnull test / select.
@@ -327,10 +354,12 @@ pub(crate) fn cast_sequence(dst: &str, src: &str, from: &IRType, to: &IRType) ->
             )
         }
         (IRType::F64, IRType::Ptr(_)) => {
-            let itmp = format!("%{}__f2i", dst);
+            let itmp = format!("{}__f2i", dst);
             format!(
-                "{} = fptosi double {} to i64\n  %{} = inttoptr i64 {} to ptr",
-                itmp, src, dst, itmp
+                "{}\n  %{} = inttoptr i64 %{} to ptr",
+                fptosi_sat(&itmp, src, "i64"),
+                dst,
+                itmp
             )
         }
         // Single-opcode conversions.

@@ -3657,3 +3657,35 @@ fn s54_a_tif_arm_return_obeys_the_same_return_type_rule() {
          fn main() { io::println(perm_str(1)); }\n",
     );
 }
+
+/// report.txt P24 — a non-pointer passed where a native declares `str`.
+///
+/// `str` is a POINTER and the LLVM backend dereferences whatever it is handed,
+/// so `io::print(' ')` passed the char's integer value and SEGFAULTED — from a
+/// program `manitc check` accepted. T3 read whatever that address held and
+/// printed byte soup. One of the five LLVM crashes the corpus sweep found.
+///
+/// The check is deliberately NARROW: a declared `str` parameter and nothing
+/// else. Widening it to every declared native parameter type breaks two
+/// INTENTIONAL behaviours this file already pins — `fmt::format` is variadic
+/// behind a `[str]` placeholder, and S53 documents that a native accepts a
+/// `bool` where an `int` is declared. Both were measured, not guessed: the
+/// broad version failed 13 tests.
+#[test]
+fn p24_a_non_pointer_where_a_native_declares_str_is_rejected() {
+    assert_check_error(
+        "p24_print_char",
+        "fn main() { io::print(' '); }",
+        "expected `str`, found `char`",
+    );
+    assert_check_error(
+        "p24_print_int",
+        "fn main() { io::print(42); }",
+        "expected `str`, found `int`",
+    );
+
+    // The intentional permissiveness is untouched.
+    assert_checks("p24_ok_str", "fn main() { io::println(\"ok\"); }");
+    assert_checks("p24_ok_bool_native", "fn main() { io::println_int(true); }");
+    assert_checks("p24_ok_trit", "fn main() { io::print_trit(+); }");
+}

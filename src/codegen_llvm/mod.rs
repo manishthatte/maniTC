@@ -212,6 +212,13 @@ impl LLVMEmitter {
         out.push_str("declare void @free(ptr)\n");
         out.push_str("declare i32 @strcmp(ptr, ptr)\n");
         out.push_str("declare i32 @usleep(i32)\n");
+        // Saturating float→integer (P23). Raw `fptosi` is undefined behaviour
+        // out of range and gives `i64::MIN` for NaN and both infinities on
+        // x86; these have Rust's semantics, which is what T3 already does.
+        out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n");
+        out.push_str("declare i32 @llvm.fptosi.sat.i32.f64(double)\n");
+        out.push_str("declare i16 @llvm.fptosi.sat.i16.f64(double)\n");
+        out.push_str("declare i8 @llvm.fptosi.sat.i8.f64(double)\n");
         out.push('\n');
 
         // ---- maniT stdlib declarations -------------------------------------

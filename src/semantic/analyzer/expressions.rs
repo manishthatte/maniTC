@@ -285,6 +285,11 @@ impl SemanticAnalyzer {
                 // e.g. println / fmt::format are variadic-ish placeholders).
                 let mut enforce = false;
                 let mut display_name = String::from("<fn>");
+                // The callee's name whether or not the builtin table knows it.
+                // `io` is not in SIG_MODULES, so `io::print` never reaches
+                // `self.functions` and `display_name` stays "<fn>" — which is
+                // why the P24 check below cannot key on it.
+                let mut callee_name = String::new();
                 let (param_tys, ret_ty) = match &tcallee.ty {
                     ManiType::Fn(pts, rt) => {
                         enforce = true;
@@ -310,6 +315,7 @@ impl SemanticAnalyzer {
                             // backlog and the call stays unchecked, exactly as
                             // it was before A1.
                             let n = name.clone();
+                            callee_name = n.clone();
                             // A2: record the call-graph edge. Done here, in the
                             // checker, rather than in a separate traversal —
                             // a second walk could disagree with this one about
@@ -367,6 +373,36 @@ impl SemanticAnalyzer {
                             "argument {} to '{}': expected `{}`, found `{}`",
                             i + 1, display_name, hint.display(), targ.ty.display()
                         )));
+                    }
+                    // P24, and deliberately NARROW. A native's declared
+                    // parameter types are known — `register_native_module_sigs`
+                    // resolves them into `native_param_manitys` — but enforcing
+                    // all of them is wrong here, and the test suite says so:
+                    // `fmt::format` is variadic behind a `[str]` placeholder,
+                    // and S53 documents that a native ACCEPTS a bool where an
+                    // int is declared. Both are intentional.
+                    //
+                    // What is never intentional is passing a non-pointer where
+                    // a `str` is declared. `str` is a POINTER, and the LLVM
+                    // backend dereferences whatever it is handed:
+                    // `io::print(' ')` passed the char's integer value and
+                    // segfaulted, from a program the checker accepted. T3 read
+                    // whatever that address happened to hold and printed byte
+                    // soup. So this rejects exactly that class and nothing
+                    // else.
+                    if !enforce && !callee_name.is_empty() && targ.ty.is_known() {
+                        if let Some(d) = self.native_param_manitys.get(&callee_name) {
+                            if matches!(d.get(i), Some(ManiType::Str))
+                                && !matches!(targ.ty, ManiType::Str | ManiType::Unknown)
+                            {
+                                return Err(self.err(targ.span, format!(
+                                    "argument {} to '{}': expected `str`, found `{}` \
+                                     — `str` is a pointer, and passing a non-pointer \
+                                     here dereferences its value",
+                                    i + 1, callee_name, targ.ty.display()
+                                )));
+                            }
+                        }
                     }
                     typed_args.push(targ);
                 }

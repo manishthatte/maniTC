@@ -564,3 +564,76 @@ fn main() -> int {
         assert_eq!(out, expected, "LLVM NaN comparisons");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The LLVM crashes the corpus sweep found (report.txt P23, P25)
+// ---------------------------------------------------------------------------
+
+/// report.txt P23 — `float as int` SATURATES, and was undefined behaviour on
+/// LLVM.
+///
+/// Plain `fptosi` is UB when the value does not fit; on x86 it yields
+/// `i64::MIN` for NaN and both infinities alike. T3's `ftoi` is Rust's `as`,
+/// which saturates. Three of the corpus's five LLVM hangs were this one cast:
+/// `exp(nan)` computed `n = (q - 0.5) as int`, got `i64::MIN`, and the scaling
+/// loop after it — `while e < 0 { e = e + 1; }` — had 9.2e18 iterations to run.
+#[test]
+fn p23_float_to_int_saturates_on_both_backends() {
+    let src = write(
+        "p23_sat",
+        r#"
+use std::io;
+use std::fmt;
+fn conv(x: float) -> int { return x as int; }
+fn main() {
+    let z: float = 0.0;
+    io::println(fmt::show_int(conv(z / z)));
+    io::println(fmt::show_int(conv(1.0 / z)));
+    io::println(fmt::show_int(conv((0.0 - 1.0) / z)));
+    io::println(fmt::show_int(conv(1e30)));
+}
+"#,
+    );
+    // NaN to zero; the infinities and the overflow to the nearest bound.
+    let expected = "0\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n";
+    let (code, out) = run_t3(&src, &[]);
+    assert_eq!(code, 0, "T3: {}", out);
+    assert_eq!(out, expected, "T3 float->int saturation");
+    if let Some((code, out)) = run_llvm(&src, &[]) {
+        assert_eq!(code, 0, "LLVM: {}", out);
+        assert_eq!(out, expected, "LLVM float->int saturation");
+    }
+}
+
+/// report.txt P25 — an out-of-bounds array WRITE is bounds-checked, not just a
+/// read.
+///
+/// A2 guarded loads and not stores, which is the wrong way round: a bad read
+/// returns a wrong value, a bad WRITE destroys something else's. On T3 it
+/// silently corrupted emulator memory and the program carried on printing; on
+/// LLVM it corrupted the heap and glibc aborted the process with
+/// `malloc.c:2601 (sysmalloc): assertion failed`.
+#[test]
+fn p25_an_out_of_bounds_write_is_caught() {
+    let src = write(
+        "p25_oob_write",
+        r#"
+use std::io;
+fn main() {
+    let mut a: [int; 4] = [0, 0, 0, 0];
+    let mut i: int = 0;
+    while i < 20 { a[i] = i; i = i + 1; }
+    io::println("survived write");
+}
+"#,
+    );
+    let (code, out) = run_t3(&src, &[]);
+    assert_ne!(code, 0, "T3 must trap, got: {}", out);
+    assert!(out.contains("out of bounds"), "T3 message: {}", out);
+    assert!(!out.contains("survived"), "T3 ran past the write: {}", out);
+    if let Some((code, out)) = run_llvm(&src, &[]) {
+        assert_ne!(code, 0, "LLVM must trap, got: {}", out);
+        assert!(out.contains("out of bounds"), "LLVM message: {}", out);
+        assert!(!out.contains("survived"), "LLVM ran past the write: {}", out);
+    }
+}

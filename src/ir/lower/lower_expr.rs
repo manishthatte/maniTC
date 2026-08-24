@@ -1455,8 +1455,28 @@ impl IRLowerer {
                 }
             }
             TypedExprKind::Index(arr, idx) => {
+                // A2 applies to the WRITE side too, and did not (report.txt
+                // P25). The read path bounds-checks and traps; this one emitted
+                // a bare GetPtr, so `a[i] = x` past the end wrote wherever the
+                // arithmetic landed. On T3 that silently corrupted emulator
+                // memory and the program carried on; on LLVM it corrupted the
+                // heap and glibc aborted the process with
+                //
+                //     Fatal glibc error: malloc.c:2601 (sysmalloc):
+                //     assertion failed: ... prev_inuse (old_top) ...
+                //
+                // A guard on loads and not on stores is the wrong way round:
+                // an out-of-bounds READ returns a wrong value, an
+                // out-of-bounds WRITE destroys something else's.
+                let arr_len = match &arr.ty {
+                    ManiType::Array(_, Some(n)) => Some(*n),
+                    _ => None,
+                };
                 let arr_val = self.lower_expr(arr);
                 let idx_val = self.lower_expr(idx);
+                if let Some(len) = arr_len {
+                    self.emit(IRInstr::BoundsCheck { idx: idx_val.clone(), len });
+                }
                 let ptr_t = self.fresh_temp();
                 self.emit(IRInstr::GetPtr {
                     dst: ptr_t.clone(),
