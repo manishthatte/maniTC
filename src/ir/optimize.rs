@@ -34,11 +34,25 @@ pub struct PassOptions {
     /// have become worth more, and where the remaining headroom is, before any
     /// new pass is written.
     pub pass_stats: bool,
+
+    /// How many times to run the per-function passes over each function (F-2).
+    ///
+    /// The pipeline ran each pass exactly ONCE, in a fixed order, so no pass
+    /// ever saw what its neighbours produced — propagation exposes constants
+    /// for folding, folding exposes identical expressions for CSE, CSE exposes
+    /// dead operands for DCE. Iterating to a fixpoint is the cheapest way to
+    /// find out whether the three passes that measured at ~zero (report.txt
+    /// P22) are broken, mis-ordered, or genuinely inapplicable.
+    ///
+    /// Bounded rather than a true fixpoint: a pair of passes that undo each
+    /// other would spin, and a bound turns that into a slow compile instead of
+    /// a hang. The loop stops early when a round changes nothing.
+    pub rounds: usize,
 }
 
 impl Default for PassOptions {
     fn default() -> Self {
-        Self { mem2reg: true, pass_stats: false }
+        Self { mem2reg: true, pass_stats: false, rounds: 1 }
     }
 }
 
@@ -140,6 +154,14 @@ pub fn run_passes_with(module: &mut IRModule, opts: PassOptions) {
         }
         let mut n = if opts.pass_stats { count_func(func) } else { 0 };
         let mut snap = if opts.pass_stats { snapshot(func) } else { Vec::new() };
+        // Round 0 is the pipeline as it always was; `rounds` above 1 repeats it
+        // until a round changes nothing.
+        //
+        // The snapshot is taken ONLY when iterating. It Debug-formats every
+        // instruction in the function, so doing it unconditionally would put
+        // that cost on every compile to support a flag that is off by default.
+        let iterating = opts.rounds.max(1) > 1;
+        let mut round_start = if iterating { snapshot(func) } else { Vec::new() };
         macro_rules! step {
             ($i:expr, $call:expr) => {{
                 $call;
@@ -155,12 +177,20 @@ pub fn run_passes_with(module: &mut IRModule, opts: PassOptions) {
                 }
             }};
         }
-        step!(0, constant_fold(func));
-        step!(1, constant_propagate(func));
-        step!(2, ternary_peephole(func));
-        step!(3, common_subexpression_eliminate(func));
-        step!(4, strength_reduce(func));
-        step!(5, dead_code_eliminate(func));
+        for round in 0..opts.rounds.max(1) {
+            if iterating && round > 0 {
+                round_start = snapshot(func);
+            }
+            step!(0, constant_fold(func));
+            step!(1, constant_propagate(func));
+            step!(2, ternary_peephole(func));
+            step!(3, common_subexpression_eliminate(func));
+            step!(4, strength_reduce(func));
+            step!(5, dead_code_eliminate(func));
+            if !iterating || snapshot(func) == round_start {
+                break; // one round only, or converged
+            }
+        }
     }
     dead_block_eliminate(module);
 

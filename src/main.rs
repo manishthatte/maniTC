@@ -95,6 +95,15 @@ enum Commands {
         #[arg(long)]
         pass_stats: bool,
 
+        /// Run the per-function optimiser passes this many times (F-2).
+        ///
+        /// The default of 1 is the historical pipeline. Above 1 the passes
+        /// repeat until a round changes nothing, so each one sees what its
+        /// neighbours produced. Bounded rather than a true fixpoint: a pair
+        /// that undid each other would otherwise spin.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        rounds: usize,
+
         /// Turn F-1 promotion OFF, compiling locals as memory the way the
         /// pre-F-1 compiler did.
         ///
@@ -377,6 +386,7 @@ fn run_compile(
     verify_ssa: bool,
     mem2reg: bool,
     pass_stats: bool,
+    rounds: usize,
 ) -> CompileResult<()> {
     let source = read_source(file).map_err(|e| CompileError::Lex(
         Diagnostic::unknown(e),
@@ -435,7 +445,7 @@ fn run_compile(
     }
     ir::optimize::run_passes_with(
         &mut ir_module,
-        ir::optimize::PassOptions { mem2reg, pass_stats },
+        ir::optimize::PassOptions { mem2reg, pass_stats, rounds },
     );
     if verify_ssa {
         report_ssa(&ir_module, "after optimisation");
@@ -986,7 +996,7 @@ fn run() {
         Commands::Compile {
             file, target, output, emit_ir, warn_as_error,
             allow, warn, deny, forbid, print_lints, target_triple, lang, verify_ssa,
-            mem2reg, no_mem2reg, pass_stats,
+            mem2reg, no_mem2reg, pass_stats, rounds,
         } => {
             let flags = LintFlags {
                 allow: allow.clone(), warn: warn.clone(),
@@ -998,7 +1008,7 @@ fn run() {
             parse_lang(lang).and_then(|lang| run_compile(
                 file, target, output, *emit_ir, *warn_as_error,
                 &flags, *print_lints, target_triple.as_deref(), lang, *verify_ssa,
-                !*no_mem2reg, *pass_stats,
+                !*no_mem2reg, *pass_stats, *rounds,
             ))
         }
         Commands::Check {
