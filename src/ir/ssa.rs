@@ -873,39 +873,6 @@ pub fn value_types(func: &IRFunction) -> HashMap<String, IRType> {
     out
 }
 
-/// Temps whose EMITTED width may differ from their IR type.
-///
-/// The LLVM backend types a call's result from the callee's declared
-/// signature, not from the IR's `ret_ty`, and coerces at each use site:
-/// `TernaryTrie::get` has `ret_ty: Trit` in the IR and is emitted as
-/// `call i64 @TernaryTrie_get`, with a `trunc` wherever the trit is wanted.
-/// That is deliberate and it works for every construct whose type comes from
-/// its operands.
-///
-/// A phi is the exception — its type comes from the IR. Promoting a variable
-/// fed by such a call therefore produced `phi i8 [ %t94, … ]` with `%t94`
-/// defined as `i64`, which clang rejects. Recorded as report.txt P12; the real
-/// repair belongs in the backend, and until it lands these are not promoted.
-///
-/// Only NARROW returns are affected. A call returning `I64`, `F64` or a
-/// pointer is emitted at that width on both backends.
-pub fn narrow_call_results(func: &IRFunction) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for block in &func.blocks {
-        for instr in &block.instrs {
-            let (dst, ret_ty) = match instr {
-                IRInstr::Call { dst: Some(d), ret_ty, .. }
-                | IRInstr::CallIndirect { dst: Some(d), ret_ty, .. } => (d, ret_ty),
-                _ => continue,
-            };
-            if !matches!(ret_ty, IRType::I64 | IRType::F64 | IRType::Ptr(_)) {
-                out.insert(dst.0.clone());
-            }
-        }
-    }
-    out
-}
-
 /// Whether a value may be stored into a slot of type `slot` without the
 /// `Store` performing a conversion that promotion would silently drop.
 ///
@@ -920,12 +887,9 @@ fn store_matches_slot(
     val: &IRValue,
     slot: &IRType,
     types: &HashMap<String, IRType>,
-    uncertain: &HashSet<String>,
 ) -> bool {
     match val {
-        IRValue::Temp(t) => {
-            !uncertain.contains(&t.0) && types.get(&t.0).is_some_and(|vt| vt == slot)
-        }
+        IRValue::Temp(t) => types.get(&t.0).is_some_and(|vt| vt == slot),
         IRValue::Const(IRConst::Float(_)) => *slot == IRType::F64,
         IRValue::Const(IRConst::Str(_)) | IRValue::Const(IRConst::Null) => {
             matches!(slot, IRType::Ptr(_))
@@ -952,7 +916,6 @@ fn store_matches_slot(
 /// returns.
 pub fn promotable_allocas(func: &IRFunction) -> Vec<(String, IRType)> {
     let types = value_types(func);
-    let uncertain = narrow_call_results(func);
     let mut candidates: HashMap<&str, IRType> = HashMap::new();
     for block in &func.blocks {
         for instr in &block.instrs {
@@ -990,7 +953,7 @@ pub fn promotable_allocas(func: &IRFunction) -> Vec<(String, IRType)> {
                             // The store is at the slot's own width, but the
                             // VALUE may still need converting to reach it, and
                             // that conversion is what the store performs.
-                            if !store_matches_slot(val, slot, &types, &uncertain) {
+                            if !store_matches_slot(val, slot, &types) {
                                 disqualified.insert(t.0.as_str());
                             }
                         }
@@ -1458,10 +1421,15 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_call_result_blocks_promotion() {
-        // `ret_ty: Trit` in the IR, `call i64` in the emitted LLVM. See
-        // `narrow_call_results`. examples/data_structures.mt is where this
-        // surfaced.
+    fn a_narrow_call_result_is_promotable_now_that_it_narrows_at_the_definition() {
+        // `ret_ty: Trit` in the IR, `call i64` in the emitted LLVM. This used
+        // to block promotion (report.txt P13): the backend recorded the
+        // DECLARED width and narrowed at each use, so a phi fed by such a call
+        // was `phi i8` with an `i64` operand and clang rejected the module.
+        //
+        // The backend now truncates at the definition, so the temp carries its
+        // IR type everywhere and the slot promotes like any other.
+        // examples/data_structures.mt is where this surfaced.
         let f = func(vec![block(
             "entry",
             vec![
@@ -1476,7 +1444,7 @@ mod tests {
             ],
             IRTerminator::Return(None),
         )]);
-        assert!(promotable_allocas(&f).is_empty());
+        assert_eq!(promotable_allocas(&f), vec![("p".to_string(), IRType::Trit)]);
     }
 
     #[test]

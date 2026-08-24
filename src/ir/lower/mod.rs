@@ -464,6 +464,32 @@ impl IRLowerer {
             });
             return IRValue::Temp(dst);
         }
+
+        // P10: a float and an integer are different WIDTHS and different
+        // ENCODINGS, so moving a value between them is a conversion, not a
+        // reinterpretation. Without this the bits of a double were stored into
+        // an `int` slot and read back as one — `let mut f: float = 7.0; f /= n`
+        // printed 0.0000…018837728731725 on T3, and on LLVM emitted
+        // `sdiv i64` against a `double` and had clang reject the module.
+        //
+        // Only float↔integer is converted here. Integer WIDTH coercion is a
+        // separate question with its own findings (P1, P9) and its own rules
+        // about which types are 27 trits wide; silently widening here would
+        // pre-empt them.
+        let from_ir = IRType::from_mani(from);
+        let to_ir = IRType::from_mani(to);
+        let is_float = |t: &IRType| matches!(t, IRType::F64);
+        let is_int = |t: &IRType| matches!(t, IRType::I64 | IRType::I8 | IRType::Trit);
+        if (is_float(&from_ir) && is_int(&to_ir)) || (is_int(&from_ir) && is_float(&to_ir)) {
+            let dst = self.fresh_temp();
+            self.emit(IRInstr::Cast {
+                dst: dst.clone(),
+                src: val,
+                from_ty: from_ir,
+                to_ty: to_ir,
+            });
+            return IRValue::Temp(dst);
+        }
         val
     }
 

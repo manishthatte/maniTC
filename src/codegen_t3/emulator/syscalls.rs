@@ -1,6 +1,6 @@
 // emulator/syscalls.rs — Syscall router.
 // Implementations are split into:
-//   syscall_io.rs   — I/O, strings, floats, time, env (0-16, 60-69, 127-132, 133-135, 200-203, 210-220, 540, 550, 552-553)
+//   syscall_io.rs   — I/O, strings, floats, time, env (0-16, 60-69, 127-132, 133-135, 200-203, 210-221, 540, 550, 552-553)
 //   syscall_fs.rs   — File system + TCP network (75-79, 500-525)
 //   syscall_proc.rs — Collections, channels, concurrency (17-59, 70-74, 80-107, 108-131)
 use super::*;
@@ -20,7 +20,7 @@ impl Emulator {
             // 551 any more and a binary that still does is stale, not valid.
             // Leaving the number out of the range makes that a visible TRAP
             // rather than a silent empty Vec.
-            0..=16 | 60..=69 | 127..=130 | 132 | 133..=135 | 200..=203 | 210..=220 | 540
+            0..=16 | 60..=69 | 127..=130 | 132 | 133..=135 | 200..=203 | 210..=221 | 540
             | 550 | 552..=553 => {
                 self.do_syscall_io(num);
             }

@@ -738,13 +738,26 @@ fn emit_function(
     // 1. Assign every temp a location, once, before anything is emitted.
     let alloc = regalloc::allocate_with(func, &struct_sizes);
 
-    // 2. Lay out the frame: spill slots first, then one region per alloca.
-    //    Both are at CONSTANT offsets from R26 — the frame does not move.
+    // 2. Lay out the frame: spill slots first, then one region per alloca that
+    //    actually lives in the frame. Both are at CONSTANT offsets from R26 —
+    //    the frame does not move.
+    //
+    //    P17: heap allocas are SKIPPED, and the same predicate the emitter uses
+    //    decides which those are. Reserving frame words for a struct that the
+    //    Alloca arm then heap-allocates left every struct and tuple with two
+    //    storages and no rule about which one won: `GetPtr` used the alloca's
+    //    register (the heap base) while a direct `Store`/`Load` on the alloca
+    //    temp consulted `alloca_off` (the frame). The two never met in code the
+    //    lowerer emits, so it cost wasted frame rather than wrong answers — but
+    //    one predicate in two places, disagreeing, is how P15 happened.
     let mut alloca_off: HashMap<String, usize> = HashMap::new();
     let mut off = alloc.n_slots;
     for block in &func.blocks {
         for instr in &block.instrs {
             if let IRInstr::Alloca { dst, ty } = instr {
+                if regalloc::is_heap_alloca(ty, &struct_sizes) {
+                    continue;
+                }
                 let w = alloca_words(ty, &struct_sizes);
                 alloca_off.insert(dst.0.clone(), off);
                 off += w;

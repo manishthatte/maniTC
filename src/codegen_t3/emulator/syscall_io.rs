@@ -416,10 +416,26 @@ impl Emulator {
                 self.regs[1] = (a / b).to_bits() as i64;
             }
             216 => {
-                // fcmp: compare R1, R2 → R1 = +1/0/-1 (like TCMP for floats)
+                // fcmp: compare R1, R2 → R1 = +1/0/-1 (like TCMP for floats),
+                // and R2 = 1 if the comparison is UNORDERED, else 0 (P20).
+                //
+                // Three values cannot express four outcomes. IEEE-754 says a
+                // NaN compares false to everything including itself, but
+                // `a > b` and `a < b` are both false for a NaN, so the
+                // three-way result collapsed to 0 — "equal" — and T3 reported
+                // `nan == nan` as TRUE where LLVM reported false. Every float
+                // comparison against a NaN was wrong, in the direction that
+                // makes a guard silently pass.
+                //
+                // The unordered bit rides in R2 rather than a second syscall.
+                // R2 is an ABI register, never allocated, and it has already
+                // been consumed as the right-hand operand by the time this
+                // returns — so the caller can read it without a save.
                 let a = f64::from_bits(self.regs[1] as u64);
                 let b = f64::from_bits(self.regs[2] as u64);
+                let unordered = a.is_nan() || b.is_nan();
                 self.regs[1] = if a > b { 1 } else if a < b { -1 } else { 0 };
+                self.regs[2] = i64::from(unordered);
             }
             218 => {
                 // heap_alloc_words: R1 = word count → R1 = base address.
@@ -469,6 +485,21 @@ impl Emulator {
             220 => {
                 // fneg: R1 = -R1 (flip IEEE 754 sign bit, bit 63)
                 self.regs[1] = self.regs[1] ^ (1i64 << 63);
+            }
+            221 => {
+                // frem: R1 % R2 → R1 (report.txt P19)
+                //
+                // Rust's `%` on f64 is C's fmod — truncated toward zero, sign
+                // of the dividend — which is what LLVM's `frem` computes, so
+                // the two backends agree by construction.
+                //
+                // This existed nowhere until P19. `Rem` was missing from the
+                // emitter's float list, so `x % y` on two floats fell through
+                // to the INTEGER path and emitted `TMOD` against two IEEE-754
+                // bit patterns: `7.5 % 2.0` returned 0 where LLVM returned 1.5.
+                let a = f64::from_bits(self.regs[1] as u64);
+                let b = f64::from_bits(self.regs[2] as u64);
+                self.regs[1] = (a % b).to_bits() as i64;
             }
 
             // ----------------------------------------------------------------

@@ -220,7 +220,14 @@ impl LLVMEmitter {
                     }
                     IRBinOp::FNe => {
                         let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
-                        format!("{} = fcmp one double {}, {}", dst_name, l, r)
+                        // `une`, not `one` (P20). IEEE-754 says `!=` is TRUE
+                        // when either operand is a NaN, and it is the ONE
+                        // comparison of the six for which that is so — the
+                        // other five are ordered predicates, which return
+                        // false on a NaN, which is the right answer for them.
+                        // `one` is ORDERED not-equal and returned false, so
+                        // `nan != 1.0` was false on LLVM.
+                        format!("{} = fcmp une double {}, {}", dst_name, l, r)
                     }
                     IRBinOp::FLt => {
                         let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
@@ -706,9 +713,35 @@ impl LLVMEmitter {
                     llvm_type(ret_ty)
                 };
 
+                // P13: when the declared C return is WIDER than the IR says the
+                // value is, narrow it HERE, at the definition, and let the temp
+                // carry its IR type from then on.
+                //
+                // The backend used to record the declared width and narrow at
+                // each USE. That works for every construct whose type comes
+                // from its operands, and fails for the one that does not: a phi
+                // takes its type from the IR, so promoting a variable fed by
+                // `Call { ret_ty: Trit }` emitted `phi i8` with an operand
+                // defined as `i64` and clang rejected the module. Narrowing
+                // once at the definition makes every use consistent, the phi
+                // included, and lets `ssa::promotable_allocas` stop refusing
+                // those slots.
+                let ir_ret = llvm_type(ret_ty);
+                let narrow = dst.is_some()
+                    && actual_ret != ir_ret
+                    && actual_ret.starts_with('i')
+                    && ir_ret.starts_with('i')
+                    && int_width(&actual_ret) > int_width(&ir_ret);
+                let raw_name = if narrow {
+                    Some(self.fresh_anon("callret"))
+                } else {
+                    None
+                };
+
                 // Record the return type for dst temp.
                 if let Some(d) = dst {
-                    self.record_temp_type(&d.0, &actual_ret);
+                    let recorded = if narrow { &ir_ret } else { &actual_ret };
+                    self.record_temp_type(&d.0, recorded);
                 }
 
                 // Vararg calls must spell out the full function type —
@@ -739,14 +772,30 @@ impl LLVMEmitter {
                     )
                 } else {
                     match dst {
-                        Some(d) => format!(
-                            "{}%{} = call {} @{}({})",
-                            call_prefix,
-                            d.0,
-                            callee_ty,
-                            mangled,
-                            args_str.join(", ")
-                        ),
+                        Some(d) => match &raw_name {
+                            // P13: call into a scratch name, then narrow into
+                            // the temp the rest of the module refers to.
+                            Some(raw) => format!(
+                                "{}%{} = call {} @{}({})\n  %{} = trunc {} %{} to {}",
+                                call_prefix,
+                                raw,
+                                callee_ty,
+                                mangled,
+                                args_str.join(", "),
+                                d.0,
+                                actual_ret,
+                                raw,
+                                ir_ret
+                            ),
+                            None => format!(
+                                "{}%{} = call {} @{}({})",
+                                call_prefix,
+                                d.0,
+                                callee_ty,
+                                mangled,
+                                args_str.join(", ")
+                            ),
+                        },
                         None => format!(
                             "{}call {} @{}({})",
                             call_prefix,

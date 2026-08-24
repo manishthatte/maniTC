@@ -24,12 +24,59 @@ pub struct PassOptions {
     /// pre-F-1 compiler's output byte for byte, which is what dates a defect as
     /// pre-existing rather than newly introduced — keep it working.
     pub mem2reg: bool,
+
+    /// Print how many instructions each pass removes, to stderr (F-2).
+    ///
+    /// The point is not curiosity. Every pass below reasons about TEMPS, and
+    /// until `mem2reg` ran by default a local variable lived in an alloca and
+    /// was invisible to all of them — so their measured effect was on IR they
+    /// could barely see through. This is what says whether the existing passes
+    /// have become worth more, and where the remaining headroom is, before any
+    /// new pass is written.
+    pub pass_stats: bool,
 }
 
 impl Default for PassOptions {
     fn default() -> Self {
-        Self { mem2reg: true }
+        Self { mem2reg: true, pass_stats: false }
     }
+}
+
+/// Instructions in one function, terminators excluded — every pass here edits
+/// the instruction lists, and a terminator is not one of them.
+fn count_func(func: &IRFunction) -> i64 {
+    func.blocks.iter().map(|b| b.instrs.len() as i64).sum()
+}
+
+/// A positional snapshot of every instruction, for the REWRITE count.
+///
+/// Counting instructions alone cannot see four of the six passes. Constant
+/// folding turns a `BinOp` into an `Assign` — same count. Propagation and
+/// strength reduction rewrite OPERANDS in place — same count. Reporting "0"
+/// for those would say they do nothing, when what it actually says is that the
+/// instrument is blind to them.
+fn snapshot(func: &IRFunction) -> Vec<String> {
+    func.blocks
+        .iter()
+        .flat_map(|b| b.instrs.iter().map(|i| format!("{:?}", i)))
+        .collect()
+}
+
+/// How many instructions a pass REWROTE without removing.
+///
+/// Only meaningful when the pass did not change the length; when it did, the
+/// removal count is the honest number and this returns None rather than
+/// pretending a positional comparison means something.
+fn rewritten(before: &[String], after: &[String]) -> Option<i64> {
+    if before.len() != after.len() {
+        return None;
+    }
+    Some(before.iter().zip(after).filter(|(a, b)| a != b).count() as i64)
+}
+
+/// The same across a whole module, skipping externs, which have no body.
+fn count_module(module: &IRModule) -> i64 {
+    module.functions.iter().filter(|f| !f.is_extern).map(count_func).sum()
 }
 
 /// Run the optimisation passes with the defaults.
@@ -51,27 +98,94 @@ pub fn run_passes(module: &mut IRModule) {
 /// referring to an alloca it had deleted — so removing those blocks before it
 /// runs is what keeps that conservatism from costing anything in practice.
 pub fn run_passes_with(module: &mut IRModule, opts: PassOptions) {
+    let start = if opts.pass_stats { count_module(module) } else { 0 };
+    let mut module_marks: Vec<(&str, i64)> = Vec::new();
+
     dead_block_eliminate(module);
+    if opts.pass_stats {
+        module_marks.push(("dead-block-eliminate", count_module(module)));
+    }
     if opts.mem2reg {
         // A phi's value has to be placed ON the edge it came from, and a
         // critical edge has nowhere to put it. Split before promoting, so every
         // phi `mem2reg` inserts already has a predecessor that ends in a plain
         // jump — which is the only shape the T3 backend emits copies for.
         super::ssa::split_critical_edges_module(module);
+        if opts.pass_stats {
+            module_marks.push(("split-critical-edges", count_module(module)));
+        }
         super::mem2reg::run(module);
+        if opts.pass_stats {
+            module_marks.push(("mem2reg", count_module(module)));
+        }
     }
+
+    // The per-function passes are attributed by DELTA rather than by running
+    // each one over the whole module in turn: they are independent per
+    // function, so accumulating differences preserves the order each function
+    // actually sees while still giving a per-pass total.
+    const FN_PASSES: [&str; 6] = [
+        "constant-fold",
+        "constant-propagate",
+        "ternary-peephole",
+        "common-subexpression",
+        "strength-reduce",
+        "dead-code-eliminate",
+    ];
+    let mut removed = [0i64; 6];
+    let mut rewrote = [0i64; 6];
     for func in &mut module.functions {
         if func.is_extern {
             continue;
         }
-        constant_fold(func);
-        constant_propagate(func);
-        ternary_peephole(func);
-        common_subexpression_eliminate(func);
-        strength_reduce(func);
-        dead_code_eliminate(func);
+        let mut n = if opts.pass_stats { count_func(func) } else { 0 };
+        let mut snap = if opts.pass_stats { snapshot(func) } else { Vec::new() };
+        macro_rules! step {
+            ($i:expr, $call:expr) => {{
+                $call;
+                if opts.pass_stats {
+                    let m = count_func(func);
+                    removed[$i] += n - m;
+                    n = m;
+                    let after = snapshot(func);
+                    if let Some(r) = rewritten(&snap, &after) {
+                        rewrote[$i] += r;
+                    }
+                    snap = after;
+                }
+            }};
+        }
+        step!(0, constant_fold(func));
+        step!(1, constant_propagate(func));
+        step!(2, ternary_peephole(func));
+        step!(3, common_subexpression_eliminate(func));
+        step!(4, strength_reduce(func));
+        step!(5, dead_code_eliminate(func));
     }
     dead_block_eliminate(module);
+
+    if opts.pass_stats {
+        let end = count_module(module);
+        let mut running = start;
+        eprintln!("pass-stats  {:<22} {:>9}", "after lowering", start);
+        for (name, n) in &module_marks {
+            eprintln!("pass-stats  {:<22} {:+9}  -> {}", name, n - running, n);
+            running = *n;
+        }
+        for (i, name) in FN_PASSES.iter().enumerate() {
+            running -= removed[i];
+            eprintln!(
+                "pass-stats  {:<22} {:+9}  -> {:<8} rewrote {}",
+                name, -removed[i], running, rewrote[i]
+            );
+        }
+        eprintln!("pass-stats  {:<22} {:+9}  -> {}", "final dead-block", end - running, end);
+        eprintln!(
+            "pass-stats  {:<22} {} -> {}  ({:+.1} %)",
+            "TOTAL", start, end,
+            if start > 0 { (end - start) as f64 * 100.0 / start as f64 } else { 0.0 }
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

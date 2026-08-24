@@ -309,10 +309,15 @@ impl IRLowerer {
                 let ptr = self.lower_expr_as_ptr(&a.target);
                 // Struct/tuple fields use the uniform 8-byte slot convention,
                 // so field stores/loads must use the slot access width.
+                // P10: the TARGET's type, not the value's. This is the slot
+                // being loaded from and stored back into, so its width and
+                // encoding are the target's by definition — `val` was already
+                // coerced to the target above, and typing the access from the
+                // value instead is what made `f /= n` load a double as an i64.
                 let ty = if matches!(&a.target.kind, TypedExprKind::Field(_, _)) {
-                    super::helpers::slot_access_ty(&IRType::from_mani(&a.value.ty))
+                    super::helpers::slot_access_ty(&IRType::from_mani(&a.target.ty))
                 } else {
-                    IRType::from_mani(&a.value.ty)
+                    IRType::from_mani(&a.target.ty)
                 };
                 if let Some(op) = &a.op {
                     // Compound assignment: load + op + store
@@ -322,7 +327,7 @@ impl IRLowerer {
                         ptr: ptr.clone(),
                         ty: ty.clone(),
                     });
-                    // `a.value.ty`, deliberately, because that is what `ty`
+                    // `a.target.ty`, deliberately, because that is what `ty`
                     // above is built from and the two MUST agree.
                     //
                     // From C4 onward the operator is type-dependent: `DivNear`
@@ -333,15 +338,16 @@ impl IRLowerer {
                     // — the `debug_assert!`s in both emitters exist to say so
                     // loudly rather than let it become `sdiv double`.
                     //
-                    // Note what this does NOT fix. A compound assignment types
-                    // itself from the ASSIGNED VALUE rather than the target,
-                    // so `let mut f: float = 7.0; f /= n;` with `n: int` loads
-                    // the double as an i64 and divides it as one. That is
-                    // report.txt P10, it predates all of this (measured on the
-                    // archived pre-C4 release binary), and it is a semantic-
-                    // pass strictness question — which R5 says must not be
-                    // landed incidentally alongside a feature.
-                    let binop = binop_to_ir(op, &a.value.ty, self.lang);
+                    // P10, now fixed: both used to come from the ASSIGNED
+                    // VALUE, so `let mut f: float = 7.0; f /= n;` with `n: int`
+                    // loaded the double as an i64 and divided it as one. The
+                    // repair is codegen-only and deliberately not the other
+                    // candidate — REJECTING `float /= int` would be a
+                    // semantic-pass strictness change, and R5 forbids landing
+                    // one incidentally because L1 is defined as "passes
+                    // `manitc check`". Typing from the target accepts exactly
+                    // the same programs and merely compiles them correctly.
+                    let binop = binop_to_ir(op, &a.target.ty, self.lang);
                     let result_t = self.fresh_temp();
                     self.emit(IRInstr::BinOp {
                         dst: result_t.clone(),

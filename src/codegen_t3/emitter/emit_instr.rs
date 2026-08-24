@@ -35,8 +35,12 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 return;
             }
             let is_float = matches!(binop_ty, IRType::F64);
-            // Float comparisons have bool result type, so check op variant directly
-            let is_float_syscall = (is_float && matches!(op, IRBinOp::Add | IRBinOp::Sub | IRBinOp::Mul | IRBinOp::Div))
+            // Float comparisons have bool result type, so check op variant directly.
+            //
+            // `Rem` belongs in this list and was missing from it (report.txt
+            // P19): a float `%` fell through to the integer path and emitted
+            // TMOD against two IEEE-754 bit patterns.
+            let is_float_syscall = (is_float && matches!(op, IRBinOp::Add | IRBinOp::Sub | IRBinOp::Mul | IRBinOp::Div | IRBinOp::Rem))
                 || matches!(op, IRBinOp::FEq | IRBinOp::FNe | IRBinOp::FLt | IRBinOp::FGt | IRBinOp::FLe | IRBinOp::FGe);
 
             // The float syscalls write R1 while setting up, BEFORE the operands
@@ -75,8 +79,14 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     }
                 }
                 match op {
-                    IRBinOp::Add | IRBinOp::Sub | IRBinOp::Mul | IRBinOp::Div => {
-                        let sc = match op { IRBinOp::Add => 212, IRBinOp::Sub => 213, IRBinOp::Mul => 214, _ => 215 };
+                    IRBinOp::Add | IRBinOp::Sub | IRBinOp::Mul | IRBinOp::Div | IRBinOp::Rem => {
+                        let sc = match op {
+                            IRBinOp::Add => 212,
+                            IRBinOp::Sub => 213,
+                            IRBinOp::Mul => 214,
+                            IRBinOp::Div => 215,
+                            _ => 221, // frem (P19)
+                        };
                         place_args!();
                         em.emit(format!("    SYSCALL #{}  ; float op", sc));
                         if rd != 1 { em.emit(format!("    MOV   {}, R1  ; float result", d)); }
@@ -141,6 +151,41 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                         em.emit(format!("    TSUB  {}, {}, {}    ; 1-max=fge", d, o, d));
                     }
                     _ => unreachable!("float binop dispatch"),
+                }
+                // P20: force the IEEE-754 answer when the comparison is
+                // UNORDERED. SYSCALL #216 leaves R2 = 1 if either operand is a
+                // NaN, and every arm above has finished with its 0/1 result in
+                // `d`, so the correction is the same two shapes for all six:
+                //
+                //   ==, <, >, <=, >=   ->  false when unordered  ->  min(d, 1-R2)
+                //   !=                 ->  TRUE  when unordered  ->  max(d, R2)
+                //
+                // Both operands are 0/1 here, so TMIN is AND and TMAX is OR.
+                // Without this, `nan == nan` was true and `nan != nan` false —
+                // a guard against NaN passed exactly when it should not.
+                // Comparisons only: the arithmetic arm above reaches here too,
+                // and syscalls 212-215/221 do not write R2 at all, so applying
+                // this to a float sum would corrupt it with a stale register.
+                let is_cmp = matches!(
+                    op,
+                    IRBinOp::FEq
+                        | IRBinOp::FNe
+                        | IRBinOp::FLt
+                        | IRBinOp::FGt
+                        | IRBinOp::FLe
+                        | IRBinOp::FGe
+                );
+                if !is_cmp {
+                    return;
+                }
+                if matches!(op, IRBinOp::FNe) {
+                    em.emit(format!("    TMAX  {}, {}, R2    ; unordered → ne is true (P20)", d, d));
+                } else {
+                    let u = em.scratch();
+                    let un = AsmEmitter::rn(u);
+                    em.emit(format!("    TLIT  {}, #1", un));
+                    em.emit(format!("    TSUB  {0}, {0}, R2   ; 1-unordered", un));
+                    em.emit(format!("    TMIN  {}, {}, {}    ; unordered → false (P20)", d, d, un));
                 }
                 return;
             }

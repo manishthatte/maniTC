@@ -86,6 +86,15 @@ enum Commands {
         #[arg(long)]
         mem2reg: bool,
 
+        /// Report how many instructions each optimiser pass removes (F-2).
+        ///
+        /// Printed to stderr. Every pass reasons about temps, so before
+        /// promotion was the default a local variable was invisible to all of
+        /// them; this is what says what they are worth now and where the
+        /// headroom is.
+        #[arg(long)]
+        pass_stats: bool,
+
         /// Turn F-1 promotion OFF, compiling locals as memory the way the
         /// pre-F-1 compiler did.
         ///
@@ -367,6 +376,7 @@ fn run_compile(
     lang: manitc::lang::LangVersion,
     verify_ssa: bool,
     mem2reg: bool,
+    pass_stats: bool,
 ) -> CompileResult<()> {
     let source = read_source(file).map_err(|e| CompileError::Lex(
         Diagnostic::unknown(e),
@@ -425,7 +435,7 @@ fn run_compile(
     }
     ir::optimize::run_passes_with(
         &mut ir_module,
-        ir::optimize::PassOptions { mem2reg },
+        ir::optimize::PassOptions { mem2reg, pass_stats },
     );
     if verify_ssa {
         report_ssa(&ir_module, "after optimisation");
@@ -976,7 +986,7 @@ fn run() {
         Commands::Compile {
             file, target, output, emit_ir, warn_as_error,
             allow, warn, deny, forbid, print_lints, target_triple, lang, verify_ssa,
-            mem2reg, no_mem2reg,
+            mem2reg, no_mem2reg, pass_stats,
         } => {
             let flags = LintFlags {
                 allow: allow.clone(), warn: warn.clone(),
@@ -988,7 +998,7 @@ fn run() {
             parse_lang(lang).and_then(|lang| run_compile(
                 file, target, output, *emit_ir, *warn_as_error,
                 &flags, *print_lints, target_triple.as_deref(), lang, *verify_ssa,
-                !*no_mem2reg,
+                !*no_mem2reg, *pass_stats,
             ))
         }
         Commands::Check {

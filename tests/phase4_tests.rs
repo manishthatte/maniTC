@@ -482,3 +482,85 @@ fn f1_mem2reg_is_on_by_default_and_no_mem2reg_opts_out() {
         "--mem2reg must be a no-op now that promotion is the default"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The two float defects the 1,147-file corpus sweep found
+// ---------------------------------------------------------------------------
+
+/// report.txt P19 — T3 had no float remainder at all.
+///
+/// `x % y` on two floats was missing from the emitter's float list, so it fell
+/// through to the INTEGER path and emitted `TMOD` against two IEEE-754 bit
+/// patterns: `7.5 % 2.0` was 0 on T3 and 1.5 on LLVM.
+///
+/// The operands go through a function so the constant folder cannot compute the
+/// answer at compile time. With both operands literal the folder gets it right
+/// for reasons unrelated to the defect, which is exactly how this first
+/// appeared as a promoted-vs-unpromoted difference and misdirected the triage.
+#[test]
+fn p19_float_remainder_agrees_across_backends() {
+    let src = write(
+        "p19_frem",
+        r#"
+use std::io;
+use std::fmt;
+fn frem(x: float, y: float) -> float { return x % y; }
+fn main() -> int {
+    io::println(fmt::show_int((frem(7.5, 2.0) * 1000.0) as int));
+    io::println(fmt::show_int((frem(-7.5, 2.0) * 1000.0) as int));
+    io::println(fmt::show_int((frem(10.0, 3.0) * 1000.0) as int));
+    return 0;
+}
+"#,
+    );
+    let expected = "1500\n-1500\n1000\n";
+    let (code, out) = run_t3(&src, &[]);
+    assert_eq!(code, 0, "T3: {}", out);
+    assert_eq!(out, expected, "T3 float remainder");
+    if let Some((code, out)) = run_llvm(&src, &[]) {
+        assert_eq!(code, 0, "LLVM: {}", out);
+        assert_eq!(out, expected, "LLVM float remainder");
+    }
+}
+
+/// report.txt P20 — a NaN compares false to everything, itself included, and
+/// `!=` is the single exception that is TRUE.
+///
+/// Both backends had this wrong, in opposite directions and for unrelated
+/// reasons. T3's three-way `fcmp` cannot express UNORDERED, so it collapsed to
+/// 0 — "equal" — and every comparison against a NaN said true. LLVM used
+/// `fcmp one`, ORDERED not-equal, so `nan != x` said false.
+///
+/// The direction matters: a guard written as `if x != x { reject }` passed
+/// exactly when it should have rejected.
+#[test]
+fn p20_nan_comparisons_follow_ieee_on_both_backends() {
+    let src = write(
+        "p20_nan",
+        r#"
+use std::io;
+fn nan_of(a: float, b: float) -> float { return a / b; }
+fn show(tag: str, b: bool) { io::print(tag); io::println_bool(b); }
+fn main() -> int {
+    let n: float = nan_of(0.0, 0.0);
+    show("eq_self ", n == n);
+    show("eq_one  ", n == 1.0);
+    show("ne_one  ", n != 1.0);
+    show("lt_one  ", n <  1.0);
+    show("gt_one  ", n >  1.0);
+    show("le_one  ", n <= 1.0);
+    show("ge_one  ", n >= 1.0);
+    return 0;
+}
+"#,
+    );
+    // Only `!=` is true. Everything else is false, `n == n` included.
+    let expected = "eq_self false\neq_one  false\nne_one  true\nlt_one  false\ngt_one  false\nle_one  false\nge_one  false\n";
+    let (code, out) = run_t3(&src, &[]);
+    assert_eq!(code, 0, "T3: {}", out);
+    assert_eq!(out, expected, "T3 NaN comparisons");
+    if let Some((code, out)) = run_llvm(&src, &[]) {
+        assert_eq!(code, 0, "LLVM: {}", out);
+        assert_eq!(out, expected, "LLVM NaN comparisons");
+    }
+}

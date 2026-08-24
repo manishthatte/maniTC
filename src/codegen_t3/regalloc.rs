@@ -438,7 +438,11 @@ fn abi_clobber_sites(
                     let float_arith = matches!(ty, IRType::F64)
                         && matches!(
                             op,
-                            IRBinOp::Add | IRBinOp::Sub | IRBinOp::Mul | IRBinOp::Div
+                            IRBinOp::Add
+                                | IRBinOp::Sub
+                                | IRBinOp::Mul
+                                | IRBinOp::Div
+                                | IRBinOp::Rem // frem, SYSCALL #221 (P19)
                         );
                     // Float comparisons carry a Bool result type, so the op
                     // variant is the only thing that identifies them.
