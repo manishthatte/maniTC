@@ -331,3 +331,177 @@ fn main() {
     assert_eq!(r.status.code(), Some(0), "v1 is unchanged");
     assert_eq!(String::from_utf8_lossy(&r.stdout), "3812798742494\n");
 }
+
+/// **report.txt P21 cluster 2 — the two backends report the same overflow in
+/// the same words.**
+///
+/// Everything about the two messages was already byte-identical except the
+/// name of the operation: the T3 emulator said `TMUL overflow: …` where the C
+/// runtime said `int multiplication overflow: …`, for the same fault on the
+/// same value. This repo treats message parity as a correctness property —
+/// `manit_check_result_ok` in `runtime/core.c` is kept byte-identical to
+/// SYSCALL #561 and a comment there says why — and these were not.
+///
+/// **The multiply case is the one that matters**, and it is why the LANGUAGE
+/// name won over the opcode. `1270932914165 * 3` is a multiply by a power of
+/// three, so F-2's ternary strength reduction lowers it to `TSHI` on T3.
+/// Naming the opcode would have made the diagnostic depend on whether the
+/// OPTIMISER fired — the programmer wrote a multiply and never asked for a
+/// shift. Reduce it or not, it must read `int multiplication`.
+///
+/// Every literal here is INSIDE the 27-trit range on purpose. A literal
+/// outside it is mangled on T3 before any arithmetic happens, so the two
+/// backends then trap at different operations on different values — that is
+/// P21 cluster 1, a different finding, and mixing it in here would make this
+/// test fail for a reason it is not about.
+#[test]
+fn n5_an_overflow_reads_the_same_on_both_backends() {
+    for (stem, op, a, b, expect) in [
+        ("n5_msg_add", "+", "3812798742493", "1", "int addition"),
+        ("n5_msg_sub", "-", "-3812798742493", "1", "int subtraction"),
+        ("n5_msg_mul", "*", "1270932914165", "3", "int multiplication"),
+    ] {
+        let src = format!(
+            "use std::io;\n\
+             fn op(x: int, y: int) -> int {{ return x {} y; }}\n\
+             fn main() {{ io::println_int(op({}, {})); }}\n",
+            op, a, b
+        );
+        let p = write(stem, &src);
+
+        // T3: the emulator prints the trap on its own output.
+        let base = p.with_extension("");
+        let c = Command::new(manitc())
+            .args(["compile", p.to_str().unwrap(), "--target", "t3",
+                   "--lang", "v2", "-o", base.to_str().unwrap()])
+            .output().expect("compile t3");
+        assert!(c.status.success(), "{} t3 compile", stem);
+        let r = Command::new(manitc())
+            .args(["run-t3", base.with_extension("t3b").to_str().unwrap()])
+            .output().expect("run t3");
+        let t3_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&r.stdout),
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let t3_trap = t3_text
+            .lines()
+            .find(|l| l.contains("TRAP:"))
+            .unwrap_or_else(|| panic!("{}: T3 did not trap:\n{}", stem, t3_text))
+            .trim()
+            .to_string();
+
+        // LLVM: `manit_fault` writes to stderr.
+        let bin = p.with_extension("bin");
+        let c = Command::new(manitc())
+            .args(["compile", p.to_str().unwrap(), "--target", "llvm",
+                   "--lang", "v2", "-o", bin.to_str().unwrap()])
+            .output().expect("compile llvm");
+        if !c.status.success() { continue; }  // no clang in this environment
+        let r = Command::new(&bin).output().expect("run llvm");
+        let ll_text = String::from_utf8_lossy(&r.stderr).to_string();
+        let ll_trap = ll_text
+            .lines()
+            .find(|l| l.contains("TRAP:"))
+            .unwrap_or_else(|| panic!("{}: LLVM did not trap:\n{}", stem, ll_text))
+            .trim()
+            .to_string();
+
+        assert_eq!(t3_trap, ll_trap, "{}: the two backends must word it alike", stem);
+        assert!(
+            t3_trap.contains(expect),
+            "{}: the LANGUAGE operation is what a trap names, not the opcode: {}",
+            stem, t3_trap
+        );
+    }
+}
+
+/// **report.txt P21 cluster 1 — an `int` literal too wide for the word.**
+///
+/// The sharpest case in the whole cluster is not a computation:
+///
+/// ```text
+/// fn main() { io::print_int(g(9223372036854775807)); }
+///
+/// T3    72854775807      reshaped before any arithmetic happens
+/// LLVM  TRAP: int addition overflow: result 9223372036854775807 …
+/// ```
+///
+/// From that point the backends are computing with different numbers, which is
+/// why four of the ten "wording only" corpus files go on differing after the
+/// wording is fixed. The two versions get different answers because they are
+/// asking different questions, and BOTH halves are pinned here — a rule with
+/// one half tested is a rule that can lose the other half silently.
+#[test]
+fn n5_an_int_literal_wider_than_the_word_is_v2s_error_and_v1s_backlog() {
+    let src = r#"
+use std::io;
+fn g(n: int) -> int { return n + 1; }
+fn main() { io::print_int(g(9223372036854775807)); }
+"#;
+    let p = write("n5_wide_literal", src);
+    let check = |args: &[&str]| -> (bool, String) {
+        let o = Command::new(manitc())
+            .arg("check")
+            .arg(p.to_str().unwrap())
+            .args(args)
+            .output()
+            .expect("check");
+        (
+            o.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+
+    // v2 REJECTS it: `int` is 27 trits there, so the literal has no value.
+    let (ok, text) = check(&["--lang", "v2"]);
+    assert!(!ok, "v2 must reject a literal that does not fit `int`:\n{}", text);
+    assert!(text.contains("does not fit `int`"), "{}", text);
+    assert!(text.contains("trint"), "the escape hatch must be named:\n{}", text);
+
+    // v1 ACCEPTS it silently. This is the R5 property the whole shape exists
+    // for: `eval/l1_probe.py` runs `manitc check` with no `--lang`, so a
+    // default-allow lint under v1 cannot move an L1 verdict. Measured at 0
+    // moved over all 1,147 model-corpus files and all 271 in the two repos.
+    let (ok, text) = check(&[]);
+    assert!(ok, "v1 must still accept it — `int` is the host word there:\n{}", text);
+    assert!(!text.contains("literal-out-of-word"), "and silently:\n{}", text);
+
+    // …until asked for the backlog, which is the migration plan.
+    let (ok, text) = check(&["--warn", "literal-out-of-word"]);
+    assert!(ok, "the backlog is a warning, not an error:\n{}", text);
+    assert!(text.contains("literal-out-of-word"), "{}", text);
+    assert!(text.contains("27-trit range"), "{}", text);
+}
+
+/// `trint` is the escape hatch and must not acquire the bound — the same
+/// argument as `n5_trint_is_not_bounded_to_the_word_on_llvm`, one level down.
+/// The literal check reuses `binop_to_ir`'s `Int | T27` predicate precisely so
+/// these two cannot drift apart.
+#[test]
+fn n5_a_wide_literal_is_fine_in_a_trint_under_v2() {
+    let src = r#"
+use std::io;
+fn main() {
+    let w: trint = 9223372036854775807;
+    let m: int = 3812798742493;
+    io::println_int(m);
+    io::println_int(w);
+}
+"#;
+    let p = write("n5_wide_literal_trint", src);
+    let o = Command::new(manitc())
+        .args(["check", p.to_str().unwrap(), "--lang", "v2"])
+        .output()
+        .expect("check");
+    assert!(
+        o.status.success(),
+        "`trint` is v2's wider type and must still hold the machine word:\n{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

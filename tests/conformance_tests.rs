@@ -30,9 +30,12 @@ fn manitc_bin() -> PathBuf {
 }
 
 fn tmp(stem: &str) -> PathBuf {
+    // Unique per call, nested under one directory per process — see the note
+    // in `expected_output_tests::temp_output` (report.txt P28).
     let slot = N.fetch_add(1, Ordering::Relaxed);
     let d = std::env::temp_dir()
-        .join(format!("manitc_conf_{}_{}", std::process::id(), slot));
+        .join(format!("manitc_conf_{}", std::process::id()))
+        .join(slot.to_string());
     std::fs::create_dir_all(&d).expect("temp dir");
     d.join(format!("{}.mt", stem))
 }

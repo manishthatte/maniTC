@@ -445,6 +445,98 @@ impl SemanticAnalyzer {
         ));
     }
 
+    /// N5 / report.txt P21 cluster 1 — an `int` literal too wide for the word.
+    ///
+    /// THE SHARPEST CASE IN P21 IS NOT A COMPUTATION, IT IS A LITERAL:
+    ///
+    /// ```text
+    /// fn main() { io::print_int(g(9223372036854775807)); }
+    ///
+    /// T3    72854775807      the literal does not fit 27 trits and is
+    ///                        reshaped before any arithmetic happens
+    /// LLVM  TRAP: int addition overflow: result 9223372036854775807 …
+    /// ```
+    ///
+    /// From that point the two backends are computing with different numbers,
+    /// which is why four of the ten corpus files that "only differ in trap
+    /// wording" go on differing after the wording is fixed: they trap at a
+    /// different operation on a different value. It is a FRONT-END question —
+    /// does a literal outside the word mean anything? — and not a codegen one.
+    ///
+    /// TWO ANSWERS, because the versions ask different questions:
+    ///
+    /// * **v2 rejects it.** N5 says `int` IS 27 trits, so the literal has no
+    ///   value, exactly as `let b: i8 = 300` has none. Not a lint: a level
+    ///   cannot allow away a value that does not exist.
+    /// * **v1 lints it, defaulting to `allow`.** Under v1 `int` is
+    ///   deliberately the host word on LLVM and the literal is legal there, so
+    ///   this is the MIGRATION BACKLOG, the pattern `undeclared-native` and
+    ///   `division-semantics` established. `--warn literal-out-of-word`
+    ///   generates the list, and the list is the migration plan.
+    ///
+    /// L1 IS UNMOVED BY CONSTRUCTION (R5), and that is why it is shaped this
+    /// way. `eval/l1_probe.py` runs `manitc check` with no `--lang`, so it
+    /// scores v1, where this defaults to `allow` and no verdict can change.
+    ///
+    /// The type test is `Int | T27` — the SAME predicate `binop_to_ir` uses to
+    /// decide N5's checked arithmetic, and for the same reason: `trint` (t54)
+    /// is the wider type v2 provides for code that wants the machine word, so
+    /// checking it would remove the escape hatch.
+    fn check_literal_fits_word(
+        &mut self,
+        lit: &Lit,
+        ty: &ManiType,
+        span: crate::ast::Span,
+    ) -> CompileResult<()> {
+        let v = match lit {
+            Lit::Int(v) | Lit::TernaryInt(v) => *v,
+            _ => return Ok(()),
+        };
+        if !matches!(ty, ManiType::Int | ManiType::T27) {
+            return Ok(());
+        }
+        // Balanced ternary is symmetric — no extra negative value — so one
+        // magnitude test decides it for both signs.
+        if v.unsigned_abs() <= crate::lang::T27_MAX as u64 {
+            return Ok(());
+        }
+
+        if self.lang.int_is_27_trits() {
+            return Err(self.err(
+                span,
+                format!(
+                    "the literal {} does not fit `int`: under --lang v2 an `int` is \
+                     a 27-trit word and holds [{}, {}]. `trint` is the wider type \
+                     for a value that needs the machine word.",
+                    v,
+                    crate::lang::T27_MIN,
+                    crate::lang::T27_MAX,
+                ),
+            ));
+        }
+
+        if self.warnings.effective_level(&WarningKind::LiteralOutOfWord)
+            == crate::lint::LintLevel::Allow
+        {
+            return Ok(());
+        }
+        self.warnings.push(CompileWarning::new(
+            WarningKind::LiteralOutOfWord,
+            &self.file,
+            span.line,
+            span.col,
+            format!(
+                "the literal {} is outside the 27-trit range [{}, {}]: it fits `int` \
+                 on the LLVM backend and is reshaped on T3, and it will not compile \
+                 under --lang v2. `trint` is the wider type.",
+                v,
+                crate::lang::T27_MIN,
+                crate::lang::T27_MAX,
+            ),
+        ));
+        Ok(())
+    }
+
     fn register_builtins(&mut self) {
         use ManiType::*;
 

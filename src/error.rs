@@ -285,6 +285,13 @@ pub enum WarningKind {
     BackendUnavailable,
     /// B1/A4: a generic argument that does not satisfy a declared bound.
     UnsatisfiedBound,
+    /// N5/P21: an `int` literal too wide for the 27-trit word.
+    ///
+    /// A migration backlog under v1, where `int` is deliberately the host word
+    /// on LLVM and such a literal is legal there. Under v2 it is not a warning
+    /// at all — `int` means 27 trits, so the literal has no value and the
+    /// analyzer rejects it outright.
+    LiteralOutOfWord,
     /// C4/R2: a `/` or `%` on an integer type, whose meaning differs between
     /// language versions. The migration backlog for the division change.
     DivisionSemantics,

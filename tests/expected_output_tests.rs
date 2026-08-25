@@ -30,9 +30,16 @@ fn expected_file(stem: &str) -> PathBuf {
 }
 
 fn temp_output(stem: &str, suffix: &str) -> PathBuf {
-    // Use a per-call unique counter so parallel tests never share the same output path.
+    // A per-call counter so parallel tests never share an output path — but
+    // NESTED under one directory per process, not one per call. Flat, this
+    // helper alone left 6,170 top-level entries in the temp directory
+    // (report.txt P28): a unique PATH is what the tests need, and a unique
+    // top-level entry per test is what makes a temp directory of 100,000
+    // slow to open.
     let slot = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("manitc_expected_{}_{}_{}", suffix, std::process::id(), slot));
+    let dir = std::env::temp_dir()
+        .join(format!("manitc_expected_{}", std::process::id()))
+        .join(format!("{}_{}", suffix, slot));
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir.join(stem)
 }

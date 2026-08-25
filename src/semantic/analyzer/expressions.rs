@@ -8,6 +8,7 @@ impl SemanticAnalyzer {
         match expr {
             Expr::Lit(lit, _) => {
                 let ty = self.infer_lit_type(lit, hint);
+                self.check_literal_fits_word(lit, &ty, span)?;
                 Ok(TypedExpr { kind: TypedExprKind::Lit(lit.clone()), ty, span })
             }
 

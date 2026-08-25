@@ -1,6 +1,7 @@
 // emulator/profiler.rs — Task (cooperative scheduler) and ExecProfile.
 // Included as pub mod profiler in emulator/mod.rs.
 use super::super::isa::{Opcode, T3_OPCODE_COUNT};
+use super::HEAP_BASE;
 
 // ---------------------------------------------------------------------------
 // Cooperative scheduler task
@@ -26,6 +27,21 @@ pub(crate) enum DebugAction {
 // ---------------------------------------------------------------------------
 // Execution profile — collected during emulation
 // ---------------------------------------------------------------------------
+
+/// Opcode mnemonics, indexed by discriminant. Shared by `summary` (which shows
+/// the top ten) and `report` (which shows all of them), so the two cannot drift
+/// apart; the `debug_assert` below is what keeps the table in step with the ISA.
+pub const OPCODE_NAMES: [&str; T3_OPCODE_COUNT] = [
+    "NOP", "TADD", "TSUB", "TMUL", "TDIV", "TMOD", "TNEG",
+    "TAND", "TOR", "TNOT", "TSHI", "TSHR", "TMIN", "TMAX",
+    "TCMP", "LOAD", "STORE", "TLIT", "MOV", "TBRANCH", "JUMP",
+    "CALL", "RET", "HALT", "SYSCALL", "TBRPOS", "TBRZERO", "TBRNEG",
+    "CALLR", "BAND", "BOR", "BXOR", "BSHL", "BSHR", "LOADT", "STORET",
+    // v1.5 lane-wise group, opcodes 36-42.
+    "TANDW", "TORW", "TXORW", "TIMPW", "TCMPW", "TPOPC", "TSELW",
+    // v1.6 rounding pair, opcodes 43-44.
+    "TDIVN", "TMODN",
+];
 
 #[derive(Debug, Clone)]
 pub struct ExecProfile {
@@ -122,32 +138,65 @@ impl ExecProfile {
             if self.total_instructions > 0 { self.memory_ops as f64 / self.total_instructions as f64 * 100.0 } else { 0.0 }));
         s.push_str(&format!("  Max call depth:     {}\n", self.max_call_depth));
         s.push_str(&format!("  Max heap used:      {} words\n",
-            self.max_heap_ptr.saturating_sub(63_000)));
+            self.max_heap_ptr.saturating_sub(HEAP_BASE)));
 
         // Top opcodes
-        let mut sorted: Vec<(usize, &str)> = Vec::new();
-        let names = [
-            "NOP","TADD","TSUB","TMUL","TDIV","TMOD","TNEG",
-            "TAND","TOR","TNOT","TSHI","TSHR","TMIN","TMAX",
-            "TCMP","LOAD","STORE","TLIT","MOV","TBRANCH","JUMP",
-            "CALL","RET","HALT","SYSCALL","TBRPOS","TBRZERO","TBRNEG",
-            "CALLR","BAND","BOR","BXOR","BSHL","BSHR","LOADT","STORET",
-            // v1.5 lane-wise group, opcodes 36-42.
-            "TANDW","TORW","TXORW","TIMPW","TCMPW","TPOPC","TSELW",
-            // v1.6 rounding pair, opcodes 43-44.
-            "TDIVN","TMODN",
-        ];
-        debug_assert_eq!(names.len(), T3_OPCODE_COUNT,
+        debug_assert_eq!(OPCODE_NAMES.len(), T3_OPCODE_COUNT,
             "opcode name table out of step with the opcode set");
-        for (i, &count) in self.opcode_counts.iter().enumerate() {
-            if count > 0 && i < names.len() {
-                sorted.push((count, names[i]));
-            }
-        }
+        let mut sorted: Vec<(usize, &str)> = self.executed_opcodes();
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
         s.push_str("  Top opcodes:\n");
         for (count, name) in sorted.iter().take(10) {
             s.push_str(&format!("    {:>8}  {}\n", count, name));
+        }
+        s
+    }
+
+    /// Every opcode that executed at least once, as `(count, mnemonic)`.
+    pub fn executed_opcodes(&self) -> Vec<(usize, &'static str)> {
+        self.opcode_counts
+            .iter()
+            .enumerate()
+            .filter(|(i, &c)| c > 0 && *i < OPCODE_NAMES.len())
+            .map(|(i, &c)| (c, OPCODE_NAMES[i]))
+            .collect()
+    }
+
+    /// The profile as one prefixed line per fact, for `run-t3 --profile`.
+    ///
+    /// **This is the machine-readable form, and that is the point of it.**
+    /// `summary()` is a human report and truncates the histogram to the top
+    /// ten; comparing two compilations of one program needs the WHOLE
+    /// histogram, because the question a pass raises is usually "what did it
+    /// trade" — CSE removes arithmetic and adds spill traffic (report.txt P22),
+    /// and a top-ten view can hide either side of that.
+    ///
+    /// Every line carries the `[T3ISA]` prefix that the corpus sweep scripts
+    /// already filter with `grep -v '^\[T3ISA\]'`, so a profiled run stays
+    /// byte-comparable with an unprofiled one even if a caller merges the two
+    /// streams. Fixed-width columns, opcodes sorted descending, and one fact
+    /// per line, so `diff` on two profiles reads as a list of what moved.
+    pub fn report(&self) -> String {
+        let mut s = String::new();
+        let mut line = |k: &str, v: usize| {
+            s.push_str(&format!("[T3ISA] profile  {:<20} {:>12}\n", k, v));
+        };
+        line("total-instructions", self.total_instructions);
+        line("program-words", self.program_words);
+        line("arithmetic-ops", self.arithmetic_ops);
+        line("ternary-native-ops", self.ternary_native_ops);
+        line("control-flow-ops", self.control_flow_ops);
+        line("memory-ops", self.memory_ops);
+        line("max-call-depth", self.max_call_depth);
+        line("max-heap-words", self.max_heap_ptr.saturating_sub(HEAP_BASE));
+
+        let mut ops = self.executed_opcodes();
+        // Descending by count, then by name, so the order is total and two
+        // runs that executed the same opcodes the same number of times produce
+        // byte-identical reports.
+        ops.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        for (count, name) in ops {
+            s.push_str(&format!("[T3ISA] profile  opcode {:<13} {:>12}\n", name, count));
         }
         s
     }

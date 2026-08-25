@@ -34,13 +34,72 @@ pub struct LinkFlags {
     pub libs: Vec<String>,
 }
 
+/// The temporary files one compilation needs, removed when it ends.
+///
+/// EVERYTHING THIS GUARD HOLDS USED TO BE LEFT BEHIND. Nothing removed the
+/// compiled runtime object or the extracted runtime sources, so every manitc
+/// process left a ~92 KB `.o` in the temp directory and every LLVM compile
+/// that could not find the runtime on disk left a directory of seven C files
+/// beside it. A 1,147-file corpus sweep leaves 1,147 of each; measured on this
+/// machine after a few of them, 80,919 stale objects and 1,819 stale
+/// directories — about 7 GB, and 100,000 entries in one directory.
+///
+/// A GUARD rather than a call at the end of the link, because the link path
+/// has several early returns and the leak that only happens when the build
+/// FAILS is the one nobody notices.
+///
+/// Only paths this compiler CREATED are ever registered — `resolve_source`
+/// adds the extracted directory and not the repository's own `runtime/`,
+/// which it may equally well return and which deleting would be a disaster.
+/// That is why registration lives inside `resolve_source` rather than at the
+/// call site: a caller cannot tell the two apart from the path alone.
+#[derive(Default)]
+pub struct Scratch {
+    paths: Vec<PathBuf>,
+}
+
+impl Scratch {
+    pub fn new() -> Scratch {
+        Scratch::default()
+    }
+
+    /// Remove `path` — a file or a directory — when this guard is dropped.
+    /// Returns it, so a call site can wrap the path it was going to use.
+    pub fn add(&mut self, path: PathBuf) -> PathBuf {
+        self.paths.push(path.clone());
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            // Best effort, deliberately: a compilation that cannot tidy up
+            // after itself has still compiled, and reporting a failure to
+            // remove a temporary file over the top of a successful build
+            // would be worse than the leak.
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(p)
+            } else {
+                std::fs::remove_file(p)
+            };
+        }
+    }
+}
+
 /// Locate `manit_runtime.c`, in order of preference:
 ///   1. next to the source file being compiled (`../runtime/`)
 ///   2. under the current working directory
 ///   3. next to the manitc executable (`../runtime/`) — this is the layout
 ///      the release tarball ships, `bin/manitc` alongside `runtime/`
 ///   4. failing all that, write the embedded copy to a temporary directory
-pub fn resolve_source(source_file: Option<&Path>) -> std::io::Result<PathBuf> {
+///
+/// Only case 4 is registered with `scratch`: the first three are real source
+/// trees that happen to be where the runtime lives.
+pub fn resolve_source(
+    source_file: Option<&Path>,
+    scratch: &mut Scratch,
+) -> std::io::Result<PathBuf> {
     let candidates = [
         source_file
             .and_then(|f| f.parent())
@@ -56,7 +115,11 @@ pub fn resolve_source(source_file: Option<&Path>) -> std::io::Result<PathBuf> {
     if let Some(found) = candidates.iter().find(|p| p.exists()) {
         return Ok(found.clone());
     }
-    write_embedded()
+    let written = write_embedded()?;
+    if let Some(dir) = written.parent() {
+        scratch.add(dir.to_path_buf());
+    }
+    Ok(written)
 }
 
 /// Write the embedded runtime — all seven files — into a temporary directory

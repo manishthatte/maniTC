@@ -2,6 +2,8 @@ pub mod types;
 pub mod lower;
 pub mod optimize;
 pub mod mem2reg;
+pub mod inline;
+pub mod merge_blocks;
 pub mod ssa;
 pub use types::*;
 pub use lower::*;

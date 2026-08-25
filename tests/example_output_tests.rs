@@ -37,12 +37,12 @@ fn expected_file(name: &str) -> PathBuf {
 }
 
 fn temp_output(name: &str) -> PathBuf {
+    // Unique per call, nested under one directory per process — see the note
+    // in `expected_output_tests::temp_output` (report.txt P28).
     let slot = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "manitc_example_{}_{}",
-        std::process::id(),
-        slot
-    ));
+    let dir = std::env::temp_dir()
+        .join(format!("manitc_example_{}", std::process::id()))
+        .join(slot.to_string());
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir.join(name)
 }

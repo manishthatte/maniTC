@@ -9,6 +9,7 @@ pub mod debugger;
 pub use debugger::{run_emulator, run_emulator_debug, run_emulator_debug_argv,
                    run_emulator_profiled, run_emulator_with_exit,
                    run_emulator_with_exit_capped, run_emulator_with_exit_capped_argv,
+                   run_emulator_with_exit_capped_argv_profiled,
                    DEFAULT_MAX_STEPS, T3_STEP_LIMIT_EXIT};
 
 mod execute;
@@ -54,6 +55,27 @@ pub(super) enum HeapObj {
     TaskResult(i64),
 }
 
+/// The initial stack pointer, and therefore the first address STATIC DATA may
+/// not reach.
+///
+/// The stack grows DOWNWARD from here while code, string literals and float
+/// literals grow UPWARD from 0, and **nothing had ever checked that the two do
+/// not meet** (report.txt P38). A program of more than 60,000 words simply
+/// overwrote its own stack and then executed whatever a `CALL` had pushed —
+/// reported as `TRAP: unknown opcode`, which names the symptom and not the
+/// cause. The assembler now refuses that layout, and this is what it refuses
+/// against; it is `pub` for exactly that reason.
+pub const STACK_BASE: usize = 60_000;
+
+/// The first address of the heap, which grows UPWARD from here to the top of
+/// memory — so the heap is `memory.len() - HEAP_BASE` words and nothing may be
+/// allocated past the end.
+///
+/// Named for the same reason `STACK_BASE` is: the number was written out three
+/// times (the constructor and the profiler's two readouts) and a bound that is
+/// spelled rather than named is a bound each caller can get differently.
+pub const HEAP_BASE: usize = 63_000;
+
 pub struct Emulator {
     pub regs: [i64; 27],
     pub pc: usize,
@@ -83,8 +105,13 @@ pub struct Emulator {
     /// The heap base moved down from 64_000 when struct allocations became
     /// heap-allocated (syscall #218): 63_000 was the base of a dead
     /// string-literal region and is free, and the extra 1_000 words are worth
-    /// having now that every struct costs heap. Allocation past the top traps
-    /// rather than silently dropping writes.
+    /// having now that every struct costs heap.
+    ///
+    /// Allocation past the top traps rather than silently dropping writes —
+    /// which is what this comment ALREADY CLAIMED while three of the four
+    /// allocators did the opposite (report.txt P39). Every one of them now
+    /// goes through `heap_reserve`, which is the only place the bound is
+    /// spelled.
     heap_ptr: usize,
     /// Heap objects (Vecs, Maps, Sets, Deques, Channels) keyed by handle.
     heap_objs: HashMap<usize, HeapObj>,
@@ -143,7 +170,7 @@ pub struct Emulator {
 impl Emulator {
     pub fn new() -> Self {
         let mut regs = [0i64; 27];
-        regs[26] = 60_000; // SP
+        regs[26] = STACK_BASE as i64; // SP
         Emulator {
             regs,
             pc: 0,
@@ -156,7 +183,7 @@ impl Emulator {
             float_data: HashMap::new(),
             input_queue: std::collections::VecDeque::new(),
             call_stack: Vec::new(),
-            heap_ptr: 63_000,
+            heap_ptr: HEAP_BASE,
             heap_objs: HashMap::new(),
             string_intern: HashMap::new(),
             files: HashMap::new(),
@@ -197,11 +224,27 @@ impl Emulator {
         self.regs[26] -= 1;
         self.regs[1] = arg;
         self.pc = fn_ptr;
-        // Run until the function's RET restores us to saved_pc
-        let mut steps = 0;
-        while !self.halted && self.call_stack.len() > depth && steps < 1_000_000 {
+        // Run until the function's RET restores us to saved_pc, charging the
+        // GLOBAL instruction budget (report.txt P33).
+        //
+        // This is a RE-ENTRANT emulator loop: a syscall handed a maniT function
+        // pointer — a `Vec::filter` predicate, a sort comparator, a scheduled
+        // task — drives the callee here rather than returning to `run`. It used
+        // to count its own iterations against a private 1,000,000, so every
+        // instruction executed inside a callback was RECORDED in the profile
+        // and CHARGED TO NOTHING: `--max-steps` bounded only the outer loop's
+        // iterations. `concurrency` ran 30,299 instructions under a budget of
+        // 26,699 and exited 0, and bisecting the budget for a dynamic
+        // instruction count therefore under-reported exactly the programs that
+        // use callbacks.
+        //
+        // `profile.total_instructions` is the right counter because it is the
+        // one thing that counts every instruction wherever it was executed.
+        while !self.halted
+            && self.call_stack.len() > depth
+            && self.profile.total_instructions < self.max_steps
+        {
             self.step();
-            steps += 1;
         }
         let ret = self.regs[1];
         // On a normal return, Ret already popped our frame and set pc=saved_pc.
@@ -255,10 +298,12 @@ impl Emulator {
         self.regs[1] = a;
         self.regs[2] = b;
         self.pc = fn_ptr;
-        let mut steps = 0;
-        while !self.halted && self.call_stack.len() > depth && steps < 1_000_000 {
+        // The global budget, exactly as in `call_fn_ptr` above (P33).
+        while !self.halted
+            && self.call_stack.len() > depth
+            && self.profile.total_instructions < self.max_steps
+        {
             self.step();
-            steps += 1;
         }
         let ret = self.regs[1];
         // Same timeout recovery as call_fn_ptr: pop stale frames, restore PC.
@@ -321,17 +366,15 @@ impl Emulator {
     fn write_lp_string(&mut self, s: &str) -> usize {
         let chars: Vec<i64> = s.chars().map(|c| c as i64).collect();
         let len = chars.len();
-        let addr = self.heap_ptr;
-        if addr < self.memory.len() {
-            self.memory[addr] = len as i64;
-        }
+        // len word + chars + null terminator.
+        let addr = match self.heap_reserve(len + 2) {
+            Some(a) => a,
+            None => return 0,
+        };
+        self.memory[addr] = len as i64;
         for (i, &c) in chars.iter().enumerate() {
-            let a = addr + 1 + i;
-            if a < self.memory.len() {
-                self.memory[a] = c;
-            }
+            self.memory[addr + 1 + i] = c;
         }
-        self.heap_ptr += len + 2; // len word + chars + null terminator
         addr
     }
 
@@ -357,11 +400,48 @@ impl Emulator {
         self.read_lp_string(addr)
     }
 
+    /// Reserve `n` words of heap and return the base address, or trap and
+    /// return `None` when the heap cannot hold them.
+    ///
+    /// **Every heap allocation goes through here** (report.txt P39). Syscall
+    /// #218 checked the bound from the day struct allocations moved to the
+    /// heap; the other three allocators did not, and two of them wrote through
+    /// a per-word `if addr + i < self.memory.len()` that SKIPPED the words
+    /// which did not fit. A program that exhausted the heap therefore received
+    /// a zeroed array and exited 0 — `math::to_balanced_ternary` returning
+    /// `[0,0,0]` rather than the digits of its argument — while the emulator's
+    /// own comment claimed "Allocation past the top traps".
+    ///
+    /// It returns `None` HAVING ALREADY TRAPPED, the same shape as `checked`
+    /// in `execute.rs`, so a caller cannot forget to report it. On that path
+    /// the address handed back is 0 and the emulator is already halted.
+    fn heap_reserve(&mut self, n: usize) -> Option<usize> {
+        let base = self.heap_ptr;
+        if base + n > self.memory.len() {
+            self.trap(format!(
+                "TRAP: heap exhausted allocating {} word(s) at {} (limit {})",
+                n,
+                base,
+                self.memory.len()
+            ));
+            return None;
+        }
+        self.heap_ptr += n;
+        Some(base)
+    }
+
     /// Allocate a runtime string, store it in `string_data`, and return its address.
+    ///
+    /// One word per string whatever its length: the TEXT lives in `string_data`
+    /// on the host side, and this reserves only the address that identifies it.
+    /// The charge is still a charge — the address space is finite — so it is
+    /// bounded like every other allocation.
     fn heap_alloc_str(&mut self, s: String) -> usize {
-        let addr = self.heap_ptr;
+        let addr = match self.heap_reserve(1) {
+            Some(a) => a,
+            None => return 0,
+        };
         self.string_data.insert(addr, s);
-        self.heap_ptr += 1;
         addr
     }
 
@@ -378,14 +458,19 @@ impl Emulator {
     }
 
     /// Allocate `len` words of memory at the heap, write `values`, and return the address.
+    ///
+    /// The reservation is `max(1)` because a zero-length array still needs a
+    /// distinct address; the writes below need no bounds test of their own,
+    /// since `heap_reserve` has already established that the whole range
+    /// exists. It is the per-word test that used to drop them silently.
     fn heap_alloc_array(&mut self, values: &[i64]) -> usize {
-        let addr = self.heap_ptr;
+        let addr = match self.heap_reserve(values.len().max(1)) {
+            Some(a) => a,
+            None => return 0,
+        };
         for (i, &v) in values.iter().enumerate() {
-            if addr + i < self.memory.len() {
-                self.memory[addr + i] = v;
-            }
+            self.memory[addr + i] = v;
         }
-        self.heap_ptr += values.len().max(1);
         addr
     }
 

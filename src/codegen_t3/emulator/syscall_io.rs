@@ -447,16 +447,14 @@ impl Emulator {
                 // every element ended up reading the same buffer.  The LLVM
                 // backend already mallocs struct allocas for the same reason.
                 let n = self.regs[1].max(1) as usize;
-                let base = self.heap_ptr;
-                if base + n > self.memory.len() {
-                    self.trap(format!(
-                        "TRAP: heap exhausted allocating {} word(s) at {} (limit {})",
-                        n,
-                        base,
-                        self.memory.len()
-                    ));
-                    return;
-                }
+                // This arm's own copy of the bound check became `heap_reserve`
+                // (report.txt P39) so that the four allocators cannot drift:
+                // it was the only one that HAD a check, and the other three
+                // silently dropped the words that did not fit.
+                let base = match self.heap_reserve(n) {
+                    Some(b) => b,
+                    None => return,
+                };
                 // Callers read fields before writing them (a partially
                 // initialised struct literal), so hand back zeroed memory
                 // rather than whatever the previous allocation left behind.

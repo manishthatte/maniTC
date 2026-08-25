@@ -142,10 +142,13 @@ impl Emulator {
             return;
         }
         let max_steps = self.max_steps;
-        let mut steps = 0;
-        while !self.halted && steps < max_steps {
+        // The budget is counted in INSTRUCTIONS EXECUTED, not in iterations of
+        // this loop, and the two are not the same thing (report.txt P33): a
+        // syscall handed a maniT callback runs it in a re-entrant loop inside
+        // one `step()`, so an iteration here can be worth thousands.
+        // `profile.total_instructions` is the counter both loops now charge.
+        while !self.halted && self.profile.total_instructions < max_steps {
             self.step();
-            steps += 1;
             // Track high-water marks
             if self.call_depth > self.profile.max_call_depth {
                 self.profile.max_call_depth = self.call_depth;
@@ -154,7 +157,17 @@ impl Emulator {
                 self.profile.max_heap_ptr = self.heap_ptr;
             }
         }
-        if steps >= max_steps {
+        // `!self.halted` FIRST, and it is not decoration (report.txt P32).
+        // The loop also exits when the program halts, and a program that halts
+        // on its `max_steps`-th instruction leaves `steps == max_steps` — so
+        // testing the budget alone reports a program that RAN TO COMPLETION as
+        // cut off, and `run-t3` returns 71 instead of the program's own exit
+        // code. `run_debug` below has always had the check in this order.
+        //
+        // It made `--max-steps` off by exactly one, which is how it was found:
+        // the smallest budget `hello` completes under bisected to 719 while the
+        // profile the same run collected said it executed 718 instructions.
+        if !self.halted && self.profile.total_instructions >= max_steps {
             self.stop_at_step_limit(max_steps);
         }
     }
@@ -281,6 +294,29 @@ pub fn run_emulator_with_exit_capped_argv(
     max_steps: usize,
     argv: Vec<String>,
 ) -> (Vec<String>, i64) {
+    let (out, code, _) =
+        run_emulator_with_exit_capped_argv_profiled(words, string_data, float_data, max_steps, argv);
+    (out, code)
+}
+
+/// As [`run_emulator_with_exit_capped_argv`], also returning the execution
+/// profile the emulator collected on the way (report.txt P31).
+///
+/// The profile was ALWAYS collected — `Emulator::step` counts every opcode
+/// unconditionally and `run` tracks the high-water marks — and until this
+/// existed the only way out of the emulator was `manitc bench`, which runs
+/// uncapped, ignores argv and reports no exit code. So the dynamic instruction
+/// count that P22 established as the right measure of an optimiser pass was
+/// being obtained by bisecting `--max-steps`: about forty emulator runs to read
+/// out a number the emulator was already holding in a field, and the per-opcode
+/// histogram was thrown away with it.
+pub fn run_emulator_with_exit_capped_argv_profiled(
+    words: Vec<i64>,
+    string_data: HashMap<usize, String>,
+    float_data: HashMap<usize, i64>,
+    max_steps: usize,
+    argv: Vec<String>,
+) -> (Vec<String>, i64, ExecProfile) {
     let mut emu = Emulator::new();
     emu.load_program(words);
     emu.string_data = string_data;
@@ -303,7 +339,7 @@ pub fn run_emulator_with_exit_capped_argv(
     } else {
         emu.regs[1]
     };
-    (out, code)
+    (out, code, emu.profile.clone())
 }
 
 /// Process exit status used when a T3 program stops on a TRAP (A5).

@@ -83,7 +83,8 @@ pub fn run_bench(
     std::fs::write(&ll_path, &ll_text).ok();
 
     // Resolve runtime
-    let runtime_c_path = match manitc::runtime_link::resolve_source(Some(file)) {
+    let mut scratch = manitc::runtime_link::Scratch::new();
+    let runtime_c_path = match manitc::runtime_link::resolve_source(Some(file), &mut scratch) {
         Ok(p) => p,
         Err(e) => {
             return Err(CompileError::Codegen(Diagnostic::unknown(format!(
@@ -93,7 +94,7 @@ pub fn run_bench(
     let link = manitc::runtime_link::flags();
 
     // Compile LLVM binary
-    let runtime_obj = manitc::runtime_link::object_path("bench");
+    let runtime_obj = scratch.add(manitc::runtime_link::object_path("bench"));
     let _ = std::process::Command::new("clang")
         .args([runtime_c_path.to_str().unwrap(), "-c", "-O2",
                "-o", runtime_obj.to_str().unwrap()])

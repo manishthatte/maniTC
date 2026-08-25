@@ -32,6 +32,28 @@ impl Emulator {
     ///
     /// Overflow is a property of the program being run, not a compiler bug, so
     /// it is reported the way division by zero already was.
+    ///
+    /// `what` NAMES THE LANGUAGE OPERATION, NOT THE OPCODE (report.txt P21
+    /// cluster 2). It used to be `TADD`/`TSUB`/`TMUL`, against the C runtime's
+    /// `int addition`/`int subtraction`/`int multiplication` for the same
+    /// fault — everything else in the two messages was already byte-identical,
+    /// and this repo treats message parity as a correctness property
+    /// (`manit_check_result_ok` in `runtime/core.c` is kept byte-identical to
+    /// SYSCALL #561 and a comment there says why).
+    ///
+    /// The LANGUAGE side won the tie for three reasons, and the third decides
+    /// it:
+    ///
+    /// 1. the reader is the author of the ManiT program, not someone debugging
+    ///    the emulator, and `TADD` is a T3ISA opcode;
+    /// 2. there is no `TADD` on the other backend at all, so naming it makes
+    ///    the diagnostic un-reproducible for half the toolchain;
+    /// 3. **an optimisation must not show through a diagnostic.** After F-2's
+    ///    ternary strength reduction `x * 3` lowers to `TSHI`, so reporting
+    ///    the opcode would make the message depend on whether the optimiser
+    ///    fired — the programmer wrote a multiply and never asked for a shift.
+    ///    `TSHI` is therefore `int multiplication` here, which is also what it
+    ///    IS: shifting left by k trits is multiplying by 3^k.
     fn checked27(&mut self, v: i64, what: &str) -> Option<i64> {
         if v > T3_MAX || v < T3_MIN {
             self.trap(format!(
@@ -135,19 +157,19 @@ impl Emulator {
 
             Opcode::Tadd => {
                 let raw = self.regs[sr2].saturating_add(rhs_eff);
-                let Some(v) = self.checked27(raw, "TADD") else { return };
+                let Some(v) = self.checked27(raw, "int addition") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
             Opcode::Tsub => {
                 let raw = self.regs[sr2].saturating_sub(rhs_eff);
-                let Some(v) = self.checked27(raw, "TSUB") else { return };
+                let Some(v) = self.checked27(raw, "int subtraction") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
             Opcode::Tmul => {
                 let raw = self.regs[sr2].saturating_mul(rhs_eff);
-                let Some(v) = self.checked27(raw, "TMUL") else { return };
+                let Some(v) = self.checked27(raw, "int multiplication") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
@@ -191,7 +213,7 @@ impl Emulator {
                     return;
                 }
                 let raw = crate::lang::div_nearest(self.regs[sr2], rhs_eff);
-                let Some(v) = self.checked27(raw, "TDIVN") else { return };
+                let Some(v) = self.checked27(raw, "int division") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
@@ -201,7 +223,7 @@ impl Emulator {
                     return;
                 }
                 let raw = crate::lang::rem_balanced(self.regs[sr2], rhs_eff);
-                let Some(v) = self.checked27(raw, "TMODN") else { return };
+                let Some(v) = self.checked27(raw, "int remainder") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }
@@ -311,7 +333,7 @@ impl Emulator {
                 // multiply by 3^n; shift amount from register (r3) or immediate
                 let n = rhs_eff.clamp(0, 26) as u32;
                 let raw = self.regs[sr2].saturating_mul(3i64.pow(n));
-                let Some(v) = self.checked27(raw, "TSHI") else { return };
+                let Some(v) = self.checked27(raw, "int multiplication") else { return };
                 self.flags = sign_i64(v);
                 wreg!(r1, v);
             }

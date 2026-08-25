@@ -16,5 +16,6 @@ pub use assembler::{assemble, write_t3_binary, read_t3_binary, read_t3_binary_wi
 pub use emulator::{run_emulator, run_emulator_debug, run_emulator_debug_argv,
                    run_emulator_profiled, run_emulator_with_exit,
                    run_emulator_with_exit_capped, run_emulator_with_exit_capped_argv,
+                   run_emulator_with_exit_capped_argv_profiled,
                    DEFAULT_MAX_STEPS, T3_STEP_LIMIT_EXIT, Emulator, ExecProfile};
 pub use emitter::emit_t3_asm;

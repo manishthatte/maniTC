@@ -161,6 +161,42 @@ pub fn assemble(asm_text: &str) -> Result<(Vec<i64>, HashMap<usize, String>, Has
         .map(|(i, k)| (float_base + i, float_data_src[k]))
         .collect();
 
+    // **The static image must end below the stack, and nothing checked it
+    // until report.txt P38.**
+    //
+    // The memory map (emulator/mod.rs) puts code at 0 growing UP, then string
+    // literals at `code_size + 1024`, then float literals — while the stack
+    // starts at `STACK_BASE` and grows DOWN. A program whose image reaches
+    // 60,000 words therefore overlaps its own stack: the first `CALL` writes a
+    // return address over an instruction, and execution eventually reads a
+    // stack word as code. The emulator reports that as
+    // `TRAP: unknown opcode <n> at PC=<n>`, which names the SYMPTOM — a word
+    // that is not an instruction — and gives no hint that the cause is size.
+    //
+    // Measured before this check: a program of 59,991 words ran correctly and
+    // one of 60,004 trapped, with no diagnostic anywhere in between. It is not
+    // an inliner defect, though inlining is what first pushed real programs
+    // over the line — 14 of the 1,147-file corpus, all silently.
+    //
+    // The bound is the hard overlap rather than a headroom estimate: how much
+    // stack a program needs is dynamic, so `>= STACK_BASE` is the one line
+    // that is certainly wrong for every program rather than arguably wrong for
+    // some.
+    let image_top = float_base + float_keys.len();
+    if image_top >= super::emulator::STACK_BASE {
+        return Err(format!(
+            "program image is {} words and does not fit below the stack at {} \
+             ({} words of code, {} string literals, {} float literals). The \
+             stack grows down from {} and would overwrite the image.",
+            image_top,
+            super::emulator::STACK_BASE,
+            code_size,
+            str_keys.len(),
+            float_keys.len(),
+            super::emulator::STACK_BASE,
+        ));
+    }
+
     // ---- Pass 2: encode ----
     let mut words = Vec::with_capacity(raw_instrs.len());
     let mut i = 0;

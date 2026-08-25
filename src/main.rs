@@ -104,6 +104,33 @@ enum Commands {
         #[arg(long, value_name = "N", default_value_t = 1)]
         rounds: usize,
 
+        /// F-2: the largest single-block callee, in IR instructions, to splice
+        /// into its callers.
+        ///
+        /// 482 of the 1,101 small non-recursive call sites in the shipped
+        /// examples have a callee that is ONE block ending in a return, and
+        /// those need no control-flow surgery at all — the body is spliced
+        /// where the call stood. The most-called of them are forwarding
+        /// wrappers with a ONE-instruction body, where inlining removes a call
+        /// frame and adds nothing.
+        #[arg(long, value_name = "N", default_value_t = manitc::ir::inline::SIZE_LIMIT)]
+        inline_limit: usize,
+
+        /// Turn F-2 inlining OFF. Equivalent to `--inline-limit 0`, and the
+        /// switch to reach for when dating a defect as pre-existing or when
+        /// bisecting a codegen change.
+        #[arg(long = "no-inline")]
+        no_inline: bool,
+
+        /// Turn P26 block merging OFF, leaving every empty block and every
+        /// jump-to-a-single-successor where the lowerer put it.
+        ///
+        /// It exists so the pass can be measured against itself on one binary:
+        /// merging removes no instructions of its own, so what it is worth
+        /// shows up only in what the passes AFTER it can then see.
+        #[arg(long = "no-merge-blocks")]
+        no_merge_blocks: bool,
+
         /// Turn F-1 promotion OFF, compiling locals as memory the way the
         /// pre-F-1 compiler did.
         ///
@@ -212,6 +239,21 @@ enum Commands {
         #[arg(long, value_name = "N", default_value_t = codegen_t3::DEFAULT_MAX_STEPS)]
         max_steps: usize,
 
+        /// Print the execution profile to stderr when the program stops.
+        ///
+        /// The emulator has always counted every instruction it executed and
+        /// every opcode separately; this is what gets it out (report.txt P31).
+        /// It is the right way to measure an optimiser pass: compile the same
+        /// program twice and diff the two profiles. Before this existed the
+        /// count had to be recovered by bisecting `--max-steps` for the
+        /// smallest budget the program completes under — forty runs to read
+        /// one number, and no histogram at the end of it.
+        ///
+        /// Every line is prefixed `[T3ISA]`, which the corpus sweep scripts
+        /// already filter, and goes to stderr, so profiling a run cannot
+        /// disturb what the program printed.
+        #[arg(long)]
+        profile: bool,
 
         /// Language version: v1 (default) or v2 (R2).
         ///
@@ -328,7 +370,8 @@ fn report_ssa(module: &ir::IRModule, stage: &str) {
     let found = manitc::ir::ssa::verify_module(module);
     let total_fns = module.functions.iter().filter(|f| !f.is_extern).count();
     let mut failing: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    let (mut multi, mut dom, mut undef, mut phi, mut dup, mut dangle) = (0, 0, 0, 0, 0, 0);
+    let (mut multi, mut dom, mut undef, mut phi, mut dup, mut dangle, mut void) =
+        (0, 0, 0, 0, 0, 0, 0);
     for (fname, v) in &found {
         failing.insert(fname.as_str());
         match v {
@@ -338,6 +381,7 @@ fn report_ssa(module: &ir::IRModule, stage: &str) {
             Violation::PhiEdges { .. } => phi += 1,
             Violation::DuplicateLabel { .. } => dup += 1,
             Violation::DanglingTarget { .. } => dangle += 1,
+            Violation::VoidPhiArm { .. } => void += 1,
         }
     }
     let st = manitc::ir::ssa::Stats::of_module(module);
@@ -354,12 +398,16 @@ loads={} stores={} phis={} phi-edges-from-branch={}",
         stage, st.blocks, st.instrs, st.temps, st.allocas, st.promotable,
         st.loads, st.stores, st.phis, st.phi_edges_from_branch
     );
-    if found.is_empty() {
-        return;
-    }
+    // **The per-class counts print even when they are all zero**, and that is
+    // deliberate. They used to be behind an early return on `found.is_empty()`,
+    // so a clean compile showed no counter line at all — and a sweep grepping
+    // for one then reported `0 files, 0 violations` and looked like a pass when
+    // it had measured nothing. A denominator that disappears when the numerator
+    // is zero is not an instrument. It also makes the line the record of WHICH
+    // classes were checked, which is what says a new one is live.
     println!(
-        "ssa {}   multiply-defined={} not-dominated={} undefined={} phi-edges={}          duplicate-label={} dangling-target={}",
-        stage, multi, dom, undef, phi, dup, dangle
+        "ssa {}   multiply-defined={} not-dominated={} undefined={} phi-edges={}          duplicate-label={} dangling-target={} void-phi-arm={}",
+        stage, multi, dom, undef, phi, dup, dangle, void
     );
     for (fname, v) in found.iter().take(5) {
         println!("ssa {}   e.g. {}: {}", stage, fname, v);
@@ -387,6 +435,8 @@ fn run_compile(
     mem2reg: bool,
     pass_stats: bool,
     rounds: usize,
+    inline_limit: usize,
+    merge_blocks: bool,
 ) -> CompileResult<()> {
     let source = read_source(file).map_err(|e| CompileError::Lex(
         Diagnostic::unknown(e),
@@ -445,7 +495,7 @@ fn run_compile(
     }
     ir::optimize::run_passes_with(
         &mut ir_module,
-        ir::optimize::PassOptions { mem2reg, pass_stats, rounds },
+        ir::optimize::PassOptions { mem2reg, pass_stats, rounds, inline_limit, merge_blocks },
     );
     if verify_ssa {
         report_ssa(&ir_module, "after optimisation");
@@ -503,7 +553,11 @@ fn run_compile(
 
             // Resolve the runtime C source and decide how to build it — full
             // (SDL2 + libcurl) or minimal. See runtime_link.
-            let runtime_c_path = runtime_link::resolve_source(Some(&file)).map_err(|e| {
+            // Removes the runtime object, and the extracted sources if it
+            // extracted any, when this scope ends — including on the early
+            // returns below.
+            let mut scratch = runtime_link::Scratch::new();
+            let runtime_c_path = runtime_link::resolve_source(Some(&file), &mut scratch).map_err(|e| {
                 CompileError::Codegen(Diagnostic::unknown(format!(
                     "failed to write the embedded C runtime: {}", e)))
             })?;
@@ -557,7 +611,7 @@ fn run_compile(
             let clang = runtime_link::find_clang();
 
             // Compile runtime to object file
-            let runtime_obj = runtime_link::object_path("compile");
+            let runtime_obj = scratch.add(runtime_link::object_path("compile"));
             let runtime_compiled = clang.as_deref().map(|clang| {
                 std::process::Command::new(clang)
                     .args([
@@ -875,6 +929,7 @@ fn run_t3(
     file: &PathBuf,
     debug: bool,
     max_steps: usize,
+    profile: bool,
     prog_args: &[String],
     lang: manitc::lang::LangVersion,
 ) -> CompileResult<()> {
@@ -941,13 +996,28 @@ fn run_t3(
         .collect();
 
     pipe_safe_print(&format!("[T3ISA] running {} ({} words)\n", file.display(), words.len()));
-    let (output_lines, exit_code) = if debug {
-        (codegen_t3::run_emulator_debug_argv(words, str_data, float_data, argv), 0)
+    let (output_lines, exit_code, prof) = if debug {
+        // The interactive debugger drives the emulator itself and hands back
+        // only the output, so there is no profile to report from this path.
+        (codegen_t3::run_emulator_debug_argv(words, str_data, float_data, argv), 0, None)
     } else {
-        codegen_t3::run_emulator_with_exit_capped_argv(words, str_data, float_data, max_steps, argv)
+        let (out, code, p) = codegen_t3::run_emulator_with_exit_capped_argv_profiled(
+            words, str_data, float_data, max_steps, argv,
+        );
+        (out, code, Some(p))
     };
     for piece in &output_lines {
         pipe_safe_print(piece);
+    }
+    // AFTER the program's own output, and on stderr: a profile is about the
+    // run, not part of it. Printed even when the program trapped or was cut
+    // off at the step limit — a profile of a run that did not finish is still
+    // the record of what it did before it stopped, and for a suspected
+    // infinite loop it is the most useful profile there is.
+    if profile {
+        if let Some(p) = &prof {
+            eprint!("{}", p.report());
+        }
     }
     // main's return value becomes the process exit status (low 8 bits).
     if exit_code != 0 {
@@ -996,7 +1066,8 @@ fn run() {
         Commands::Compile {
             file, target, output, emit_ir, warn_as_error,
             allow, warn, deny, forbid, print_lints, target_triple, lang, verify_ssa,
-            mem2reg, no_mem2reg, pass_stats, rounds,
+            mem2reg, no_mem2reg, pass_stats, rounds, inline_limit, no_inline,
+            no_merge_blocks,
         } => {
             let flags = LintFlags {
                 allow: allow.clone(), warn: warn.clone(),
@@ -1009,6 +1080,8 @@ fn run() {
                 file, target, output, *emit_ir, *warn_as_error,
                 &flags, *print_lints, target_triple.as_deref(), lang, *verify_ssa,
                 !*no_mem2reg, *pass_stats, *rounds,
+                if *no_inline { 0 } else { *inline_limit },
+                !*no_merge_blocks,
             ))
         }
         Commands::Check {
@@ -1024,8 +1097,9 @@ fn run() {
         }
         Commands::Lex { file } => run_lex(file),
         Commands::Parse { file } => run_parse(file),
-        Commands::RunT3 { file, debug, max_steps, args, lang } => {
-            parse_lang(lang).and_then(|lang| run_t3(file, *debug, *max_steps, args, lang))
+        Commands::RunT3 { file, debug, max_steps, profile, args, lang } => {
+            parse_lang(lang)
+                .and_then(|lang| run_t3(file, *debug, *max_steps, *profile, args, lang))
         }
         Commands::Bench { file, iterations, lang } => {
             parse_lang(lang).and_then(|lang| run_bench(file, *iterations, lang))

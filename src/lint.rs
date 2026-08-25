@@ -137,6 +137,20 @@ pub const LINTS: &[(WarningKind, &str, LintLevel)] = &[
     // describes, and no shipped program declares a bound yet, so denying it
     // cannot break code that exists.
     (WarningKind::UnsatisfiedBound, "unsatisfied-bound", LintLevel::Deny),
+    // N5/R2, report.txt P21 cluster 1. An `int` literal too wide for the
+    // 27-trit word — the migration backlog for the change v2 already made.
+    //
+    // `allow` by default, and for `undeclared-native`'s reason rather than out
+    // of timidity: under v1 `int` IS the host word on LLVM, so such a literal
+    // is legal there and warning by default would report working v1 programs.
+    // `--warn literal-out-of-word` generates the list on demand and that list
+    // is the migration plan.
+    //
+    // The level applies only under v1. Under v2 this is not a lint at all:
+    // `int` means 27 trits, the literal has no value, and the analyzer rejects
+    // it the way it rejects any literal that does not fit its type. A lint
+    // level cannot allow away a value that does not exist.
+    (WarningKind::LiteralOutOfWord, "literal-out-of-word", LintLevel::Allow),
 ];
 
 /// Resolve a lint name to its kind. `None` for an unknown name.

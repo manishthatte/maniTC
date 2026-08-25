@@ -572,6 +572,9 @@ pub enum Violation {
     DuplicateLabel { label: String },
     /// A terminator naming a label no block defines.
     DanglingTarget { block: String, label: String },
+    /// A phi arm whose value is `IRValue::Void`, which neither backend can
+    /// name in a phi.
+    VoidPhiArm { block: String, temp: String, edge: String },
 }
 
 impl std::fmt::Display for Violation {
@@ -607,6 +610,11 @@ impl std::fmt::Display for Violation {
             Violation::DanglingTarget { block, label } => {
                 write!(f, "{} branches to {}, which no block defines", block, label)
             }
+            Violation::VoidPhiArm { block, temp, edge } => write!(
+                f,
+                "phi %{} in {} takes Void on the edge from {}",
+                temp, block, edge
+            ),
         }
     }
 }
@@ -727,6 +735,33 @@ pub fn verify(func: &IRFunction) -> Vec<Violation> {
                         found,
                     });
                 }
+                // **A `Void` ARM, which is a different defect from a missing
+                // one and was invisible here until report.txt P35.**
+                //
+                // `IRValue::Void` is legitimate at a `Return` — a
+                // value-returning function reaches `Return(Some(Void))` from
+                // the trailing block of an exhaustive `match`, and both
+                // backends COERCE it there, LLVM emitting `ret ptr null`. In a
+                // PHI there is no coercion and no token to emit: LLVM renders
+                // the arm as the empty string, `[ , %next8 ]`, which is not
+                // parseable, and T3 quietly drops it and runs.
+                //
+                // Neither check above can see it. `Undefined` cannot, because
+                // `Void` is not a temp and `phi_uses` does not yield it;
+                // `PhiEdges` cannot, because the arm is PRESENT and so the
+                // edge counts still match. A malformed module therefore
+                // verified clean while only the LLVM backend objected — which
+                // is why this is checked here rather than left to a backend.
+                for (v, label) in incoming.iter() {
+                    if matches!(v, IRValue::Void) {
+                        out.push(Violation::VoidPhiArm {
+                            block: block.label.clone(),
+                            temp: dst.0.clone(),
+                            edge: label.clone(),
+                        });
+                    }
+                }
+
                 for (temp, label) in phi_uses(instr) {
                     let Some(&edge) = cfg.index.get(label) else {
                         // Already reported as a phi-edge mismatch above.
