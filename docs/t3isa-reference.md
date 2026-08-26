@@ -149,17 +149,53 @@ above.
 | Register | Role |
 |----------|------|
 | R0 | Always reads as 0; writes are discarded |
-| R1 | Function argument 0 / return value |
-| R2–R8 | Function arguments 1–7 |
-| R9–R23 | General-purpose temporaries |
-| R24 | Dedicated return-value stash (callee must not clobber) |
-| R25 | Reserved (currently unused) |
-| R26 | Stack pointer (SP). Starts at top of memory, grows down |
+| R1–R3 | ABI: syscall arguments, syscall result, function return value. **Never allocated to a temp.** R1 is also argument 0 |
+| R4–R20 | The allocatable pool — 17 registers. A parameter may also *arrive* in R4–R8, which is why the pool's low end overlaps argument passing |
+| R21–R25 | Emission scratch. Never allocated; the emitter may clobber any of them at any point |
+| R26 | Stack pointer (SP). Initial value 60,000 (§3); grows down |
 
-The FLAGS register is set by `TCMP Rd, Rx, Ry`:
+> **Corrected 27 August 2026.** The table above previously read `R9–R23`
+> general-purpose, `R24` *"dedicated return-value stash (callee must not
+> clobber)"*, `R25` *"reserved (currently unused)"*. Four of the seven rows
+> disagreed with the allocator. The authority is the written invariant in
+> `src/codegen_t3/regalloc.rs`, which the allocator **enforces** (`POOL_LO = 4`,
+> `POOL_HI = 20`, and the test `no_allocated_register_is_outside_the_pool`)
+> rather than merely asserting. R24 in particular is not a stash and never was:
+> its only appearance in the compiler is `const SCRATCH: usize = 24` in
+> `emit_parallel_moves`, breaking cycles in parallel register copies — it is
+> clobbered freely, which is the opposite of the retired claim. It appears zero
+> times in every checked-in `.t3l` listing.
+
+**FLAGS is the sign of the last data-processing result**, not a comparison
+flag. `TCMP Rd, Rx, Ry` writes it as you would expect —
+
 - +1 if `Rx > Ry`
 - 0 if `Rx == Ry`
 - −1 if `Rx < Ry`
+
+— because `TCMP`'s *result* is that trit. But so does every other
+data-processing opcode, with the sign of whatever it computed. Measured against
+the emulator on 27 August 2026, **27 opcodes write FLAGS and 18 do not**:
+
+| | opcodes |
+|---|---|
+| **write FLAGS** | `TADD` `TSUB` `TMUL` `TDIV` `TMOD` `TDIVN` `TMODN` `TNEG` `TAND` `TOR` `TNOT` `TANDW` `TORW` `TXORW` `TIMPW` `TCMPW` `TPOPC` `TSELW` `TSHI` `TSHR` `BAND` `BOR` `BXOR` `BSHL` `BSHR` `TCMP` `LOADT` |
+| **leave it alone** | `NOP` `TMIN` `TMAX` `LOAD` `STORE` `TLIT` `MOV` `TBRANCH` `TBRPOS` `TBRZERO` `TBRNEG` `JUMP` `CALL` `CALLR` `RET` `HALT` `SYSCALL` `STORET` |
+
+The practical consequence: **FLAGS does not survive arithmetic.** A `TCMP`
+followed by a `TADD` leaves FLAGS describing the addition. The emitted code for
+`a < b` is `TCMP` then `TNEG` then `TMAX`, and after it FLAGS holds the sign
+of the `TNEG`, not of the comparison — `TMAX` is one of the 18 and preserves it.
+Branch on the comparison's *register*, which is what `TBRANCH` does, and treat
+FLAGS as valid only in the instruction immediately after the one that set it.
+
+> **Corrected 27 August 2026.** This section previously said only *"The FLAGS
+> register is set by `TCMP Rd, Rx, Ry`"* and gave the three cases. No sentence
+> was false; what was missing was that `TCMP` is one of twenty-seven, which is
+> the difference between a comparison flag and a result sign — an absence
+> rather than an untruth, which is the kind of documentation defect this
+> project keeps finding and the argument for pinning a documented claim with a
+> test rather than reviewing the prose.
 
 ---
 
@@ -591,8 +627,11 @@ takes a string address in R1 and looks it up in the string sidecar table.
 
 ### Argument passing
 
-Arguments are passed in registers R1–R8 (up to 8 arguments). If more than 8
-arguments are needed, the excess must be stack-allocated by the caller.
+Arguments are passed in registers R1–R8 (up to 8 arguments; `PARAM_MAX = 8` in
+`regalloc.rs`). If more than 8 arguments are needed, the excess must be
+stack-allocated by the caller. Note that R4–R8 do double duty: they carry
+arguments 3–7 *and* are part of the allocatable pool (§2), so a parameter
+arriving in one of them reserves it.
 
 ```
 R1 = first argument  (also the return value register)
@@ -607,24 +646,26 @@ A single return value is placed in R1 before `RET`.
 
 ### Caller-save vs callee-save
 
-The current emitter is **all caller-save**: the caller saves any live values
-to the stack before a `CALL` and restores them afterward. The callee is not
-obligated to preserve any registers.
+**A `CALL` may destroy every register.** The callee allocates from the same
+pool, so the rule is not "caller-save" in the usual sense — it is stronger:
+*nothing live across a call is in a register at all.* The allocator's
+`must_spill` enforces it, which is what lets the call sequence use the whole
+machine without saving anything. A value needed after a call is stored to the
+frame once and reloaded once.
 
-R24 is used as a dedicated "stash" register for return values that must be
-preserved across a subsequent call:
-
-```asm
-CALL  foo
-MOV   R24, R1   ; stash foo's result
-CALL  bar       ; R1 is free again
-MOV   R9, R24   ; recover stashed value
-```
+> **Corrected 27 August 2026.** This section previously described R24 as a
+> *"dedicated stash register for return values that must be preserved across a
+> subsequent call"* and showed `MOV R24, R1 ; stash foo's result`. **The
+> compiler has never emitted that.** R24 is emission scratch (§2), and a value
+> live across a call is spilled to the frame, not parked in a register. The
+> retired example describes a convention this backend deliberately replaced —
+> see the register invariant at the top of `src/codegen_t3/regalloc.rs`.
 
 ### Stack frame
 
-The stack grows downward from address 65535. `R26` always points to the most
-recently allocated word. Function prologue:
+The stack grows downward from the initial `R26` of **60,000** — see §3's
+memory map, which is authoritative for every address in this document. `R26`
+always points to the most recently allocated word. Function prologue:
 
 ```asm
 TSUB R26, R26, #N    ; allocate N words for locals
