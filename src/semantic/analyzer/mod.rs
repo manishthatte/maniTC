@@ -58,6 +58,17 @@ fn did_you_mean(name: &str, candidates: impl Iterator<Item = String>) -> Option<
 // Semantic Analyzer
 // ---------------------------------------------------------------------------
 
+/// P65: how far an instantiation has got.
+///
+/// `Failed` is not an error — it is the decision to leave that call site
+/// exactly as it was before monomorphisation existed. See `ensure_mono`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonoState {
+    InProgress,
+    Ok,
+    Failed,
+}
+
 pub struct SemanticAnalyzer {
     pub(crate) symbols: SymbolTable,
     pub(crate) functions: HashMap<String, (Vec<ManiType>, ManiType)>,
@@ -169,6 +180,45 @@ pub struct SemanticAnalyzer {
     /// there is nothing left to say which parameter was `T` — this keeps the
     /// declaration around for exactly the functions where it matters.
     pub(crate) fn_generic_sigs: HashMap<String, GenericSig>,
+    /// P68: the declared type parameters of every generic struct, and its
+    /// fields in AST form, keyed by struct name.
+    ///
+    /// `self.structs` cannot answer either question. It holds the fields with
+    /// their types already RESOLVED, and a struct's type parameters are never
+    /// pushed as `type_params` when it is registered, so `pub first: T`
+    /// resolved to `Unknown` and no record survives of which parameter it was.
+    /// Inferring a literal's type arguments, and resolving a field's type once
+    /// they are known, both need the declaration back.
+    pub(crate) struct_generics: HashMap<String, Vec<String>>,
+    pub(crate) struct_field_ast: HashMap<String, Vec<(String, crate::ast::Type)>>,
+    /// P65: the AST of every generic free function with a body, keyed by name.
+    ///
+    /// Distinct from `fn_generic_sigs`, which records only functions with
+    /// BOUNDS — `fn id<T>(x: T) -> T` has none and is exactly as broken.
+    /// Monomorphisation needs the body, not just the signature.
+    pub(crate) generic_fn_asts: HashMap<String, crate::ast::FnDef>,
+    /// P69: for each generic `impl<T>` method recorded in `generic_fn_asts`,
+    /// the base type its impl block is for — the `Box2` of `impl<T> Box2<T>`.
+    ///
+    /// It is what lets an instantiation bind `Self`. A free function has no
+    /// `Self` and needs no entry; a method's `self` parameter is declared
+    /// `Type::Named("Self")`, which ordinarily resolves through
+    /// `current_impl_type` and so carries the BASE NAME ONLY — `Box2` with no
+    /// arguments, which is precisely the erasure this finding is about. Bound
+    /// through `type_params` instead, `Self` arrives as `Box2<float>` and
+    /// `self.a` resolves to `float` through P68's field lookup.
+    pub(crate) generic_impl_owner: HashMap<String, (String, usize)>,
+    /// P65: what is known about each instantiation, keyed by mangled name.
+    /// `InProgress` is what makes a recursive generic terminate: the call
+    /// inside the body being instantiated is told the name will exist.
+    pub(crate) mono_state: HashMap<String, MonoState>,
+    /// P65: the instantiated functions, appended to the program at the end.
+    pub(crate) mono_fns: Vec<TypedFnDef>,
+    /// P65: when set, `check_fn` binds the function's type parameters to these
+    /// concrete types instead of to `Unknown`. That single substitution is the
+    /// whole of monomorphisation's type work, because `resolve_type` already
+    /// consults `type_params` before anything else.
+    pub(crate) mono_binding: Option<HashMap<String, ManiType>>,
     /// R2: the language version being checked against.
     ///
     /// The checker's only use of it is the `division-semantics` lint, whose
@@ -359,6 +409,13 @@ impl SemanticAnalyzer {
             declared_fn_avail: HashMap::new(),
             bodied_fns: std::collections::HashSet::new(),
             fn_generic_sigs: HashMap::new(),
+            struct_generics: HashMap::new(),
+            struct_field_ast: HashMap::new(),
+            generic_fn_asts: HashMap::new(),
+            generic_impl_owner: HashMap::new(),
+            mono_state: HashMap::new(),
+            mono_fns: Vec::new(),
+            mono_binding: None,
             lang: crate::lang::LangVersion::default(),
         };
         analyzer.register_builtins();
@@ -702,9 +759,9 @@ impl SemanticAnalyzer {
         self.functions.insert("channel_new".to_string(), (vec![], chan_ty));
         self.functions.insert("Mutex::new".to_string(),
             (vec![Unknown], Generic("Mutex".to_string(), vec![Unknown])));
-        self.functions.insert("AtomicTrit::new".to_string(), (vec![Trit],  Struct("AtomicTrit".to_string())));
-        self.functions.insert("Barrier::new".to_string(),    (vec![Int],   Struct("Barrier".to_string())));
-        self.functions.insert("Semaphore::new".to_string(),  (vec![Int],   Struct("Semaphore".to_string())));
+        self.functions.insert("AtomicTrit::new".to_string(), (vec![Trit],  Struct("AtomicTrit".to_string(), Vec::new())));
+        self.functions.insert("Barrier::new".to_string(),    (vec![Int],   Struct("Barrier".to_string(), Vec::new())));
+        self.functions.insert("Semaphore::new".to_string(),  (vec![Int],   Struct("Semaphore".to_string(), Vec::new())));
 
         // Record all registered names so user functions may shadow them.
         self.builtin_names = self.functions.keys().cloned().collect();
@@ -767,15 +824,37 @@ impl SemanticAnalyzer {
                     "TernaryTrie" => Ok(ManiType::Generic("TernaryTrie".to_string(), resolved_args)),
                     "Channel" => Ok(ManiType::Generic("Channel".to_string(), resolved_args)),
                     "Mutex" => Ok(ManiType::Generic("Mutex".to_string(), resolved_args)),
-                    "AtomicTrit" => Ok(ManiType::Struct("AtomicTrit".to_string())),
-                    "Barrier" => Ok(ManiType::Struct("Barrier".to_string())),
-                    "Semaphore" => Ok(ManiType::Struct("Semaphore".to_string())),
-                    "Pair" => Ok(ManiType::Generic("Pair".to_string(), resolved_args)),
+                    "AtomicTrit" => Ok(ManiType::Struct("AtomicTrit".to_string(), Vec::new())),
+                    "Barrier" => Ok(ManiType::Struct("Barrier".to_string(), Vec::new())),
+                    "Semaphore" => Ok(ManiType::Struct("Semaphore".to_string(), Vec::new())),
+                    // NO `"Pair"` ARM. It used to be here and it was a
+                    // PHANTOM: every other name in this match has an
+                    // implementation behind it — `Vec`, `Map`, `Set`, `Deque`,
+                    // `TernaryTrie`, `Channel`, `Mutex` are native, `Result` is
+                    // lowered, `Range` is what `..` produces — and `Pair` had
+                    // none. Measured: outside this line the name appeared in
+                    // one warning-suppression list and in no stdlib source, no
+                    // IR, and no backend.
+                    //
+                    // What it did was SHADOW A USER'S OWN STRUCT. A program
+                    // declaring `struct Pair<T>` registered it in
+                    // `self.structs`, and then every `Pair<T>` ANNOTATION came
+                    // through here and resolved to `Generic("Pair", [..])`
+                    // while the LITERAL resolved to `Struct("Pair")` — two
+                    // types that do not unify, so `fn swap<T>(p: Pair<T>)`
+                    // could not be called with a `Pair` (report.txt P67).
+                    // Renaming the struct to anything not on this list fixed
+                    // it, which is what showed the defect was the NAME.
+                    //
+                    // Removing the arm changes nothing for a program that does
+                    // NOT declare `Pair`: the fallback below produces the
+                    // identical `Generic("Pair", args)`. It changes behaviour
+                    // in exactly the case that was broken.
                     "Range" => Ok(ManiType::Generic("Range".to_string(), resolved_args)),
                     _ => {
                         // Check if it's a known struct
                         if self.structs.contains_key(name.as_str()) {
-                            Ok(ManiType::Struct(name.clone()))
+                            Ok(ManiType::Struct(name.clone(), resolved_args.clone()))
                         } else {
                             // Permissive: treat as unknown generic
                             Ok(ManiType::Generic(name.clone(), resolved_args))
@@ -809,7 +888,7 @@ impl SemanticAnalyzer {
             // `Self` resolves to the current impl type
             "Self" => {
                 if let Some(impl_ty) = &self.current_impl_type {
-                    return Ok(ManiType::Struct(impl_ty.clone()));
+                    return Ok(ManiType::Struct(impl_ty.clone(), Vec::new()));
                 }
                 return Ok(ManiType::Unknown);
             }
@@ -829,11 +908,11 @@ impl SemanticAnalyzer {
             "void" | "()" => Ok(ManiType::Void),
             // Concurrency types treated as opaque structs
             "AtomicTrit" | "Barrier" | "Semaphore" | "MutexGuard" => {
-                Ok(ManiType::Struct(name.to_string()))
+Ok(ManiType::Struct(name.to_string(), Vec::new()))
             }
             _ => {
                 if self.structs.contains_key(name) {
-                    Ok(ManiType::Struct(name.to_string()))
+                    Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 } else if self.enums.contains_key(name) {
                     Ok(ManiType::Enum(name.to_string()))
                 } else {
@@ -993,8 +1072,44 @@ impl SemanticAnalyzer {
         "Ord", "PartialOrd", "Eq", "PartialEq", "Display", "Debug", "Clone", "Copy", "Hash",
     ];
 
+    /// The traits whose meaning IS an operator, and the predicate that
+    /// decides the operator. P45.
+    ///
+    /// `Ord` and `PartialOrd` are not free-standing claims about a type: they
+    /// say `<` and `>` may be applied to it, and `binop_type` already owns
+    /// that decision through `ManiType::is_comparable`. Two places deciding
+    /// the same question is the shape of P60 — and here they DISAGREED, which
+    /// is P45. `str` is not comparable (`"mm" > "aa"` is a clean TypeError)
+    /// and yet satisfied `Ord`, so `largest<T: Ord>("mm", "aa")` compiled and
+    /// returned the second argument every time.
+    ///
+    /// Tying the trait to the operator's own predicate rather than naming
+    /// `str` fixes four more types in the same motion — `Array`, `Tuple`,
+    /// `Vec<T>` and `Result<T, E>` all counted as "primitive" under the old
+    /// rule, since it asked only what a type is NOT.
+    fn ordering_trait(trait_name: &str) -> bool {
+        matches!(trait_name, "Ord" | "PartialOrd")
+    }
+
     /// Whether a concrete type satisfies one trait.
     fn type_satisfies(&self, ty: &ManiType, trait_name: &str) -> bool {
+        // ORDERING IS DECIDED BEFORE THE USER-IMPL ESCAPE HATCH, AND THAT
+        // ORDER IS THE FIX RATHER THAN AN OPTIMISATION.
+        //
+        // `>` is built into `binop_type` and dispatches to nothing: measured,
+        // `trait_impls` is read at exactly two sites and neither is in the
+        // lowering of a binary operator. So `impl Ord for str` cannot make
+        // `"mm" > "aa"` work — and with the escape hatch first, writing it
+        // made the program COMPILE AND PRINT `aa` again, which is P45's
+        // original silent wrong answer restored by following P45's own
+        // diagnostic. A remedy a diagnostic suggests has to be a remedy.
+        if Self::ordering_trait(trait_name) {
+            // NOT `is_primitive &&` — the two predicates would then have to be
+            // kept in step, and `is_comparable` is already the whole answer:
+            // every type it admits is one the operator admits, by
+            // construction, because it is the same call `binop_type` makes.
+            return ty.is_comparable();
+        }
         // A user impl always satisfies, for any type including a primitive.
         let base = Self::type_impl_key(ty);
         if let Some(base) = &base {
@@ -1005,7 +1120,7 @@ impl SemanticAnalyzer {
         // Primitives satisfy the structural traits intrinsically.
         let is_primitive = !matches!(
             ty,
-            ManiType::Struct(_) | ManiType::Enum(_) | ManiType::Unknown | ManiType::Fn(_, _)
+            ManiType::Struct(_, _) | ManiType::Enum(_) | ManiType::Unknown | ManiType::Fn(_, _)
         );
         is_primitive && Self::BUILTIN_TRAITS.contains(&trait_name)
     }
@@ -1013,7 +1128,7 @@ impl SemanticAnalyzer {
     /// The name a type is keyed under in `trait_impls`, if it has one.
     fn type_impl_key(ty: &ManiType) -> Option<String> {
         match ty {
-            ManiType::Struct(n) | ManiType::Enum(n) => Some(n.clone()),
+            ManiType::Struct(n, _) | ManiType::Enum(n) => Some(n.clone()),
             ManiType::Generic(n, _) => Some(n.clone()),
             ManiType::Int => Some("int".to_string()),
             ManiType::Float => Some("float".to_string()),
@@ -1053,7 +1168,20 @@ impl SemanticAnalyzer {
                 }
             }
             AT::Generic(_, args, _) => {
-                if let ManiType::Generic(_, actual_args) = actual {
+                // P69: a USER struct's arguments count too. `ManiType::Struct`
+                // has carried them only since P68, and this function was
+                // written before that — so a parameter declared `B<T>` bound
+                // nothing at all when the argument was a `B<float>`, because
+                // that arrives as `Struct("B", [float])` and only
+                // `ManiType::Generic` was matched. The visible effect was that
+                // monomorphisation stopped at the first boundary: `top(f)`
+                // over a `B<float>` left `T` unbound, so `top` stayed erased
+                // and the `x.big()` inside it had an `Unknown` to work from.
+                let actual_args = match actual {
+                    ManiType::Generic(_, a) | ManiType::Struct(_, a) => Some(a),
+                    _ => None,
+                };
+                if let Some(actual_args) = actual_args {
                     for (d, a) in args.iter().zip(actual_args.iter()) {
                         Self::bind_generics(d, a, generics, out);
                     }
@@ -1075,6 +1203,319 @@ impl SemanticAnalyzer {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// P68: the type arguments a struct literal was built at, in the order the
+    /// declaration names its parameters.
+    ///
+    /// `None` for a non-generic struct, and for a generic one whose parameters
+    /// the fields do not pin down to concrete types — those keep the empty
+    /// argument list they have always had rather than a half-inferred one.
+    pub(crate) fn struct_literal_args(
+        &self,
+        name: &str,
+        field_tys: &[(String, ManiType)],
+    ) -> Option<Vec<ManiType>> {
+        let generics = self.struct_generics.get(name)?;
+        let decl = self.struct_field_ast.get(name)?;
+        let mut binding: HashMap<String, ManiType> = HashMap::new();
+        for (fname, fdecl) in decl {
+            if let Some((_, actual)) = field_tys.iter().find(|(n, _)| n == fname) {
+                Self::bind_generics(fdecl, actual, generics, &mut binding);
+            }
+        }
+        let mut out = Vec::new();
+        for g in generics {
+            let ty = binding.get(g)?;
+            if !ty.fully_known() {
+                return None;
+            }
+            out.push(ty.clone());
+        }
+        Some(out)
+    }
+
+    /// P68: a field's type on a struct whose type arguments are known.
+    ///
+    /// Takes `&self`, so it substitutes through an explicit binding rather
+    /// than by pushing `type_params` — `field_type`, its main caller, is an
+    /// `&self` method and making it `&mut` would ripple through the analyzer
+    /// for no gain.
+    pub(crate) fn struct_field_ty_at(
+        &self,
+        name: &str,
+        args: &[ManiType],
+        field: &str,
+    ) -> Option<ManiType> {
+        let generics = self.struct_generics.get(name)?;
+        if generics.len() != args.len() {
+            return None;
+        }
+        let decl = self.struct_field_ast.get(name)?;
+        let (_, fdecl) = decl.iter().find(|(n, _)| n == field)?;
+        let binding: HashMap<&str, &ManiType> = generics
+            .iter()
+            .map(|g| g.as_str())
+            .zip(args.iter())
+            .collect();
+        self.resolve_type_bound(fdecl, &binding)
+    }
+
+    /// P68: resolve an AST type with the struct's type parameters substituted.
+    ///
+    /// Recurses so that a field declared `Vec<T>` or `[T; 3]` resolves too,
+    /// rather than only a bare `T`. Anything that is not a parameter is handed
+    /// to the ordinary `resolve_type`.
+    fn resolve_type_bound(
+        &self,
+        ty: &crate::ast::Type,
+        binding: &HashMap<&str, &ManiType>,
+    ) -> Option<ManiType> {
+        use crate::ast::Type as AT;
+        match ty {
+            AT::Named(n, _) => {
+                if let Some(t) = binding.get(n.as_str()) {
+                    return Some((*t).clone());
+                }
+                self.resolve_type(ty).ok()
+            }
+            AT::Generic(n, args, _) => {
+                let resolved: Option<Vec<ManiType>> = args
+                    .iter()
+                    .map(|a| self.resolve_type_bound(a, binding))
+                    .collect();
+                let resolved = resolved?;
+                if self.structs.contains_key(n.as_str()) {
+                    Some(ManiType::Struct(n.clone(), resolved))
+                } else {
+                    Some(ManiType::Generic(n.clone(), resolved))
+                }
+            }
+            AT::Array(inner, size, _) => Some(ManiType::Array(
+                Box::new(self.resolve_type_bound(inner, binding)?),
+                *size,
+            )),
+            AT::Tuple(items, _) => {
+                let ts: Option<Vec<ManiType>> = items
+                    .iter()
+                    .map(|t| self.resolve_type_bound(t, binding))
+                    .collect();
+                Some(ManiType::Tuple(ts?))
+            }
+            AT::Ref(inner, _, _) | AT::Ptr(inner, _, _) => {
+                self.resolve_type_bound(inner, binding)
+            }
+            _ => self.resolve_type(ty).ok(),
+        }
+    }
+
+    /// P65: the symbol an instantiation is emitted under.
+    ///
+    /// A type's `display()` can contain `<`, `>`, `,` and spaces — `Vec<int>`,
+    /// `Result<int, str>` — none of which survive as a label on either
+    /// backend, so every character outside `[A-Za-z0-9_]` collapses to `_`.
+    /// The `$` separator is deliberate: it cannot appear in a maniT
+    /// identifier, so an instantiation can never collide with a user function,
+    /// and both backends accept it in a symbol.
+    pub(crate) fn mono_name(base: &str, binding: &[(String, ManiType)]) -> String {
+        let mut out = String::from(base);
+        for (_, ty) in binding {
+            out.push('$');
+            for c in ty.display().chars() {
+                out.push(if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' });
+            }
+        }
+        out
+    }
+
+    /// P65: bind a generic call's type parameters from its argument types.
+    ///
+    /// Returns the binding in the callee's own parameter ORDER — the mangled
+    /// name has to be stable, and a `HashMap` iteration order is not.
+    /// `None` when this is not a call to a generic function with a body, or
+    /// when any parameter is unbound or did not resolve to a concrete type:
+    /// those keep today's behaviour rather than getting a half-instantiation.
+    pub(crate) fn mono_binding_for(
+        &self,
+        callee: &str,
+        arg_tys: &[ManiType],
+    ) -> Option<Vec<(String, ManiType)>> {
+        let ast = self.generic_fn_asts.get(callee)?;
+        let mut map: HashMap<String, ManiType> = HashMap::new();
+        for (declared, actual) in ast.params.iter().map(|p| &p.ty).zip(arg_tys.iter()) {
+            Self::bind_generics(declared, actual, &ast.generics, &mut map);
+        }
+        let mut out = Vec::new();
+        for g in &ast.generics {
+            let ty = map.get(g)?;
+            if !ty.fully_known() {
+                return None;
+            }
+            out.push((g.clone(), ty.clone()));
+        }
+        Some(out)
+    }
+
+    /// P69: the complete type environment an instantiation of `base` is
+    /// checked under — the binding, plus `Self` when `base` is an `impl<T>`
+    /// method.
+    ///
+    /// `Self` is derived POSITIONALLY: `ast::ImplBlock` reduces `impl<T>
+    /// Box2<T>` to the base name `Box2` plus an ordered `generics` list, so
+    /// the impl's n-th parameter is the struct's n-th argument and there is no
+    /// other reading the AST supports. That is exactly right for the ordinary
+    /// form and is the reason the binding can be recovered from the receiver
+    /// alone. `Self` is deliberately NOT part of the mangled name: it is a
+    /// function of the binding, so including it would only make the symbol
+    /// longer.
+    fn mono_env(
+        &self,
+        base: &str,
+        binding: &[(String, ManiType)],
+    ) -> HashMap<String, ManiType> {
+        let mut map: HashMap<String, ManiType> = binding.iter().cloned().collect();
+        if let Some((owner, _)) = self.generic_impl_owner.get(base) {
+            map.insert(
+                "Self".to_string(),
+                ManiType::Struct(
+                    owner.clone(),
+                    binding.iter().map(|(_, t)| t.clone()).collect(),
+                ),
+            );
+        }
+        map
+    }
+
+    /// P69: bind a generic `impl<T>` method's type parameters from the
+    /// receiver's type arguments.
+    ///
+    /// The impl's parameters come first in the recorded AST's `generics`, so
+    /// the receiver's arguments pair with a PREFIX of it and any parameters
+    /// the method declares on its own account are left out of the binding —
+    /// `check_fn` gives those `Unknown`, which is the erased behaviour they
+    /// have today. `None` when the receiver supplies fewer arguments than the
+    /// impl declares parameters, which is not a shape any impl block can be
+    /// written in but is cheaper to refuse than to reason about.
+    pub(crate) fn mono_binding_for_impl(
+        &self,
+        qname: &str,
+        args: &[ManiType],
+    ) -> Option<Vec<(String, ManiType)>> {
+        let ast = self.generic_fn_asts.get(qname)?;
+        let &(_, n) = self.generic_impl_owner.get(qname)?;
+        // The receiver must supply exactly as many arguments as the impl
+        // declares parameters. Anything else has no positional reading, and
+        // refusing it keeps the erased path rather than guessing at one.
+        if args.len() != n || ast.generics.len() < n {
+            return None;
+        }
+        Some(
+            ast.generics[..n]
+                .iter()
+                .cloned()
+                .zip(args[..n].iter().cloned())
+                .collect(),
+        )
+    }
+
+    /// P65: the declared return type of a generic callee under one binding.
+    ///
+    /// Resolved through `type_params` rather than by substituting into a
+    /// `ManiType`, so a return type of `Pair<T>` or `Vec<T>` comes back
+    /// resolved the same way the instantiated body will resolve it. Anything
+    /// that fails to resolve leaves the call's type alone.
+    pub(crate) fn mono_ret_ty(
+        &mut self,
+        callee: &str,
+        binding: &[(String, ManiType)],
+    ) -> Option<ManiType> {
+        let ast = self.generic_fn_asts.get(callee).cloned()?;
+        let rt = ast.ret_ty.as_ref()?;
+        let saved = std::mem::take(&mut self.type_params);
+        for (g, ty) in self.mono_env(callee, binding) {
+            self.type_params.insert(g, ty);
+        }
+        let out = self.resolve_type(rt).ok();
+        self.type_params = saved;
+        out
+    }
+
+    /// P65: make sure an instantiation of `base` for `binding` exists, and say
+    /// whether the call site may be pointed at it.
+    ///
+    /// **A FAILED INSTANTIATION IS NOT AN ERROR, AND THAT IS THE WHOLE DESIGN
+    /// OF THIS INCREMENT.** Checking a generic body with its real types finds
+    /// type errors the erased copy could not — `tif t { .. }` where `T` turned
+    /// out to be `int`, or `a > b` where it turned out to be a struct — and
+    /// reporting them would REJECT PROGRAMS THAT COMPILE TODAY. Two of those
+    /// are pinned by tests stating a deliberate design: bounds are opt-in, and
+    /// `b1_an_unbounded_generic_is_unchanged` says so in as many words. So an
+    /// instantiation that does not check is DISCARDED and the call keeps the
+    /// erased path it has always had. The result is a change that can only fix
+    /// programs, never break one, which is what lets it land without an R2
+    /// version bump — and it moves no `manitc check` verdict, so it is not an
+    /// R5 event either.
+    ///
+    /// The follow-on decision — making a failed instantiation a hard error,
+    /// which is what closes A4 for good — is deliberately NOT taken here. It
+    /// is a language change and wants its own measured step.
+    ///
+    /// Re-entrant by construction: instantiating a body checks that body,
+    /// which may reach more generic calls. `InProgress` answers `true` so a
+    /// recursive generic asks for a name that is already being built instead
+    /// of recursing forever. On failure everything generated inside the
+    /// window is discarded too, because only bodies inside the window can
+    /// name it.
+    pub(crate) fn ensure_mono(&mut self, base: &str, binding: &[(String, ManiType)]) -> bool {
+        let mangled = Self::mono_name(base, binding);
+        match self.mono_state.get(&mangled) {
+            Some(MonoState::Ok) | Some(MonoState::InProgress) => return true,
+            Some(MonoState::Failed) => return false,
+            None => {}
+        }
+        let Some(ast) = self.generic_fn_asts.get(base).cloned() else {
+            return false;
+        };
+        let mut inst = ast;
+        inst.name = mangled.clone();
+        self.mono_state.insert(mangled.clone(), MonoState::InProgress);
+
+        // Everything `check_fn` mutates and does not restore on its error
+        // path. It leaves a scope open and `current_fn` replaced when the body
+        // fails, which is invisible when analysis aborts and corrupting when
+        // it does not.
+        let saved_tp = std::mem::take(&mut self.type_params);
+        let saved_ret = self.current_fn_ret.clone();
+        let saved_fn = self.current_fn.clone();
+        let depth = self.symbols.depth();
+        let warn_mark = self.warnings.warnings.len();
+        let fns_mark = self.mono_fns.len();
+        let saved_binding = self.mono_binding.replace(self.mono_env(base, binding));
+
+        let res = self.check_fn(&inst);
+
+        self.mono_binding = saved_binding;
+        self.type_params = saved_tp;
+        self.current_fn_ret = saved_ret;
+        self.current_fn = saved_fn;
+        self.symbols.truncate_to(depth);
+        // The instantiated body is a COPY of source the reader wrote once, so
+        // its warnings are the same warnings — emitted when the generic itself
+        // was checked. Kept once, not once per instantiation.
+        self.warnings.warnings.truncate(warn_mark);
+
+        match res {
+            Ok(tf) => {
+                self.mono_fns.push(tf);
+                self.mono_state.insert(mangled, MonoState::Ok);
+                true
+            }
+            Err(_) => {
+                self.mono_fns.truncate(fns_mark);
+                self.mono_state.insert(mangled, MonoState::Failed);
+                false
+            }
         }
     }
 
@@ -1119,7 +1560,19 @@ impl SemanticAnalyzer {
                 }
                 let known_trait = self.trait_defs.contains_key(trait_name)
                     || Self::BUILTIN_TRAITS.contains(&trait_name.as_str());
-                let msg = if known_trait {
+                let msg = if Self::ordering_trait(trait_name) {
+                    // Do NOT offer `impl Ord for <ty>` here. It parses, it
+                    // satisfies nothing, and it returns the program to the
+                    // wrong answer this bound exists to prevent (P45).
+                    format!(
+                        "`{}` does not satisfy the bound `{}: {}` required by '{}': \
+                         `<` and `>` cannot be applied to `{}` at all, and an \
+                         `impl {} for {}` would not change that — maniT's comparison \
+                         operators are built in and never dispatch to a user impl",
+                        ty.display(), bound.param, trait_name, callee,
+                        ty.display(), trait_name, ty.display()
+                    )
+                } else if known_trait {
                     format!(
                         "`{}` does not satisfy the bound `{}: {}` required by '{}'; \
                          add `impl {} for {}`",
@@ -1416,6 +1869,9 @@ impl SemanticAnalyzer {
         // A2: infer backend availability over the call graph now that every
         // body has been checked and every edge recorded.
         self.infer_availability();
+
+        // P65: the instantiations, generated eagerly at their call sites.
+        typed_fns.extend(std::mem::take(&mut self.mono_fns));
 
         Ok(TypedProgram {
             functions: typed_fns,
@@ -1724,6 +2180,11 @@ impl SemanticAnalyzer {
             match item {
                 Item::FnDef(f) if f.body.is_some() => {
                     self.bodied_fns.insert(f.name.clone());
+                    if !f.generics.is_empty() {
+                        // P65: kept whole, because instantiating means checking
+                        // the BODY again under a different binding.
+                        self.generic_fn_asts.insert(f.name.clone(), f.clone());
+                    }
                     if !f.bounds.is_empty() {
                         self.fn_generic_sigs.insert(
                             f.name.clone(),
@@ -1758,6 +2219,16 @@ impl SemanticAnalyzer {
                     }
                     self.structs.insert(s.name.clone(), fields);
                     self.struct_pub_fields.insert(s.name.clone(), pub_fields);
+                    // P68: keep the declaration for generic structs. The
+                    // resolved `fields` above have already lost which type
+                    // parameter each one was.
+                    if !s.generics.is_empty() {
+                        self.struct_generics.insert(s.name.clone(), s.generics.clone());
+                        self.struct_field_ast.insert(
+                            s.name.clone(),
+                            s.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
+                        );
+                    }
                 }
                 Item::EnumDef(e) => {
                     let mut variants = Vec::new();
@@ -1821,6 +2292,27 @@ impl SemanticAnalyzer {
                     // Register under the qualified name TypeName::method_name
                     let mut qm = method.clone();
                     qm.name = format!("{}::{}", imp.ty, method.name);
+                    // P69: keep a generic impl method's AST whole, the same
+                    // way P65 keeps a generic free function's, so a call can
+                    // instantiate it for the types the receiver turned out to
+                    // hold. The impl's parameters go FIRST and the method's
+                    // own follow: `ensure_mono` binds the leading ones from
+                    // the receiver and `check_fn` leaves the rest `Unknown`,
+                    // so a method that is generic on its own account keeps
+                    // exactly the erased behaviour it has today rather than
+                    // half an instantiation.
+                    if !imp.generics.is_empty() && method.body.is_some() {
+                        let mut gm = qm.clone();
+                        gm.generics = imp
+                            .generics
+                            .iter()
+                            .chain(method.generics.iter())
+                            .cloned()
+                            .collect();
+                        self.generic_fn_asts.insert(qm.name.clone(), gm);
+                        self.generic_impl_owner
+                            .insert(qm.name.clone(), (imp.ty.clone(), imp.generics.len()));
+                    }
                     self.register_fn(&qm)?;
                     // Track the return type for method-call resolution
                     let ret_ty = if let Some(rt) = &method.ret_ty {
@@ -2058,10 +2550,29 @@ impl SemanticAnalyzer {
     // ---------------------------------------------------------------------------
 
     fn check_fn(&mut self, f: &FnDef) -> CompileResult<TypedFnDef> {
-        // Push generic type params as Unknown for this function's scope
+        // Push generic type params for this function's scope: `Unknown`
+        // ordinarily, and the concrete binding when this is a P65
+        // instantiation. Everything else about checking an instantiated body
+        // is identical, which is the point — `resolve_type` consults
+        // `type_params` before any other rule, so binding it to `float` makes
+        // `a > b` a FLOAT comparison and `-> T` a `-> float`, with no
+        // substitution pass over the AST at all.
         let saved_type_params = std::mem::take(&mut self.type_params);
         for gp in &f.generics {
-            self.type_params.insert(gp.clone(), ManiType::Unknown);
+            let bound = self
+                .mono_binding
+                .as_ref()
+                .and_then(|m| m.get(gp).cloned())
+                .unwrap_or(ManiType::Unknown);
+            self.type_params.insert(gp.clone(), bound);
+        }
+        // P69: `Self` inside an instantiated `impl<T>` method. Not one of
+        // `f.generics` — it is not written in any generic list — but it is
+        // resolved by the same rule, and it has to be, because
+        // `name_to_manitype("Self")` answers from `current_impl_type`, which
+        // holds the base name and cannot hold the arguments.
+        if let Some(t) = self.mono_binding.as_ref().and_then(|m| m.get("Self")) {
+            self.type_params.insert("Self".to_string(), t.clone());
         }
 
         let ret_ty = if let Some(rt) = &f.ret_ty {

@@ -380,10 +380,53 @@ fn b1_a_where_clause_binds_the_same_as_angle_brackets() {
     assert!(out.contains("T: Display"), "{}", out);
 }
 
+/// A user `impl` satisfies a bound — stated on `Display`, which is where the
+/// claim is true.
+///
+/// THIS TEST USED `Ord` UNTIL 26 AUGUST 2026 AND THAT WAS THE WRONG TRAIT TO
+/// STATE IT ON. What B1 is about is that writing the `impl` makes the bound
+/// bind; `Display` shows that with nothing else attached. `Ord` also carries
+/// an OPERATOR, and the operator is built into the compiler: measured,
+/// `trait_impls` is read at exactly two sites and neither is in the lowering
+/// of a binary operation, so no `impl Ord` has ever made `>` work on anything.
+/// Accepting the bound on the strength of that impl let
+/// `largest<T: Ord>("mm", "aa")` compile and return `"aa"` — report.txt P45,
+/// and A4's own struct case with it. The companion test below states the
+/// exception; this one keeps B1's actual claim, unchanged in substance.
 #[test]
 fn b1_a_user_impl_satisfies_the_bound() {
     let (ok, out) = check(
         "b1_impl.mt",
+        "trait Display { fn show(self) -> int; }\n\
+         struct P { pub x: int }\n\
+         impl Display for P { fn show(self) -> int { 0 } }\n\
+         fn pick<T: Display>(a: T, b: T) -> T { a }\n\
+         fn main() { let p: P = P { x: 1 }; let q: P = P { x: 2 };\n\
+             io::println_int(pick(p, q).x); }\n",
+        &[],
+    );
+    assert!(ok, "an explicit impl must satisfy the bound:\n{}", out);
+}
+
+/// ...but NOT an ordering bound, and this is the exception P45 bought.
+///
+/// `Ord` and `PartialOrd` are satisfied by exactly the types `<` and `>`
+/// accept, and by nothing else — a user `impl` does not enter into it, because
+/// the operator would not call it. The old rule let the user impl short-circuit
+/// the check, so the fix for P45 was as much about ORDER as about the
+/// predicate: deciding ordering BEFORE the escape hatch rather than after.
+///
+/// The cost of this exception is stated honestly: a program whose generic body
+/// never compares anything, like the `pick` above, is refused here for a
+/// contract it does not exercise. That is the trade — a bound is a claim about
+/// the TYPE, not about which lines of the body run — and it is reversible.
+/// Once generic functions are monomorphised (report.txt P65) the instantiated
+/// body type-checks with the real type and reports `>` on a struct itself, at
+/// which point the bound check becomes a courtesy rather than the only guard.
+#[test]
+fn b1_a_user_impl_does_not_satisfy_an_ordering_bound() {
+    let (ok, out) = check(
+        "b1_impl_ord.mt",
         "trait Ord { fn cmp(self, other: P) -> int; }\n\
          struct P { pub x: int }\n\
          impl Ord for P { fn cmp(self, other: P) -> int { 0 } }\n\
@@ -392,7 +435,19 @@ fn b1_a_user_impl_satisfies_the_bound() {
              io::println_int(pick(p, q).x); }\n",
         &[],
     );
-    assert!(ok, "an explicit impl must satisfy the bound:\n{}", out);
+    assert!(
+        !ok,
+        "`impl Ord for P` satisfied an ordering bound again. It cannot make \
+         `>` work on `P` — a direct `p > q` is a TypeError and stays one — so \
+         accepting it is A4's hole reopened by A4's own prescribed remedy:\n{}",
+        out
+    );
+    assert!(
+        out.contains("never dispatch to a user impl"),
+        "the diagnostic must say WHY the impl does not help, or the reader \
+         writes it again:\n{}",
+        out
+    );
 }
 
 #[test]

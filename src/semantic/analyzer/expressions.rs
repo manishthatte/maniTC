@@ -278,7 +278,7 @@ impl SemanticAnalyzer {
             }
 
             Expr::Call(callee, args, _) => {
-                let tcallee = self.check_expr(callee, None)?;
+                let mut tcallee = self.check_expr(callee, None)?;
                 // Try to resolve function name or fn-type for type lookup.
                 // `enforce` is set only when the signature is trustworthy:
                 // fn-typed values and user-defined functions always are; builtin
@@ -412,11 +412,32 @@ impl SemanticAnalyzer {
                 // arguments actually turned out to be. After the loop, because
                 // it needs every argument's inferred type — a bound on `T` used
                 // in two parameter positions cannot be judged from one of them.
+                let mut ret_ty = ret_ty;
                 if !display_name.is_empty() && display_name != "<fn>" {
                     let arg_tys: Vec<ManiType> =
                         typed_args.iter().map(|a| a.ty.clone()).collect();
                     let name = display_name.clone();
                     self.check_generic_bounds(&name, &arg_tys, span);
+
+                    // P65: point this call at an instantiation of the callee
+                    // for the types it was actually given.
+                    //
+                    // Both halves matter and the second is easy to miss. The
+                    // NAME change is what makes the body compile with real
+                    // types instead of the `Unknown`-erased-to-`i64` copy every
+                    // call shared. The RETURN TYPE change is what stops the
+                    // result arriving as `Unknown` at the caller — that is the
+                    // half responsible for `id(p).second` reading slot 0,
+                    // since a field lookup on `<unknown>` finds no struct.
+                    if let Some(binding) = self.mono_binding_for(&name, &arg_tys) {
+                        if self.ensure_mono(&name, &binding) {
+                            if let Some(rt) = self.mono_ret_ty(&name, &binding) {
+                                ret_ty = rt;
+                            }
+                            tcallee.kind =
+                                TypedExprKind::Ident(Self::mono_name(&name, &binding));
+                        }
+                    }
                 }
 
                 Ok(TypedExpr {
@@ -466,7 +487,7 @@ impl SemanticAnalyzer {
                 // `user_method_arity` holds an entry only where the receiver is
                 // certain, so a missing entry means no check rather than a
                 // guess.
-                if let ManiType::Struct(tn) | ManiType::Enum(tn) = &tobj.ty {
+                if let ManiType::Struct(tn, _) | ManiType::Enum(tn) = &tobj.ty {
                     if let Some(&want) = self.user_method_arity
                         .get(tn.as_str())
                         .and_then(|m| m.get(method.as_str()))
@@ -480,9 +501,49 @@ impl SemanticAnalyzer {
                     }
                 }
                 // For method calls, we do basic resolution
-                let ret_ty = self.resolve_method_type(&tobj.ty, method, span);
+                let mut ret_ty = self.resolve_method_type(&tobj.ty, method, span);
+
+                // P69: point this call at an instantiation of the method for
+                // the types the RECEIVER turned out to hold.
+                //
+                // This is P65's free-function path with its one missing piece
+                // supplied. There the binding comes from the ARGUMENTS; here
+                // there is no argument carrying `T` at all — `fn bigger(self)
+                // -> T` mentions it only in return position — so the binding
+                // comes from the receiver's own type arguments, which
+                // `ManiType::Struct` has carried since P68. Without that, this
+                // increment would have nothing to read.
+                //
+                // The three halves, and the third has no counterpart in the
+                // free-function path: the NAME makes the body check with real
+                // types instead of `Unknown`-erased-to-`i64`; the RETURN TYPE
+                // stops the result arriving as `Unknown` at the caller; and
+                // the CALLEE is recorded on the expression, because the
+                // lowerer derives a method's symbol from the receiver's type
+                // and the receiver is still a `Box2<float>` whichever
+                // instantiation was chosen.
+                let mut mono_callee: Option<String> = None;
+                if let ManiType::Struct(sname, sargs) = &tobj.ty {
+                    if !sargs.is_empty() && sargs.iter().all(|a| a.fully_known()) {
+                        let qname = format!("{}::{}", sname, method);
+                        if let Some(binding) = self.mono_binding_for_impl(&qname, sargs) {
+                            if self.ensure_mono(&qname, &binding) {
+                                if let Some(rt) = self.mono_ret_ty(&qname, &binding) {
+                                    ret_ty = rt;
+                                }
+                                mono_callee = Some(Self::mono_name(&qname, &binding));
+                            }
+                        }
+                    }
+                }
+
                 Ok(TypedExpr {
-                    kind: TypedExprKind::MethodCall(Box::new(tobj), method.clone(), typed_args),
+                    kind: TypedExprKind::MethodCall(
+                        Box::new(tobj),
+                        method.clone(),
+                        typed_args,
+                        mono_callee,
+                    ),
                     ty: ret_ty,
                     span,
                 })
@@ -537,7 +598,7 @@ impl SemanticAnalyzer {
             Expr::Field(obj, field, _) => {
                 let tobj = self.check_expr(obj, None)?;
                 // Feature 4: pub visibility enforcement
-                if let ManiType::Struct(struct_name) = &tobj.ty {
+                if let ManiType::Struct(struct_name, _) = &tobj.ty {
                     if let Some(pub_fields) = self.struct_pub_fields.get(struct_name.as_str()) {
                         if let Some((_, is_pub)) = pub_fields.iter().find(|(n, _)| n == field) {
                             if !is_pub {
@@ -849,7 +910,7 @@ impl SemanticAnalyzer {
 
                 if let Some(base_expr) = spread_expr {
                     // Type-check the base expression (must be the same struct type).
-                    let typed_base = self.check_expr(&base_expr, Some(&ManiType::Struct(name.clone())))?;
+                    let typed_base = self.check_expr(&base_expr, Some(&ManiType::Struct(name.clone(), Vec::new())))?;
 
                     // Build a map of explicit overrides for quick lookup.
                     let mut overrides: std::collections::HashMap<String, Expr> =
@@ -918,9 +979,22 @@ impl SemanticAnalyzer {
                     }
                 }
 
+                // P68: a generic struct literal records what its type
+                // parameters turned out to be. `Box2 { a: 1.5, b: 2.5 }` is a
+                // `Box2<float>`, and until this line it was a bare `Box2` —
+                // which is why an `impl<T>` method had nothing to instantiate
+                // against and stayed type-erased (report.txt P65's open half).
+                let field_tys: Vec<(String, ManiType)> = typed_fields
+                    .iter()
+                    .map(|(n, e)| (n.clone(), e.ty.clone()))
+                    .collect();
+                let args = self
+                    .struct_literal_args(name, &field_tys)
+                    .unwrap_or_default();
+
                 Ok(TypedExpr {
                     kind: TypedExprKind::StructLit(name.clone(), typed_fields),
-                    ty: ManiType::Struct(name.clone()),
+                    ty: ManiType::Struct(name.clone(), args),
                     span,
                 })
             }

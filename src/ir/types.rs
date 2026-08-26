@@ -193,7 +193,7 @@ impl IRType {
             // of 8 bytes per extra element, on every tuple construction.
             // See tuple_arity_from_name, just above.
             ManiType::Tuple(elems) => IRType::Struct(format!("<tuple:{}>", elems.len())),
-            ManiType::Struct(name) => IRType::Struct(name.clone()),
+            ManiType::Struct(name, _) => IRType::Struct(name.clone()),
             ManiType::Enum(name) => IRType::Struct(name.clone()),
             ManiType::Fn(_, _) => IRType::Ptr(Box::new(IRType::I8)),
             ManiType::Generic(_, _) => IRType::Ptr(Box::new(IRType::I8)),

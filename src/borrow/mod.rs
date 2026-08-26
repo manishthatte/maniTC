@@ -345,7 +345,7 @@ fn check_expr_borrows(
         }
 
         // --- Method call ---
-        TypedExprKind::MethodCall(receiver, _method, args) => {
+        TypedExprKind::MethodCall(receiver, _method, args, _) => {
             check_expr_borrows(receiver, env, loop_from)?;
             for arg in args {
                 check_expr_borrows(arg, env, loop_from)?;
@@ -578,7 +578,7 @@ fn is_move_type(ty: &ManiType) -> bool {
         // usage pattern aliases them across tasks (`let c = counter; spawn
         // { c.lock(); ... }`). Copying the handle copies the reference, so
         // they are Copy, not move.
-        ManiType::Struct(name)
+        ManiType::Struct(name, _)
             if matches!(
                 name.as_str(),
                 "AtomicTrit" | "Barrier" | "Semaphore" | "MutexGuard"
@@ -594,7 +594,7 @@ fn is_move_type(ty: &ManiType) -> bool {
 
         // Move types -- heap-allocated or composite.
         ManiType::Str => true,
-        ManiType::Struct(_) => true,
+        ManiType::Struct(_, _) => true,
         ManiType::Enum(_) => true,
         ManiType::Generic(_, _) => true,
         ManiType::Array(_, _) => true,

@@ -1273,12 +1273,49 @@ fn max<T>(a: T, b: T) -> T {
 
 Call as `max(3, 7)` — the type parameter is inferred.
 
+**A generic function is compiled once per distinct combination of concrete
+argument types.** `max(3, 7)` and `max(1.5, 2.5)` in the same program produce
+two separate copies, each compiled with the real type, so the first compares
+integers and the second compares floats. Nothing about this is visible in the
+source; it matters because a single shared copy could not do both.
+
+> **Before 26 August 2026 there was only one copy, compiled with the type
+> parameter erased to a machine word**, and the results for anything but `int`
+> and `trit` were wrong rather than approximate: `max(1.5, 2.5)` truncated its
+> arguments to 1 and 2, compared those, and returned an integer that the
+> printer then read as a float bit pattern — `0.000…001`, a denormal.
+> `max(-1.5, -2.5)` printed `NaN`. `int` and `trit` were correct because their
+> representation *is* the machine word (report.txt P65).
+
+**A method in an `impl<T>` block is instantiated the same way**, from the
+receiver's type arguments rather than from the call's arguments — which is what
+makes it work for `fn bigger(self) -> T`, where `T` appears in no argument
+position at all.
+
+> **Until 27 August 2026 it was not**, and the notice above described a generic
+> METHOD exactly: `Box2 { a: -1.5, b: -2.5 }.bigger()` answered `-2.5`, because
+> the erased body compared the two floats as integer bit patterns and negative
+> doubles order the opposite way from theirs. Positive floats came out right,
+> which is why it survived a session behind a test that used them
+> (report.txt P69).
+
+One limit remains:
+
+* **A generic body that does not type-check for the concrete type falls back**
+  to the older, erased compilation rather than reporting. So a `<T>` with no
+  bound continues to accept whatever it accepted before — bounds remain opt-in
+  — and the price is that the error is not reported either. **A method
+  returning `T` has a sharper corollary**: when the fallback is taken the
+  call's type stays unknown, so `let q = p.bigger(); q.x` reads the WRONG
+  FIELD — slot 0, whatever was asked for — rather than being refused
+  (report.txt P69).
+
 ### Trait bounds
 
 A bare `<T>` places no requirement on `T`. The function above compares two
 values of it, so calling it with a type that has no ordering is meaningless —
-and it used to compile clean and return the wrong answer, comparing the two
-values' addresses rather than the values. Constrain the parameter instead:
+and it used to compile clean and return the wrong answer. Constrain the
+parameter instead:
 
 ```
 fn max<T: Ord>(a: T, b: T) -> T {
@@ -1304,27 +1341,97 @@ constrains `T` by both.
 
 A bound is satisfied if the concrete type has an `impl` of that trait, or if it
 is a primitive and the trait is one of the structural traits every primitive
-has: `Ord`, `PartialOrd`, `Eq`, `PartialEq`, `Display`, `Debug`, `Clone`,
-`Copy`, `Hash`. Structs and enums are not covered by that rule — write the
-`impl`:
+has: `Eq`, `PartialEq`, `Display`, `Debug`, `Clone`, `Copy`, `Hash`. Structs
+and enums are not covered by that rule — write the `impl`.
+
+**`Ord` and `PartialOrd` are decided differently, and a user `impl` does not
+enter into it.** They are satisfied by exactly the types `<` and `>` accept:
+`int`, `float`, `trit`, `tryte`, `t9`, `t27`, `t54`, `tfloat`, `bool`, `bool3`
+and `char`. Not `str`, not an array, a tuple, a `Vec<T>`, a `Result<T, E>`, a
+struct or an enum. Writing `impl Ord for str` does not change that and is not
+a workaround: maniT's comparison operators are built into the compiler and
+never dispatch to a user `cmp`, so the `impl` would satisfy a bound whose
+operator still cannot run.
+
+To order values of a type the operators do not accept, compare a component
+that they do:
 
 ```
-impl Ord for Point { fn cmp(self, other: Point) -> int { ... } }
+fn wider(a: Rect, b: Rect) -> Rect { if a.w > b.w { a } else { b } }
 ```
 
 An unsatisfied bound is reported under the `unsatisfied-bound` lint, which is
 `deny` by default (see [Lint levels](#20-lint-levels)).
 
+> **Until 26 August 2026 this section explained the wrong answer by saying the
+> comparison compared the two values' ADDRESSES, and told you to write
+> `impl Ord for Point`.** Neither survived being tested. The comparison is not
+> an address comparison: swapping the order in which the two values are
+> DECLARED does not flip the result, because the comparison is simply always
+> false (report.txt P45, pinned by `ord63_address_theory`). And the prescribed
+> `impl` made the bound pass while changing nothing about the operator, so
+> following this section's own advice restored the silent wrong answer it
+> exists to prevent. Both claims were true-sounding descriptions of a
+> mechanism nobody had measured.
+
 ### Generic structs
 
 ```
 struct Pair<T> {
-    first: T,
-    second: T,
+    pub first: T,
+    pub second: T,
 }
 
 let p = Pair { first: 1, second: 2 };
+io::print_int(p.first);
 ```
+
+The type parameter is inferred from the literal, so `p` above is a
+`Pair<int>`, and a `Pair` of floats holds floats:
+
+```
+let q = Pair { first: 1.5, second: 2.5 };
+if q.first > q.second { ... }        // a FLOAT comparison
+```
+
+> **The fields in this example gained their `pub` on 27 August 2026.** Without
+> it the struct declares and the literal builds, but `p.first` is refused —
+> "field 'first' of type 'Pair' is private" — so the example could be read and
+> not used. Nothing in it was false; it simply stopped one line before the
+> line that fails.
+>
+> **And until the same day, a `Pair<T>` could not be passed to a function
+> expecting one at all**, because `Pair` was on a hardcoded list of built-in
+> generic constructors and shadowed the user's own declaration (report.txt
+> P67). A struct of floats also could not hold its own values: the literal
+> truncated them to integers (P68).
+
+A method in an `impl<T>` block is instantiated per type, like a free function:
+
+```
+struct Box2<T> { pub a: T, pub b: T }
+impl<T> Box2<T> {
+    fn bigger(self) -> T { if self.a > self.b { self.a } else { self.b } }
+}
+
+let p = Box2 { a: -1.5, b: -2.5 };
+io::print_float(p.bigger());          // -1.5
+```
+
+> **Until 27 August 2026 that line printed `-2.5`** — the body was compiled
+> once with `T` erased to a machine word, so the comparison read two IEEE-754
+> bit patterns as integers, and negative doubles order the opposite way from
+> theirs (report.txt P69). The impl's parameters are bound from the receiver's
+> type arguments, positionally, so `impl<A, B> Two<A, B>` on a `Two<int, float>`
+> gives `A = int` and `B = float`.
+
+One limit remains, pinned by a test:
+
+* **Some struct names are reserved and say so badly.** Declaring
+  `struct Vec<T>`, or `Map`, `Set`, `Deque`, `TernaryTrie`, `Channel`,
+  `Mutex`, `Result` or `Range`, is shadowed by the built-in of that name, and
+  the program is then refused with a type error naming neither the cause nor
+  the remedy. Pick another name (report.txt P67).
 
 ### Generic types in the standard library
 

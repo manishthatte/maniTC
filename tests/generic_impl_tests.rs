@@ -105,6 +105,19 @@ fn check_status(name: &str) -> bool {
         .success()
 }
 
+/// `manitc check`'s exit status for a source string written to a temp file.
+/// P45's agreement test builds its programs rather than shipping 45 fixtures.
+fn check_source(tag: &str, src: &str) -> bool {
+    let p = tmp(&format!("{}.mt", tag));
+    std::fs::write(&p, src).expect("write temp source");
+    Command::new(manitc())
+        .args(["check", p.to_str().unwrap()])
+        .output()
+        .expect("check")
+        .status
+        .success()
+}
+
 fn assert_t3_value(name: &str) {
     let want = expected(name);
     match run_t3(name) {
@@ -140,37 +153,115 @@ fn pe61_mixed_plain_variant() {
 
 /// impl<T> Pair<T> swap — THE DOCUMENTED FORM. Both backends print 2 2.
 #[test]
-#[ignore = "§62: impl<T> Pair<T> swap — THE DOCUMENTED FORM. Both bac"]
 fn gs62_impl_single_param() {
     assert_t3_value("gs62_impl_single_param");
 }
 
 /// impl<A,B> Pair<A,B> swap, mixed int/str — returns an address
 #[test]
-#[ignore = "§62: impl<A,B> Pair<A,B> swap, mixed int/str — returns an"]
 fn gs62_impl_two_param() {
     assert_t3_value("gs62_impl_two_param");
 }
 
 /// method returning the UNSWAPPED Pair<A,B> — so it is not about swapping
 #[test]
-#[ignore = "§62: method returning the UNSWAPPED Pair<A,B> — so it is"]
 fn gs62_impl_noswap() {
     assert_t3_value("gs62_impl_noswap");
 }
 
 /// generic struct read back out of a Vec
 #[test]
-#[ignore = "§62: generic struct read back out of a Vec"]
 fn gs62_vec_of_generic() {
     assert_t3_value("gs62_vec_of_generic");
 }
 
-/// generic struct into a generic free fn — TypeError, the honest failure
+/// generic struct into a generic free fn — and it was never about generics.
+///
+/// Recorded for a day as the third defect in P44's family: a struct literal's
+/// bare type `Pair` never unifies with `Pair<T>`, so a generic struct could not
+/// be passed to a generic free function at all. **It was about the NAME.**
+/// `resolve_type` carried a hardcoded list of built-in generic constructors and
+/// `Pair` was on it with nothing behind it, so a user's own `struct Pair<T>`
+/// was shadowed: the ANNOTATION resolved to `Generic("Pair", [..])` and the
+/// LITERAL to `Struct("Pair")`, and those do not unify. Renaming the struct to
+/// `Duo` — one `sed`, same program — compiled and printed `2 1` on both
+/// backends, which is what showed it (report.txt P67).
+///
+/// Kept spelled `Pair` on purpose. The name IS the test.
 #[test]
-#[ignore = "§62: generic struct into a generic free fn — TypeError, t"]
 fn gs62_generic_freefn() {
     assert_t3_value("gs62_generic_freefn");
+}
+
+/// P67: RENAMING A STRUCT MUST NOT CHANGE WHAT A PROGRAM MEANS — and this
+/// records exactly which names still break that.
+///
+/// The test the defect deserved, rather than the one that found it. A program
+/// is compiled once per struct NAME, identical otherwise, and the answers are
+/// compared against a control name on no list.
+///
+/// TWO SETS, AND THE DISTINCTION IS THE FINDING. `resolve_type` carries a
+/// hardcoded list of generic constructors, and a name on it shadows a user's
+/// own `struct <name><T>`: the ANNOTATION resolves to `Generic(name, [..])`
+/// while the LITERAL resolves to `Struct(name)`, and those do not unify.
+///
+///   * `Pair` was on that list with NOTHING BEHIND IT — no stdlib source, no
+///     IR, no backend — so it shadowed a user struct for nothing. Removed
+///     (report.txt P67), and it is asserted here to work.
+///   * The other nine have real implementations, so shadowing them is a
+///     genuine collision rather than a phantom, and "the built-in wins" is a
+///     defensible rule. They are listed below as still-shadowed, so this test
+///     ENCODES the current convention rather than imposing a new one — and it
+///     fails if the set changes in either direction.
+///
+/// What is NOT defensible is that the collision is silent: the program is
+/// refused with `expected Vec<<unknown>>, found Vec`, which names neither the
+/// cause nor the remedy. That is recorded as P67's open half.
+#[test]
+fn p67_a_struct_name_must_not_change_the_program() {
+    // Names with no built-in behind them: a user struct must work.
+    const FREE: &[&str] = &["Duo", "Pair", "Task", "String"];
+    // Names whose built-in has an implementation, which currently wins.
+    const SHADOWED: &[&str] = &[
+        "Vec", "Map", "Set", "Deque", "TernaryTrie", "Channel", "Mutex",
+        "Result", "Range",
+    ];
+    let prog = |n: &str| {
+        format!(
+            "struct {n}<T> {{ pub first: T, pub second: T }}\n\
+             fn swap<T>(p: {n}<T>) -> {n}<T> {{ {n} {{ first: p.second, second: p.first }} }}\n\
+             fn main() {{ let p = {n} {{ first: 1, second: 2 }}; let q = swap(p);\n\
+                 io::println_int(q.first); }}\n"
+        )
+    };
+
+    let broken: Vec<&str> = FREE
+        .iter()
+        .copied()
+        .filter(|n| !check_source(&format!("p67_free_{n}"), &prog(n)))
+        .collect();
+    assert!(
+        broken.is_empty(),
+        "declaring `struct {}<T>` and using it is refused, while the identical \
+         program under another name compiles. A name with no built-in behind it \
+         must not shadow a user's own declaration — report.txt P67. Refused: {:?}",
+        broken.first().unwrap_or(&"?"),
+        broken,
+    );
+
+    let no_longer_shadowed: Vec<&str> = SHADOWED
+        .iter()
+        .copied()
+        .filter(|n| check_source(&format!("p67_sh_{n}"), &prog(n)))
+        .collect();
+    assert!(
+        no_longer_shadowed.is_empty(),
+        "these names no longer shadow a user struct: {:?}. That may well be an \
+         improvement — if so, move them to FREE and say so in report.txt P67. \
+         This half of the test exists to make the convention visible, not to \
+         defend it.",
+        no_longer_shadowed,
+    );
 }
 
 /// generic struct, field access only — control
@@ -197,11 +288,24 @@ fn gs62_two_param_fn() {
     assert_t3_value("gs62_two_param_fn");
 }
 
-/// str through <T: Ord> — accepted, no diagnostic, comparison always false
+/// str through <T: Ord> — now REFUSED, which is P45's fix.
+///
+/// THIS ROW CHANGED THE QUESTION IT ASKS, AND THAT IS THE FINDING. It used to
+/// assert that `largest("mm", "aa")` prints `mm`, which is what the probe
+/// session expected to see once the defect was gone. It is not what should
+/// happen: `str` has no ordering in maniT at all — `"mm" > "aa"` is a clean
+/// TypeError — so a `<T: Ord>` bound instantiated at `str` is exactly the
+/// program the bound exists to reject. Making it PRINT the right answer would
+/// have meant giving `str` an ordering, a language change nobody asked for,
+/// arrived at by taking a fixture's expectation as a specification.
 #[test]
-#[ignore = "§63: str through <T: Ord> — accepted, no diagnostic, comp"]
 fn ord63_str_via_bound() {
-    assert_t3_value("ord63_str_via_bound");
+    assert!(
+        !check_status("ord63_str_via_bound"),
+        "ord63_str_via_bound: `largest<T: Ord>(\"mm\", \"aa\")` compiles again. \
+         The bound does not bind, and the program returns its SECOND argument \
+         every time — report.txt P45."
+    );
 }
 
 /// direct str comparison — correctly a TypeError. The front end KNOWS.
@@ -220,9 +324,16 @@ fn ord63_str_direct() {
     );
 }
 
-/// float through <T: Ord> — the returned VALUE is corrupted, not just the choice
+/// float through a generic — the returned VALUE was corrupted, not just the
+/// choice. FIXED by P65's monomorphisation.
+///
+/// NOT P45 and never about the bound: `float` IS ordered, so the bound was
+/// correctly satisfied and the call correctly accepted. The value was
+/// destroyed by type erasure — the argument numerically CAST into an `i64`
+/// parameter, the comparison done on integers, and the result read back as
+/// float BITS. `largest(1.5, 2.5)` printed 1e-323 (the integer 2 as a bit
+/// pattern) and `largest(-1.5, -2.5)` printed NaN (the integer -1, all ones).
 #[test]
-#[ignore = "§63: float through <T: Ord> — the returned VALUE is corru"]
 fn ord63_float_via_bound() {
     assert_t3_value("ord63_float_via_bound");
 }
@@ -239,11 +350,299 @@ fn ord63_int_trit_via_bound() {
     assert_t3_value("ord63_int_trit_via_bound");
 }
 
-/// REFUTES the reference's address explanation: swapping DECLARATION order does not flip it
+/// P45: `Ord` ADMITS EXACTLY THE TYPES `<` AND `>` ADMIT, CHECKED BY ASKING
+/// BOTH AND COMPARING — not by restating a list.
+///
+/// The defect was two places deciding one question and disagreeing.
+/// `binop_type` asks `ManiType::is_comparable`; `check_generic_bounds` asked
+/// "is it a primitive", which is a question about what a type is NOT, and
+/// `str`, `[int; 2]`, `(int, int)`, `Vec<T>` and `Result<T, E>` all answered
+/// yes. So `largest<T: Ord>("mm", "aa")` compiled and returned `"aa"` every
+/// time while `"mm" > "aa"` was a clean TypeError one syntactic form away.
+///
+/// THIS TEST CROSSES AN ORIGIN BOUNDARY, WHICH IS WHY IT IS WORTH MORE THAN
+/// THE TABLE IT REPLACED. Asserting "these eleven types satisfy `Ord`" would
+/// be me checking a list against the list I had just written — P64's
+/// common-origin trap, where agreement carries no information. Asking the
+/// OPERATOR and asking the BOUND and requiring the same answer tests two
+/// independently-written code paths against each other, and it keeps its
+/// meaning if the language later makes `str` ordered: both verdicts move
+/// together and the test still passes without being edited.
+///
+/// EACH CASE CARRIES A CONTROL, AND THE CONTROL IS NOT CEREMONY. A malformed
+/// program fails BOTH ways and therefore AGREES — a vacuous pass, and the
+/// failure mode this exact test shape invites. The control compiles the
+/// declarations and the two bindings with no comparison at all, so a case
+/// that stops meaning anything says so instead of going quietly green.
 #[test]
-#[ignore = "§63: REFUTES the reference's address explanation: swappin"]
+fn ord63_bound_agrees_with_the_operator() {
+    // (label, extra declarations, type, literal a, literal b)
+    const CASES: &[(&str, &str, &str, &str, &str)] = &[
+        ("int", "", "int", "1", "2"),
+        ("float", "", "float", "1.5", "2.5"),
+        ("trit", "", "trit", "+", "-"),
+        ("bool", "", "bool", "true", "false"),
+        ("bool3", "", "bool3", "True", "False"),
+        ("char", "", "char", "'a'", "'b'"),
+        ("tryte", "", "tryte", "1 as tryte", "2 as tryte"),
+        ("t9", "", "t9", "1 as t9", "2 as t9"),
+        ("t27", "", "t27", "1 as t27", "2 as t27"),
+        ("t54", "", "t54", "1 as t54", "2 as t54"),
+        ("tfloat", "", "tfloat", "1.5 as tfloat", "2.5 as tfloat"),
+        ("str", "", "str", "\"aa\"", "\"bb\""),
+        ("array", "", "[int; 2]", "[1, 2]", "[3, 4]"),
+        ("tuple", "", "(int, int)", "(1, 2)", "(3, 4)"),
+        ("struct", "struct P { pub v: int }", "P", "P { v: 1 }", "P { v: 2 }"),
+        ("vec", "use std::collections;", "Vec<int>", "Vec::new()", "Vec::new()"),
+        ("result", "", "Result<int, str>", "Ok(1)", "Ok(2)"),
+    ];
+
+    let mut disagreed = Vec::new();
+    for (label, decls, ty, a, b) in CASES {
+        let bind = format!("let x: {ty} = {a}; let y: {ty} = {b};");
+        let control = format!("{decls}\nfn main() {{ {bind} }}");
+        let direct = format!("{decls}\nfn main() {{ {bind} if x > y {{ }} }}");
+        let via_bound = format!(
+            "{decls}\nfn gt2<T: Ord>(p: T, q: T) -> bool {{ p > q }}\n\
+             fn main() {{ {bind} if gt2(x, y) {{ }} }}"
+        );
+
+        assert!(
+            check_source(&format!("ord63_ctl_{label}"), &control),
+            "ord63 agreement: the CONTROL for `{label}` does not compile, so this \
+             row proves nothing — both verdicts below would be `reject` and would \
+             agree vacuously.\n{control}"
+        );
+
+        let d = check_source(&format!("ord63_dir_{label}"), &direct);
+        let v = check_source(&format!("ord63_bnd_{label}"), &via_bound);
+        if d != v {
+            disagreed.push(format!(
+                "  {label}: `x > y` {} but `gt2<T: Ord>(x, y)` {}",
+                if d { "compiles" } else { "is rejected" },
+                if v { "compiles" } else { "is rejected" },
+            ));
+        }
+    }
+
+    assert!(
+        disagreed.is_empty(),
+        "the `Ord` bound and the `>` operator disagree about {} type(s) — \
+         each such type is a program that type-checks through the bound and \
+         computes a wrong answer, which is report.txt P45:\n{}",
+        disagreed.len(),
+        disagreed.join("\n"),
+    );
+}
+
+/// P45: an `impl Ord` does NOT satisfy an ordering bound, because `>` never
+/// dispatches to it — and the old diagnostic told the user to write one.
+///
+/// Following that advice made the program compile and print `aa` again, which
+/// is the original wrong answer restored by the fix's own suggestion. The
+/// remedy a diagnostic names has to be a remedy.
+#[test]
+fn ord63_user_impl_ord_is_not_a_workaround() {
+    let src = "use std::io;\n\
+               trait Ord { fn cmp(self, other: str) -> int; }\n\
+               impl Ord for str { fn cmp(self, other: str) -> int { 0 } }\n\
+               fn largest<T: Ord>(a: T, b: T) -> T { if a > b { a } else { b } }\n\
+               fn main() { io::println(largest(\"mm\", \"aa\")); }\n";
+    assert!(
+        !check_source("ord63_user_impl", src),
+        "`impl Ord for str` satisfied the bound again. It cannot make `>` work — \
+         the comparison operators are lowered by the compiler and read no trait \
+         table — so accepting it returns the program to printing `aa` for \
+         `largest(\"mm\", \"aa\")`."
+    );
+}
+
+/// REFUTES the reference's address explanation — and is now refused outright.
+///
+/// The program declares `hi` before `lo` and then `lo2` before `hi2`, so if
+/// the comparison really compared ADDRESSES, as `language-reference.md` §14
+/// claimed until 26 August 2026, the two lines would differ. They did not:
+/// both printed `aaa`, because the comparison was simply always false. That
+/// measurement is what retired the explanation, and it is recorded in §14's
+/// dated notice, because it can no longer be re-derived by running this
+/// program — with P45 fixed the program does not compile at all.
+///
+/// The row is kept, asserting the refusal, since the source is the record of
+/// what the refutation was performed ON.
+#[test]
 fn ord63_address_theory() {
-    assert_t3_value("ord63_address_theory");
+    assert!(
+        !check_status("ord63_address_theory"),
+        "ord63_address_theory: a `<T: Ord>` bound instantiated at `str` compiles \
+         again — see report.txt P45."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// report.txt P65 — a generic function is type-erased to a machine word
+// ---------------------------------------------------------------------------
+
+/// The RETURN type of a generic call, which is the half that is not about
+/// floats at all.
+///
+/// `fn id<T>(x: T) -> T` gave its call the type `Unknown`, so `q.first` and
+/// `q.second` were both field lookups on `<unknown>`, which is not a key in
+/// the struct table, so both resolved to slot 0. It printed `1 1`. A one-field
+/// struct would have been right by luck, which is why the fixture has two.
+#[test]
+fn p65_generic_return_field() {
+    assert_t3_value("p65_generic_return_field");
+}
+
+/// ONE generic, FOUR calls, TWO types — the shape a single erased body cannot
+/// serve, whatever its representation.
+///
+/// This is the test that would still mean something if the fix were replaced
+/// by a different one. A single body has to pick a comparison and a width; the
+/// int calls need integer comparison and the float calls need float
+/// comparison, and `-1.5 > -2.5` is the case that separates them from a
+/// bit-pattern compare, since IEEE-754 negatives order the opposite way to
+/// their bit patterns as integers. Interleaving int and float calls also
+/// checks that instantiations do not overwrite one another.
+#[test]
+fn p65_two_instantiations() {
+    assert_t3_value("p65_two_instantiations");
+}
+
+/// `docs/language-reference.md` §14's OWN example, pinned.
+///
+/// The section claims a generic function is compiled once per distinct
+/// combination of concrete argument types, and illustrates it with exactly
+/// this `max`. Documentation defects in this file have three times now been
+/// true-sounding sentences nobody ran (P51, P55, §14's address explanation),
+/// so the claim is pinned rather than reviewed. Note the bound is ABSENT here
+/// on purpose: it is the reference's example verbatim, and it also shows the
+/// fix does not depend on `T: Ord`.
+#[test]
+fn p65_reference_example() {
+    assert_t3_value("p65_reference_example");
+}
+
+/// `docs/language-reference.md` §14's generic-struct example, pinned.
+///
+/// The section's example declared its fields WITHOUT `pub` and never read one,
+/// so it could be read and not used: copying it and adding `p.first` gives
+/// "field 'first' of type 'Pair' is private". A fourth documentation defect of
+/// the shape this file keeps finding — no false sentence, an example that
+/// stops one line before the line that fails. It now shows the field read and
+/// the float case, and this pins both.
+#[test]
+fn p68_reference_generic_struct() {
+    assert_t3_value("p68_reference_generic_struct");
+}
+
+/// P68: a generic struct's field holds the value it was given.
+///
+/// `Box2 { a: 1.5 }` used to hold the integer 1, and `p.a` read back 5e-324.
+/// Two lines of the struct-literal lowering disagreed: the value was coerced
+/// to the DECLARED field type — `Unknown` for a field declared `T`, which
+/// means `i64`, which truncates — and then STORED with the value's own type,
+/// `F64`. A generic struct could not carry a float at all, on either backend,
+/// and no test noticed because every generic struct in every corpus holds
+/// integers.
+///
+/// Both orderings, on purpose. Positive doubles order the same way as their
+/// bit patterns read as integers, so the `(1.5, 2.5)` line alone passes under
+/// an integer comparison; `(-1.5, -2.5)` is what distinguishes them. The `int`
+/// line is the control: whatever changes here must leave the case that always
+/// worked alone.
+#[test]
+fn p68_generic_struct_float_field() {
+    assert_t3_value("p68_generic_struct_float_field");
+}
+
+/// The SAME defect through a METHOD — P65's last piece, closed by P69, and
+/// this row is the one that proves it rather than a pair that passes anyway.
+///
+/// P65 instantiated generic FREE FUNCTIONS. A method in an `impl<T>` block was
+/// not, so its body was checked once with `T` erased and its comparison was an
+/// INTEGER comparison of two float bit patterns. P69 instantiates it, binding
+/// the impl's parameters from the RECEIVER's type arguments.
+///
+/// **IT USED TO TEST ONLY `(1.5, 2.5)`, AND P68 MADE THAT PAIR PASS WHILE THE
+/// DEFECT STOOD.** Positive IEEE-754 doubles order the same way as their bit
+/// patterns read as integers, so an integer comparison gets the right answer
+/// on them; once P68 stopped the field store truncating the value, the row
+/// printed `2.5` and would have been un-`#[ignore]`d as fixed. The negative
+/// pair is what separates the two — negatives order the OPPOSITE way — and
+/// `(-1.5, -2.5)` answered `-2.5` for another whole session behind it.
+///
+/// This is the file's own rule turned on its author: **a single case for a
+/// comparison is half a test**, and the half that was missing is the one that
+/// distinguishes the fix from the accident. Keep both pairs.
+#[test]
+fn p65_impl_method_instantiated() {
+    assert_t3_value("p65_impl_method_still_erased");
+}
+
+/// TWO instantiations of ONE method in ONE program, and both orderings of each.
+///
+/// The single-instantiation row cannot tell a monomorphised method from a
+/// method that happens to be lowered for the type the one call site used. This
+/// one needs `Box2::bigger$float` and `Box2::bigger$int` to coexist and to
+/// disagree about what `>` means, which is the property the mangled name is
+/// for. The `int` rows are the control: `int` is unaffected by erasure
+/// *because its representation IS the erasure*, so they were green throughout
+/// and a change that broke them would be a change to the ordinary path.
+#[test]
+fn p69_impl_method_two_instantiations() {
+    assert_t3_value("p69_impl_method_two_instantiations");
+}
+
+/// The receiver reached through TWO generic free functions.
+///
+/// Instantiating at the top level is not enough, and this is the row that says
+/// so: `mid<T>(x: B<T>)` binds `T` from a parameter whose declared type is
+/// `B<T>` and whose actual type is `Struct("B", [float])` — and `bind_generics`
+/// matched only `ManiType::Generic` there, because `ManiType::Struct` did not
+/// carry arguments until P68. So `mid` stayed erased, `x` inside it was a
+/// `B<unknown>`, and the method call had nothing to bind from. Monomorphisation
+/// stopped at the first boundary it crossed, silently.
+///
+/// Both orderings, so the row distinguishes the fix from `a` always winning.
+#[test]
+fn p69_impl_method_through_generic_fn() {
+    assert_t3_value("p69_impl_method_through_generic_fn");
+}
+
+/// TWO type parameters, with the float in each slot in turn.
+///
+/// The impl's parameters are mapped to the receiver's arguments POSITIONALLY —
+/// that is the only reading `ast::ImplBlock` supports, since it reduces
+/// `impl<A, B> Two<A, B>` to a base name plus an ordered list. A mapping that
+/// silently reversed, or that bound every parameter to the first argument,
+/// gets the `Two<float, int>` rows right by luck; the `Two<int, float>` rows
+/// are what catch it.
+///
+/// **THE FIRST VERSION OF THIS ROW WAS HOLLOW AND THE CONTROL BINARY SAID SO.**
+/// It was `fn geta(self) -> A { self.a }` — a field read and nothing else — so
+/// erasure could not change the answer, and it passed on the pre-P69 compiler
+/// unchanged. A test for a type-erasure defect has to make the program DO
+/// something the erased type gets wrong, and for `T` that means a COMPARISON:
+/// negative doubles order the opposite way from their bit patterns read as
+/// integers. Written that way it answers `-2.5 / -7 / -7 / -2.5` on the
+/// control and `-1.5 / -7 / -7 / -1.5` here.
+#[test]
+fn p69_impl_method_two_type_params() {
+    assert_t3_value("p69_impl_method_two_type_params");
+}
+
+/// `docs/language-reference.md` §14's generic-method example, verbatim.
+///
+/// The reference now states an OUTPUT for this program (`-1.5`), and a stated
+/// output is a claim that can quietly stop being true. Three documentation
+/// defects in that file (P51, P55, §14's refuted address explanation) had no
+/// false sentence in them — an absence, a word, and a mechanism that was true
+/// when written — which is the argument for pinning a documented claim with a
+/// test rather than re-reading the prose.
+#[test]
+fn p69_reference_impl_method() {
+    assert_t3_value("p69_reference_impl_method");
 }
 
 // ---------------------------------------------------------------------------

@@ -1025,7 +1025,7 @@ impl IRLowerer {
                 }
             }
 
-            TypedExprKind::MethodCall(obj, method, args) => {
+            TypedExprKind::MethodCall(obj, method, args, mono_callee) => {
                 // A method on a `Result` lowers to the same loads and branches
                 // that `match` on one already does — see ir/lower/lower_result.rs.
                 // Falling through to the generic call below is what produced
@@ -1043,7 +1043,17 @@ impl IRLowerer {
                 // A collection of `str` compares text, not pointers — route the
                 // comparing methods to their `_str` variants (see STR_SENSITIVE).
                 let suffix = if needs_str_compare(&obj.ty, method) { "_str" } else { "" };
-                let func_name = format!("{}::{}{}", base_type, method, suffix);
+                // P69: a monomorphised `impl<T>` method is called by the name
+                // the checker chose. Deriving it from the receiver would name
+                // the ERASED body — `Box2<float>` strips to `Box2` and gives
+                // `Box2::bigger`, the copy in which `T` is `i64` — so the one
+                // place the instantiation is known has to say so. Every other
+                // method call carries `None` and takes the line below,
+                // unchanged.
+                let func_name = match mono_callee {
+                    Some(n) => n.clone(),
+                    None => format!("{}::{}{}", base_type, method, suffix),
+                };
                 // Hidden trailing lengths for `[T]` (unsized array) params —
                 // method params include self, so prepend the receiver.
                 let typed_args: Vec<&TypedExpr> =
@@ -1225,9 +1235,24 @@ impl IRLowerer {
                 let field_manitys = self.struct_field_manitys.get(name).cloned();
                 for (i, (_, fval)) in fields.iter().enumerate() {
                     let mut val = self.lower_expr(fval);
+                    // **COERCE ONLY TO A KNOWN FIELD TYPE.** A GENERIC struct's
+                    // fields are registered as `Unknown` — a struct's type
+                    // parameters are not in scope when it is registered, so
+                    // `pub a: T` resolves to nothing — and coercing INTO
+                    // `Unknown` means coercing into `i64`, which truncates a
+                    // float. The `Store` two statements below already uses the
+                    // VALUE's own type, so the two lines disagreed: the value
+                    // was cast to an integer and then stored as a float.
+                    // `Box2 { a: 1.5 }` held 1, and `f.a` read back 5e-324.
+                    //
+                    // This is P65's shape a third time — a value-changing cast
+                    // into an erased type — and the same answer: do not
+                    // convert to a type nobody knows. report.txt P68.
                     if let Some(fmt) = field_manitys.as_ref().and_then(|f| f.get(i)) {
-                        let fmt = fmt.clone();
-                        val = self.coerce_value(val, &fval.ty, &fmt);
+                        if fmt.is_known() {
+                            let fmt = fmt.clone();
+                            val = self.coerce_value(val, &fval.ty, &fmt);
+                        }
                     }
                     let idx = IRValue::Const(IRConst::Int(i as i64));
                     // Uniform 8-byte slot convention for aggregates (see slot_access_ty).
@@ -1521,6 +1546,36 @@ impl IRLowerer {
     /// diagnostic. That fallback is the defect, not the missing arm — a lookup
     /// that cannot fail silently would have surfaced this the first time
     /// anyone wrote `p.1`.
+    ///
+    /// AND THE SAME FALLBACK SWALLOWED report.txt P44, WHICH IS THE TUPLE
+    /// DEFECT ONE TYPE CONSTRUCTOR LATER — **THOUGH P44'S CAUSE TURNED OUT TO
+    /// BE SOMETHING ELSE, AND THIS ARM IS NOW DEFENCE IN DEPTH RATHER THAN THE
+    /// FIX.** See P67: a user's `struct Pair<T>` was shadowed by a hardcoded
+    /// built-in name with no implementation behind it, which is the only reason
+    /// a user struct's DECLARED type ever arrived here as `Generic`. With the
+    /// phantom removed, `Pair<T>` resolves to `Struct("Pair")` like any other
+    /// declared struct — and measured, with this arm deleted, all 36 rows of
+    /// `generic_impl_tests` still pass and the assertion below fires on none of
+    /// the 295 `.mt` files in both repos. The arm is kept because it costs one
+    /// line and the ONE case it would still catch is a struct named `Vec`,
+    /// `Map`, `Result` or one of the other six names that do have
+    /// implementations and still shadow a user declaration. A generic struct's type is
+    /// `Generic("Pair", [..])`, whose `display()` is `Pair<int>` — again never
+    /// a key in `self.structs`, which is keyed on the DECLARATION name. So
+    /// `q.first` and `q.second` both resolved to slot 0 and
+    /// `Pair { first: 1, second: 2 }.swap()` printed `2 2` where it should
+    /// print `2 1`, on BOTH backends, from a program `check` exits 0 on.
+    ///
+    /// Note where the type comes from: a struct LITERAL has bare type `Pair`,
+    /// so a field read straight off the literal was always correct, and only a
+    /// value that had crossed a method, a `Vec` or a function boundary — where
+    /// the declared return type `Pair<T>` survives — carried the `Generic`
+    /// form. That is why the defect is invisible until a boundary and why
+    /// cross-backend parity is blind to it: a shared lowering shares its bugs.
+    ///
+    /// The layout does not depend on the type arguments — every field is one
+    /// machine word and `self.structs` holds one entry per declaration — so
+    /// the base name is the right key, not a monomorphised one.
     fn field_slot_index(&self, obj_ty: &ManiType, field: &str) -> i64 {
         if let ManiType::Tuple(elems) = obj_ty {
             if let Ok(i) = field.parse::<usize>() {
@@ -1531,12 +1586,39 @@ impl IRLowerer {
             return 0;
         }
         let struct_name = match obj_ty {
-            ManiType::Struct(name) => name.clone(),
+            ManiType::Struct(name, _) => name.clone(),
+            ManiType::Generic(name, _) => name.clone(),
             _ => obj_ty.display().to_string(),
         };
-        self.structs
+        // The `unwrap_or(0)` the two findings above blame is now a
+        // `debug_assert!`, so a miss is loud in every test run and in every
+        // debug build rather than silently reading the first slot. It is not a
+        // hard error because `lower` returns an `IRModule` with no error
+        // channel, and a panic in the compiler is its own defect (P50) — but
+        // an unreachable fallback that stays silent is how both of these lived.
+        //
+        // Measured before making it an assertion rather than argued, with a
+        // temporary per-lookup trace so the sweep had a POSITIVE control: a
+        // run that reports no misses because it performed no lookups is not
+        // evidence, and zero-byte output cannot tell the two apart.
+        //
+        // 8,169 lookups over 1,442 files — every `.mt` in both repos (295
+        // files) on both backends, 93 files performing 3,077 lookups on EACH,
+        // plus the pinned 1,147-file model corpus, 92 files performing 2,015 —
+        // and ZERO misses with the `Generic` arm above. The two backends
+        // agreeing to the unit is not a coincidence to note but the property
+        // being relied on: this function runs before the backends split, which
+        // is also why P44 was wrong on both and parity could not see it.
+        let slot = self.structs
             .get(&struct_name)
-            .and_then(|fields| fields.iter().position(|(n, _)| n == field))
-            .unwrap_or(0) as i64
+            .and_then(|fields| fields.iter().position(|(n, _)| n == field));
+        debug_assert!(
+            slot.is_some(),
+            "field_slot_index: no slot for field `{}` on `{}` (key `{}`) — \
+             a miss silently reads slot 0, which is report.txt P44 and the \
+             20 August tuple defect both",
+            field, obj_ty.display(), struct_name,
+        );
+        slot.unwrap_or(0) as i64
     }
 }

@@ -1,2 +1,1 @@
-zzz
-zzz
+(check must FAIL: `str` does not satisfy the bound `T: Ord` required by 'largest')

@@ -28,22 +28,22 @@ on every row.
 | `pe61_match_only.mt` | §61 | **PASSES** | — | payload enum declared AND matched, never constructed — control |
 | `pe61_nopayload.mt` | §61 | **PASSES** | — | enum with no payload variants, constructed — control |
 | `pe61_mixed_plain_variant.mt` | §61 | **PASSES** | — | mixed enum, only the PLAIN variant constructed — control |
-| `gs62_impl_single_param.mt` | §62 | **FAILS** | `§62: impl<T> Pair<T> swap — THE DOCUMENTED FORM. Both bac` | impl<T> Pair<T> swap — THE DOCUMENTED FORM. Both backends print 2 2. |
-| `gs62_impl_two_param.mt` | §62 | **FAILS** | `§62: impl<A,B> Pair<A,B> swap, mixed int/str — returns an` | impl<A,B> Pair<A,B> swap, mixed int/str — returns an address |
-| `gs62_impl_noswap.mt` | §62 | **FAILS** | `§62: method returning the UNSWAPPED Pair<A,B> — so it is ` | method returning the UNSWAPPED Pair<A,B> — so it is not about swapping |
-| `gs62_vec_of_generic.mt` | §62 | **FAILS** | `§62: generic struct read back out of a Vec` | generic struct read back out of a Vec |
+| `gs62_impl_single_param.mt` | §62 | **PASSES** (P44 fixed, 26 Aug) | — | impl<T> Pair<T> swap — THE DOCUMENTED FORM; printed 2 2, now prints 2 1 |
+| `gs62_impl_two_param.mt` | §62 | **PASSES** (P44 fixed, 26 Aug) | — | impl<A,B> Pair<A,B> swap, mixed int/str |
+| `gs62_impl_noswap.mt` | §62 | **PASSES** (P44 fixed, 26 Aug) | — | method returning the UNSWAPPED Pair<A,B> — so it is not about swapping |
+| `gs62_vec_of_generic.mt` | §62 | **PASSES** (P44 fixed, 26 Aug) | — | generic struct read back out of a Vec |
 | `gs62_generic_freefn.mt` | §62 | **FAILS-CHECK** | `§62: generic struct into a generic free fn — TypeError, t` | generic struct into a generic free fn — TypeError, the honest failure |
 | `gs62_fields_only.mt` | §62 | **PASSES** | — | generic struct, field access only — control |
 | `gs62_swap_inline.mt` | §62 | **PASSES** | — | the same swap written INLINE at the call site — control |
 | `gs62_impl_nongeneric.mt` | §62 | **PASSES** | — | impl on a NON-generic struct — control, so impl is not the culprit |
 | `gs62_two_param_fn.mt` | §62 | **PASSES** | — | two type params on a FUNCTION — control, so generics are not the culprit |
-| `ord63_str_via_bound.mt` | §63 | **FAILS** | `§63: str through <T: Ord> — accepted, no diagnostic, comp` | str through <T: Ord> — accepted, no diagnostic, comparison always false |
+| `ord63_str_via_bound.mt` | §63 | **PASSES** (P45 fixed, 26 Aug) | — | str through <T: Ord> — now REFUSED; the row asserts the refusal, not a value |
 | `ord63_str_direct.mt` | §63 | **PASSES** | — | direct str comparison — correctly a TypeError. The front end KNOWS. |
 | `ord63_float_via_bound.mt` | §63 | **FAILS** | `§63: float through <T: Ord> — the returned VALUE is corru` | float through <T: Ord> — the returned VALUE is corrupted, not just the choice |
 | `ord63_float_controls.mt` | §63 | **PASSES** | — | print_float and direct float compare — controls ruling out the printer |
 | `ord63_int_trit_via_bound.mt` | §63 | **PASSES** | — | int and trit through the bound — control, the bound works for these |
-| `ord63_address_theory.mt` | §63 | **FAILS** | `§63: REFUTES the reference's address explanation: swappin` | REFUTES the reference's address explanation: swapping DECLARATION order does not flip it |
-| `s64_reverse_kills_t3.mt` | §64 | **FAILS** | `§64: str::reverse on multi-byte: T3 emits NOTHING, losing` | str::reverse on multi-byte: T3 emits NOTHING, losing all later output |
+| `ord63_address_theory.mt` | §63 | **PASSES** (P45 fixed, 26 Aug) | — | REFUTES the reference's address explanation; now refused, so the row asserts the refusal |
+| `s64_reverse_kills_t3.mt` | §64 | **PASSES** (P50 fixed, 26 Aug) | — | str::reverse on multi-byte crashed the compiler process; the row asserts it does not |
 | `s64_len_equals_bytelen.mt` | §64 | **FAILS** | `§64: str::len counts BYTES; it and byte_len are synonyms` | str::len counts BYTES; it and byte_len are synonyms |
 | `s64_char_as_int_sign.mt` | §64 | **FAILS** | `§64: `char as int` is UNSIGNED on T3 and SIGNED on LLVM f` | `char as int` is UNSIGNED on T3 and SIGNED on LLVM for bytes >= 128 |
 | `s64_ascii_control.mt` | §64 | **PASSES** | — | the same three calls on ASCII — control, so this is not `str` being broken |
@@ -89,13 +89,18 @@ on every row.
 * T3 actual: `check: expected `Pair<<unknown>>`, found `Pair``
 * LLVM actual: `same`
 
-### `ord63_str_via_bound.mt` — §63
+### `ord63_str_via_bound.mt` — §63 — **RESOLVED 26 August 2026 (P45)**
 
-* expected stdout: `mm
+* was expected stdout: `mm
 mm
 zz`
-* T3 actual: `aa\naa\nab`
-* LLVM actual: `aa\naa\nab`
+* was T3 actual: `aa\naa\nab`
+* was LLVM actual: `aa\naa\nab`
+* **now**: `check` REFUSES it — `` `str` does not satisfy the bound `T: Ord` ``.
+  The expectation itself was wrong: `str` has no ordering in maniT (`"mm" > "aa"`
+  is a TypeError), so printing `mm` would have required giving `str` an ordering.
+  A fixture's expectation is a report of what someone wanted to see, not a
+  specification.
 
 ### `ord63_float_via_bound.mt` — §63
 
@@ -104,12 +109,16 @@ zz`
 * T3 actual: `0.000...001 (denormal) then NaN`
 * LLVM actual: `same`
 
-### `ord63_address_theory.mt` — §63
+### `ord63_address_theory.mt` — §63 — **RESOLVED 26 August 2026 (P45)**
 
-* expected stdout: `zzz
+* was expected stdout: `zzz
 zzz`
-* T3 actual: `aaa\naaa`
-* LLVM actual: `aaa\naaa`
+* was T3 actual: `aaa\naaa`
+* was LLVM actual: `aaa\naaa`
+* **now**: refused, same diagnostic. The `aaa\naaa` above IS the refutation of
+  §14's address explanation — declaration order does not flip it — and it can no
+  longer be re-derived by running the program, so it now lives in the dated
+  notice in `docs/language-reference.md` §14.
 
 ### `s64_reverse_kills_t3.mt` — §64
 
@@ -134,8 +143,19 @@ done`
 
 ## Counts
 
-* 19 programs, 9 failing, 10 controls
+* 19 programs, **3 still failing**, 16 passing. Nine were failing when this
+  manifest was written on 26 August; P44 resolved four (`gs62_impl_*`,
+  `gs62_vec_of_generic`) and P45 two (`ord63_str_via_bound`,
+  `ord63_address_theory`) the same day. What remains is
+  `pe61_construct_payload` (P43), `gs62_generic_freefn` (P44's third,
+  honest defect: a struct literal's bare type never unifies with `Pair<T>`)
+  and `ord63_float_via_bound` (the type-erasure defect, report.txt P65).
 * §61 payload-enum constructor · §62 generic struct across a boundary · §63 unbound `T: Ord`
+
+**THIS TABLE IS A SNAPSHOT AND THE TEST FILE IS THE AUTHORITY.** A count
+written here has to be re-checked by hand every time a row moves, and it has
+already gone stale once within a day. `grep '#\[ignore' ../../generic_impl_tests.rs`
+is the live list; each entry carries its finding id.
 
 Note `ord63_str_direct.mt` is listed PASSES but its *expected* result is a
 `check` FAILURE — it exists to show the front end already rejects the
@@ -167,3 +187,66 @@ at all; either convention consistently applied would be defensible.
 
 `§65` and `§66` are deliberately NOT here — both are fixed in the maniTC tree
 with regression tests as of 26 August (P46, P49).
+
+
+---
+
+## P65 addendum — 26 August, evening
+
+Three programs added for report.txt P65, the type-erasure defect that P45's fix
+separated out. These did not come from a probe session; they were written here.
+
+| file | finding | status | ignore reason | what it is |
+|---|---|---|---|---|
+| `p65_generic_return_field.mt` | P65 | **PASSES** | — | a generic call's RETURN type was `Unknown`, so both field reads resolved to slot 0 and it printed `1 1` |
+| `p65_two_instantiations.mt` | P65 | **PASSES** | — | ONE generic, FOUR calls, TWO types, interleaved — the shape a single erased body cannot serve |
+| `p65_reference_example.mt` | P65 | **PASSES** | — | `docs/language-reference.md` §14's own `max` example, pinned — unbounded `<T>` called at `int` and at `float` in one program |
+| `p65_impl_method_still_erased.mt` | P65 (open half) | **FAILS** | `P65 (open half): an impl<T> method is still type-erased — the NEGATIVE pair is what shows it` | the same defect through a METHOD. **Strengthened on 27 August**: it tested only `(1.5, 2.5)`, and P68 made that pair pass while the defect stood, because positive doubles order the same way as their bit patterns. `(-1.5, -2.5)` is the half that still fails. |
+
+`p65_generic_return_field` has TWO fields on purpose: with one, slot 0 is the
+right answer by luck, and the row would pass while the defect stood.
+
+`p65_two_instantiations` includes `largest(-1.5, -2.5)` on purpose: IEEE-754
+negatives order the OPPOSITE way to their bit patterns read as integers, so
+that call separates a real float comparison from a bit-pattern one. The
+positive pair alone does not.
+
+
+---
+
+## P67 / P68 addendum — 27 August
+
+| file | finding | status | what it is |
+|---|---|---|---|
+| `p68_generic_struct_float_field.mt` | P68 | **PASSES** | a generic struct's field holds the value it was given; both orderings, plus an `int` control |
+| `p68_reference_generic_struct.mt` | P68 | **PASSES** | `docs/language-reference.md` §14's generic-struct example, which declared private fields and never read one |
+
+`gs62_generic_freefn.mt` moved to **PASSES** on 27 August and is kept spelled
+`Pair` on purpose: **the name IS the test** (report.txt P67). Renaming it would
+delete the defect it exists to catch.
+
+Note also that P44's four `gs62_impl_*` rows now pass for a different reason
+than the one recorded when they were un-`#[ignore]`d — P67 removed the cause,
+and P44's own fix is defence in depth. The rows are unchanged; only the
+explanation moved.
+
+---
+
+## P69 addendum — 27 August
+
+| file | finding | status | what it is |
+|---|---|---|---|
+| `p65_impl_method_still_erased.mt` | P65/P69 | **PASSES** | the open half of P65, closed. Kept under its original name so the finding it names stays findable; both pairs, and the NEGATIVE one is the one that shows the fix |
+| `p69_impl_method_two_instantiations.mt` | P69 | **PASSES** | two instantiations of ONE method in ONE program, `float` and `int`, both orderings of each. The `int` rows are the control — `int` is unaffected by erasure *because its representation IS the erasure* |
+| `p69_impl_method_through_generic_fn.mt` | P69 | **PASSES** | the receiver reached through TWO generic free functions. Monomorphisation used to stop at the first boundary, because `bind_generics` matched only `ManiType::Generic` and a user struct's arguments live in `ManiType::Struct` |
+| `p69_impl_method_two_type_params.mt` | P69 | **PASSES** | `impl<A, B>` with the float in each slot in turn, so a reversed or first-argument-for-everything mapping is caught |
+| `p69_reference_impl_method.mt` | P69 | **PASSES** | `docs/language-reference.md` §14's generic-method example, which now states an output |
+
+**`p69_impl_method_two_type_params` was HOLLOW as first written and the pinned
+control binary is what said so.** It was `fn geta(self) -> A { self.a }` — a
+field read and nothing else — and it passed on the PRE-CHANGE compiler
+unchanged, asserting nothing about the change it was written for. A test for a
+type-erasure defect has to make the program DO something the erased type gets
+wrong, and for a type parameter that means a COMPARISON. **Run every new row
+against the previous pinned binary before believing it**: that is P40's
+"reintroduce the defect" for the price of one command.

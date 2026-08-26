@@ -592,7 +592,7 @@ impl IRLowerer {
             // `load %struct.S, ptr @G` — an aggregate by value, which the
             // rest of the pipeline treats as a pointer.
             let ty = match &g.ty {
-                ManiType::Struct(_) => IRType::Ptr(Box::new(IRType::from_mani(&g.ty))),
+                ManiType::Struct(_, _) => IRType::Ptr(Box::new(IRType::from_mani(&g.ty))),
                 _ => IRType::from_mani(&g.ty),
             };
             lowerer.global_vars.insert(g.name.clone(), ty.clone());

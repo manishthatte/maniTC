@@ -21,7 +21,23 @@ pub enum ManiType {
     Void,
     Array(Box<ManiType>, Option<usize>),
     Tuple(Vec<ManiType>),
-    Struct(String),
+    /// A nominal struct, with the type arguments it was instantiated at.
+    ///
+    /// **The arguments are carried, not compared.** `types_compatible` looks
+    /// only at the NAME, exactly as it did when this variant held a bare
+    /// `String`, so adding them changes no verdict. They exist so that a
+    /// generic struct's value can say what `T` turned out to be, which is what
+    /// an `impl<T>` method needs in order to be instantiated (report.txt P65's
+    /// open half).
+    ///
+    /// Why not reuse `Generic(name, args)`: because every question the rest of
+    /// the compiler asks about a struct — "is this a struct called n", what
+    /// `IRType` is it, is it a move type — is asked by matching `Struct`, and
+    /// a second spelling would mean auditing all of them and getting one
+    /// wrong. This way the type stays nominally a struct everywhere and the
+    /// arguments simply ride along. It is also what made the change safe to
+    /// make: every site is a pattern the compiler forced me to visit.
+    Struct(String, Vec<ManiType>),
     Enum(String),
     Fn(Vec<ManiType>, Box<ManiType>),
     Generic(String, Vec<ManiType>), // Result<T,E> etc.
@@ -87,7 +103,12 @@ impl ManiType {
             ManiType::Unknown => "<unknown>".to_string(),
             ManiType::Array(t, n) => format!("[{}; {:?}]", t.display(), n),
             ManiType::Tuple(ts) => format!("({})", ts.iter().map(|t| t.display()).collect::<Vec<_>>().join(", ")),
-            ManiType::Struct(n) => n.clone(),
+            ManiType::Struct(n, args) if args.is_empty() => n.clone(),
+            ManiType::Struct(n, args) => format!(
+                "{}<{}>",
+                n,
+                args.iter().map(|t| t.display()).collect::<Vec<_>>().join(", ")
+            ),
             ManiType::Enum(n) => n.clone(),
             ManiType::Fn(ps, r) => format!("fn({}) -> {}", ps.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "), r.display()),
             ManiType::Generic(n, args) => format!("{}<{}>", n, args.iter().map(|t| t.display()).collect::<Vec<_>>().join(", ")),
@@ -130,7 +151,17 @@ pub fn types_compatible(a: &ManiType, b: &ManiType) -> bool {
                 && types_compatible(ra, rb)
         }
         // A module-qualified struct/enum name matches its unqualified form.
-        (Struct(x), Struct(y)) | (Enum(x), Enum(y)) => {
+        // NAME ONLY, deliberately. `Struct` gained its type arguments so that
+        // an instantiation could be identified; comparing them here would make
+        // `Box2<int>` and `Box2<float>` incompatible, which is correct in
+        // principle and a strictness change in practice, so it is a separate
+        // decision rather than a side effect of carrying the arguments.
+        (Struct(x, _), Struct(y, _)) => {
+            x == y
+                || x.ends_with(&format!("::{}", y))
+                || y.ends_with(&format!("::{}", x))
+        }
+        (Enum(x), Enum(y)) => {
             x.ends_with(&format!("::{}", y)) || y.ends_with(&format!("::{}", x))
         }
         _ => false,
@@ -229,7 +260,16 @@ pub enum TypedExprKind {
     BinOp(Box<TypedExpr>, BinOpKind, Box<TypedExpr>),
     UnOp(UnOpKind, Box<TypedExpr>),
     Call(Box<TypedExpr>, Vec<TypedExpr>),
-    MethodCall(Box<TypedExpr>, String, Vec<TypedExpr>),
+    /// Receiver, method name, arguments, and — P69 — the resolved callee
+    /// symbol when it is not derivable from the receiver's type.
+    ///
+    /// The lowerer builds a method's callee name as `<receiver base type>::<method>`,
+    /// which is exactly right until an `impl<T>` method is monomorphised: the
+    /// instantiation is called `Box2::bigger$float` and the receiver still
+    /// displays as `Box2<float>`. Nothing in the receiver's type says which
+    /// instantiation the checker chose, so the checker says it here. `None`
+    /// everywhere else, which is every method call that existed before P69.
+    MethodCall(Box<TypedExpr>, String, Vec<TypedExpr>, Option<String>),
     Index(Box<TypedExpr>, Box<TypedExpr>),
     Field(Box<TypedExpr>, String),
     Block(TypedBlock),

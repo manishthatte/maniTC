@@ -1025,3 +1025,313 @@ vacuous on exactly the defects they exist to catch.
 **`--verify-ssa` is correct to report 0 on P46 and cannot be blamed**: it
 checks single assignment, dominance and phi edges, not operand types. That is
 the extension to write next, and it is the natural successor to `VoidPhiArm`.
+
+
+## P44, P45 — the two generic-type defects, fixed
+
+**P44 was the only kind of defect this campaign ranks first: a silent wrong
+answer on both backends, from a program `check` exits 0 on.**
+`impl<T> Pair<T> { fn swap(self) -> Pair<T> }` printed `2 2` where it should
+print `2 1`.
+
+`field_slot_index` keys `self.structs` on the DECLARATION name. A struct
+LITERAL has bare type `Pair`, which is that name — so a field read straight off
+a literal was always right, and only a value that had crossed a method, a `Vec`
+or a function boundary carried the declared `Pair<T>`, whose `ManiType` is
+`Generic("Pair", [..])` and whose `display()` is `Pair<int>`. Never a key. The
+lookup fell to `unwrap_or(0)` and every field read slot 0.
+
+One match arm. It is exact rather than approximate, and the reason is worth
+stating: **a struct's layout does not depend on its type arguments** — every
+field is one machine word and there is one `structs` entry per declaration — so
+the base name IS the right key and no monomorphised key is wanted. (P65 is the
+case where that argument does NOT hold.)
+
+**The `unwrap_or(0)` is now a `debug_assert!`, and that is the half that
+generalises.** The same silent fallback swallowed the 20 August tuple defect one
+type constructor earlier. Measured before being made an assertion, with a
+temporary per-lookup trace so the sweep had a POSITIVE CONTROL — **8,169
+lookups over 1,442 files, zero misses**, T3 and LLVM agreeing to the unit
+because the function runs before the backends split. That agreement is also why
+the parity matrix was 17/17 throughout: a shared lowering shares its bugs.
+
+**P45 was two registries deciding one question and disagreeing** — P60's shape.
+`binop_type` decides `<` and `>` by `ManiType::is_comparable`. `type_satisfies`
+decided `Ord` by "is it a primitive", written as
+`!matches!(ty, Struct | Enum | Unknown | Fn)`, and `str`, `[int; 2]`,
+`(int, int)`, `Vec<T>` and `Result<T, E>` are none of those four. All five
+satisfied `Ord` while the operator rejected every one. Tying the trait to
+`is_comparable` — the same call the operator makes — fixed all five; naming
+`str` would have fixed one.
+
+**The second instance was in the diagnostic and was worse than the defect.** It
+said "add `impl Ord for str`". Doing so made the program compile and print the
+wrong answer again, because `>` dispatches to nothing: `trait_impls` is read at
+exactly two sites and neither is in the lowering of a binary operator. So the
+ordering rule had to be decided BEFORE the user-impl escape hatch rather than
+after it — **an ORDERING change, not a predicate change** — and that also closes
+**A4's own struct case**, which had been open the whole time through the remedy
+A4 itself prescribed.
+
+The test crosses an origin boundary: for fifteen types it compiles `x > y` and
+the same comparison through `gt2<T: Ord>` and requires the two VERDICTS to
+agree, never stating which types are ordered. **Each row carries a control with
+no comparison in it**, because a malformed program is rejected both ways and
+therefore AGREES — the vacuous pass is the failure this test shape invites.
+
+## P65 — the fix P44 and P45 both stopped short of
+
+Type erasure. A generic function is lowered ONCE with its type parameters bound
+to `Unknown`, which lowers as `I64`. The body's `>` is an INTEGER compare
+whatever `T` is, and the call site coerces the argument with a **value-changing**
+`Cast { from_ty: F64, to_ty: I64 }`.
+
+`largest(1.5, 2.5)` truncates to 1 and 2, compares as integers, returns the
+integer 2, and `io::print_float` reads it as a BIT PATTERN: 1e-323, printed to
+323 places. `largest(-1.5, -2.5)` returns -1, all ones, which is a quiet NaN.
+**Both lines were predicted before being measured and both match to the digit**,
+which is what says the mechanism is the whole mechanism.
+
+`int` and `trit` are unaffected **because their representation IS the erasure**.
+A defect in a type-erasing lowering is invisible for exactly the types the
+erasure happens to pick.
+
+The second costume was found by P44's new assertion within the hour: the RETURN
+type is not substituted either, so `fn id<T>(x: T) -> T` followed by
+`id(p).second` looks up a field on `<unknown>` and reads slot 0. **The shipped
+release binary prints `1 1` where it should print `1 2`, on both backends.**
+The fsi sweep covered 1,442 files and found zero misses; this program is in
+none of them and took an hour of ordinary probing to write. **Zero misses over a
+corpus is a statement about the corpus, not about the language.**
+
+## P66 — and the last sentence of the previous section is wrong
+
+The section above this one ends: "That is the extension to write next, and it
+is the natural successor to `VoidPhiArm`." **It was written, measured and
+withdrawn.**
+
+Built as a `PhiArmType` violation — a phi arm whose defining instruction states
+a type other than the phi's, which is exactly P46's shape. On the 17 examples,
+the same 17 that pass 17/17 on both backends across six flag combinations, it
+reported **1,107 mismatches in 15 of the 17 files, in 31 distinct type pairs,
+334 of them mixing float with an integer type**. 740 more across thatteOS.
+Nothing about those files is broken.
+
+**The IR has no phi type invariant to verify.** `codegen_llvm/emit_instr.rs`'s
+`Phi` arm computes the LLVM type from the ARMS — starting from `llvm_type(ty)`,
+then widening the whole phi to `ptr` if any incoming value is a pointer — and
+records that as the temp's type. The IR's `ty` on a phi is advisory.
+
+**Why `VoidPhiArm` generalised and this does not**, which is the distinction to
+keep: `IRValue::Void` in a phi is UNREPRESENTABLE — there is no token to emit,
+so the module will not parse — and that is a property of the IR alone. A type
+mismatch is representable and a later stage RESOLVES it, so it is not a property
+of the IR alone, and no narrowing turns it into one. **Ask whether the property
+you are about to verify is one the IR owns, or one a later stage decides.**
+
+P46's blind spot is therefore not closed, and its real shape is now named: the
+IR is untyped in practice, and closing it means giving the IR a typing
+discipline both backends respect — work on the scale of monomorphisation, not a
+verifier patch.
+
+## Verification of P44 and P45 together
+
+| | |
+|---|---|
+| `cargo test --no-fail-fast` | **689 passing, 0 failing, 7 ignored**, 0 warnings |
+| 17 examples, both backends, 6 flag combinations | **17/17, parity 17/17** |
+| thatteOS, both halves built by the working-tree compiler | **61/61**, 10 userspace binaries |
+| `--verify-ssa`, 17 examples + all 55 thatteOS sources | **0 violations over 72 files, 0 files missing the denominator line** |
+| R5, repos | **2 differences over 295** — both the P45 fixtures the change is about |
+| R5, model corpus | **0 differences over 1,147** |
+| `field_slot_index` misses | **0 over 8,169 lookups in 1,442 files** |
+| binary | `c19387169f5ff7e3` (`/var/scratch/tmp/manitc-p45-final`) |
+
+Both fixes were checked by REINTRODUCING the defect. P44: exactly the four
+`gs62_*` rows go red and the 22 controls stay green, with the assertion naming
+the finding by id rather than printing a plausible wrong number. P45: the
+agreement test names all five disagreeing types and what each does.
+
+
+## P65 — monomorphisation of generic free functions
+
+Done, for free functions. The `impl<T>` method half is open and is blocked on
+something else (below).
+
+**The type work is one line, because the machinery was already there.**
+`resolve_type` consults `self.type_params` before any other rule, and
+`check_fn` fills it with `Unknown` for each of the function's generics. Bind it
+to the CONCRETE types and check the same AST again, and the result is a fully
+concrete `TypedFnDef` — `a > b` becomes a float comparison, `-> T` becomes
+`-> float` — with no substitution pass over the AST at all. A
+`TypedProgram`-level transform was considered and is the wrong shape: by then
+`T` has been erased to `Unknown` and is indistinguishable from every other
+`Unknown`.
+
+**Two halves at the call site.** The NAME is rewritten to the instantiation,
+which makes the body compile with real types. The RETURN TYPE is recomputed
+under the binding, which stops the result arriving as `Unknown` — the half
+responsible for `id(p).second` reading slot 0. Fixing only the name fixes only
+the float row.
+
+**A failed instantiation is discarded, not reported, and that is the shape of
+the increment.** Checking a body with its real types finds errors the erased
+copy could not. The first version reported them and four tests went red — two
+of which state a deliberate design in as many words:
+`b1_an_unbounded_generic_is_unchanged` says "Bounds are opt-in. A bare `<T>`
+must still compile exactly as before … because inferring one would reject
+programs that check today." So an instantiation that does not check is thrown
+away and the call keeps the erased path. **The change can only fix a program,
+never break one**, which is why it needs no R2 version bump and is not an R5
+event. Making a failed instantiation a hard error — which closes A4 for good —
+is a separate language decision and is deliberately not taken here.
+
+**Re-entrancy exposed a latent defect in `check_fn`.** Instantiation happens
+from inside expression checking, so `check_fn` re-enters; its body check is
+`self.check_block(block)?`, which on error returns without popping the scope it
+pushed or restoring `current_fn`/`current_fn_ret`. Invisible for its whole life
+because a failing analysis aborts. `ensure_mono` snapshots and restores all
+four, and `SymbolTable` grew `depth`/`truncate_to`.
+
+### Measured
+
+| | |
+|---|---|
+| `cargo test --no-fail-fast` | **693 passing, 0 failing, 7 ignored**, 0 warnings |
+| 17 examples, both backends, 6 flag combinations | **17/17, parity 17/17** |
+| thatteOS, both halves | **61/61**, 10 userspace binaries |
+| `--verify-ssa`, 72 files | **0 violations**, 0 files missing the denominator line |
+| R5, repos / corpus | **0 differences over 295** and **0 over 1,147** |
+| dynamic instructions, 17 examples | **376,172 → 376,172, identical to the digit** |
+| image size, 17 examples | **+1 word in total** (in `oop`) |
+| reach | **16 instantiations across 10 files**; thatteOS generates none |
+| behaviour diff, repos | **1 of 187 programs**, and it is `ord63_float_via_bound` |
+| behaviour diff, corpus | **0 of 583 programs**, none compiled by only one binary |
+
+Reintroducing it turns exactly three rows red — `ord63_float_via_bound`,
+`p65_generic_return_field`, `p65_two_instantiations` — and nothing else.
+
+`p65_two_instantiations` is the row that would still mean something under a
+different fix: ONE generic, FOUR calls, TWO types, interleaved. A single body
+has to pick a comparison and a width, and `-1.5 > -2.5` separates a float
+comparison from a bit-pattern one, because IEEE-754 negatives order the
+opposite way to their bit patterns read as integers.
+
+### The open half, and why it is not "the same change for methods"
+
+An `impl<T>` method is still compiled once with `T` erased, and still prints
+1e-323 for a `Box2` of floats — measured, and pinned as
+`p65_impl_method_still_erased`. A method's binding would have to come from the
+RECEIVER's type, and **a generic struct literal does not carry its type
+arguments**: `Box2 { a: 1.5, b: 2.5 }` has bare type `Box2`, not `Box2<float>`.
+That is the same missing inference that keeps `gs62_generic_freefn` broken —
+P44's third, honest defect, where a bare `Pair` never unifies with `Pair<T>`.
+One fix serves both, and it is type inference on struct literals rather than
+more monomorphisation.
+
+
+## P67 — the name was the defect
+
+`resolve_type`'s `Type::Generic(name, args)` arm matched a hardcoded list of
+built-in generic constructors BEFORE asking whether the user had declared a
+struct of that name, and **`Pair` was on the list with nothing behind it**.
+Measured: outside that one line the name appears in a warning-suppression list
+and nowhere else — no stdlib source, no IR, no backend. Every other entry is
+real.
+
+So a program declaring `struct Pair<T>` had its ANNOTATIONS resolve to
+`Generic("Pair", [..])` while its LITERALS resolved to `Struct("Pair")`, and
+those do not unify. `fn swap<T>(p: Pair<T>)` could not be called with a `Pair`.
+
+**The experiment is one `sed`.** Rename `Pair` to `Duo` throughout the same
+program: it compiles and prints `2 1` on both backends.
+
+**And it is P44's cause.** P44 was recorded as "a generic struct is correct as
+data and wrong through every boundary" and fixed with a `Generic` arm in
+`field_slot_index`. That fixed the symptom; the reason a user struct's declared
+type ever arrived there as a `Generic` was this phantom. Measured: with P44's
+arm DELETED and P67 fixed, all 36 rows of `generic_impl_tests` pass and the
+miss assertion fires on none of the 295 `.mt` files in both repos. The arm is
+kept as defence in depth for the nine names that DO have implementations, and
+its comment now says so.
+
+**Why the original generalisation was wrong**, which is the transferable part:
+the probe session put §62 at "the INTERSECTION of generic and crosses a
+boundary" on the strength of ten one-variable-apart programs. **All ten spelled
+the struct `Pair`.** A one-variable-apart family is evidence only about the
+variables it varies, and a type's NAME reads like notation rather than like a
+variable — which is exactly why nobody varied it. **When a family of probes
+agrees, ask what every member HOLDS FIXED.**
+
+Open: the nine names with real implementations (`Vec`, `Map`, `Set`, `Deque`,
+`TernaryTrie`, `Channel`, `Mutex`, `Result`, `Range`) still shadow a user
+struct, and do it silently — the program is refused with
+`expected Vec<<unknown>>, found Vec`, naming neither cause nor remedy.
+`p67_a_struct_name_must_not_change_the_program` compiles one program under
+thirteen names and asserts BOTH halves, so it encodes the convention rather
+than imposing one.
+
+## P68 — a generic struct could not hold a float
+
+`Box2 { a: 1.5, b: 2.5 }` stored the integer 1; `p.a` read back 5e-324. A
+non-generic `struct B { pub a: float }` was correct, which localised it.
+
+**Two lines of one loop, four statements apart, disagreed.** The struct-literal
+lowering COERCES each field value to the DECLARED field type and STORES it with
+the VALUE's own type. A generic struct's fields are registered `Unknown` — a
+struct's type parameters are not in scope when it is registered — so the
+coercion targeted `i64` and truncated, while the store said `F64`. The IR shows
+a `Cast { from_ty: F64, to_ty: I64 }` immediately before a `Store { ty: F64 }`,
+and the non-generic control has no `Cast` at all.
+
+**Coercing into an unknown type is P65's shape for the third time**, and the
+fix is the same: `if fmt.is_known()`.
+
+The other half: **`ManiType::Struct` now carries the type arguments the literal
+was built at**, and a field read resolves the declaration under them — without
+which `p.a` stays `Unknown` and `p.a > p.b` is an integer comparison of bit
+patterns, right for positive doubles and wrong for negative ones.
+
+**Why the existing `Generic(name, args)` was not reused**: every question the
+compiler asks about a struct is asked by matching `Struct`, at 27 sites, and a
+second spelling means auditing all 27 and getting one wrong — `from_mani` alone
+would have mapped a generic struct to `Ptr(I8)`. Carrying the arguments inside
+the existing variant keeps the type nominally a struct everywhere, and made the
+change safe: every site was a pattern the compiler forced a visit to. **The
+arguments are carried, not compared** — `types_compatible` still looks only at
+the name — so no verdict moves.
+
+**It nearly made an open defect look fixed.** `p65_impl_method_still_erased`
+tested `(1.5, 2.5)` and nothing else; positive doubles order the same way as
+their bit patterns, so the moment the store stopped truncating, the row printed
+`2.5` and would have been un-`#[ignore]`d while the method body was still
+erased. `(-1.5, -2.5)` still answers `-2.5`. **A single case for a comparison
+is half a test, and the missing half is the one that tells a fix from an
+accident** — P45's own rule, catching the author who wrote it down.
+
+### Measured (P67 and P68 together)
+
+| | |
+|---|---|
+| `cargo test --no-fail-fast` | **697 passing, 0 failing, 6 ignored**, 0 warnings |
+| 17 examples, both backends, 6 flag combinations | **17/17, parity 17/17** |
+| thatteOS, both halves | **61/61**, 10 userspace binaries |
+| `--verify-ssa`, 72 files | **0 violations** |
+| R5, repos / corpus | **1 of 295** (P67's fixture, rejected → accepted) and **0 of 1,147** |
+| behaviour diff, repos | **187 of 187 identical, 0 changed**; 1 file newly compiling |
+| behaviour diff, corpus | **583 of 583 identical, 0 changed**; none compiled by only one binary |
+
+Nothing in either repo uses a generic struct with a float field, which is why a
+defect this total was invisible: **every generic struct in every corpus holds
+integers.**
+
+### Still open
+
+`impl<T>` methods are not instantiated. The design is unblocked: the receiver
+now carries its type arguments, and `ast::ImplBlock` reduces `impl<T> Box2<T>`
+to a base name plus a positional `generics` list, so the mapping is positional
+by construction. Three pieces remain — record the generic impl methods' ASTs;
+instantiate through `ensure_mono` with the impl's generics and `Self` bound;
+and redirect the call, which is the piece with no precedent, because the
+lowerer derives a method's callee name from the RECEIVER's type rather than
+from the typed expression.

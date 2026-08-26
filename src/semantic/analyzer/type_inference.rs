@@ -335,7 +335,21 @@ impl SemanticAnalyzer {
             }
             return ManiType::Unknown;
         }
-        if let ManiType::Struct(name) = obj_ty {
+        if let ManiType::Struct(name, args) = obj_ty {
+            // P68: on a struct whose type arguments are known, a field's type
+            // comes from the DECLARATION resolved under them. `self.structs`
+            // holds `Unknown` for every field declared as a type parameter,
+            // because a struct's parameters are not in scope when it is
+            // registered — so without this the arguments carried by the type
+            // would be inert.
+            if !args.is_empty() {
+                let (n, a) = (name.clone(), args.clone());
+                if let Some(t) = self.struct_field_ty_at(&n, &a, field) {
+                    if t.is_known() {
+                        return t;
+                    }
+                }
+            }
             if let Some(fields) = self.structs.get(name.as_str()) {
                 for (fname, fty) in fields {
                     if fname == field {
@@ -355,7 +369,7 @@ impl SemanticAnalyzer {
     pub(super) fn resolve_method_type(&mut self, obj_ty: &ManiType, method: &str, span: Span) -> ManiType {
         // Check user-defined impl methods first (before built-in fallbacks)
         let type_name_str = match obj_ty {
-            ManiType::Struct(n) | ManiType::Enum(n) => Some(n.as_str()),
+            ManiType::Struct(n, _) | ManiType::Enum(n) => Some(n.as_str()),
             _ => None,
         };
         if let Some(tn) = type_name_str {
@@ -515,15 +529,15 @@ impl SemanticAnalyzer {
             (ManiType::Generic(name, _), "unlock") if name == "MutexGuard" => ManiType::Void,
 
             // AtomicTrit methods
-            (ManiType::Struct(name), "load") if name == "AtomicTrit" => ManiType::Trit,
-            (ManiType::Struct(name), "store") if name == "AtomicTrit" => ManiType::Void,
+            (ManiType::Struct(name, _), "load") if name == "AtomicTrit" => ManiType::Trit,
+            (ManiType::Struct(name, _), "store") if name == "AtomicTrit" => ManiType::Void,
 
             // Barrier methods
-            (ManiType::Struct(name), "wait") if name == "Barrier" => ManiType::Bool,
+            (ManiType::Struct(name, _), "wait") if name == "Barrier" => ManiType::Bool,
 
             // Semaphore methods
-            (ManiType::Struct(name), "acquire") if name == "Semaphore" => ManiType::Void,
-            (ManiType::Struct(name), "release") if name == "Semaphore" => ManiType::Void,
+            (ManiType::Struct(name, _), "acquire") if name == "Semaphore" => ManiType::Void,
+            (ManiType::Struct(name, _), "release") if name == "Semaphore" => ManiType::Void,
 
             // Task methods
             (ManiType::Generic(name, args), "join") if name == "Task" => {
@@ -607,7 +621,7 @@ impl SemanticAnalyzer {
             }
             Pattern::Struct(sname, field_pats, _) => {
                 let struct_name = match scrut_ty {
-                    ManiType::Struct(n) => n.clone(),
+                    ManiType::Struct(n, _) => n.clone(),
                     _ => sname.clone(),
                 };
                 let fields = self.structs.get(&struct_name).cloned().unwrap_or_default();
