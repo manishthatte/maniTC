@@ -203,10 +203,33 @@ impl Emulator {
             }
             62 => {
                 // str_slice(ptr=R1, start=R2, end=R3) → R1 = new ptr
+                //
+                // P50: BYTE indices, and it must not be able to panic.
+                //
+                // This used to slice the Rust `String` directly, and Rust
+                // refuses a slice that splits a character: `s[1..2]` inside
+                // 'é' PANICS AND TAKES THE WHOLE EMULATOR PROCESS WITH IT.
+                // So an ordinary ManiT program containing a non-ASCII literal
+                // crashed the toolchain — not a wrong answer, not a T3 trap,
+                // a host panic with a Rust backtrace. `str::reverse` is ManiT
+                // source that walks a string one index at a time, so it
+                // reached this on the first multi-byte character.
+                //
+                // Bytes is also what PARITY requires rather than merely what
+                // is safe: the C runtime's `str_slice` is `manit_substr` over
+                // a `char*`, so LLVM has always sliced bytes.
+                //
+                // What this does NOT fix is §64's design question. The
+                // emulator holds strings as `String`, so a slice landing
+                // inside a character comes back with U+FFFD where LLVM keeps
+                // the raw bytes — still a divergence, just no longer a crash.
+                // Byte-exact parity means holding `Vec<u8>`, which is a
+                // representation change for the whole string surface.
                 let s = self.get_string_r1();
-                let start = (self.regs[2] as usize).min(s.len());
-                let end = (self.regs[3] as usize).min(s.len());
-                let sliced = s[start.min(end)..end].to_string();
+                let bytes = s.as_bytes();
+                let end = (self.regs[3] as usize).min(bytes.len());
+                let start = (self.regs[2] as usize).min(end);
+                let sliced = String::from_utf8_lossy(&bytes[start..end]).into_owned();
                 let addr = self.heap_alloc_str(sliced);
                 self.regs[1] = addr as i64;
             }
@@ -461,7 +484,13 @@ impl Emulator {
                 for i in 0..n {
                     self.memory[base + i] = 0;
                 }
-                self.heap_ptr += n;
+                // P41: `heap_reserve` ADVANCES `heap_ptr` as well as checking
+                // the bound, so the bump this arm used to do for itself is now
+                // its second. Left behind by P39's extraction, it charged 2n
+                // words for every n-word struct — the addresses stayed disjoint
+                // (which is why only the arithmetic in the unit test could see
+                // it) but the heap emptied at half its real capacity, and P39's
+                // new bound check turns that into a trap rather than silence.
                 self.regs[1] = base as i64;
             }
             219 => {

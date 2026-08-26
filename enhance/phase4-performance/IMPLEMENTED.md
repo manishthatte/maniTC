@@ -872,13 +872,156 @@ even without inlining and is now refused by the P38 image check, and
   map, not the ISA's 65,536-word limit. Moving the stack, globals and heap up
   together is the change; the assembler now refuses an over-large image rather
   than corrupting it.
-- **P36 — loop-invariant code motion in the T3 backend.** OPEN, and the largest
-  thing this phase found without fixing. `TLIT` is loop-invariant and nothing
-  hoists it; there is no rematerialisation and no LICM pass. It is what makes
-  the inliner's loop refusal necessary, and it costs every loop the compiler
-  emits, not only the spliced ones.
+- **P36 — loop-invariant code motion in the T3 backend.** STILL OPEN, but it
+  is no longer the largest thing here and **its premise turned out to be
+  wrong** — see P40 below, which is what looking at it produced. LICM would
+  not have removed the TLITs P36 points at, because a constant is an OPERAND
+  in this IR and not an INSTRUCTION, so there is nothing in the loop for a
+  code-motion pass to lift. What remains genuinely open is the narrow case P36
+  measured: a constant substituted into a loop BOUND by the inliner, which is
+  why the inliner still refuses callees with a back edge.
 - **P26 is DONE** — `src/ir/merge_blocks.rs`, above. The entry that stood here
   called it "a design question rather than a patch"; the design question
   dissolved structurally.
 - **P13's real fix** landed with F-1's follow-up; the backend now truncates at
   the call's DEFINITION rather than at each use.
+
+## P40 — the immediate operand the emitter never used
+
+**Found by going to look at P36, and it contradicts P36's premise. It is the
+largest single performance finding of the campaign: 420,668 → 376,172 dynamic
+instructions over the seventeen examples, −44,496, −10.58 %.**
+
+Every data-processing opcode on T3ISA takes its third operand as either a
+register or a balanced 3-trit immediate. `assembler.rs::reg_or_imm_pair`
+encodes `#k` as register R0 — always zero — with `k` in the imm field, and
+`execute.rs` computes `rhs_eff = regs[sr3] + imm`. **`TADD Rd, Ra, #5` and
+`TADD Rd, Ra, Rb` are the same instruction with a different third register.**
+The emitter used the form for the shifts and the frame push/pop and nowhere
+else: `val_reg` on a constant took a scratch register and emitted a TLIT.
+
+**TLIT was the most-executed opcode in the language** — 78,293 of 420,668,
+18.6 % of everything the examples ran — and a scan of the emitted assembly put
+9,553 of 26,191 static TLIT sites (36 %) in the directly collapsible shape.
+
+| stage | dynamic | Δ |
+|---|---|---|
+| baseline | 420,668 | |
+| (1) binary operators | 398,936 | −21,732 (−5.17 %) |
+| (2) `GetPtr` + (3) the dead clamp | **376,172** | **−44,496 (−10.58 %)** |
+
+Tranche (3) is a deletion rather than a substitution: `<` and `>` ended with
+`TLIT o, #1` / `TMIN d, d, o`, and `TCMP` writes `sign_i64` ∈ {−1,0,+1}, which
+`TMAX d, d, R0` leaves in {0,1} — so the clamp was the identity. Two
+instructions on every `<` and `>` in the language.
+
+**The signature is what makes it believable.** Exactly two opcodes move and
+their deltas sum to the total: TLIT 78,293 → 43,274 (−35,019) and TMIN
+13,531 → 4,054 (−9,477). Every other opcode is identical to the digit.
+**15 improved, 2 unchanged, 0 worse**; images 162,044 → 151,309 words (−6.6 %).
+
+For scale against the rest of the phase, measured the same way: CSE re-scoping
+−1.51 %, the inliner (both halves) −0.43 %, block merging −0.26 %. **This is
+more than all of Phase 4's optimiser work put together, and it is not an
+optimiser pass — it is instruction selection that was never written.**
+
+**The test went hollow first.** `f2_a_small_constant_operand_is_spent_as_an_immediate`
+first asserted `asm.contains(", #13")`, which `TLIT R6, #13` satisfies exactly
+as well as `TADD R4, R5, #13`; it passed with the change reverted. It now
+parses the line and checks the operand slot. Reintroducing the defect is what
+caught that, and both new tests were re-checked that way.
+
+## P41, P42 — two defects found by running things that were already there
+
+- **P41.** Syscall #218 bumped `heap_ptr` twice — once inside P39's
+  `heap_reserve`, once in a line the extraction left in the caller — so every
+  struct allocation charged 2n words for n. **Its unit test was already red at
+  HEAD `1d1b5e7`**, which was gated on `cargo check --all-targets`; that builds
+  test targets and never runs them, and the commit message repeats a "647
+  passing" table copied rather than measured.
+- **P42.** `thatteos/userspace/build.sh` still did the three hand-link steps
+  `../build.sh` deleted on 23 August, so **userspace had not built since 10
+  August** and `tests/test_all.sh` was running sixteen-day-old binaries. Worse:
+  every userspace test is guarded on the binary existing, so with `bin/` empty
+  the suite runs 27 tests, passes 27 and prints **"ALL TESTS PASSED"** — 34 of
+  61 assertions vanish and the summary still reads green. Fixed by the same
+  delegation. thatteOS is now 61/61 with **both halves** built by the
+  working-tree compiler, which is the first time that has been true.
+
+## P43, P44, P45 — three defects handed over by the oracle probes
+
+Recorded in `report.txt` and pinned as `tests/generic_impl_tests.rs`: nineteen
+programs, ten controls that pass and nine `#[ignore]`d rows carrying their
+finding id. Payload-enum constructors emit an undefined symbol (and **LLVM
+writes the module and exits 0**); a generic struct crossing a method, a `Vec`
+or a function boundary reads the wrong field **on both backends**; and a
+`<T: Ord>` bound is never checked against the argument type, so the fix the
+language reference prescribes for that exact bug does not bind.
+
+**P44 is the one that bears on this phase's own evidence.** The cross-backend
+parity matrix has carried most of the correctness argument here, and it reports
+17/17 on a program that prints `2 2` where it should print `2 1` — because both
+backends print it. **Parity is evidence about the parts of the two backends
+that DIFFER; a shared lowering shares its bugs.**
+
+
+## Verification of P40, P41 and P42 together
+
+| | |
+|---|---|
+| `cargo test --no-fail-fast` | **659 passing, 0 failing, 9 ignored**, 0 warnings |
+| `cargo test -- --ignored` | **9 failing, deliberately** — P43/P44/P45's standing list |
+| 17 examples × 6 flag combinations × 2 backends | **17/17, parity 17/17** (output AND exit code) |
+| 17 examples, output vs the pre-change binary | **0 of 17 differ**, all exit codes identical |
+| dynamic instructions | **420,668 → 376,172, −10.58 %**; 15 better, 2 unchanged, 0 worse |
+| `--verify-ssa`, 17 examples (both stages) and all 55 thatteOS sources | **0 violations** |
+| thatteOS, **kernel and userspace both** built by the working-tree compiler | **61/61** |
+| R5: `manitc check` verdicts vs the pre-change binary, 271 repo files | **0 differences** |
+| corpus sweep, v1 inline ON, 1,147 files | **13 diffs of 574 — and the control on the pre-change binary gives 13 with IDENTICAL diff and trap file sets** |
+
+The six flag combinations are `{none, --no-inline, --no-mem2reg,
+--no-merge-blocks}` plus `{--lang v2, --lang v2 --no-inline}`.
+
+**R5 holds structurally as well as by measurement**: `manitc check` runs neither
+the assembler nor the emitter, so nothing in P40 can reach it. Measured anyway.
+
+**The sweep needed a CONTROL, not a baseline.** Against the previous handoff's
+recorded 12 diffs the change looks like +1. The extra file is
+`bench_T1-13__shortest_len.mt` and the cause is P39's heap bound check, which
+landed after `manitc-v3` was pinned: under that binary the program printed 84
+lines past an exhausted heap instead of trapping. Running the pre-change binary
+over the same list gives the same 13, file for file.
+
+**Edge cases checked directly rather than argued**: ±13 (the field's edge) is
+spent as an operand and ±14 falls back to TLIT; negative immediates; `trit` and
+`bool` constants; truncating `/` and `%` with negative operands; and division
+by a literal zero, which both binaries refuse at compile time identically.
+
+
+## P46, P47 — a default-build failure, and the harness that hid it
+
+**P46 belongs to this phase specifically**: it became reachable when
+`--mem2reg` was made the default on 24 August. `Vec::get` is declared `i64`
+while the IR knows the element type, so on a `Vec<str>` the promoted phi is
+`ptr` with an `i64` arm and clang refuses the module. `--no-mem2reg` compiled
+it throughout.
+
+It is **P13's shape with the conversion pointing the other way**, and P13's own
+comment already stated the principle — reconcile at the DEFINITION, because a
+phi is the one construct whose type does not come from its operands. P13
+implemented it for "declared integer is wider" only. `inttoptr` is one more arm.
+
+The symmetric `ptrtoint` case was written, and is wrong: a `Result` handle
+comes back from `@Ok` as a declared `ptr` that the backend then uses as an
+address. Three tests red, and a corpus sweep that compiled 493 files of 1,147
+against the correct version's 574.
+
+**P47 is why the suite was green.** `run_llvm` skipped whenever a failed
+compile mentioned clang, calling it "no toolchain in this environment" — but an
+absent toolchain makes the compile SUCCEED, so the only way into that branch is
+clang rejecting the module. 34 call sites, each `if let Some(..)`, each
+vacuous on exactly the defects they exist to catch.
+
+**`--verify-ssa` is correct to report 0 on P46 and cannot be blamed**: it
+checks single assignment, dominance and phi edges, not operand types. That is
+the extension to write next, and it is the natural successor to `VoidPhiArm`.

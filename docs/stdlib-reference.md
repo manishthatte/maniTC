@@ -481,7 +481,7 @@ Binary/ternary interop — packing trits into bytes and back.
 | `bridge::is_valid_encoding` | `(b1: trit, b0: trit) -> bool3` | ManiT | yes | In the two-bit-per-trit scheme, (1,1) has no corresponding trit value. This function allows callers to detect corruption or encoding errors at the binary-ternary boundary before conversion. |
 | `bridge::t27_pair_to_binary` | `(hi: t27, lo: t27) -> [trit` | native | yes | Unpack a pair of t27 values (high, low) back into a 54-bit binary array. |
 | `bridge::trit_to_bits` | `(t: trit) -> (trit, trit)` | ManiT | yes | The returned tuple (b1, b0) uses trit values 0 and +1 to represent binary 0 and 1 respectively, since maniT has no native bit type. |
-| `bridge::tryte_to_byte` | `(ty: tryte) -> t9` | ManiT | yes | Within each pair, the lower position holds b0 and the upper holds b1 (so position 2k = b0 of trit k, position 2k+1 = b1 of trit k). |
+| `bridge::tryte_to_byte` | `(ty: tryte) -> t9` | ManiT | yes | The pair IS lossless in the direction that matters: all 27 trytes survive `tryte_to_byte` then `byte_to_tryte`, measured on both backends. Scanning all 256 bytes through `byte_to_tryte` then `tryte_to_byte` and finding 232 that do not round-trip is NOT evidence of a defect — 229 of them are not valid encodings at all (27 values cannot have 256 distinct encodings) and the other 3 are the canonical encodings above 255. |
 | `bridge::validate_binary_buffer` | `(bits: [trit; 54]) -> bool3` | ManiT | not probed | This is the fast-path check for incoming binary data at the binary-ternary bridge boundary. |
 | `bridge::word_to_binary` | `(w: t27) -> [trit` | native | yes | This is the format expected by binary DMA, PCIe, or USB bridges described in Claim 17. |
 

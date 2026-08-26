@@ -29,6 +29,7 @@ construct the compiler currently accepts.
 19. [External declarations](#19-external-declarations)
 20. [Lint levels](#20-lint-levels)
 21. [Language versions](#21-language-versions)
+22. [Ownership and moves](#22-ownership-and-moves)
 
 ---
 
@@ -271,6 +272,22 @@ Declared at the top level outside any function:
 pub let MAX_SIZE: int = 1024;
 let mut COUNTER: int = 0;
 ```
+
+### Binding a value may consume it
+
+Binding one variable to another **moves** the value when its type is not
+`Copy`, and the original binding cannot be read afterwards:
+
+```manit
+let s: str = "hello";
+let t: str = s;
+io::println(s);       // error: use of moved value: 's'
+```
+
+This is the one rule in ManiT that most often surprises a reader arriving from
+another language, in **both directions** — passing a value to a function does
+*not* move it. See [§22 Ownership and moves](#22-ownership-and-moves) for the
+complete rule and the list of `Copy` types.
 
 ---
 
@@ -640,12 +657,36 @@ let t = (1, "hello", 3.14);
 let (n, s, f) = t;   // destructuring
 ```
 
-### Lambda / closure
+### Lambda
 
 ```
 let double = fn(x: int) => x * 2;
 let result = double(21);   // 42
 ```
+
+**A lambda cannot capture.** It is an anonymous function, not a closure:
+referring to any variable from the enclosing scope is a compile error, and the
+compiler says so directly.
+
+```
+let k: int = 3;
+let f = fn(x: int) => x * k;
+// error: lambda captures outer variable 'k' — closures are not yet
+//        supported; use a parameter instead
+```
+
+> **This heading read "Lambda / closure" until 26 August 2026.** Nothing in the
+> prose promised capture and the single example captured nothing, but the word
+> was there for a construct that cannot close over anything, and the one
+> example a reader had to generalise from could not tell them otherwise. Pass
+> what you need as a parameter.
+
+**Binding an EXISTING function to a variable needs a type annotation.**
+`let f: fn(int) -> int = dbl;` works; `let f = dbl;` compiles to a reference to
+a symbol named after the *binding* and fails to assemble or link (report.txt
+P53). A lambda is unaffected, because it is emitted under the name it is bound
+to. Function-typed *parameters* are unaffected too, which is why the stdlib's
+higher-order surface — `Vec::map`, `Vec::filter`, `Vec::fold` — is fine.
 
 ### Spawn
 
@@ -1665,3 +1706,128 @@ Recommendation R2 holds that delay is preferable to making a change of this
 kind casually, and moving the default in the same release that introduces the
 behaviour would be making it casually. When the default moves, it moves as its
 own change, with the backlog already generated.
+
+---
+
+## 22. Ownership and moves
+
+ManiT has a move checker. It runs after type checking and before IR lowering,
+reports as `<borrow>`, and rejects programs:
+
+```
+error: TypeError: <borrow>:2:63: use of moved value: 's'
+```
+
+It is deliberately small: **there are no lifetime annotations, no reference
+types, no reborrowing and no non-lexical liveness analysis.** It is a safety
+net over bindings, not a Rust-style borrow checker, and the rest of this
+section is the whole of it.
+
+### Copy types are never moved
+
+A value of these types is copied wherever it is used, and none of the rules
+below apply to it:
+
+`int`, `float`, `bool`, `bool3`, `trit`, `tryte`, `t9`, `t27`, `t54`,
+`tfloat`, `char`, `void`, and function-pointer types.
+
+The concurrency handles are also `Copy`, deliberately — `Mutex`, `Channel`,
+`Task`, `AtomicTrit`, `Barrier`, `Semaphore` and `MutexGuard`. Their runtime
+representation is a pointer to shared state and the documented usage pattern
+aliases them across tasks, so copying a handle copies the reference. See
+[§15 Concurrency](#15-concurrency).
+
+Everything else is a **move type**: `str`, `Vec<T>`, arrays, tuples, structs,
+enums, `Result`, and any generic instantiated over them.
+
+### What moves, and what does not
+
+This is the part to read carefully, because **assignment moves and passing to a
+function does not** — which is the opposite of the convention in several
+languages with similar syntax.
+
+| construct | moves? |
+|---|---|
+| `let t = s;` | **yes** |
+| `s2 = s;` (assignment) | **yes** |
+| `(s, 1)` — tuple literal element | **yes** |
+| `Point { x: s }` — struct literal field | **yes** |
+| `take(s)` — argument to a function | no |
+| `v.push(s)` — argument to a method | no |
+| `[s, "c"]` — array literal element | no |
+
+So all three of these are errors, and all three are the *same* error — the
+`let` moved `s`, and everything after it is a use of a moved value:
+
+```manit
+let s: str = "ab";
+let t: str = s;
+io::println(s);        // error: use of moved value: 's'
+let u: str = s;        // error, likewise
+io::print_int(take(s)); // error, likewise
+```
+
+while all of these are accepted, because a call never consumes its argument:
+
+```manit
+let s: str = "ab";
+take(s);
+take(s);               // fine — take() borrowed it both times
+io::println(s);        // fine
+let t: str = s;        // fine — this is the first move
+```
+
+> **Note.** The array and tuple rows differ from each other, and that is a
+> quirk of the implementation rather than a designed distinction. Do not rely
+> on the array row.
+
+### Rebinding clears a move
+
+Assigning a fresh value to a moved binding makes it usable again:
+
+```manit
+let mut s: str = "ab";
+let t: str = s;        // s is moved
+s = "cd";              // s is live again
+io::println(s);        // fine
+```
+
+### Shadowing is per-binding, not per-name
+
+The checker keys a move on the *binding* — its declaration scope and name — not
+on the bare name. Moving an inner shadow does not poison the outer variable,
+and an inner `let` does not launder an outer move:
+
+```manit
+let s: str = "ab";
+if true {
+    let s: str = "cd";   // a different binding
+    let t: str = s;      // moves the INNER s only
+}
+io::println(s);          // fine — the outer s was never moved
+```
+
+### Moving in a loop
+
+Moving a variable declared **outside** a loop, from **inside** its body, is
+rejected: the body runs more than once, so the second iteration would consume
+an already-moved value.
+
+```manit
+let s: str = "ab";
+for i in 0..3 {
+    let t: str = s;      // error: value moved in a loop body
+}
+```
+
+A variable declared inside the body is fresh on every iteration, so moving it
+is fine. Calling a function with `s` in a loop is also fine, since a call does
+not move.
+
+### What the checker does not do
+
+It does not track moves through references (there are none), does not reason
+about conditional moves converging at a join point beyond forking the moved-set
+across match arms, and does not free anything — see
+`KNOWN_ISSUES` on the absence of a free/destroy API. A move is a compile-time
+restriction on reading a binding, not a runtime transfer of ownership.

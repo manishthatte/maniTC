@@ -482,6 +482,53 @@ impl AsmEmitter {
     }
 }
 
+/// The value of `val` if it fits T3ISA's balanced 3-trit immediate field.
+///
+/// An immediate operand is not a special addressing mode on this machine: the
+/// assembler encodes `#k` as register R0 — which always reads as zero — with
+/// `k` in the imm field, and the data-processing path computes
+/// `rhs_eff = regs[sr3] + imm`. So `TADD Rd, Ra, #5` and `TADD Rd, Ra, Rb`
+/// are the same instruction with a different third register, and the
+/// immediate form costs exactly nothing.
+///
+/// `Str`, `Float` and `Null` are deliberately absent. A string or float
+/// constant is an ADDRESS the emitter materialises through a label or a
+/// syscall rather than a small number, and `irconst_to_i64` maps both to
+/// values that would be silently wrong here — a float to its 64-bit pattern,
+/// a `Str` to 0.
+pub(super) fn t3_imm3(val: &IRValue) -> Option<i64> {
+    use crate::codegen_t3::isa::{IMM_MAX, IMM_MIN};
+    let k = match val {
+        IRValue::Const(IRConst::Int(n))  => *n,
+        IRValue::Const(IRConst::Bool(b)) => if *b { 1 } else { 0 },
+        IRValue::Const(IRConst::Trit(t)) => *t as i64,
+        _ => return None,
+    };
+    if (IMM_MIN..=IMM_MAX).contains(&k) { Some(k) } else { None }
+}
+
+/// Whether this operator's T3 encoding puts `rhs` in the third operand slot of
+/// an opcode that accepts an immediate there.
+///
+/// Gated on the OPERATOR rather than on the value, because three groups of
+/// arms spend `r` differently and only this list spends it as a bare third
+/// operand: the shifts select their own immediate and fall back to the
+/// register form when the amount overflows the field; the two string
+/// comparisons hand `r` to a `MOV`, which has no immediate form, and also
+/// compare it against `"R1"` as a string, which `"#5"` would silently fail;
+/// and the float operators never reach this path at all.
+pub(super) fn binop_takes_imm3(op: &IRBinOp) -> bool {
+    matches!(
+        op,
+        IRBinOp::Add | IRBinOp::AddT27 | IRBinOp::Sub | IRBinOp::SubT27
+            | IRBinOp::Mul | IRBinOp::MulT27 | IRBinOp::Div | IRBinOp::Rem
+            | IRBinOp::DivNear | IRBinOp::RemNear
+            | IRBinOp::And | IRBinOp::Or | IRBinOp::Xor
+            | IRBinOp::IEq | IRBinOp::INe
+            | IRBinOp::ILt | IRBinOp::IGt | IRBinOp::ILe | IRBinOp::IGe
+    )
+}
+
 fn irconst_to_i64(c: &IRConst) -> i64 {
     match c {
         IRConst::Int(n)   => *n,

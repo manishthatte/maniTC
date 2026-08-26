@@ -112,6 +112,20 @@ fn is_valid_encoding(b1: trit, b0: trit) -> bool3 {
 //
 // Within each pair, the lower position holds b0 and the upper holds b1
 // (so position 2k = b0 of trit k, position 2k+1 = b1 of trit k).
+//
+// "BYTE" IS A MISNOMER AND THE RANGE IS 0..=273, NOT 0..=255 (report.txt P57).
+// Six TERNARY positions is 3^6 = 729 values, not 2^6 = 64, and the encoding
+// actually uses 0..=273 — trytes +11, +12 and +13 encode to 271, 270 and 273.
+// The return type is `t9` and this header has always said "packed into a t9",
+// so nothing is lost; but a caller who reads the NAME and stores the result in
+// eight bits truncates exactly those three values.
+//
+// The pair IS lossless in the direction that matters: all 27 trytes survive
+// `tryte_to_byte` then `byte_to_tryte`, measured on both backends. Scanning
+// all 256 bytes through `byte_to_tryte` then `tryte_to_byte` and finding 232
+// that do not round-trip is NOT evidence of a defect — 229 of them are not
+// valid encodings at all (27 values cannot have 256 distinct encodings) and
+// the other 3 are the canonical encodings above 255.
 fn tryte_to_byte(ty: tryte) -> t9 {
     let mut n: int = ty as int;
     let mut packed: int = 0;
@@ -229,7 +243,23 @@ fn binary_to_word(bits: [trit; 54]) -> t27 {
             b1 = 1;
         }
         value = value + (b1 - b0) * place;
-        place = place * 3;
+        // report.txt P56. The advance is GUARDED because the last one is dead
+        // and fatal. On k = 26 `place` is already 3^26; multiplying once more
+        // on the way out of the loop produces 3^27 = 7625597484987, which is
+        // roughly twice the largest `int` and traps T3:
+        //
+        //   TRAP: int multiplication overflow: result 7625597484987 is
+        //   outside the 27-trit range
+        //
+        // The result is COMPLETE before that multiplication — it is dead, and
+        // it killed the module's headline operation on the native backend.
+        // LLVM computes it in i64, never notices, and returns the right
+        // answer, so this was a divergence in which T3 WAS THE HONEST ONE:
+        // it reported a real overflow in code that had no business performing
+        // the multiplication at all.
+        if k < 26 {
+            place = place * 3;
+        }
         k = k + 1;
     }
     return value as t27;
@@ -281,7 +311,17 @@ fn binary_to_t27_pair(bits: [trit; 54]) -> (t27, t27) {
         if bits[k + 27] > 0 {
             hi = hi + place;
         }
-        place = place * 3;
+        // Guarded for the same reason as `binary_to_word` above (report.txt
+        // P56): on k = 26 the advance would form 3^27 and trap T3 after both
+        // accumulators are already complete. THIS WAS THE SECOND SITE of the
+        // same one-line defect, and the pattern — accumulate against a place
+        // value, advance unconditionally, loop to the width of the type — is
+        // what to grep for. `stdlib/ternary.mt` had already carried this exact
+        // guard at two sites, with a comment naming 3^27; the knowledge was in
+        // the codebase and had simply not been propagated here.
+        if k < 26 {
+            place = place * 3;
+        }
         k = k + 1;
     }
     return (hi as t27, lo as t27);

@@ -766,11 +766,48 @@ impl LLVMEmitter {
                 // included, and lets `ssa::promotable_allocas` stop refusing
                 // those slots.
                 let ir_ret = llvm_type(ret_ty);
-                let narrow = dst.is_some()
-                    && actual_ret != ir_ret
-                    && actual_ret.starts_with('i')
+                // P46 generalises P13 from "narrower integer" to "any
+                // representation change", because narrowing was never the
+                // point — reconciling the DECLARED type with the IR's type at
+                // the definition was. The case P13 missed is a generic
+                // collection native: `Vec::get` is declared `i64` because an
+                // element is one machine word, while the IR knows the element
+                // type, so on a `Vec<str>` the IR says `ptr`. Unpromoted, the
+                // variable was an `alloca ptr` and the store/load coerced;
+                // promoted, the phi takes `ptr` from the IR and one of its
+                // arms is the `i64` call — which clang rejects. So this was a
+                // DEFAULT-BUILD failure from the day `--mem2reg` became the
+                // default, and `--no-mem2reg` still compiles it.
+                //
+                // TWO conversions, not four, and the two absent ones are
+                // absent for measured reasons rather than for tidiness.
+                //
+                // Integer WIDENING would have to choose between `sext` and
+                // `zext`, which is a decision about the native's contract and
+                // not a repair.
+                //
+                // The MIRROR case — declared `ptr`, IR says integer — looks
+                // like the natural symmetric partner and is wrong. It was
+                // written, and it turned three tests red: a `Result` handle
+                // comes back from `@Ok` as a declared `ptr` and the IR types
+                // it `i64`, but the backend then USES it as an address
+                // (`load i64, ptr %t0`), so it deliberately keeps the declared
+                // pointer type and coerces at each use. Converting at the
+                // definition there destroys exactly what P13 was protecting
+                // in the other direction. Symmetry is not an argument.
+                let conv: Option<&'static str> = if dst.is_none() || actual_ret == ir_ret {
+                    None
+                } else if actual_ret.starts_with('i')
                     && ir_ret.starts_with('i')
-                    && int_width(&actual_ret) > int_width(&ir_ret);
+                    && int_width(&actual_ret) > int_width(&ir_ret)
+                {
+                    Some("trunc")
+                } else if actual_ret.starts_with('i') && ir_ret == "ptr" {
+                    Some("inttoptr")
+                } else {
+                    None
+                };
+                let narrow = conv.is_some();
                 let raw_name = if narrow {
                     Some(self.fresh_anon("callret"))
                 } else {
@@ -812,16 +849,18 @@ impl LLVMEmitter {
                 } else {
                     match dst {
                         Some(d) => match &raw_name {
-                            // P13: call into a scratch name, then narrow into
-                            // the temp the rest of the module refers to.
+                            // P13/P46: call into a scratch name, then convert
+                            // into the temp the rest of the module refers to.
+                            // The three opcodes share this syntax exactly.
                             Some(raw) => format!(
-                                "{}%{} = call {} @{}({})\n  %{} = trunc {} %{} to {}",
+                                "{}%{} = call {} @{}({})\n  %{} = {} {} %{} to {}",
                                 call_prefix,
                                 raw,
                                 callee_ty,
                                 mangled,
                                 args_str.join(", "),
                                 d.0,
+                                conv.unwrap(),
                                 actual_ret,
                                 raw,
                                 ir_ret

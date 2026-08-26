@@ -2029,6 +2029,19 @@ fn main() {
 // is a doc that drifts, and four months is how long that took last time.
 
 #[test]
+// WHAT THIS GUARANTEES, AND WHAT IT DOES NOT (noted 26 Aug 2026). `--check`
+// re-derives the doc from the live stdlib sources and diffs it against the
+// stored file, so it catches a doc that has fallen behind the source — which
+// is what it is for, and it caught exactly that twice today when stdlib
+// bodies were edited.
+//
+// It does NOT establish that the doc is CORRECT. A bug in the scanner produces
+// a consistent wrong doc and this passes, because the generator and the
+// checker derive from the same code. That is the day's recurring shape — two
+// things compared that share the fault, so their agreement carries no
+// information (report.txt P44, P59, P62) — and it is stated here rather than
+// repaired because freshness is the property actually wanted from a generated
+// file. Do not read a green result as "the reference is right".
 fn s27_the_stdlib_reference_is_current() {
     let out = Command::new("python3")
         .args([
@@ -3688,4 +3701,340 @@ fn p24_a_non_pointer_where_a_native_declares_str_is_rejected() {
     assert_checks("p24_ok_str", "fn main() { io::println(\"ok\"); }");
     assert_checks("p24_ok_bool_native", "fn main() { io::println_int(true); }");
     assert_checks("p24_ok_trit", "fn main() { io::print_trit(+); }");
+}
+
+// report.txt P49 — `t27f::from_float` normalised the wrong way round
+// ---------------------------------------------------------------------------
+//
+// `from_float` picked the LARGEST e with 3^e <= |f|, forcing |f| / 3^e into
+// [1,3) so that `float_to_int` truncated it to 1 or 2. Seventeen of the
+// eighteen mantissa trits were always zero and `MANTISSA_MAX` was unreachable
+// by construction. `normalize`, in the same file, documents the opposite and
+// correct discipline: shift the mantissa UP while it fits, so a normalized
+// exponent is negative.
+//
+// The test asserts ACCURACY rather than an exact value. `to_float`
+// reconstructs through binary and the file already documents that as lossy —
+// 100 + 200 comes back as 300.00000000000006 — so pinning a literal would be
+// pinning that lossiness. What the defect changed is the ORDER OF MAGNITUDE
+// of the error: 25-33 %, against a representation good to 3^-18 ≈ 2.6e-9.
+//
+// Both backends were wrong IDENTICALLY, so the parity matrix could not see
+// this and neither could the differential oracle. It is pinned by value.
+#[test]
+fn p49_from_float_fills_the_mantissa_instead_of_the_exponent() {
+    let src = "\
+use std::io;
+
+// Relative error of a round trip, as a percentage, so the assertion reads in
+// units the defect was measured in.
+fn err_pct(x: float) -> float {
+    let back: float = t27f::to_float(t27f::from_float(x));
+    let d: float = if back > x { back - x } else { x - back };
+    // The DENOMINATOR must be |x|. Dividing by x itself makes the percentage
+    // NEGATIVE for a negative input, and every `< tolerance` check then passes
+    // for free — which is exactly what the negative-value row did when the
+    // defect was reintroduced to check this test.
+    let ax: float = if x > 0.0 { x } else { 0.0 - x };
+    return (d / ax) * 100.0;
+}
+
+fn main() {
+    // Exactly representable in balanced ternary: 4 = 3+1, 12, 100, 729.
+    // Before the fix these came back 25 %, 25 %, 19 % and 27 % low.
+    io::println_int(if err_pct(4.0)    < 0.000001 { 1 } else { 0 });
+    io::println_int(if err_pct(12.0)   < 0.000001 { 1 } else { 0 });
+    io::println_int(if err_pct(100.0)  < 0.000001 { 1 } else { 0 });
+    io::println_int(if err_pct(1000.0) < 0.000001 { 1 } else { 0 });
+    // NOT representable in ternary — 1/2 is 0.111... in base 3 — so the
+    // achievable error is the 18-trit limit, not zero. It was 33 % low.
+    io::println_int(if err_pct(0.5) < 0.0001 { 1 } else { 0 });
+    // The mantissa must actually be large now. Before, it was 1 or 2 for
+    // every input; MANTISSA_MAX is 193710244 and this is well past 2.
+    io::println_int(if t27f::mantissa(t27f::from_float(12.0)) > 1000000 { 1 } else { 0 });
+    // And the sign must survive the new normalisation loop.
+    io::println_int(if err_pct(0.0 - 12.0) < 0.000001 { 1 } else { 0 });
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("p49_from_float.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(
+        t3.trim(),
+        "1\n1\n1\n1\n1\n1\n1",
+        "t3: a 0 is a round trip still losing precision — got {:?}",
+        t3
+    );
+    assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+
+// report.txt P56 / P57 — stdlib/bridge.mt
+// ---------------------------------------------------------------------------
+//
+// P56: `binary_to_word` advanced its place value once more than it used, and
+// the extra advance produced 3^27 — about twice the largest `int` — which
+// traps T3 AFTER the result is already complete. LLVM computed it in i64 and
+// never noticed, so this was a divergence in which T3 was the honest one.
+//
+// The test asserts the EXTREMES, not a convenient middling value: +/-
+// 3812798742493 is the 27-trit range, so it exercises every trit including the
+// most significant, which is the one the guarded advance is about. A test on
+// small values passes with the guard placed one iteration wrong.
+#[test]
+fn p56_binary_to_word_round_trips_the_whole_27_trit_range() {
+    let src = "\
+use std::io;
+
+fn main() {
+    let mut bad: int = 0;
+    let mut v: int = -13;
+    while v <= 13 {
+        let bits: [trit; 54] = bridge::word_to_binary(v as t27);
+        if bridge::binary_to_word(bits) as int != v { bad = bad + 1; }
+        v = v + 1;
+    }
+    io::print_int(bad); io::newline();
+    let hi: [trit; 54] = bridge::word_to_binary(3812798742493 as t27);
+    io::print_int(bridge::binary_to_word(hi) as int); io::newline();
+    let lo: [trit; 54] = bridge::word_to_binary((0 - 3812798742493) as t27);
+    io::print_int(bridge::binary_to_word(lo) as int); io::newline();
+
+    // THE SECOND SITE. `binary_to_t27_pair` carried the identical unguarded
+    // advance and was missed by fixing only the function that was reported.
+    let (h, l) = bridge::binary_to_t27_pair(hi);
+    io::print_int(bridge::binary_to_word(bridge::t27_pair_to_binary(h, l)) as int);
+    io::newline();
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("p56_bridge_word.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(
+        t3.trim(),
+        "0\n3812798742493\n-3812798742493\n3812798742493",
+        "t3: a trap here is the dead multiplication returning — got {:?}",
+        t3
+    );
+    assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+/// **P57: the byte/tryte pair is LOSSLESS, and its range is 0..=273.**
+///
+/// This one pins a NON-defect, deliberately. A scan of all 256 bytes through
+/// `byte_to_tryte` then `tryte_to_byte` finds 232 that do not round-trip, and
+/// that reads like breakage — it cost another session five parked tasks. It is
+/// arithmetic: 27 values cannot have 256 distinct encodings, so 229 bytes are
+/// not valid encodings at all, and the remaining 3 are canonical encodings
+/// above 255 (trytes 11, 12, 13 encode to 271, 270, 273).
+///
+/// Six TERNARY positions is 3^6 = 729, not 2^6 = 64. "byte" is a misnomer; the
+/// return type `t9` is correct and always was.
+#[test]
+fn p57_the_byte_tryte_pair_is_lossless_and_exceeds_255() {
+    let src = "\
+use std::io;
+
+fn main() {
+    let mut bad: int = 0;
+    let mut hi: int = -100000;
+    let mut over: int = 0;
+    let mut t: int = -13;
+    while t <= 13 {
+        let b: int = bridge::tryte_to_byte(t as tryte) as int;
+        if bridge::byte_to_tryte(b as t9) as int != t { bad = bad + 1; }
+        if b > hi { hi = b; }
+        if b > 255 { over = over + 1; }
+        t = t + 1;
+    }
+    io::print_int(bad); io::newline();
+    io::print_int(hi); io::newline();
+    io::print_int(over); io::newline();
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("p57_bridge_tryte.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(
+        t3.trim(),
+        "0\n273\n3",
+        "t3: expected 0 round-trip failures, a maximum of 273, and 3 \
+         encodings above 255 — got {:?}",
+        t3
+    );
+    assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+/// **report.txt P59: `Vec::remove` returns the removed element.**
+///
+/// It used to return nothing, while `Vec<T>::remove` is typed `T`. All four
+/// layers agreed with each other and none with the type: `void Vec_remove` in
+/// the C runtime, `declare void` in the LLVM backend, a discarded result in
+/// the T3 emulator, and the no-result syscall helper in the T3 emitter —
+/// which allocates the destination register and then drops it.
+///
+/// **The last part is why it looked intermittent.** T3 returned whatever the
+/// PRECEDING operation had left in that register: `3` after a `len() >= 3`
+/// comparison, `30` after a `pop()`. The defect was neither intermittent nor
+/// data-dependent, and the FIFO drain below is the shape that found it —
+/// `remove(0)` in a loop is the one idiom that needs the value.
+///
+/// It survived because `v.remove(i)` as a STATEMENT is correct and is the
+/// common use: nothing in manitc's 76 `.mt` files or thatteOS's 55 reads the
+/// result.
+#[test]
+fn p59_vec_remove_returns_the_element_it_removed() {
+    let src = "\
+use std::io;
+
+fn main() {
+    let v: Vec<int> = Vec::new();
+    v.push(10); v.push(20); v.push(30);
+    io::print_int(v.remove(1)); io::newline();          // 20, from the middle
+    io::print_int(v.len()); io::newline();              // 2
+    io::print_int(v.get(0)); io::print_int(v.get(1)); io::newline();  // 1030
+
+    // The two orderings that made it look data-dependent: whatever ran just
+    // before must not reach the result.
+    let w: Vec<int> = Vec::new();
+    w.push(10); w.push(20); w.push(30);
+    if w.len() >= 3 { io::print_int(w.remove(0)); io::newline(); }    // 10, not 3
+
+    let x: Vec<int> = Vec::new();
+    x.push(10); x.push(20); x.push(30);
+    let p: int = x.pop();
+    io::print_int(p); io::print_int(x.remove(0)); io::newline();      // 3010, not 3030
+
+    // Out of range is 0 and leaves the vector alone, on both backends.
+    let y: Vec<int> = Vec::new();
+    y.push(7);
+    io::print_int(y.remove(5)); io::print_int(y.len()); io::newline(); // 01
+
+    // The FIFO drain this was found by.
+    let q: Vec<int> = Vec::new();
+    q.push(1); q.push(2); q.push(3);
+    while q.len() > 0 { io::print_int(q.remove(0)); }
+    io::newline();                                                    // 123
+}
+";
+    let ((t3_code, t3), (ll_code, ll)) = run_both_backends("p59_vec_remove.mt", src);
+    assert_eq!(t3_code, 0, "t3 exited {}: {}", t3_code, t3);
+    assert_eq!(ll_code, 0, "llvm exited {}: {}", ll_code, ll);
+    assert_eq!(
+        t3.trim(),
+        "20\n2\n1030\n10\n3010\n01\n123",
+        "t3 got {:?}",
+        t3
+    );
+    assert_eq!(t3.trim(), ll.trim(), "backends disagree: {:?} vs {:?}", t3, ll);
+}
+
+/// **report.txt P62: a program's own `impl` wins over a stdlib module's.**
+///
+/// A source module is pulled in by REFERENCE, not only by `use` — "referencing
+/// a module is intent enough to expand it", and a bare method name counts. So
+/// a program that defines its own type with a method whose name a source
+/// module also implements drags that module in. Harmless bloat until impl
+/// blocks began expanding (P61); after it, the module's `impl` arrived
+/// alongside the program's own and the analyser refused the duplicate.
+///
+/// **Caught by R5** — `manitc check` verdicts against the pre-change binary —
+/// which moved from 0 differences to 5, all of them `stdlib/tritfs_test.mt`
+/// and its four fuzz-corpus copies. That file inlines its own copy of TritFS
+/// deliberately and says so in a comment.
+///
+/// The third case is the one that makes the narrow repair necessary:
+/// suppressing the pull-in instead was tried, and a program defining its own
+/// `reverse` while also calling `s.reverse()` on a `str` then lost the `str`
+/// body and failed at LINK rather than at check — visible bloat traded for a
+/// silent failure.
+#[test]
+fn p62_a_programs_own_impl_is_not_duplicated_by_an_expanded_module() {
+    // 1. Own type whose method name a source module also implements.
+    let own = "\
+use std::io;
+
+struct Doc { pub x: int }
+
+impl Doc {
+    fn make() -> Doc { return Doc { x: 5 }; }
+    fn reverse(self) -> int { return 0 - self.x; }
+}
+
+fn main() { let d: Doc = Doc::make(); io::print_int(d.reverse()); io::newline(); }
+";
+    let ((c1, o1), (c2, o2)) = run_both_backends("p62_own_impl.mt", own);
+    assert_eq!(c1, 0, "t3 exited {}: {}", c1, o1);
+    assert_eq!(c2, 0, "llvm exited {}: {}", c2, o2);
+    assert_eq!(o1.trim(), "-5", "t3 got {:?}", o1);
+    assert_eq!(o1.trim(), o2.trim(), "backends disagree");
+
+    // 2. The mixed case: its OWN `reverse` and the stdlib's, in one program.
+    //    Both must resolve — this is what the over-broad first fix broke.
+    let mixed = "\
+use std::io;
+
+struct Doc { pub x: int }
+
+impl Doc { fn reverse(self) -> int { return 0 - self.x; } }
+
+fn main() {
+    let d: Doc = Doc { x: 5 };
+    io::print_int(d.reverse());
+    io::print(\" \");
+    let s: str = \"abc\";
+    io::println(s.reverse());
+}
+";
+    let ((c3, o3), (c4, o4)) = run_both_backends("p62_mixed_impl.mt", mixed);
+    assert_eq!(c3, 0, "t3 exited {}: {}", c3, o3);
+    assert_eq!(c4, 0, "llvm exited {}: {}", c4, o4);
+    assert_eq!(
+        o3.trim(),
+        "-5 cba",
+        "the program's own `reverse` AND `str::reverse` must both resolve — \
+         got {:?}",
+        o3
+    );
+    assert_eq!(o3.trim(), o4.trim(), "backends disagree");
+}
+
+/// **report.txt P63 / P41: the heap is 2,536 words, and P41 doubled it.**
+///
+/// `HEAP_BASE` is 63,000 and `memory.len()` is 65,536, so an allocating
+/// program has 2,536 words — 634 four-word structs. This pins the boundary
+/// because it is the arithmetic that makes P41 measurable rather than merely
+/// argued: with the double bump the same program managed 317.
+///
+/// A second, INDEPENDENT ceiling from P38's 60,000-word code image: one is
+/// reached by writing a long program, the other by allocating data.
+#[test]
+fn p63_the_heap_holds_exactly_what_the_memory_map_says() {
+    let prog = |n: i32| {
+        format!(
+            "use std::io;\n\
+             struct P {{ pub a: int, pub b: int, pub c: int, pub d: int }}\n\
+             fn main() {{\n\
+             \x20   let v: Vec<int> = Vec::new();\n\
+             \x20   let mut i: int = 0;\n\
+             \x20   while i < {} {{ let p: P = P {{ a: i, b: i, c: i, d: i }}; v.push(p.a); i = i + 1; }}\n\
+             \x20   io::println(\"ok\");\n\
+             }}\n",
+            n
+        )
+    };
+
+    // 2536 / 4 = 634 four-word structs fit; the next one does not.
+    let ((c1, o1), _) = run_both_backends("p63_heap_fits.mt", &prog(634));
+    assert_eq!(c1, 0, "634 four-word structs must fit in a 2,536-word heap: {}", o1);
+    assert_eq!(o1.trim(), "ok", "got {:?}", o1);
+
+    let ((_, o2), _) = run_both_backends("p63_heap_over.mt", &prog(635));
+    assert!(
+        o2.contains("heap exhausted"),
+        "635 four-word structs must EXHAUST a 2,536-word heap and say so — a \
+         silent success here means P39's bound check is gone and the program \
+         is writing past the end of memory again. Got {:?}",
+        o2
+    );
 }

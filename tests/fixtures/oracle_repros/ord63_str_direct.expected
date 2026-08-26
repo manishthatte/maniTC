@@ -1,0 +1,1 @@
+(check must FAIL: operator `>` cannot be applied to `str` and `str`)

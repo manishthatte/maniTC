@@ -66,11 +66,23 @@ int Vec_contains(ManitVec* v, int64_t x) {
     return 0;
 }
 
-void Vec_remove(ManitVec* v, int64_t i) {
-    if (!v || i < 0 || i >= v->len) return;
+/* Returns the REMOVED ELEMENT (report.txt P59).
+ *
+ * This was `void`, while `Vec<T>::remove` is typed `T` by
+ * semantic/analyzer/type_inference.rs. Every layer agreed with the C
+ * signature and none with the type: the LLVM declaration was `declare void`,
+ * the T3 emulator discarded what it removed, and the T3 emitter used the
+ * no-result syscall helper -- which allocates the destination register and
+ * then drops it, so the caller read whatever the PRECEDING operation had left
+ * there. Out of range yields 0 on both backends, matching the old silent
+ * return rather than inventing a trap. */
+int64_t Vec_remove(ManitVec* v, int64_t i) {
+    if (!v || i < 0 || i >= v->len) return 0;
+    int64_t removed = v->data[i];
     memmove(v->data + i, v->data + i + 1,
             (size_t)(v->len - i - 1) * sizeof(int64_t));
     v->len--;
+    return removed;
 }
 
 static int cmp_i64(const void* a, const void* b) {

@@ -46,6 +46,18 @@ const SOURCE_MODULES: &[(&str, &str)] = &[
     ("bridge", include_str!("../../stdlib/bridge.mt")),
     ("crypto", include_str!("../../stdlib/crypto.mt")),
     ("t27f", include_str!("../../stdlib/t27f.mt")),
+    // `tritfs` — the ternary filesystem. It is wholly ManiT source with no
+    // native implementation on either backend, exactly like the three above,
+    // and it was MISSING FROM THIS LIST while being registered as a known
+    // module in `analyzer/mod.rs::STDLIB_MODULES` (report.txt P60). Two
+    // registries, one authoritative for ACCEPTING a call and one for EMITTING
+    // it: a module in the first and absent from the second type-checks and
+    // then fails to link, on both backends.
+    //
+    // That is N1 verbatim, one module later. N1 is why this pass exists; the
+    // fix was written, documented, and declares itself the authority — and a
+    // fourth module of exactly the kind it was written for never reached it.
+    ("tritfs", include_str!("../../stdlib/tritfs.mt")),
     // `ternary` is the one mixed module: the primitives the backends lower
     // directly stay `// native` declarations, and everything built on top of
     // them is ManiT source so both backends get it from one definition.
@@ -216,6 +228,17 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
         parsed.push((name, module));
     }
 
+    // Types the HOST program defines an `impl` for. A module's impl block on
+    // the same type name is skipped rather than merged (P62).
+    let host_impl_types: HashSet<String> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::ImplBlock(b) => Some(b.ty.clone()),
+            _ => None,
+        })
+        .collect();
+
     // Build the combined rewrite context and transform each module.
     let mut merged_items: Vec<Item> = Vec::new();
     // Host-program rewrites: qualified const name -> inlined initializer,
@@ -316,6 +339,66 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
                 }
                 Item::EnumDef(e) => {
                     merged_items.push(Item::EnumDef(e.clone()));
+                }
+                // report.txt P61. Impl blocks used to fall into the `_ => {}`
+                // below and vanish, so a module's free functions and its
+                // structs expanded while its METHODS did not: `TritFS::new()`
+                // type-checked (the struct is here, so the analyser resolves
+                // the method) and then failed to link on both backends.
+                //
+                // The methods keep their bare names, unlike free functions.
+                // Method resolution is by `Type::method` and the struct is
+                // registered under its bare name, so qualifying them would
+                // make them unreachable rather than unique.
+                //
+                // Body-less methods are skipped for exactly the reason
+                // body-less `fn`s are, twenty lines above: a `;` body is a
+                // native declaration the backends provide, and merging it
+                // would emit an empty definition shadowing the real one. That
+                // is not hypothetical here — six stdlib modules (async, fs,
+                // io, net, sync, time) have 152 impl methods between them and
+                // every one is a native declaration.
+                Item::ImplBlock(imp) => {
+                    // report.txt P62. The HOST'S OWN DEFINITION WINS.
+                    //
+                    // A module is pulled in by REFERENCE, not only by `use` —
+                    // "referencing a module is intent enough to expand it",
+                    // and a bare method name counts. So a program that defines
+                    // its own type with a method whose name a source module
+                    // also implements drags that module in. That was harmless
+                    // bloat until impl blocks started expanding (P61): now the
+                    // module's `impl` arrives alongside the program's own and
+                    // the analyser refuses the duplicate.
+                    //
+                    // `stdlib/tritfs_test.mt` is exactly that program — it
+                    // inlines its own copy of TritFS deliberately and says so.
+                    //
+                    // Skipping only the COLLIDING block is the narrow repair.
+                    // Suppressing the pull-in instead was tried and is worse:
+                    // a program that defines its own `reverse` AND calls
+                    // `s.reverse()` on a `str` then loses the str body, and
+                    // fails at LINK rather than at check — trading visible
+                    // bloat for a silent failure.
+                    if host_impl_types.contains(&imp.ty) {
+                        continue;
+                    }
+                    let mut imp = imp.clone();
+                    imp.methods.retain(|m| m.body.is_some());
+                    if imp.methods.is_empty() {
+                        continue;
+                    }
+                    for m in &mut imp.methods {
+                        if let Some(body) = &mut m.body {
+                            ctx.rewrite_block(body);
+                        }
+                        for p in &mut m.params {
+                            ctx.rewrite_type(&mut p.ty);
+                        }
+                        if let Some(rt) = &mut m.ret_ty {
+                            ctx.rewrite_type(rt);
+                        }
+                    }
+                    merged_items.push(Item::ImplBlock(imp));
                 }
                 Item::GlobalVar(g) if ctx.mutable_globals.contains(&g.name) => {
                     let mut g = g.clone();
@@ -1030,5 +1113,178 @@ fn rewrite_types_in_expr(expr: &mut Expr, map: &HashMap<String, String>) {
             rewrite_types_in_expr(h, map);
         }
         Expr::Lit(_, _) | Expr::Ident(_, _) | Expr::Break(_) | Expr::Continue(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::{expand, SOURCE_MODULES};
+    use crate::semantic::analyzer::SemanticAnalyzer;
+
+    /// Every registered stdlib module whose `.mt` defines a function BODY must
+    /// also be in `SOURCE_MODULES` (report.txt P60).
+    ///
+    /// There are two registries. `SemanticAnalyzer::STDLIB_MODULES` is
+    /// authoritative for ACCEPTING `use std::X` and the calls that follow;
+    /// `SOURCE_MODULES` here is authoritative for EMITTING the bodies. A module
+    /// in the first and absent from the second type-checks and then fails to
+    /// link — `Undefined label` on T3, `use of undefined value` on LLVM — from
+    /// a program `manitc check` exits 0 on.
+    ///
+    /// **That is N1, and this test exists because N1 recurred.** N1 is why this
+    /// pass was written; `tritfs` was a fourth module of exactly the kind it
+    /// was written for and never reached the list. The hazard was documented
+    /// in prose directly above `STDLIB_MODULES` — "Miss that last one and the
+    /// module resolves, type-checks, and then fails at link" — and the prose
+    /// did not stop it happening. A registry that must agree with another
+    /// registry should be checked, not described.
+    ///
+    /// The discriminator is syntactic and exact: a native declaration ends in
+    /// a semicolon (`fn println(s: str) ;  // native`) and a source-implemented
+    /// one has a brace body. Mixed modules like `ternary` and `str` have both,
+    /// and belong in `SOURCE_MODULES` on the strength of the braces.
+    #[test]
+    fn every_source_implemented_module_is_expanded() {
+        // (name, file text) for each registered module that ships a .mt.
+        let sources: &[(&str, &str)] = &[
+            ("io", include_str!("../../stdlib/io.mt")),
+            ("math", include_str!("../../stdlib/math.mt")),
+            ("ternary", include_str!("../../stdlib/ternary.mt")),
+            ("collections", include_str!("../../stdlib/collections.mt")),
+            ("fmt", include_str!("../../stdlib/fmt.mt")),
+            ("str", include_str!("../../stdlib/str.mt")),
+            ("sync", include_str!("../../stdlib/sync.mt")),
+            ("async", include_str!("../../stdlib/async.mt")),
+            ("env", include_str!("../../stdlib/env.mt")),
+            ("time", include_str!("../../stdlib/time.mt")),
+            ("fs", include_str!("../../stdlib/fs.mt")),
+            ("net", include_str!("../../stdlib/net.mt")),
+            ("t27f", include_str!("../../stdlib/t27f.mt")),
+            ("crypto", include_str!("../../stdlib/crypto.mt")),
+            ("bridge", include_str!("../../stdlib/bridge.mt")),
+            ("tritfs", include_str!("../../stdlib/tritfs.mt")),
+            ("test", include_str!("../../stdlib/test.mt")),
+            ("trit", include_str!("../../stdlib/trit.mt")),
+        ];
+
+        // Every module the analyser accepts must appear above, or this test
+        // silently stops covering it — the failure mode it exists to prevent.
+        for m in SemanticAnalyzer::STDLIB_MODULES {
+            assert!(
+                sources.iter().any(|(n, _)| n == m),
+                "`{}` is in STDLIB_MODULES but this test has no source for it; \
+                 add it here or the registry check stops covering it",
+                m
+            );
+        }
+
+        let has_body = |text: &str| {
+            text.lines().any(|l| {
+                let t = l.trim_start();
+                (t.starts_with("fn ") || t.starts_with("pub fn "))
+                    && t.contains('(')
+                    && t.trim_end().ends_with('{')
+                    || ((t.starts_with("fn ") || t.starts_with("pub fn "))
+                        && t.contains(") {")
+                        || (t.starts_with("fn ") || t.starts_with("pub fn "))
+                            && t.contains("-> ")
+                            && t.contains('{'))
+            })
+        };
+
+        for (name, text) in sources {
+            let expanded = SOURCE_MODULES.iter().any(|(n, _)| n == name);
+            if has_body(text) {
+                assert!(
+                    expanded,
+                    "stdlib/{}.mt defines function bodies and `{}` is a \
+                     registered module, but it is NOT in SOURCE_MODULES. Every \
+                     call to it will type-check and then fail to link. Add it \
+                     to SOURCE_MODULES in this file.",
+                    name, name
+                );
+            } else {
+                assert!(
+                    !expanded,
+                    "stdlib/{}.mt is declarations only — every `fn` ends in a \
+                     semicolon and the backends implement them — so expanding \
+                     it compiles nothing and only costs time. Remove `{}` from \
+                     SOURCE_MODULES.",
+                    name, name
+                );
+            }
+        }
+    }
+
+    /// **Every source-implemented impl METHOD survives expansion**
+    /// (report.txt P61).
+    ///
+    /// The test above checks that a module is expanded. It cannot see whether
+    /// everything IN the module is, and for a while nothing was: `ImplBlock`
+    /// fell into the catch-all of the merge loop, so a module's free functions
+    /// and its structs expanded while its methods vanished. `TritFS::new()`
+    /// then type-checked — the struct is present, so the analyser resolves the
+    /// method — and failed to link on both backends.
+    ///
+    /// **The defect had a population of one.** `tritfs` is the only module in
+    /// the standard library with source-implemented impl methods; the other six
+    /// with impl blocks (async, fs, io, net, sync, time) have 152 methods
+    /// between them and every one is a native declaration. **A defect with a
+    /// population of one is not rare, it is untested** — nothing else in the
+    /// stdlib could ever have exercised this path.
+    ///
+    /// So this asserts the BEHAVIOUR rather than the table: expand a program
+    /// that imports each source module, and count the brace-bodied impl
+    /// methods that come out against the number that went in.
+    #[test]
+    fn every_source_implemented_impl_method_survives_expansion() {
+        use crate::ast::{Item, Program, UseDecl};
+
+        for (name, text) in SOURCE_MODULES {
+            // Brace-bodied impl methods in the module source, counted by
+            // parsing rather than by regex.
+            let mut lexer = crate::lexer::Lexer::with_file(text, *name);
+            let tokens = lexer.tokenize().expect("stdlib module must lex");
+            let mut parser = crate::parser::Parser::with_file(tokens, *name);
+            let module = parser.parse().expect("stdlib module must parse");
+            let want: usize = module
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::ImplBlock(b) => Some(b),
+                    _ => None,
+                })
+                .map(|b| b.methods.iter().filter(|m| m.body.is_some()).count())
+                .sum();
+
+            // A one-line program that imports the module, expanded.
+            let prog = Program {
+                items: vec![Item::UseDecl(UseDecl {
+                    path: vec!["std".to_string(), (*name).to_string()],
+                    span: Default::default(),
+                })],
+            };
+            let expanded = expand(&prog)
+                .expect("expansion must succeed")
+                .unwrap_or_else(|| panic!("`{}` is in SOURCE_MODULES but expand() declined it", name));
+            let got: usize = expanded
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::ImplBlock(b) => Some(b),
+                    _ => None,
+                })
+                .map(|b| b.methods.iter().filter(|m| m.body.is_some()).count())
+                .sum();
+
+            assert_eq!(
+                got, want,
+                "stdlib/{}.mt defines {} impl method(s) with a body and \
+                 expansion emitted {}. Every call to a dropped method \
+                 type-checks and then fails to link — `Undefined label` on T3, \
+                 `use of undefined value` on LLVM.",
+                name, want, got
+            );
+        }
     }
 }

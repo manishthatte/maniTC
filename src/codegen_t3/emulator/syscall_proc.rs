@@ -122,13 +122,20 @@ impl Emulator {
             }
             26 => {
                 // Vec::remove(handle=R1, index=R2)
+                // R1 = the REMOVED ELEMENT (report.txt P59). `Vec<T>::remove`
+                // is typed `T`; this discarded what it removed and left R1
+                // holding whatever the previous operation had put there, so
+                // the returned value tracked the PRECEDING statement and the
+                // defect looked data-dependent when it was not.
                 let h = self.regs[1] as usize;
                 let idx = self.regs[2] as usize;
+                let mut removed: i64 = 0;
                 if let Some(HeapObj::Vec(vec)) = self.heap_objs.get_mut(&h) {
                     if idx < vec.len() {
-                        vec.remove(idx);
+                        removed = vec.remove(idx);
                     }
                 }
+                self.regs[1] = removed;
             }
 
             // ----------------------------------------------------------------

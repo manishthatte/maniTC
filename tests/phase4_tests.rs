@@ -130,12 +130,47 @@ fn run_llvm(src: &PathBuf, extra: &[&str]) -> Option<(i32, String)> {
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
     let c = Command::new(manitc()).args(&args).output().expect("compile");
+    // report.txt P47. This guard used to be `if stderr.contains("clang") {
+    // return None }`, meaning "no toolchain in this environment" — and it was
+    // exactly backwards. When clang is genuinely ABSENT the compiler
+    // SUCCEEDS: it prints `[LLVM] clang not found`, writes the .ll and exits
+    // 0. So the only way to reach a FAILED compile whose stderr mentions
+    // clang is clang REJECTING THE MODULE — precisely the defect the test
+    // exists to catch. Every LLVM codegen bug the toolchain caught therefore
+    // made its test pass vacuously, across 34 call sites in this file, and
+    // P46 was a default-build failure that lived behind it.
+    //
+    // The two states are told apart by the ARTEFACT, not by the message: a
+    // failed compile is always a real failure, and an absent toolchain is a
+    // successful compile with no binary at the end of it.
     if !c.status.success() {
-        let blob = String::from_utf8_lossy(&c.stderr).to_string();
-        if blob.contains("clang") {
-            return None; // no toolchain in this environment
-        }
-        panic!("LLVM compile failed:\n{}", blob);
+        panic!(
+            "LLVM compile failed:\n{}{}",
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+    }
+    if !bin.exists() {
+        // THE ASSERTION AT THE REPORTING BOUNDARY, which is worth more than
+        // getting the branch above right. Returning `None` here is a claim
+        // that this machine cannot run LLVM at all, and every caller spells
+        // that `if let Some(..)` — so a wrong `None` is a silent pass at 34
+        // sites. Rather than trust the path that computed it, state the
+        // invariant where the claim is made, against an ENVIRONMENT FACT:
+        // `find_clang` is the same discovery the compiler itself uses, so if
+        // it finds a toolchain then a missing binary is a real failure and
+        // never a skip. The branch can now be wrong without being silent.
+        assert!(
+            manitc::runtime_link::find_clang().is_none(),
+            "no binary at {} although clang IS available ({:?}) — this is a \
+             REAL failure being reported as an absent toolchain, which is the \
+             defect P47 was\n{}{}",
+            bin.display(),
+            manitc::runtime_link::find_clang(),
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+        return None; // clang genuinely absent: IR written, nothing to run
     }
     let r = Command::new(&bin).output().expect("run");
     Some((
@@ -907,11 +942,21 @@ fn f2_an_image_that_does_not_fit_below_the_stack_is_refused() {
     let mut body = String::from(
         "use std::io;\nfn seed(n: int) -> int { if n <= 0 { return 1; } return 1 + seed(n - 1); }\nfn main() {\n    let mut a: int = seed(3);\n",
     );
-    // 34,000 of these is ~63,000 T3 words, comfortably over the 60,000-word
-    // stack base and still about a second to compile. 24,000 was the first
-    // attempt and gave 44,600 words, which fits — the test then asserted
-    // nothing at all.
-    for i in 0..34000 {
+    // The count is DERIVED from the memory map rather than fitted to it.
+    //
+    // 34,000 of these used to be ~63,000 words because `a = a + k` cost two
+    // instructions: a TLIT to materialise `k` and a TADD to add it. P40 spends
+    // `k` as the immediate operand the machine always had, so a statement is
+    // now exactly ONE word (measured: 34,000 → 34,027 and 50,000 → 50,027),
+    // the image fell to 34,027, and this test went red having asserted the
+    // truth about a program that now fits.
+    //
+    // Refitting the constant would only postpone that. `STACK_BASE` statements
+    // cannot fit below `STACK_BASE` whatever codegen does, since a statement
+    // that survives folding is at least one word; the `+ 1000` is for the
+    // prologue and `seed`. It also tracks the memory map on its own, which is
+    // the change P38 left open.
+    for i in 0..(manitc::codegen_t3::emulator::STACK_BASE + 1000) {
         body.push_str(&format!("    a = a + {};\n", i % 7));
     }
     body.push_str("    io::println_int(a);\n}\n");
@@ -2419,5 +2464,192 @@ fn main() {
     if let Some((code, out)) = run_llvm(&src, &[]) {
         assert_eq!(code, 0, "LLVM: {}", out);
         assert_eq!(out, expected, "LLVM with merging");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// report.txt P40 — the immediate operand the emitter never used
+// ---------------------------------------------------------------------------
+
+/// **A small constant is spent as an operand, and the field's EDGE is exact.**
+///
+/// T3ISA's data-processing opcodes take their third operand as either a
+/// register or a balanced 3-trit immediate: `#k` assembles to the zero register
+/// with `k` in the imm field, and the emulator computes
+/// `rhs_eff = regs[sr3] + imm`. The emitter used that only for the shifts and
+/// the frame adjustments, and materialised every other constant with a TLIT
+/// into a scratch register first.
+///
+/// The interesting part of this test is not that `x + 13` is 20 — it is the
+/// pair either side of the boundary. The field holds -13..=13, so `x + 13`
+/// must use the immediate and `x + 14` must fall back to the register form;
+/// getting the guard backwards assembles to "Immediate out of range" at 14, and
+/// dropping it silently truncates. Both halves are asserted against the emitted
+/// assembly rather than inferred from the answer.
+#[test]
+fn f2_a_small_constant_operand_is_spent_as_an_immediate() {
+    // `opaque` defeats constant folding, so each expression survives to codegen.
+    let src = write(
+        "f2_imm3_edges",
+        "use std::io;\n\
+         fn opaque(n: int) -> int { if n <= 0 { return 1; } return 1 + opaque(n - 1); }\n\
+         fn main() {\n\
+         \x20   let x: int = opaque(6);\n\
+         \x20   io::println_int(x + 13);\n\
+         \x20   io::println_int(x + (0 - 13));\n\
+         \x20   io::println_int(x - (0 - 13));\n\
+         \x20   io::println_int(x * (0 - 1));\n\
+         \x20   io::println_int(x / 3);\n\
+         \x20   io::println_int((0 - x) % 5);\n\
+         \x20   io::println_int(x + 14);\n\
+         \x20   if x < 13 { io::println(\"lt13\"); }\n\
+         \x20   if x > (0 - 13) { io::println(\"gt-13\"); }\n\
+         \x20   if x < 0 { io::println(\"BAD\"); }\n\
+         }\n",
+    );
+
+    let expected = "20\n-6\n20\n-7\n2\n-2\n21\nlt13\ngt-13\n";
+    let (code, out) = run_t3(&src, &[]);
+    assert_eq!(code, 0, "T3 exited {}: {}", code, out);
+    assert_eq!(out, expected, "T3 answers");
+
+    // Both backends, because an operand-encoding mistake is exactly the kind of
+    // thing that produces a plausible number on one machine only.
+    if let Some((lcode, lout)) = run_llvm(&src, &[]) {
+        assert_eq!(lcode, 0, "LLVM: {}", lout);
+        assert_eq!(lout, expected, "LLVM must agree with T3");
+    }
+
+    // These assertions look at the OPERAND SLOT, not at the text `#13`.
+    // A first version asserted `asm.contains(", #13")`, which `TLIT R6, #13`
+    // satisfies just as well as `TADD R4, R5, #13` — so it passed with the
+    // change reverted and proved nothing. Reintroducing the defect is what
+    // caught that, and it is why this parses the line.
+    let asm = std::fs::read_to_string(src.with_extension("t3s")).expect("t3s");
+    const IMM_OPS: [&str; 8] = ["TADD", "TSUB", "TMUL", "TDIV", "TMOD", "TCMP", "TMIN", "TMAX"];
+    let imm_operands: Vec<(String, i64)> = asm
+        .lines()
+        .filter_map(|l| {
+            let body = l.split(';').next().unwrap_or("").trim();
+            let (op, rest) = body.split_once(char::is_whitespace)?;
+            if !IMM_OPS.contains(&op) {
+                return None;
+            }
+            // The immediate is the THIRD operand and nowhere else.
+            let third = rest.split(',').nth(2)?.trim();
+            let k: i64 = third.strip_prefix('#')?.parse().ok()?;
+            Some((op.to_string(), k))
+        })
+        .collect();
+
+    assert!(
+        imm_operands.iter().any(|(_, k)| *k == 13),
+        "13 is inside the field and no arithmetic opcode spent it as an operand"
+    );
+    assert!(
+        imm_operands.iter().any(|(_, k)| *k == -13),
+        "the field is BALANCED — -13 is in range and was not spent either"
+    );
+    assert!(
+        imm_operands.iter().all(|(_, k)| (-13..=13).contains(k)),
+        "an out-of-field immediate reached an operand slot; the assembler \
+         refuses those, so this would be a hard error on a longer program: {:?}",
+        imm_operands.iter().filter(|(_, k)| !(-13..=13).contains(k)).collect::<Vec<_>>()
+    );
+    assert!(
+        asm.lines().any(|l| l.contains("TLIT") && l.contains("#14")),
+        "14 is outside the field and must still be materialised with TLIT"
+    );
+}
+
+/// **The trichotomy comparisons no longer end in a clamp that cannot fire.**
+///
+/// `<` and `>` used to finish `TLIT o, #1` / `TMIN d, d, o`. `TCMP` writes
+/// `sign_i64`, whose range is exactly {-1,0,+1}; `TMAX d, d, R0` leaves {0,1};
+/// so taking the minimum with 1 was the identity. Two instructions on every
+/// `<` and `>` in the language.
+///
+/// Asserted on the emitted code, because the answers were right before as well.
+#[test]
+fn f2_a_less_than_does_not_clamp_a_value_that_cannot_exceed_one() {
+    let src = write(
+        "f2_lt_no_clamp",
+        "use std::io;\n\
+         fn opaque(n: int) -> int { if n <= 0 { return 1; } return 1 + opaque(n - 1); }\n\
+         fn main() {\n\
+         \x20   let a: int = opaque(2);\n\
+         \x20   let b: int = opaque(5);\n\
+         \x20   if a < b { io::println(\"lt\"); }\n\
+         \x20   if b > a { io::println(\"gt\"); }\n\
+         \x20   if b < a { io::println(\"BAD lt\"); }\n\
+         \x20   if a > b { io::println(\"BAD gt\"); }\n\
+         }\n",
+    );
+
+    let (code, out) = run_t3(&src, &[]);
+    assert_eq!(code, 0, "T3 exited {}: {}", code, out);
+    assert_eq!(out, "lt\ngt\n", "the comparisons still answer correctly");
+
+    let asm = std::fs::read_to_string(src.with_extension("t3s")).expect("t3s");
+    assert!(
+        !asm.contains("clamp to"),
+        "the dead clamp is back:\n{}",
+        asm.lines().filter(|l| l.contains("clamp")).collect::<Vec<_>>().join("\n")
+    );
+    // The comparison itself must still be there — deleting it would also
+    // satisfy the assertion above.
+    assert!(asm.contains("lt: sign(l-r)"), "the `<` lowering vanished");
+    assert!(asm.contains("gt: sign(l-r)"), "the `>` lowering vanished");
+}
+
+// ---------------------------------------------------------------------------
+// report.txt P46 — a generic native's declared type vs the IR's, at a phi
+// ---------------------------------------------------------------------------
+
+/// **A `Vec<str>` element assigned to a mutable `str` in a loop must build.**
+///
+/// `Vec::get` is declared returning `i64` — an element is one machine word —
+/// while the IR knows the element type, so on a `Vec<str>` the IR says `ptr`.
+/// Unpromoted, the variable is an `alloca ptr` and the store/load coerces.
+/// Promoted, the phi takes `ptr` from the IR and one arm is the `i64` call,
+/// and clang rejects the module. **So this was a DEFAULT-BUILD failure from
+/// the day `--mem2reg` became the default**, and `--no-mem2reg` compiled it
+/// throughout — which is also how it was localised.
+///
+/// It is P13's shape with the conversion pointing the other way, which is why
+/// the fix is one more arm on P13's own mechanism rather than a new one.
+///
+/// The T3 half of the assertion is not padding: T3 never had the defect, so it
+/// is the statement of what the answer should be.
+#[test]
+fn f1_a_vec_element_through_a_promoted_phi_keeps_its_type() {
+    let src = write(
+        "f1_vecget_phi",
+        "use std::io;\n\
+         fn main() {\n\
+         \x20   let v: Vec<str> = Vec::new();\n\
+         \x20   v.push(\"aa\"); v.push(\"bb\");\n\
+         \x20   let mut w: str = \"\";\n\
+         \x20   for i in 0..v.len() { w = v.get(i); }\n\
+         \x20   io::println(w);\n\
+         }\n",
+    );
+
+    let (code, out) = run_t3(&src, &[]);
+    assert_eq!(code, 0, "T3 exited {}: {}", code, out);
+    assert_eq!(out, "bb\n", "T3 answer");
+
+    // The point of the test: the DEFAULT build must produce a module clang
+    // accepts. `run_llvm` returns None only when the backend is unavailable.
+    if let Some((lcode, lout)) = run_llvm(&src, &[]) {
+        assert_eq!(lcode, 0, "LLVM default build: {}", lout);
+        assert_eq!(lout, "bb\n", "LLVM must agree with T3");
+    }
+
+    // And the flag that used to be the difference must still agree, since it
+    // is the configuration the fix has to converge with rather than replace.
+    if let Some((lcode, lout)) = run_llvm(&src, &["--no-mem2reg"]) {
+        assert_eq!(lcode, 0, "LLVM --no-mem2reg: {}", lout);
+        assert_eq!(lout, "bb\n", "--no-mem2reg must agree too");
     }
 }

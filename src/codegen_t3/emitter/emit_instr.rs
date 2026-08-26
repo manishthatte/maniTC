@@ -205,8 +205,23 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
 
             let rd = em.dst_reg(dst);
             let rl = em.val_reg(lhs);
-            let rr = em.val_reg(rhs);
-            let (d, l, r) = (AsmEmitter::rn(rd), AsmEmitter::rn(rl), AsmEmitter::rn(rr));
+            // P40: spend a small constant rhs as the THIRD OPERAND rather than
+            // materialising it. Every data-processing opcode on this machine
+            // already takes an immediate there — `#k` assembles to the zero
+            // register plus `k` in the imm field — and the emitter had never
+            // used it outside the shifts and the frame adjustments, so each
+            // such site paid a TLIT and a scratch register for a value the
+            // instruction could have carried itself.
+            //
+            // The materialisation is SKIPPED rather than emitted and dropped:
+            // `val_reg` writes into `lines` on the way past, so calling it and
+            // ignoring the result would leave the TLIT behind.
+            let r_imm = if binop_takes_imm3(op) { t3_imm3(rhs) } else { None };
+            let r = match r_imm {
+                Some(k) => format!("#{}", k),
+                None => AsmEmitter::rn(em.val_reg(rhs)),
+            };
+            let (d, l) = (AsmEmitter::rn(rd), AsmEmitter::rn(rl));
 
             match op {
                 // N5: the checked variants are the SAME instructions here.
@@ -340,21 +355,25 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     em.emit(format!("    TMAX  {}, {}, {}    ; abs(cmp)=ne bool", d, d, t));
                 }
 
+                // The "clamp to ≤1" these two used to end with was DEAD, and
+                // provably so rather than probably (P40). `TCMP` writes
+                // `sign_i64` (isa.rs), whose range is exactly {-1,0,+1}; `TNEG`
+                // preserves that range; and `TMAX d, d, R0` — R0 always reads
+                // as zero — leaves {0,1}. `TMIN d, d, 1` on a value that cannot
+                // exceed 1 is the identity, so the pair cost one materialised
+                // literal and one instruction on every `<` and `>` in the
+                // language, in and out of loops. Kept for `IEq`/`ILe`/`IGe`
+                // below, where the literal is the LEFT operand of `1 - x` and
+                // is doing real work.
                 IRBinOp::ILt => {
-                    let one = em.scratch(); let o = AsmEmitter::rn(one);
                     em.emit(format!("    TCMP  {}, {}, {}    ; lt: sign(l-r)", d, l, r));
                     em.emit(format!("    TNEG  {}, {}         ; +1 if l<r", d, d));
-                    em.emit(format!("    TMAX  {}, {}, R0    ; clip neg to 0", d, d));
-                    em.emit(format!("    TLIT  {}, #1", o));
-                    em.emit(format!("    TMIN  {}, {}, {}    ; clamp to ≤1", d, d, o));
+                    em.emit(format!("    TMAX  {}, {}, R0    ; clip neg to 0 → {{0,1}}", d, d));
                 }
 
                 IRBinOp::IGt => {
-                    let one = em.scratch(); let o = AsmEmitter::rn(one);
                     em.emit(format!("    TCMP  {}, {}, {}    ; gt: sign(l-r)", d, l, r));
-                    em.emit(format!("    TMAX  {}, {}, R0    ; clip neg to 0", d, d));
-                    em.emit(format!("    TLIT  {}, #1", o));
-                    em.emit(format!("    TMIN  {}, {}, {}    ; clamp to ≤1", d, d, o));
+                    em.emit(format!("    TMAX  {}, {}, R0    ; clip neg to 0 → {{0,1}}", d, d));
                 }
 
                 IRBinOp::ILe => {
@@ -576,8 +595,17 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
         IRInstr::GetPtr { dst, ptr, idx, .. } => {
             let rd = em.dst_reg(dst);
             let rp = em.val_reg(ptr);
-            let ri = em.val_reg(idx);
-            em.emit(format!("    TADD  {}, {}, {}  ; getptr", AsmEmitter::rn(rd), AsmEmitter::rn(rp), AsmEmitter::rn(ri)));
+            // P40, the second tranche. A struct-field or fixed-slot projection
+            // has a CONSTANT index, and `GetPtr` is 21 % of this IR, so this
+            // was the largest single source of TLITs left after the binary
+            // operators — a literal materialised for the sole purpose of being
+            // added to a base address one instruction later.
+            let i = t3_imm3(idx);
+            let ri = match i {
+                Some(k) => format!("#{}", k),
+                None => AsmEmitter::rn(em.val_reg(idx)),
+            };
+            em.emit(format!("    TADD  {}, {}, {}  ; getptr", AsmEmitter::rn(rd), AsmEmitter::rn(rp), ri));
         }
 
         // ------------------------------------------------------------------ Call
@@ -1293,7 +1321,8 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 }
                 // Vec sort / reverse
                 "Vec::remove" => {
-                    emit_syscall_2arg(em, args, dst, 26, "Vec::remove");
+                    // `_ret`, because this call HAS a result (report.txt P59).
+                    emit_syscall_2arg_ret(em, args, dst, 26, "Vec::remove");
                 }
                 "Vec::sort_str" => {
                     emit_syscall_1arg(em, args, dst, 39, "Vec::sort_str");

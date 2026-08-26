@@ -90,9 +90,46 @@ fn from_float(f: float) -> T27F {
         scale = scale / 3.0;
         e = e - 1;
     }
-    // Mantissa = f / 3^e, rounded to integer. pow3_float also handles
+    // report.txt P49. THIS NORMALISED THE WRONG WAY ROUND, and `normalize`
+    // twenty lines below says which way is right: "shift mantissa up
+    // (multiply by 3, decrease exponent) while it fits", exactly as IEEE
+    // keeps an implicit leading 1, so a normalized exponent is NEGATIVE.
+    //
+    // The loops above maximise the EXPONENT: they leave the largest e with
+    // 3^e <= |f|, which forces |f| / 3^e into [1,3), and `float_to_int` then
+    // truncates it to 1 or 2. Seventeen of the eighteen mantissa trits were
+    // always zero and MANTISSA_MAX was unreachable by construction, so
+    // `from_float(4.0)` came back as 3 and `from_float(0.5)` as one third —
+    // errors of a quarter to a third, identical on both backends, which is
+    // why cross-backend parity could not see it either.
+    //
+    // Normalising AFTER the fact does not help and it is worth saying why:
+    // by then the precision is gone, and multiplying a mantissa of 1 by three
+    // seventeen times only reproduces 3. The exponent has to be chosen BEFORE
+    // the mantissa is taken, which is what this loop does — the smallest e
+    // for which |f| / 3^e still fits. It runs at most ~18 times, since each
+    // step multiplies the quotient by three and MANTISSA_MAX is about 3^17.6.
+    let man_max: float = int_to_float(MANTISSA_MAX);
+    while abs_f / pow3_float(e - 1) <= man_max {
+        e = e - 1;
+    }
+    // Mantissa = f / 3^e, ROUNDED to integer. pow3_float also handles
     // negative exponents (integer pow3 would return 0 and divide by zero).
-    let man: word = float_to_int(f / pow3_float(e));
+    //
+    // The rounding is the second half of P49 and it is worth a line. Once the
+    // exponent is chosen to fill the mantissa, the quotient is a large number
+    // reached by dividing in binary, so it lands just under the integer it
+    // should be: 12.0 / 3^-15 computes as 172186883.99999997, and
+    // `float_to_int` truncates toward zero — giving 172186883 and a round trip
+    // of 11.999999930. One half added before the truncation makes it
+    // 172186884, and 172186884 / 3^15 is 12 exactly. `float_to_int` itself is
+    // left alone: it is documented as truncating and has other callers.
+    let scaled: float = f / pow3_float(e);
+    let man: word = if scaled >= 0.0 {
+        float_to_int(scaled + 0.5)
+    } else {
+        float_to_int(scaled - 0.5)
+    };
     from_parts(e, man)
 }
 
