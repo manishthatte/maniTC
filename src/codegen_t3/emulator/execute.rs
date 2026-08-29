@@ -504,12 +504,26 @@ impl Emulator {
                     self.regs[26] = clamp27(self.regs[26] + 1);
                     self.pc = ret_addr;
                 } else {
-                    self.halted = true;
+                    // §11.6, and this is the path `main` actually takes: a
+                    // compiled `main` RETURNS with an empty call stack rather
+                    // than reaching a `HALT`, so putting §11.6 only on `HALT`
+                    // left `main` still ending the whole program and
+                    // discarding every task it had spawned.
+                    //
+                    // A task that returns off the bottom of its own call stack
+                    // has finished, which is what `sched_task_exit` is for; it
+                    // is `self.halted = true` and nothing more when nothing
+                    // has spawned.
+                    self.sched_task_exit();
                 }
             }
 
             Opcode::Halt => {
-                self.halted = true;
+                // §11.6: "`main` returning does not end the program" — it
+                // terminates as a task and the rest run on. With nothing
+                // spawned this is `self.halted = true` and nothing else, which
+                // is what it has always been.
+                self.sched_task_exit();
             }
 
             Opcode::Syscall => {

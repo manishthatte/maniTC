@@ -340,11 +340,16 @@ impl Emulator {
             }
             71 => {
                 // channel_send(handle=R1, value=R2)
+                //
+                // §11.5 (SEND) and (SEND-WAKE). Never blocks — §11.1 leaves
+                // channels unbounded, which §11.4 gives as the reason `send`
+                // is not a fourth yield point.
                 let h = self.regs[1] as usize;
                 let v = self.regs[2];
                 if let Some(HeapObj::Channel(ch)) = self.heap_objs.get_mut(&h) {
                     ch.push_back(v);
                 }
+                self.sched_wake_one(h);
             }
             72 => {
                 // channel_recv(handle=R1) → R1 = value, or a TRAP on an open
@@ -357,10 +362,22 @@ impl Emulator {
                 // cannot be satisfied. Both backends now say so. A CLOSED empty
                 // channel still yields 0 — that is the drain case, and it is
                 // what `examples/concurrency.mt` relies on.
+                //
+                // §11.5 (RECV) and (RECV-BLOCK), once anything has spawned.
+                // P81's trap survives UNCHANGED for a program that never
+                // spawns, and that is not a compromise: with no other task,
+                // blocking would empty the run queue on the spot and §11.6
+                // would trap for deadlock anyway. The two agree on the
+                // verdict; the unscheduled path reaches it in one step and
+                // says something more specific while doing so.
                 let h = self.regs[1] as usize;
                 let val = match self.heap_objs.get_mut(&h) {
                     Some(HeapObj::Channel(ch)) => match ch.pop_front() {
                         Some(v) => v,
+                        None if self.sched.active => {
+                            self.sched_block_on(h);
+                            return;
+                        }
                         None => {
                             self.trap(
                                 "TRAP: recv on an empty channel that is still \
@@ -394,17 +411,28 @@ impl Emulator {
             }
 
             // ----------------------------------------------------------------
-            // Cooperative scheduler syscalls (80-82) — no-op stubs
+            // Cooperative scheduler syscalls (80-82) — §11 of docs/semantics.md
             // ----------------------------------------------------------------
             80 => {
-                // spawn(fn_ptr=R1, arg=R2) — no-op stub
-                self.regs[1] = 0;
+                // task_fork() → R1 = 0 in the CHILD, the new task's id in the
+                // PARENT. §11.5 (SPAWN); see `sched.rs` for why a fork and not
+                // an entry address.
+                //
+                // The stub this replaces took `(fn_ptr, arg)`, which would
+                // have needed capture analysis, closure conversion and an
+                // environment record for every `spawn` in
+                // `examples/concurrency.mt` — all of which a fork makes
+                // unnecessary, because the child IS the parent's store.
+                let id = self.sched_fork();
+                self.regs[1] = id as i64;
             }
             81 => {
-                // yield() — no-op stub
+                // yield() — §11.5 (YIELD).
+                self.sched_yield();
             }
             82 => {
-                // task_exit() — no-op stub
+                // task_exit() — §11.5 (DONE).
+                self.sched_task_exit();
             }
 
             // ----------------------------------------------------------------

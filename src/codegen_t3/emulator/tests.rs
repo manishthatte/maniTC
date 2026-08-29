@@ -1380,3 +1380,302 @@ fn v15_profiler_sees_every_lane_opcode() {
             "{:?} missing from profile summary:\n{}", op, summary);
     }
 }
+
+// ---------------------------------------------------------------------------
+// §11 — cooperative scheduling (CONCURRENCY_DECISION.md §5, step 2)
+// ---------------------------------------------------------------------------
+//
+// `SYSCALL #80` is a FORK: R1 comes back 0 in the child and the new task's id
+// in the parent, so a spawned block is reached by an ORDINARY branch on that
+// value. See `sched.rs` for why that beats taking the block's address — in one
+// sentence, a block nothing branches to has no CFG predecessor and every pass
+// that walks the graph then computes the wrong answer for it.
+//
+// These programs are T3 ASSEMBLY because the lowering is the next piece of
+// work. Deliberate rather than a stopgap: the scheduler is the mechanism, and
+// proving it against machine code neither waits on a lowering nor hides behind
+// one. Every trace was derived from docs/semantics.md §11.5 by hand before it
+// was run. `SYSCALL #1` is print_int, so the traces are digits.
+
+fn run_sched_asm(asm: &str) -> (String, bool) {
+    let (words, _, _) = assemble(asm).expect("assemble failed");
+    let mut emu = Emulator::new();
+    emu.load_program(words);
+    emu.run();
+    let out: Vec<u8> = emu.output.iter().flatten().copied().collect();
+    (String::from_utf8_lossy(&out).into_owned(), emu.trapped)
+}
+
+/// §11.5 (SPAWN): the task is appended at the BACK and the spawner CONTINUES.
+///
+/// Under the stub this replaces, syscall 80 set R1 = 0 and did nothing — so
+/// the PARENT would have taken the child's branch and nothing would have been
+/// spawned at all. That the old stub returned exactly the child's value is a
+/// coincidence worth noticing: it makes this row fail loudly rather than
+/// quietly do half the right thing.
+#[test]
+fn sched_fork_appends_and_the_spawner_continues() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+TLIT  R1, #2
+SYSCALL #1
+SYSCALL #82
+  cont:
+TLIT  R1, #1
+SYSCALL #1
+HALT
+"#);
+    assert!(!trapped, "unexpected trap: {:?}", out);
+    assert_eq!(
+        out, "12",
+        "§11.5 (SPAWN): the spawner prints 1 first; `21` would mean the block \
+         was evaluated in place, which is what both backends do today"
+    );
+}
+
+/// §11.6: `main` returning does not end the program — it terminates as a task
+/// and the rest run on. The compatible choice, because `spawn { B }` runs B
+/// inline today, so every spawned block in every existing program already
+/// completes before `main` returns.
+#[test]
+fn sched_main_halting_does_not_end_the_program() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+TLIT  R1, #2
+SYSCALL #1
+SYSCALL #82
+  cont:
+TLIT  R1, #1
+SYSCALL #1
+HALT
+"#);
+    assert!(!trapped);
+    assert!(
+        out.contains('2'),
+        "§11.6: HALT ends the TASK, not the program, so the spawned task must \
+         still run. Got {:?}",
+        out
+    );
+}
+
+/// §11.5 (YIELD) moves the head of the run queue to the back.
+#[test]
+fn sched_yield_moves_the_head_to_the_back() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+TLIT  R1, #2
+SYSCALL #1
+SYSCALL #81
+TLIT  R1, #4
+SYSCALL #1
+SYSCALL #82
+  cont:
+TLIT  R1, #1
+SYSCALL #1
+SYSCALL #81
+TLIT  R1, #3
+SYSCALL #1
+HALT
+"#);
+    assert!(!trapped, "unexpected trap: {:?}", out);
+    assert_eq!(
+        out, "1234",
+        "§11.5 (YIELD): R = [main,t] -> [t,main] -> [main,t]. `1324` would \
+         mean yield did nothing"
+    );
+}
+
+/// §11.5 (RECV-BLOCK) and (SEND-WAKE): a receive on an empty channel suspends
+/// the task with its `recv` still in front of it; a send wakes it; it resumes
+/// by RE-EXECUTING the receive.
+///
+/// Also the row that pins the PC rewind. `step` advances the PC before it
+/// executes an opcode, so without the rewind a woken task resumes PAST its
+/// receive and prints whatever R1 held — here the channel handle, which is a
+/// perfectly plausible-looking number.
+#[test]
+fn sched_recv_blocks_and_send_wakes_it() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+SYSCALL #70
+TADD  R5, R1, #0
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+TADD  R1, R5, #0
+SYSCALL #72
+SYSCALL #1
+SYSCALL #82
+  cont:
+SYSCALL #81
+TADD  R1, R5, #0
+TLIT  R2, #7
+SYSCALL #71
+TLIT  R1, #9
+SYSCALL #1
+HALT
+"#);
+    assert!(!trapped, "unexpected trap: {:?}", out);
+    assert_eq!(
+        out, "97",
+        "§11.5: main yields, the task blocks on the empty channel, main sends \
+         7 and prints 9, and the woken task RE-EXECUTES its receive"
+    );
+}
+
+/// §11.6: `R` empty with `B` non-empty is a DETECTED deadlock, and §8's rule
+/// that the trace before a trap is retained still holds.
+///
+/// This is the property P5.1 measured the absence of: on LLVM the same shape
+/// blocks in `pthread_cond_wait` with stdout unflushed and prints NOTHING —
+/// losing the trace along with the answer.
+#[test]
+fn sched_deadlock_is_detected_and_the_trace_survives() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+SYSCALL #70
+TADD  R5, R1, #0
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+TADD  R1, R5, #0
+SYSCALL #72
+SYSCALL #1
+SYSCALL #82
+  cont:
+TLIT  R1, #5
+SYSCALL #1
+HALT
+"#);
+    assert!(trapped, "§11.6: nothing can fill the channel, so this is a trap");
+    assert!(out.starts_with('5'), "§8: the trace before the trap survives: {:?}", out);
+    assert!(
+        out.contains("deadlock") && out.contains("no runnable task can fill"),
+        "§11.6: the message names the situation and not the symptom: {:?}",
+        out
+    );
+}
+
+/// §11.2: a spawned task gets a COPY of its spawner's store. The register file
+/// is half of that store.
+#[test]
+fn sched_a_forked_task_gets_a_copy_of_the_registers() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+TLIT  R5, #1
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+TADD  R1, R5, #0
+SYSCALL #1
+SYSCALL #82
+  cont:
+TLIT  R5, #2
+TADD  R1, R5, #0
+SYSCALL #1
+HALT
+"#);
+    assert!(!trapped, "unexpected trap: {:?}", out);
+    assert_eq!(
+        out, "21",
+        "§11.2: main's later write is its own, and the task still sees the 1 \
+         it was forked with. `22` would mean one shared register file"
+    );
+}
+
+/// §11.2's other half, and the reason the whole design works: the STACK is
+/// copied too, and every task sees it at the SAME addresses.
+///
+/// That is what lets a spawned block reach the locals it was written beside
+/// with no capture analysis at all — it shares the frame layout because it IS
+/// the same frame, one copy later. Carving the stack region into per-task
+/// slices instead would break exactly this: a copied frame can hold the
+/// ADDRESS of one of its own slots, and rebasing the copy leaves that address
+/// pointing into the spawner's frame.
+#[test]
+fn sched_a_forked_task_gets_a_copy_of_the_stack() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+TSUB  R26, R26, #1
+TLIT  R6, #3
+STORE R6, [R26+0]
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+LOAD  R1, [R26+0]
+SYSCALL #1
+SYSCALL #82
+  cont:
+TLIT  R6, #8
+STORE R6, [R26+0]
+LOAD  R1, [R26+0]
+SYSCALL #1
+HALT
+"#);
+    assert!(!trapped, "unexpected trap: {:?}", out);
+    assert_eq!(
+        out, "83",
+        "§11.2: the task reads 3 from ITS copy of the frame after main has \
+         overwritten its own with 8. `88` would mean one shared stack"
+    );
+}
+
+/// The fork's two return values are what make the ordinary branch work, so
+/// they are asserted directly rather than only through their consequences.
+#[test]
+fn sched_fork_returns_zero_to_the_child_and_the_id_to_the_parent() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+SYSCALL #80
+TBRANCH R1, cont, body, cont
+  body:
+SYSCALL #1
+SYSCALL #82
+  cont:
+SYSCALL #1
+HALT
+"#);
+    assert!(!trapped, "unexpected trap: {:?}", out);
+    assert_eq!(
+        out, "10",
+        "the parent's fork returns task id 1 and the child's returns 0 — the \
+         two values an ordinary branch tells apart"
+    );
+}
+
+/// A program that never spawns must be untouched, so the scheduler is inert
+/// until syscall 80 fires — and P81's trap is still exactly right when there
+/// is no other task that could ever fill the channel.
+#[test]
+fn sched_is_inert_until_something_forks() {
+    let (out, trapped) = run_sched_asm(r#"
+main:
+  entry:
+SYSCALL #70
+SYSCALL #72
+HALT
+"#);
+    assert!(trapped);
+    assert!(
+        out.contains("runs its block in place"),
+        "with nothing spawned P81's more specific message survives: {:?}",
+        out
+    );
+}

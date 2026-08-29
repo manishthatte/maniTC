@@ -1,6 +1,6 @@
 // ir/lower/lower_expr.rs — Expression and pointer lowering for IRLowerer.
 
-use super::IRLowerer;
+use super::{IRLowerer, SchedMode};
 use super::helpers::{array_value_ty, binop_to_ir, slot_access_ty, unop_to_ir};
 use crate::ir::types::*;
 use crate::ast::{BinOpKind, UnOpKind};
@@ -1453,7 +1453,14 @@ impl IRLowerer {
             TypedExprKind::Await(inner) => self.lower_expr(inner),
 
             TypedExprKind::Spawn(block) => {
-                self.lower_block(block);
+                match self.sched {
+                    // `docs/memory-model.md` §4, and what every ManiT program
+                    // has always done: evaluate the block in place.
+                    SchedMode::Inline => {
+                        self.lower_block(block);
+                    }
+                    SchedMode::Cooperative => self.lower_spawn_as_fork(block),
+                }
                 IRValue::Void
             }
 
@@ -1704,4 +1711,75 @@ impl IRLowerer {
         IRValue::Temp(cell)
     }
 
+}
+
+impl IRLowerer {
+    /// §11.5 (SPAWN), lowered as a FORK.
+    ///
+    /// ```text
+    ///     id = __task_fork()          ; 0 in the child, the task id in the parent
+    ///     if id == 0 -> body else -> cont
+    ///   body:
+    ///     <B>                          ; exactly the inline lowering
+    ///     __task_exit()
+    ///     unreachable
+    ///   cont:
+    /// ```
+    ///
+    /// **Every block here is on an ordinary edge that some party really
+    /// takes**, which is the whole reason for the fork. The first design took
+    /// the ADDRESS of the body block and spawned into it; that leaves the body
+    /// with no CFG predecessor, so `remove_unreachable_blocks` deletes it and
+    /// dominance, `mem2reg`, CSE and `--verify-ssa` all answer wrongly for it.
+    /// Modelling a control-flow edge that is not a terminator's would mean
+    /// visiting every consumer of the CFG — and P72 is the record of what that
+    /// costs, because the compiler names the matches that stop COMPILING and
+    /// is silent about the ones that merely stop being TRUE.
+    ///
+    /// So the graph gains nothing new at all, and the passes need no changes.
+    /// `B` is lowered by the same `lower_block` the inline path uses, so it
+    /// optimises identically and there is no second lowering to keep in step.
+    pub(super) fn lower_spawn_as_fork(&mut self, block: &crate::semantic::TypedBlock) {
+        let id = self.fresh_temp();
+        self.emit(IRInstr::Call {
+            dst: Some(id.clone()),
+            func: "__task_fork".to_string(),
+            args: vec![],
+            ret_ty: IRType::I64,
+        });
+
+        let is_child = self.fresh_temp();
+        self.emit(IRInstr::BinOp {
+            dst: is_child.clone(),
+            op: IRBinOp::IEq,
+            lhs: IRValue::Temp(id),
+            rhs: IRValue::Const(IRConst::Int(0)),
+            ty: IRType::I64,
+        });
+
+        let body_label = self.fresh_label("spawn_body");
+        let cont_label = self.fresh_label("spawn_cont");
+        self.set_term(IRTerminator::BinBranch {
+            cond: IRValue::Temp(is_child),
+            true_label: body_label.clone(),
+            false_label: cont_label.clone(),
+        });
+
+        let body_idx = self.new_block(body_label);
+        self.switch_to(body_idx);
+        self.lower_block(block);
+        // §11.5 (DONE). Not a `Return`: the child's copied stack still holds
+        // its parent's frames, so returning would run the SPAWNER's
+        // continuation inside the task.
+        self.emit(IRInstr::Call {
+            dst: None,
+            func: "__task_exit".to_string(),
+            args: vec![],
+            ret_ty: IRType::Void,
+        });
+        self.set_term(IRTerminator::Unreachable);
+
+        let cont_idx = self.new_block(cont_label);
+        self.switch_to(cont_idx);
+    }
 }

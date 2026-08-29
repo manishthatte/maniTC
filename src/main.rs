@@ -131,6 +131,22 @@ enum Commands {
         #[arg(long = "no-merge-blocks")]
         no_merge_blocks: bool,
 
+        /// How `spawn { B }` is compiled: `inline` (the default) or
+        /// `cooperative` (§11 of docs/semantics.md).
+        ///
+        /// `inline` evaluates the block in place, which is what
+        /// `docs/memory-model.md` §4 says the language does and what every
+        /// ManiT program has always done. `cooperative` compiles it into a
+        /// TASK, on the scheduler `CONCURRENCY_DECISION.md` chose.
+        ///
+        /// **T3 only, and it is behind a flag for R2's reason**: the LLVM
+        /// backend has no scheduler until step 3 of that document's §5, so
+        /// making this the default now would break cross-backend parity on
+        /// every spawning program for as long as step 3 takes. Asking for it
+        /// with `--target llvm` is refused rather than silently ignored.
+        #[arg(long = "sched", default_value = "inline")]
+        sched: String,
+
         /// Turn F-1 promotion OFF, compiling locals as memory the way the
         /// pre-F-1 compiler did.
         ///
@@ -415,6 +431,38 @@ loads={} stores={} phis={} phi-edges-from-branch={}",
 }
 
 /// A5: print the effective lint levels.
+/// `--sched`, and the one place the T3-only restriction is enforced.
+///
+/// Refused rather than ignored on LLVM: a flag that is silently dropped is how
+/// a user comes to believe a program is scheduled when it is not, and §11's
+/// whole point is that the two lowerings produce different output.
+fn parse_sched(s: &str, target: &str) -> CompileResult<manitc::ir::lower::SchedMode> {
+    use manitc::ir::lower::SchedMode;
+    let mode = match s {
+        "inline" => SchedMode::Inline,
+        "cooperative" => SchedMode::Cooperative,
+        other => {
+            return Err(CompileError::Codegen(Diagnostic::unknown(format!(
+                "unknown --sched `{}`: expected `inline` or `cooperative`",
+                other,
+            ))));
+        }
+    };
+    if mode == SchedMode::Cooperative && target != "t3" {
+        return Err(CompileError::Codegen(Diagnostic::unknown(
+            concat!(
+                "--sched cooperative is implemented for --target t3 only. ",
+                "The LLVM backend has no scheduler yet: that is step 3 of ",
+                "enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md ",
+                "\u{a7}5, and it must emulate the same semantics rather ",
+                "than call pthreads.",
+            )
+                .to_string(),
+        )));
+    }
+    Ok(mode)
+}
+
 fn print_lint_manifest(t: &manitc::lint::LintTable) {
     for line in t.manifest_lines() {
         println!("{}", line);
@@ -437,6 +485,7 @@ fn run_compile(
     rounds: usize,
     inline_limit: usize,
     merge_blocks: bool,
+    sched: manitc::ir::lower::SchedMode,
 ) -> CompileResult<()> {
     let source = read_source(file).map_err(|e| CompileError::Lex(
         Diagnostic::unknown(e),
@@ -489,7 +538,7 @@ fn run_compile(
     manitc::borrow::check_borrows(&typed_program)?;
 
     // IR lowering + optimization
-    let mut ir_module = IRLowerer::lower_with(&typed_program, lang);
+    let mut ir_module = IRLowerer::lower_with_sched(&typed_program, lang, sched);
     if verify_ssa {
         report_ssa(&ir_module, "after lowering");
     }
@@ -1070,7 +1119,7 @@ fn run() {
             file, target, output, emit_ir, warn_as_error,
             allow, warn, deny, forbid, print_lints, target_triple, lang, verify_ssa,
             mem2reg, no_mem2reg, pass_stats, rounds, inline_limit, no_inline,
-            no_merge_blocks,
+            no_merge_blocks, sched,
         } => {
             let flags = LintFlags {
                 allow: allow.clone(), warn: warn.clone(),
@@ -1079,13 +1128,15 @@ fn run() {
             // Promotion is the default; `--mem2reg` is a no-op that asks for it
             // explicitly, and `--no-mem2reg` is the only way to decline it.
             let _ = mem2reg;
-            parse_lang(lang).and_then(|lang| run_compile(
-                file, target, output, *emit_ir, *warn_as_error,
-                &flags, *print_lints, target_triple.as_deref(), lang, *verify_ssa,
-                !*no_mem2reg, *pass_stats, *rounds,
-                if *no_inline { 0 } else { *inline_limit },
-                !*no_merge_blocks,
-            ))
+            parse_lang(lang)
+                .and_then(|lang| parse_sched(sched, target).map(|sc| (lang, sc)))
+                .and_then(|(lang, sc)| run_compile(
+                    file, target, output, *emit_ir, *warn_as_error,
+                    &flags, *print_lints, target_triple.as_deref(), lang, *verify_ssa,
+                    !*no_mem2reg, *pass_stats, *rounds,
+                    if *no_inline { 0 } else { *inline_limit },
+                    !*no_merge_blocks, sc,
+                ))
         }
         Commands::Check {
             file, warn_as_error, allow, warn, deny, forbid, print_lints, backend, lang,

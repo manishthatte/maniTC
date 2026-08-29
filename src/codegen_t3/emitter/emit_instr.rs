@@ -1322,6 +1322,23 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "task_exit" => {
                     em.emit("    SYSCALL #82  ; task_exit".to_string());
                 }
+                // §11.5 (SPAWN), the pair `lower_spawn_as_fork` emits.
+                //
+                // `__task_fork` takes NO arguments and returns 0 in the child
+                // and the new task's id in the parent, so the helper's arity
+                // is used at zero — it walks `args`, which is empty, and then
+                // moves R1 into the destination, which is all this needs.
+                //
+                // Distinct from the `"async::spawn" | "spawn"` arm above:
+                // that one is the old two-argument `(fn_ptr, arg)` surface
+                // from `stdlib/async.mt`, which is a different thing reaching
+                // the same syscall number and is left exactly as it was.
+                "__task_fork" => {
+                    emit_syscall_1arg_ret(em, args, dst, 80, "task_fork");
+                }
+                "__task_exit" => {
+                    em.emit("    SYSCALL #82  ; task_exit (spawned block)".to_string());
+                }
                 // Vec sort / reverse
                 "Vec::remove" => {
                     // `_ret`, because this call HAS a result (report.txt P59).

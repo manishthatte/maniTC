@@ -15,6 +15,10 @@ pub enum Tok {
     Str(String),
     // keywords
     Fn, Let, Mut, If, Elif, Else, Tif, While, Return, As, Use, Match,
+    // §11. Concurrency: three yield points and no others, so three
+    // keywords is nearly all of it — `send`/`recv` are methods and
+    // `channel()` is a call, both of which the core already parses.
+    Spawn, Yield, TyChan,
     Question, Dot, Underscore,
     True, False, B3True, B3Unknown, B3False,
     TyTrit, TyBool3, TyBool, TyInt, TyVoid,
@@ -94,6 +98,8 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "_" => Tok::Underscore,
                 "true" => Tok::True, "false" => Tok::False,
                 "True" => Tok::B3True, "Unknown" => Tok::B3Unknown, "False" => Tok::B3False,
+                "spawn" => Tok::Spawn, "yield" => Tok::Yield,
+                "chan" => Tok::TyChan,
                 "trit" => Tok::TyTrit, "bool3" => Tok::TyBool3,
                 "bool" => Tok::TyBool, "int" => Tok::TyInt, "void" => Tok::TyVoid,
                 "tand" => Tok::Tand, "tor" => Tok::Tor, "tnot" => Tok::Tnot,

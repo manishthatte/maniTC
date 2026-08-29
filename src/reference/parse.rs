@@ -89,6 +89,7 @@ impl P {
                 self.expect(&Tok::Gt)?;
                 Ty::Result(Box::new(ok))
             }
+            Tok::TyChan => Ty::Chan,
             Tok::Ident(n) if n == "str" => Ty::Str,
             other => return Err(format!("not a core type: {:?}", other)),
         })
@@ -179,6 +180,18 @@ impl P {
                 let cond = self.expr()?;
                 let body = self.block()?;
                 Ok(Stmt::While { cond, body })
+            }
+            // §11.5 (SPAWN). No semicolon after the block, like `while`.
+            Tok::Spawn => {
+                self.bump();
+                let body = self.block()?;
+                Ok(Stmt::Spawn(body))
+            }
+            // §11.5 (YIELD).
+            Tok::Yield => {
+                self.bump();
+                self.expect(&Tok::Semi)?;
+                Ok(Stmt::Yield)
             }
             Tok::Return => {
                 self.bump();

@@ -11,7 +11,8 @@
 //! Independence rule: see lex.rs.
 
 use super::ast::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// §3. T3_MAX = (3^27 - 1) / 2.
 pub const T3_MAX: i64 = 3_812_798_742_493;
@@ -68,6 +69,13 @@ pub enum Val {
     /// A string. In the core it exists only to be printed or carried as a
     /// `Result` message, so it has no operations of its own.
     Text(String),
+    /// §11.3. A channel, as an index into the configuration's channel store
+    /// `𝒞`. An index and not a pointer because a channel has IDENTITY and no
+    /// contents of its own: `𝒞` and the blocked map `B` are indexed by it, and
+    /// copying the value copies the name of the channel rather than the queue.
+    /// That is what lets §11.2 hand a spawned task a COPY of its spawner's
+    /// store and still have the two share the channel.
+    Chan(usize),
 }
 
 /// §6.8. A `Result<T, str>` value.
@@ -98,6 +106,11 @@ impl Val {
             // shows and what `tif` dispatches on.
             Val::Res(r) => r.tag as i64,
             Val::Text(_) => 0,
+            // A channel has no numeric face. §11 defines no cast to or from
+            // one and no printer for one, so this is unreachable from a
+            // program that parses; 0 rather than a panic because the core's
+            // rule is that `cast` is total.
+            Val::Chan(_) => 0,
         }
     }
 }
@@ -116,6 +129,14 @@ pub enum Abort {
     Trap(Trap),
     /// The non-`Ok` `Result` being propagated out of the enclosing call.
     Propagate(Val),
+    /// §11. The program has already ended under some other task — a trap
+    /// there, or §11.6's deadlock — so this one stops where it stands.
+    ///
+    /// It is NOT a trap and contributes nothing to the observation: the event
+    /// that ended the program is already recorded, and a cancelled task
+    /// reporting a second one would make the outcome depend on which thread
+    /// the operating system happened to wake.
+    Cancelled,
 }
 
 type R<T> = Result<T, Abort>;
@@ -127,14 +148,296 @@ fn trap<T>(msg: impl Into<String>) -> R<T> {
 /// §7. `return` is not an expression, so it needs its own control-flow path.
 enum Flow { Normal, Return(Option<Val>) }
 
-pub struct Interp<'a> {
-    fns: HashMap<String, &'a Fn>,
-    /// §4. The output trace.
-    pub out: String,
-    /// A step budget. Not part of the semantics — a non-terminating program has
-    /// no observable behaviour to compare, and the conformance harness needs to
-    /// stop rather than hang. Exceeding it is reported distinctly from a trap.
+
+// ---------------------------------------------------------------------------
+// §11 The scheduler
+// ---------------------------------------------------------------------------
+
+/// §11.3. A task's name.
+pub type TaskId = usize;
+
+/// §11.3. The parts of a configuration that are shared between tasks: the run
+/// queue `R`, the blocked map `B`, the channel store `𝒞`, and the trace `ω`.
+///
+/// One mutex covers all four, and §11.4 is the reason that is not a
+/// bottleneck: at most one task is ever runnable, so the lock is never
+/// contended. **Its job is to make "exactly one task runs at a time"
+/// expressible in Rust, not to arbitrate between tasks that might otherwise
+/// race** — under §11.2 they have nothing to race over.
+struct Shared {
+    /// §11.3 ω. One trace for the whole program: output is a program-level
+    /// observable, and §11.3 says which task produced which part of it is not.
+    out: String,
+    /// The step budget of §4's note, shared rather than per-task: a
+    /// non-terminating PROGRAM is what it exists to stop.
     budget: u64,
+    /// §11.3 R. The head is the running task.
+    run: VecDeque<TaskId>,
+    /// §11.3 B, one queue per channel so (SEND-WAKE) can take the
+    /// longest-waiting waiter rather than an arbitrary one.
+    blocked: Vec<VecDeque<TaskId>>,
+    /// §11.3 𝒞.
+    chans: Vec<VecDeque<Val>>,
+    /// §8: the first trap ends the program, so later ones are not recorded.
+    trap: Option<String>,
+    /// The program is over — by a trap, or by §11.6's deadlock, or normally.
+    /// A task waiting for its turn wakes, sees this, and unwinds.
+    stopping: bool,
+}
+
+/// §11.3–§11.6, as an object. Every method is named for the rule it implements.
+struct Sched {
+    m: Mutex<Shared>,
+    cv: Condvar,
+    /// Ids handed out. Separate from `Shared` only because it is never read
+    /// under the same lock as anything else.
+    next_id: Mutex<TaskId>,
+}
+
+impl Sched {
+    fn new(budget: u64) -> Self {
+        Sched {
+            m: Mutex::new(Shared {
+                out: String::new(),
+                budget,
+                // §11.3: a program starts as ONE task.
+                run: VecDeque::from([0usize]),
+                blocked: Vec::new(),
+                chans: Vec::new(),
+                trap: None,
+                stopping: false,
+            }),
+            cv: Condvar::new(),
+            next_id: Mutex::new(1),
+        }
+    }
+
+    /// A poisoned lock cannot happen here — no task panics while holding it,
+    /// and a ManiT trap is a value rather than a panic — but recovering rather
+    /// than unwrapping keeps a bug in this file from becoming a hang in the
+    /// harness.
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        self.m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Block until `id` is the head of the run queue — §11.3's "the head of
+    /// `R` is the running task" — or the program ends underneath it.
+    fn await_turn(&self, id: TaskId) -> R<()> {
+        let mut g = self.lock();
+        loop {
+            // Checked FIRST: a task that is at the head of a run queue nobody
+            // will ever advance is still cancelled.
+            if g.stopping {
+                return Err(Abort::Cancelled);
+            }
+            if g.run.front() == Some(&id) {
+                return Ok(());
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// §11.3 ω.
+    fn emit(&self, text: &str) {
+        self.lock().out.push_str(text);
+    }
+
+    fn tick(&self) -> R<()> {
+        let mut g = self.lock();
+        if g.budget == 0 {
+            return trap("step budget exhausted (non-terminating?)");
+        }
+        g.budget -= 1;
+        Ok(())
+    }
+
+    /// A fresh channel: an entry in 𝒞 and its own queue in B.
+    fn new_channel(&self) -> usize {
+        let mut g = self.lock();
+        g.chans.push(VecDeque::new());
+        g.blocked.push(VecDeque::new());
+        g.chans.len() - 1
+    }
+
+    /// §11.5 (SPAWN). Appends at the back, and does **not** yield — §11.4
+    /// records that as a choice: the spawning task's own code reads
+    /// sequentially.
+    fn enqueue_new_task(&self) -> TaskId {
+        let mut n = self.next_id.lock().unwrap_or_else(|e| e.into_inner());
+        let id = *n;
+        *n += 1;
+        self.lock().run.push_back(id);
+        id
+    }
+
+    /// §11.5 (YIELD). The head goes to the back.
+    ///
+    /// When it is the only runnable task this is the identity, which is what
+    /// the rule says: `R·⟨s,σ⟩` with `R` empty is `⟨s,σ⟩`.
+    fn yield_now(&self, id: TaskId) -> R<()> {
+        {
+            let mut g = self.lock();
+            debug_assert_eq!(g.run.front(), Some(&id), "§11.3: only the head runs");
+            g.run.pop_front();
+            g.run.push_back(id);
+        }
+        self.cv.notify_all();
+        self.await_turn(id)
+    }
+
+    /// §11.5 (SEND) and (SEND-WAKE).
+    ///
+    /// Never blocks: §11.1 leaves channels unbounded, which §11.4 gives as the
+    /// reason `send` is not a fourth yield point. Exactly one waiter is woken,
+    /// and it is the longest-waiting.
+    fn send(&self, c: usize, v: Val) {
+        {
+            let mut g = self.lock();
+            g.chans[c].push_back(v);
+            if let Some(w) = g.blocked[c].pop_front() {
+                g.run.push_back(w);
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    /// §11.5 (RECV) and (RECV-BLOCK).
+    ///
+    /// **The loop is the specification, not an optimisation.** (RECV-BLOCK)
+    /// puts the task into `B` with its `recv` still in front of it, so being
+    /// woken means re-executing the receive rather than being handed a value.
+    /// That is what makes an intervening `recv` by a third task — which may
+    /// take the very value this one was woken for — behave here exactly as the
+    /// rules say, instead of by whatever the implementation found convenient.
+    fn recv(&self, id: TaskId, c: usize) -> R<Val> {
+        loop {
+            {
+                let mut g = self.lock();
+                if let Some(v) = g.chans[c].pop_front() {
+                    return Ok(v);
+                }
+                debug_assert_eq!(g.run.front(), Some(&id), "§11.3: only the head runs");
+                g.run.pop_front();
+                g.blocked[c].push_back(id);
+                self.check_end(&mut g);
+            }
+            self.cv.notify_all();
+            self.await_turn(id)?;
+        }
+    }
+
+    /// §11.5 (DONE).
+    fn finish(&self, id: TaskId) {
+        {
+            let mut g = self.lock();
+            if let Some(at) = g.run.iter().position(|t| *t == id) {
+                g.run.remove(at);
+            }
+            self.check_end(&mut g);
+        }
+        self.cv.notify_all();
+    }
+
+    /// §11.6, the two end conditions, read off the configuration itself.
+    ///
+    /// Called wherever a task leaves the run queue, which is the only way `R`
+    /// can become empty. If anything is still waiting on a channel, no
+    /// runnable task can ever fill it — that is not an inference about the
+    /// future but a fact about the present configuration, and it is the
+    /// property a pthread runtime cannot compute.
+    fn check_end(&self, g: &mut Shared) {
+        if !g.run.is_empty() || g.stopping {
+            return;
+        }
+        if g.blocked.iter().any(|q| !q.is_empty()) {
+            g.trap = Some(
+                "deadlock — every task is blocked on a channel that no runnable \
+                 task can fill"
+                    .into(),
+            );
+        }
+        g.stopping = true;
+    }
+
+    /// §8 through §11: the first trap ends the whole program.
+    fn record_trap(&self, why: String) {
+        {
+            let mut g = self.lock();
+            if g.trap.is_none() {
+                g.trap = Some(why);
+            }
+            g.stopping = true;
+        }
+        self.cv.notify_all();
+    }
+}
+
+/// What a task runs. `main` is a call and therefore has a return value to
+/// discard; a spawned block is a statement sequence over a store copied from
+/// its spawner (§11.2).
+enum Work<'a> {
+    Main(&'a Fn),
+    Spawned(&'a [Stmt], Vec<HashMap<String, (Val, bool)>>),
+}
+
+/// One task, start to finish, on its own thread.
+///
+/// The recursive evaluator's own call stack **is** the task's continuation —
+/// which is why there is a thread here rather than a state machine. A `yield`
+/// can occur inside a loop inside a called function, so resuming means
+/// resuming a Rust call stack, and an OS thread is the cheapest way to have
+/// several of those. Determinism is not weakened by it and does not depend on
+/// the scheduler being fair: §11.3's run queue admits exactly one runnable
+/// task, so the threads never race, and every switch is at one of §11.4's
+/// three points.
+fn run_task<'a, 'sc>(
+    sched: &'sc Sched,
+    fns: &'sc HashMap<String, &'a Fn>,
+    lang: Lang,
+    scope: &'sc std::thread::Scope<'sc, 'a>,
+    id: TaskId,
+    work: Work<'a>,
+) where
+    'a: 'sc,
+{
+    let mut it = Interp { fns, sched, scope, id, lang };
+    if it.sched.await_turn(id).is_err() {
+        return; // cancelled before it ever ran
+    }
+    let is_main = matches!(work, Work::Main(_));
+    let outcome = match work {
+        Work::Main(f) => it.call_body(f, Vec::new()).map(|_| ()),
+        // §11: a spawned block is the task's top level, so `return` there ends
+        // the TASK. There is no enclosing call for it to return from — the
+        // function that wrote the `spawn` may have returned long ago.
+        Work::Spawned(body, mut env) => it.stmts(body, &mut env).map(|_| ()),
+    };
+    match outcome {
+        Ok(()) => sched.finish(id),
+        Err(Abort::Cancelled) => {}
+        Err(Abort::Trap(Trap(why))) => sched.record_trap(why),
+        // §6.9's `?` has no enclosing call at a task's top level. Reported
+        // rather than swallowed, for the reason §6.9 gives for `?` existing at
+        // all: a non-`Ok` that vanishes is the failure mode being avoided.
+        Err(Abort::Propagate(_)) => sched.record_trap(
+            if is_main { "`?` propagated out of main" }
+            else { "`?` propagated out of a spawned task" }
+                .to_string(),
+        ),
+    }
+}
+
+pub struct Interp<'a, 'sc> {
+    fns: &'sc HashMap<String, &'a Fn>,
+    /// §11.3. The trace, the budget, the run queue, the blocked map and the
+    /// channel store all live here, because all five are shared between tasks.
+    /// A program that never spawns still runs through it, as the one task
+    /// §11.3 says a program starts as — one code path and not two.
+    sched: &'sc Sched,
+    /// §11.5 (SPAWN) needs to create a task, and a task is a thread.
+    scope: &'sc std::thread::Scope<'sc, 'a>,
+    /// Which task this evaluator is. Read only by the scheduler operations.
+    id: TaskId,
     /// R2: the language version being evaluated. Read in exactly one place —
     /// the `/` and `%` rule of §6.1.
     lang: Lang,
@@ -159,16 +462,19 @@ pub fn run_with(program: &[Fn], lang: Lang) -> Result<Observation, String> {
     if !fns.contains_key("main") {
         return Err("no `main`".into());
     }
-    let mut it = Interp { fns, out: String::new(), budget: 200_000_000, lang };
-    let main = it.fns["main"];
-    match it.call_body(main, Vec::new()) {
-        Ok(_) => Ok(Observation { out: it.out, trap: None }),
-        Err(Abort::Trap(Trap(why))) => Ok(Observation { out: it.out, trap: Some(why) }),
-        Err(Abort::Propagate(_)) => Ok(Observation {
-            out: it.out,
-            trap: Some("`?` propagated out of main".into()),
-        }),
-    }
+    let sched = Sched::new(200_000_000);
+    let main = fns["main"];
+
+    // §11.3: a program starts as `⟨ ⟨main's body, ∅⟩ , ∅ , ∅ , ε ⟩` — one
+    // task. A program with no `spawn` in it never leaves that state, so the
+    // sequential language runs down this path too and there is no second
+    // implementation of it to disagree with.
+    std::thread::scope(|scope| {
+        run_task(&sched, &fns, lang, scope, 0, Work::Main(main));
+    });
+
+    let g = sched.lock();
+    Ok(Observation { out: g.out.clone(), trap: g.trap.clone() })
 }
 
 // ---------------------------------------------------------------------------
@@ -226,13 +532,17 @@ fn t_any(a: i8, b: i8) -> i8 {
 }
 fn t_cmp(a: i8, b: i8) -> i8 { if a > b { 1 } else if a < b { -1 } else { 0 } }
 
-impl<'a> Interp<'a> {
+impl<'a, 'sc> Interp<'a, 'sc>
+where
+    'a: 'sc,
+{
     fn tick(&mut self) -> R<()> {
-        if self.budget == 0 {
-            return trap("step budget exhausted (non-terminating?)");
-        }
-        self.budget -= 1;
-        Ok(())
+        self.sched.tick()
+    }
+
+    /// §11.3 ω. One trace for the whole program.
+    fn emit(&self, text: &str) {
+        self.sched.emit(text);
     }
 
     // ---- §8 range check ---------------------------------------------------
@@ -265,6 +575,8 @@ impl<'a> Interp<'a> {
                 "`{}` applied to an int: a three-valued operator takes trit or bool3 (semantics.md §6.4)", op)),
             Val::Text(_) => return trap(format!(
                 "`{}` applied to a str", op)),
+            Val::Chan(_) => return trap(format!(
+                "`{}` applied to a channel", op)),
         })
     }
 
@@ -370,6 +682,28 @@ impl<'a> Interp<'a> {
                         return Ok(Flow::Return(v));
                     }
                 }
+                // §11.5 (SPAWN). The new task is appended at the back and
+                // this one CONTINUES — §11.4 records not yielding here as a
+                // choice, and it is what lets a task's own code read
+                // sequentially.
+                //
+                // §11.2: the task gets a COPY of this store, so the two share
+                // nothing but channels — whose value is an index
+                // (`Val::Chan`), so it survives the copy still naming the same
+                // channel.
+                Stmt::Spawn(body) => {
+                    let id = self.sched.enqueue_new_task();
+                    let copy = env.clone();
+                    let (sched, fns, lang, scope) =
+                        (self.sched, self.fns, self.lang, self.scope);
+                    self.scope.spawn(move || {
+                        run_task(sched, fns, lang, scope, id, Work::Spawned(body, copy));
+                    });
+                }
+
+                // §11.5 (YIELD).
+                Stmt::Yield => self.sched.yield_now(self.id)?,
+
                 Stmt::While { cond, body } => loop {
                     self.tick()?;
                     let c = self.expr(cond, env)?;
@@ -442,6 +776,13 @@ impl<'a> Interp<'a> {
             // the two are never merged here.
             Expr::Method(recv, name, args) => {
                 let r = self.expr(recv, env)?;
+                // §11.5 (SEND), (SEND-WAKE), (RECV), (RECV-BLOCK). Dispatched
+                // on the RECEIVER's value form and not on the method NAME, so
+                // a `Result` carrying a method spelled `send` is still a
+                // `Result`: the core has no overloading and this keeps it so.
+                if let Val::Chan(c) = r {
+                    return self.chan_method(c, name, args, env);
+                }
                 self.result_method(r, name, args, env)
             }
 
@@ -609,6 +950,36 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// §11.5. The two channel operations.
+    fn chan_method(
+        &mut self,
+        c: usize,
+        name: &str,
+        args: &'a [Expr],
+        env: &mut Vec<HashMap<String, (Val, bool)>>,
+    ) -> R<Val> {
+        match name {
+            "send" => {
+                let v = match args {
+                    [a] => self.expr(a, env)?,
+                    _ => return trap("`send` takes exactly one argument"),
+                };
+                // §6.7: the channel carries `int`, so the value is cast on the
+                // way IN. Casting on the way out would make what a receiver
+                // sees depend on the binding it happens to be stored in.
+                self.sched.send(c, cast(v, Ty::Int));
+                Ok(Val::Int(0))
+            }
+            "recv" => {
+                if !args.is_empty() {
+                    return trap("`recv` takes no arguments");
+                }
+                self.sched.recv(self.id, c)
+            }
+            other => trap(format!("`{}` is not a channel operation", other)),
+        }
+    }
+
     fn call(
         &mut self,
         name: &str,
@@ -637,30 +1008,40 @@ impl<'a> Interp<'a> {
             _ => {}
         }
 
+        // §11.1. A channel constructor. `channel()` rather than a literal
+        // because the core has no type arguments to write: §11's channel
+        // carries `int`, which is all that specifying INTERLEAVING needs.
+        if name == "channel" {
+            if !args.is_empty() {
+                return trap("`channel()` takes no arguments");
+            }
+            return Ok(Val::Chan(self.sched.new_channel()));
+        }
+
         // §1. The core's only library surface: the four printers.
         match name {
             "io::print" | "io::println" => {
                 for a in args {
                     if let Expr::Str(s) = a {
-                        self.out.push_str(s);
+                        self.emit(s);
                     } else {
                         match self.expr(a, env)? {
-                            Val::Text(t) => self.out.push_str(&t),
-                            v => self.out.push_str(&v.as_print_int().to_string()),
+                            Val::Text(t) => self.emit(&t),
+                            v => self.emit(&v.as_print_int().to_string()),
                         }
                     }
                 }
-                if name == "io::println" { self.out.push('\n'); }
+                if name == "io::println" { self.emit("\n"); }
                 return Ok(Val::Int(0));
             }
             "io::print_int" | "io::println_int" => {
                 for a in args {
                     match self.expr(a, env)? {
-                        Val::Text(t) => self.out.push_str(&t),
-                        v => self.out.push_str(&v.as_print_int().to_string()),
+                        Val::Text(t) => self.emit(&t),
+                        v => self.emit(&v.as_print_int().to_string()),
                     }
                 }
-                if name == "io::println_int" { self.out.push('\n'); }
+                if name == "io::println_int" { self.emit("\n"); }
                 return Ok(Val::Int(0));
             }
             _ => {}
@@ -685,7 +1066,10 @@ impl<'a> Interp<'a> {
     }
 }
 
-impl<'a> Interp<'a> {
+impl<'a, 'sc> Interp<'a, 'sc>
+where
+    'a: 'sc,
+{
     /// §6.8. The six `Result` accessors the reference documents.
     ///
     /// `tag()` is the primitive one — it hands back the trit, which is what
@@ -765,7 +1149,10 @@ fn cast(v: Val, to: Ty) -> Val {
         Ty::Void => Val::Int(0),
         // A `Result` and a `str` are not scalars and the core defines no cast
         // to either: a declared type of that shape leaves the value alone.
-        Ty::Str | Ty::Result(_) => v,
+        // §11.3: a channel is a name, not a number. There is no cast to or
+        // from one, so a declared `chan` leaves the value alone — the same
+        // rule `str` and `Result` get, and for the same reason.
+        Ty::Str | Ty::Result(_) | Ty::Chan => v,
     }
 }
 
@@ -784,6 +1171,6 @@ fn reshape(v: Val, like: Val) -> Val {
         Val::Bool(_) => cast(v, Ty::Bool),
         // Assigning into a Result- or str-shaped binding replaces it wholesale;
         // there is no narrowing to do.
-        Val::Res(_) | Val::Text(_) => v,
+        Val::Res(_) | Val::Text(_) | Val::Chan(_) => v,
     }
 }

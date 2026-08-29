@@ -10,6 +10,10 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ty {
     Int, Trit, Bool3, Bool, Void, Str,
+    /// §11. A channel. The core has one element type — `int` — because §11
+    /// exists to specify INTERLEAVING, and a second element type would add
+    /// nothing to it while adding generics to a core that has none.
+    Chan,
     /// `Result<T, str>`. The core fixes the error type to `str`, which is what
     /// the language reference itself recommends: "ManiT writes `Result<T, str>`
     /// and uses `Unknown(msg)` for the absent case".
@@ -71,6 +75,12 @@ pub enum Stmt {
     While { cond: Expr, body: Vec<Stmt> },
     Return(Option<Expr>),
     Expr(Expr),
+    /// §11.5 (SPAWN). A STATEMENT, not an expression: `spawn` produces no
+    /// value in this core, and making it an expression would be the first half
+    /// of the `Task<T>` decision §11.1 declines to take.
+    Spawn(Vec<Stmt>),
+    /// §11.5 (YIELD).
+    Yield,
 }
 
 #[derive(Debug, Clone)]

@@ -54,9 +54,15 @@ complete run found two more, and the second is the one that matters:
 
 - `Result<T, str>`, its three constructors and six accessors, `?`, and `match`
 
+- `spawn`, `yield`, and a channel with `send`/`recv` — **§11, and §11 alone**.
+  That section specifies a target and is ahead of every implementation,
+  including the reference; §1.2 says what that means for the suite.
+
 **Out of scope, deliberately:** floats, strings beyond literal output and
 `Result` messages, arrays, structs, enums, traits, generics, closures, modules,
-concurrency, the heap.
+the heap. Concurrency was on this list until §11 was written; `Task<T>`,
+`await`, `Mutex`, `Barrier`, `Semaphore` and bounded channels remain on it, and
+§11.1 says why each.
 
 **Out of scope but wanted next: tail expressions.** `fn f() -> int { if c { 1 }
 else { 2 } }` — a block whose last expression is its value, and `if` used as an
@@ -90,6 +96,24 @@ default moves, it will move as its own change.
 `--warn division-semantics` lists every `/` and `%` whose meaning depends on
 the version. That list is the migration backlog, generated from the program
 rather than maintained by hand.
+
+### 1.2 Sections that are ahead of the implementations
+
+Every section of this document except §11 describes behaviour that all three
+implementations have. **§11 describes behaviour none of them has yet**, and it
+is marked so in its own first line.
+
+The distinction has to be carried into the suite rather than left to a reader,
+because a conformance row is a claim about agreement and these rows are claims
+about a *gap*. A row that runs a §11 program against a backend is asserting
+that the backend does not implement §11 yet — which is a true and useful thing
+to pin, since it is what will change when it does — and it must say so in its
+name and its message. A row that merely fails, or is quietly skipped, turns the
+specification's lead over the implementation into either a false alarm or
+nothing at all.
+
+This is the same rule §9 states for agreement, applied to disagreement:
+**record it, give it an owner, and never let it be silent.**
 
 ## 2. Syntax of the core
 
@@ -156,6 +180,10 @@ observable behaviour. Nothing else — not timing, not instruction counts, not
 register allocation — is observable.
 
 Evaluation is deterministic. Every rule below has a disjoint left-hand side.
+
+This is the configuration of a program with one thread of control, which is
+every program §1 admits except those using §11. §11.3 extends it to a task
+pool and §11.7 shows the determinism survives.
 
 ## 5. Evaluation order
 
@@ -520,7 +548,237 @@ This is a pre-existing property of `trint` on T3, not something N5 introduces;
 v2 closes §10.1, it is the **only** remaining place where the two backends
 disagree about integer width. Recorded as report.txt P9.
 
-## 11. Changes
+## 11. Interleaving
+
+**Status: this section specifies a TARGET, and is ahead of all three
+implementations.** Everything above describes what ManiT does; this describes
+what it will do when
+`enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md` is implemented.
+Until then `docs/memory-model.md` §4 is the normative account of the language
+as it runs — execution is sequential and `spawn { B }` evaluates `B` in place
+— and report.txt P5.2/P5.3 are open against *that*, not against this.
+
+Saying so is the point of writing it here rather than later. The decision was
+taken on 24 August 2026 and its own §5 puts specification first, "because A3's
+whole point is that the third implementation comes from the written rules, and
+concurrency is where an unwritten rule does the most damage".
+
+### 11.1 What is in this core
+
+`spawn { … }`, `yield`, and a channel with `send` and `recv`. That is all,
+and the smallness is deliberate: §1's rule is to specify the core and grow it.
+
+**Deliberately not specified yet**, each because it needs a decision this
+document should not take casually:
+
+- **`Task<T>` and `await`** — report.txt P5.2 and P5.3. `spawn` here produces
+  no value, which is what `docs/memory-model.md` §4 already says it does. Giving
+  it a handle means deciding what awaiting a task that has already finished
+  does, what awaiting one twice does, and whether a handle can outlive its
+  task. The next increment, and the reason `spawn` is a STATEMENT below.
+- **`Mutex`, `Barrier`, `Semaphore`** — the decision document §2 keeps them as
+  *structured waiting* rather than mutual exclusion. They are expressible in
+  terms of §11.4's yield points, and they need none of their own.
+- **Bounded channels**, so `send` never blocks (§11.4).
+- **Closing a channel**, which is how a receiver learns no more will come.
+  Without it the only way a `recv` ends is a value or the deadlock of §11.6.
+- **Three-valued synchronisation** — `held / free / unknown`, the genuinely
+  novel question. It depends on D2 (clock-domain types) and is research.
+
+### 11.2 Tasks do not share a store
+
+A spawned task gets a **copy** of the spawning task's store at the moment of
+the spawn, and its writes are its own. Channels are the only way one task can
+affect another.
+
+This is not a simplification made for the reference's convenience; it is the
+strongest form of the decision document's claim. Cooperative scheduling makes
+data races *unreachable rather than undefined* by confining interleaving to
+yield points — and with no shared mutable state at all, there is nothing to
+race over even at one. It is also the shape §6 of that document endorses for
+anything wanting true parallelism later: "processes over channels, not inside
+the memory model".
+
+The core has no heap (§1), so this costs nothing here. A version of this
+section that admits references will have to say what a spawn captures, and
+that is where the yield-point rule starts doing real work.
+
+### 11.3 Configurations
+
+§4's `⟨ s , σ , ω ⟩` becomes `⟨ R , B , 𝒞 , ω ⟩`:
+
+- `R` — the **run queue**, a finite sequence of tasks. A task is a pair
+  `⟨s, σ⟩` of a statement sequence and its own store. The **head of `R` is the
+  running task**; there is never more than one.
+- `B` — the **blocked map**, from channel to the finite sequence of tasks
+  waiting to receive on it, longest-waiting first.
+- `𝒞` — the **channel store**, from channel to the finite sequence of values
+  sent and not yet received.
+- `ω` — the output trace, exactly as in §4. It is one trace for the whole
+  program, not one per task: output is a program-level observable.
+
+A program starts as `⟨ ⟨main's body, ∅⟩ , ∅ , ∅ , ε ⟩`. Observable behaviour
+is still the pair `(ω, outcome)` of §4, and nothing else — in particular **not
+which task produced which part of `ω`**, and not how many steps a task ran
+before yielding.
+
+### 11.4 Yield points — the complete list
+
+A running task keeps running until it reaches one of exactly three things:
+
+1. **`yield`** — explicit.
+2. **`recv` on a channel whose queue is empty.**
+3. **its own termination.**
+
+**That is the whole list, and its completeness is the specification.** A
+conforming implementation may not switch tasks anywhere else — not at a call,
+not at a return, not on a loop back-edge, not at a print, and not on a timer.
+
+Two consequences worth stating separately, because both are choices:
+
+- **`spawn` does not yield.** The spawning task continues; the new task is
+  appended at the back. So a task's own code reads sequentially, which is what
+  makes `spawn` usable without reasoning about the scheduler.
+- **`send` does not yield**, because §11.1 leaves channels unbounded, so a send
+  can always proceed. If bounded channels are ever added, a full `send` becomes
+  a fourth yield point, and this list is what has to change.
+
+### 11.5 The rules
+
+Rule (LOCAL) is what makes every rule in §5–§8 apply unchanged to the running
+task: an ordinary step of the head task is a step of the configuration.
+
+```
+                    ⟨s, σ, ω⟩ → ⟨s', σ', ω'⟩
+        ─────────────────────────────────────────────────────      (LOCAL)
+        ⟨ ⟨s,σ⟩·R , B, 𝒞, ω ⟩ → ⟨ ⟨s',σ'⟩·R , B, 𝒞, ω' ⟩
+
+
+   ⟨ ⟨spawn{b}; s, σ⟩·R , B, 𝒞, ω ⟩ → ⟨ ⟨s,σ⟩·R·⟨b,σ⟩ , B, 𝒞, ω ⟩  (SPAWN)
+
+        ⟨ ⟨yield; s, σ⟩·R , B, 𝒞, ω ⟩ → ⟨ R·⟨s,σ⟩ , B, 𝒞, ω ⟩      (YIELD)
+```
+
+`send` appends, and wakes at most one waiter — the longest-waiting, appended
+to the back of the run queue:
+
+```
+                        B(c) = ε
+        ─────────────────────────────────────────────────────      (SEND)
+        ⟨ ⟨c.send(v); s, σ⟩·R , B, 𝒞, ω ⟩
+                    → ⟨ ⟨s,σ⟩·R , B, 𝒞[c ↦ 𝒞(c)·v], ω ⟩
+
+                     B(c) = ⟨t⟩·W
+        ─────────────────────────────────────────────────────      (SEND-WAKE)
+        ⟨ ⟨c.send(v); s, σ⟩·R , B, 𝒞, ω ⟩
+                    → ⟨ ⟨s,σ⟩·R·t , B[c ↦ W], 𝒞[c ↦ 𝒞(c)·v], ω ⟩
+```
+
+`recv` takes the head of the queue, or blocks:
+
+```
+                      𝒞(c) = v·Q
+        ─────────────────────────────────────────────────────      (RECV)
+        ⟨ ⟨let x = c.recv(); s, σ⟩·R , B, 𝒞, ω ⟩
+                    → ⟨ ⟨s, σ[x ↦ v]⟩·R , B, 𝒞[c ↦ Q], ω ⟩
+
+                        𝒞(c) = ε
+        ─────────────────────────────────────────────────────      (RECV-BLOCK)
+        ⟨ ⟨t, σ⟩·R , B, 𝒞, ω ⟩ → ⟨ R , B[c ↦ B(c)·⟨t,σ⟩], 𝒞, ω ⟩
+                    where t is `let x = c.recv(); s`
+```
+
+A task whose statement sequence is exhausted is removed:
+
+```
+            ⟨ ⟨ε,σ⟩·R , B, 𝒞, ω ⟩ → ⟨ R , B, 𝒞, ω ⟩               (DONE)
+```
+
+### 11.6 Termination, and deadlock as a trap
+
+```
+    R = ε   and   B = ∅          the program ends, outcome = Normal
+    R = ε   and   B ≠ ∅          TRAP (§8), outcome = Trap
+```
+
+The second is the decision document's §3, and it is the strongest single
+argument for cooperative scheduling: **the scheduler knows the whole runnable
+set, so it can detect a deadlock a pthread runtime can only suffer.** The
+message names the situation rather than the symptom:
+
+```
+TRAP: deadlock — every task is blocked on a channel that no runnable task can fill
+```
+
+The trace produced up to that point is retained and observable, exactly as §8
+requires. That is what P5.1 could not do: on LLVM the same program blocked in
+`pthread_cond_wait` with stdout unflushed and printed **nothing at all**, so
+the trace was lost along with the answer.
+
+**`main` returning does not end the program.** `main` is a task like any other
+and simply terminates; the remaining tasks run. This is the compatible choice
+rather than the obvious one, and the reason is P5.4: because `spawn { B }`
+runs `B` inline today, every spawned block in every existing program has
+already completed by the time `main` returns. Ending the program at `main`
+would silently discard work those programs currently do.
+
+### 11.7 Determinism
+
+**Proposition.** `→` is a partial function: for every configuration at most
+one rule applies. Therefore a core program has exactly one observable
+behaviour, and §4's determinism survives concurrency intact.
+
+*Argument.* Every rule's left-hand side is keyed on the **head** of `R`, which
+is unique, and on the head task's next statement, and the statement forms
+`spawn`/`yield`/`send`/`recv`/other are disjoint. (RECV) and (RECV-BLOCK) are
+separated by whether `𝒞(c)` is empty, and (SEND) and (SEND-WAKE) by whether
+`B(c)` is. The two termination cases of §11.6 apply only when `R` is empty,
+where no other rule does.
+
+This is why the scheduler is specified as a queue with stated insertion points
+rather than left to the implementation. **An implementation is free to be slow
+here and not free to be clever**: reordering the run queue, running a task
+"until it blocks" past a `yield`, or waking all waiters instead of one all
+produce configurations these rules do not.
+
+**But a wrong configuration is not the same as a wrong observation, and one of
+these three is much harder to catch than it looks.** Waking *all* waiters
+instead of one survives every obvious test, because a spuriously woken receiver
+re-executes its `recv`, finds nothing, and blocks again **while printing
+nothing** — so the extra wake leaves no trace. It is observable only where it
+changes the ORDER of `B`, which needs a program that wakes a receiver, takes
+the value out from under it, and lets it go back to the end of the queue before
+the next send chooses between it and another. `tests/interleaving_tests.rs`
+carries that program, and the row above it — the obvious one, counting how many
+waiters woke — does not fail against a wake-all at all.
+
+Recorded here rather than only in the test because it generalises past this
+rule: **a specification clause that selects one of several waiting things is
+testable only once the choice changes what is PRINTED**, and something that
+goes straight back to waiting prints nothing.
+
+### 11.8 What implementing this will cost
+
+Recorded here because the specification cannot be read as cost-free, and
+because the cost falls on step 2 rather than on this section.
+
+**It moves the output of existing programs.** `spawn { B }` runs `B` before
+the statement after it today; under (SPAWN) it runs later. Every program that
+spawns and prints has its trace reordered — `examples/concurrency.mt`
+included, which P5.4 records as passing on both backends and being
+byte-identical between them *because* every producer runs to completion before
+the consumer starts.
+
+**This section cannot move anything.** Concurrency was outside §1's core until
+now, so no conformance program uses it and none could. The reference
+interpreter can therefore implement §11 in full while both backends remain
+sequential, and the resulting disagreement is the specification being ahead of
+the implementations rather than a regression — provided the conformance suite
+says so explicitly. See §9: a row that compares the reference against a backend
+on a concurrency program is asserting the gap, and must be labelled as
+asserting it.
+
+## 12. Changes
 
 - **0.1** (24 Aug 2026) — first version. Core as listed in §1. Written as A3,
   Phase 3. Found report.txt P2 while being written, and P3 and P4 on the
@@ -540,3 +798,13 @@ disagree about integer width. Recorded as report.txt P9.
   return-value ABI mismatch in the C runtime that C4's longer instruction
   sequence turned into a wrong answer, and **P8**, spans in merged stdlib
   source being attributed to the user's file.
+- **0.4** (29 Aug 2026) — §11, interleaving. The first section of this document
+  that is **ahead of every implementation**, written as step 1 of
+  `CONCURRENCY_DECISION.md` §5 ("specify first"), and §1.2 says what that
+  obliges the conformance suite to do about it. Three yield points and no
+  others; tasks that share no store, so a data race is unreachable rather than
+  undefined; a deterministic run queue; and deadlock as a **detected trap**
+  rather than a hang, which is the property a pthread runtime cannot offer and
+  the one P5.1 measured the absence of. Found report.txt **P83** while being
+  written: the decision this section implements had been taken five days
+  earlier and `report.txt` still told the reader to go and take it.

@@ -62,6 +62,27 @@ pub struct IRLowerer {
     // `DivNear`/`RemNear` over `Div`/`Rem`, and copied onto the IRModule so
     // the backends see the same answer the lowerer did.
     lang: LangVersion,
+    /// §11 / `CONCURRENCY_DECISION.md` §5 step 2: how `spawn { B }` is
+    /// lowered. Default `Inline`, which is `docs/memory-model.md` §4 and what
+    /// every ManiT program has always done.
+    sched: SchedMode,
+}
+
+/// What `spawn { B }` means at lowering time.
+///
+/// Behind a mode rather than switched outright, for R2's reason and not for
+/// timidity: the LLVM backend has no scheduler until step 3 of
+/// `CONCURRENCY_DECISION.md` §5, so making cooperative lowering the default
+/// now would break cross-backend parity on every spawning program for as long
+/// as step 3 takes — and "moving the default in the same release that
+/// introduces the behaviour would be making it casually".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchedMode {
+    /// `spawn { B }` evaluates `B` in place. `docs/memory-model.md` §4.
+    #[default]
+    Inline,
+    /// §11: `spawn { B }` creates a task. T3 only, for now.
+    Cooperative,
 }
 
 impl IRLowerer {
@@ -311,6 +332,7 @@ impl IRLowerer {
             static_structs: Vec::new(),
             current_fn_ret: ManiType::Void,
             lang: LangVersion::default(),
+            sched: SchedMode::default(),
         }
     }
 
@@ -540,8 +562,22 @@ impl IRLowerer {
 
     /// Lower a checked program under an explicit language version (R2).
     pub fn lower_with(typed_program: &TypedProgram, lang: LangVersion) -> IRModule {
+        Self::lower_with_sched(typed_program, lang, SchedMode::default())
+    }
+
+    /// As [`lower_with`], choosing how `spawn` is lowered (§11).
+    ///
+    /// A third entry point rather than a changed signature, for the reason the
+    /// second one gives: the existing callers already say what they mean, and
+    /// making them all name a default is how a default stops being read.
+    pub fn lower_with_sched(
+        typed_program: &TypedProgram,
+        lang: LangVersion,
+        sched: SchedMode,
+    ) -> IRModule {
         let mut lowerer = IRLowerer::new();
         lowerer.lang = lang;
+        lowerer.sched = sched;
         let mut functions = Vec::new();
         let mut globals = Vec::new();
 

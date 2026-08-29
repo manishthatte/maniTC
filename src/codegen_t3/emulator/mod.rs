@@ -18,6 +18,8 @@ mod syscall_io;
 mod syscall_fs;
 mod syscall_proc;
 mod ordered;
+/// §11 — cooperative scheduling (CONCURRENCY_DECISION.md §5 step 2).
+mod sched;
 use ordered::{OrderedMap, OrderedSet};
 
 #[cfg(test)]
@@ -140,6 +142,10 @@ pub struct Emulator {
     next_net_fd: usize,
     /// Call depth counter for stack overflow detection.
     call_depth: usize,
+    /// §11.3's configuration — the run queue, the blocked map and every
+    /// suspended task. Inert until something spawns, so a program that never
+    /// does is untouched down to the word.
+    pub(crate) sched: sched::Sched,
     /// Cooperative scheduler tasks.
     #[allow(dead_code)]
     tasks: Vec<Task>,
@@ -201,6 +207,7 @@ impl Emulator {
             tcp_listeners: HashMap::new(),
             next_net_fd: 100,
             call_depth: 0,
+            sched: sched::Sched::default(),
             tasks: Vec::new(),
             current_task: 0,
             profile: ExecProfile::new(),
