@@ -86,8 +86,17 @@ pub struct Emulator {
     /// normal HALT/RET. A5: the process exit status is taken from R1, so
     /// without this a trapped program could still report success.
     pub trapped: bool,
-    pub output: Vec<String>,
-    pub string_data: HashMap<usize, String>,
+    /// P82: BYTES, not `String`.
+    ///
+    /// maniT strings are byte strings (P72), and a Rust `String` cannot hold a
+    /// byte sequence that is not valid UTF-8. So `str::from_char(0xC3)` could
+    /// not produce the single byte `0xC3` — it produced the two-byte UTF-8
+    /// encoding of U+00C3 — and `str::to_upper("aéb")` came out
+    /// `A \303\203 \302\251 B` on T3 against LLVM's `A \303 \251 B`. The
+    /// value path was byte-exact after P72; the REPRESENTATION was not, which
+    /// is what P50 deferred to "P48's design question".
+    pub output: Vec<Vec<u8>>,
+    pub string_data: HashMap<usize, Vec<u8>>,
     pub float_data: HashMap<usize, i64>,
     pub input_queue: std::collections::VecDeque<i64>,
     call_stack: Vec<usize>,
@@ -378,13 +387,97 @@ impl Emulator {
         addr
     }
 
-    /// Get a string from R1 — try string_data first, then lp-string in memory.
+    /// Get a string from R1 as TEXT — lossy, for the callers that genuinely
+    /// want text (file paths, environment values, numeric parsing).
+    ///
+    /// P82: prefer [`Self::bytes_r1`] anywhere the exact bytes matter. This one
+    /// replaces anything invalid with U+FFFD, which is the behaviour that used
+    /// to be unavoidable and is now a choice made per call site.
     fn get_string_r1(&self) -> String {
-        let addr = self.regs[1] as usize;
-        if let Some(s) = self.string_data.get(&addr) {
-            return s.clone();
+        String::from_utf8_lossy(&self.bytes_r1()).into_owned()
+    }
+
+    /// P82: find `needle` in `hay`, as BYTES.
+    ///
+    /// maniT's `str` is a byte string, so `find`, `contains`, `split` and
+    /// `replace` are byte operations. Doing them on a lossily-decoded `String`
+    /// would make them agree with LLVM only while every byte is ASCII — which
+    /// is precisely the condition P48 recorded as a property of the CORPUS
+    /// rather than of the language.
+    pub(crate) fn bytes_find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
         }
-        self.read_lp_string(addr)
+        if needle.len() > hay.len() {
+            return None;
+        }
+        (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+    }
+
+    /// P82: split `hay` on every non-overlapping occurrence of `sep`, as bytes.
+    pub(crate) fn bytes_split(hay: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+        if sep.is_empty() {
+            return vec![hay.to_vec()];
+        }
+        let mut out = Vec::new();
+        let mut rest = hay;
+        while let Some(i) = Self::bytes_find(rest, sep) {
+            out.push(rest[..i].to_vec());
+            rest = &rest[i + sep.len()..];
+        }
+        out.push(rest.to_vec());
+        out
+    }
+
+    /// P82: replace every non-overlapping `find` with `repl`, as bytes.
+    pub(crate) fn bytes_replace(hay: &[u8], find: &[u8], repl: &[u8]) -> Vec<u8> {
+        if find.is_empty() {
+            return hay.to_vec();
+        }
+        let mut out = Vec::new();
+        let mut rest = hay;
+        while let Some(i) = Self::bytes_find(rest, find) {
+            out.extend_from_slice(&rest[..i]);
+            out.extend_from_slice(repl);
+            rest = &rest[i + find.len()..];
+        }
+        out.extend_from_slice(rest);
+        out
+    }
+
+    /// P82: the program's output rendered as TEXT, for callers that compare it
+    /// as text — tests, and anything reporting rather than reproducing it.
+    ///
+    /// Lossy on purpose and named so. The bytes are the record; this is a view.
+    pub fn output_text(&self) -> Vec<String> {
+        self.output
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect()
+    }
+
+    /// P82: append to the program's output.
+    ///
+    /// Takes anything that converts to bytes, so a `String` built by the
+    /// emulator (a formatted integer, a fixed message) and a `Vec<u8>` read out
+    /// of `string_data` both go through one place. `String::into_bytes` is
+    /// exact, so a literal loses nothing on the way.
+    pub(crate) fn push_out(&mut self, s: impl Into<Vec<u8>>) {
+        self.output.push(s.into());
+    }
+
+    /// P82: the exact BYTES behind the `str` in R1.
+    pub(crate) fn bytes_r1(&self) -> Vec<u8> {
+        self.bytes_at(self.regs[1])
+    }
+
+    /// P82: the exact BYTES behind an arbitrary `str` value.
+    pub(crate) fn bytes_at(&self, addr: i64) -> Vec<u8> {
+        let addr = addr as usize;
+        if let Some(b) = self.string_data.get(&addr) {
+            return b.clone();
+        }
+        self.read_lp_string(addr).into_bytes()
     }
 
     /// The text behind an arbitrary `str` value, wherever it came from.
@@ -393,9 +486,14 @@ impl Emulator {
     /// that has to compare its elements as TEXT — rather than by identity —
     /// has to come back through here for each one.
     pub(crate) fn str_at(&self, addr: i64) -> String {
+        String::from_utf8_lossy(&self.bytes_at(addr)).into_owned()
+    }
+
+    #[allow(dead_code)]
+    fn str_at_unused(&self, addr: i64) -> String {
         let addr = addr as usize;
         if let Some(s) = self.string_data.get(&addr) {
-            return s.clone();
+            return String::from_utf8_lossy(s).into_owned();
         }
         self.read_lp_string(addr)
     }
@@ -436,12 +534,12 @@ impl Emulator {
     /// on the host side, and this reserves only the address that identifies it.
     /// The charge is still a charge — the address space is finite — so it is
     /// bounded like every other allocation.
-    fn heap_alloc_str(&mut self, s: String) -> usize {
+    fn heap_alloc_str(&mut self, s: impl Into<Vec<u8>>) -> usize {
         let addr = match self.heap_reserve(1) {
             Some(a) => a,
             None => return 0,
         };
-        self.string_data.insert(addr, s);
+        self.string_data.insert(addr, s.into());
         addr
     }
 
@@ -451,7 +549,9 @@ impl Emulator {
     /// pass through unchanged.
     pub(crate) fn intern_key(&mut self, k: i64) -> i64 {
         if let Some(s) = self.string_data.get(&(k as usize)) {
-            let s = s.clone();
+            // P82: intern on the exact BYTES. Two strings are the same key when
+            // their bytes are, which is also what `str_eq` now decides.
+            let s = String::from_utf8_lossy(s).into_owned();
             return *self.string_intern.entry(s).or_insert(k);
         }
         k

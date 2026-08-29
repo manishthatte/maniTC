@@ -882,10 +882,13 @@ fn run_parse(file: &PathBuf) -> CompileResult<()> {
 
 /// Write to stdout, exiting quietly when the reader has gone away
 /// (e.g. `manitc run-t3 prog.t3b | head`) instead of panicking on SIGPIPE.
-fn pipe_safe_print(s: &str) {
+/// P82: takes BYTES. It always wrote bytes — `s.as_bytes()` — and taking a
+/// `&str` was the only thing preventing a maniT string that is not valid UTF-8
+/// from reaching stdout intact.
+fn pipe_safe_print(s: &[u8]) {
     use std::io::Write;
     let mut out = std::io::stdout();
-    if let Err(e) = out.write_all(s.as_bytes()).and_then(|_| out.flush()) {
+    if let Err(e) = out.write_all(s).and_then(|_| out.flush()) {
         if e.kind() == std::io::ErrorKind::BrokenPipe {
             std::process::exit(0);
         }
@@ -995,7 +998,7 @@ fn run_t3(
         .chain(prog_args.iter().cloned())
         .collect();
 
-    pipe_safe_print(&format!("[T3ISA] running {} ({} words)\n", file.display(), words.len()));
+    pipe_safe_print(format!("[T3ISA] running {} ({} words)\n", file.display(), words.len()).as_bytes());
     let (output_lines, exit_code, prof) = if debug {
         // The interactive debugger drives the emulator itself and hands back
         // only the output, so there is no profile to report from this path.

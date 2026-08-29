@@ -186,7 +186,7 @@ fn test_emu_syscall_print_int() {
         encode(Opcode::Halt, 0, 0, 0, 0),
     ]);
     emu.run();
-    assert_eq!(emu.output, vec!["42"]);
+    assert_eq!(emu.output_text(), vec!["42"]);
 }
 
 #[test]
@@ -202,7 +202,7 @@ fn test_emu_syscall_print_trit() {
         encode(Opcode::Halt, 0, 0, 0, 0),
     ]);
     emu.run();
-    assert_eq!(emu.output, vec!["-", "0", "+"]);
+    assert_eq!(emu.output_text(), vec!["-", "0", "+"]);
 }
 
 #[test]
@@ -415,7 +415,7 @@ HALT
     let mut emu = Emulator::new();
     emu.load_program(words);
     emu.run();
-    assert_eq!(emu.output, vec!["42"]);
+    assert_eq!(emu.output_text(), vec!["42"]);
 }
 
 #[test]
@@ -472,7 +472,7 @@ fn test_run_emulator_api() {
         encode(Opcode::Halt, 0, 0, 0, 0),
     ];
     let out = run_emulator(words, HashMap::new(), HashMap::new());
-    assert_eq!(out, vec!["7"]);
+    assert_eq!(out, vec![b"7".to_vec()]);
 }
 
 #[test]
@@ -759,7 +759,7 @@ fn test_syscall_router_totality() {
     // A number outside every claimed range takes the graceful TRAP path.
     let mut emu = Emulator::new();
     emu.do_syscall(9999);
-    assert!(emu.output.iter().any(|l| l.contains("TRAP: unknown syscall #9999")));
+    assert!(emu.output_text().iter().any(|l| l.contains("TRAP: unknown syscall #9999")));
 }
 
 #[test]
@@ -801,7 +801,7 @@ fn test_unclaimed_syscalls_in_ranges_trap_gracefully() {
             continue;
         }
         assert!(
-            emu.output.iter().any(|l| l.contains("TRAP: unknown syscall")),
+            emu.output_text().iter().any(|l| l.contains("TRAP: unknown syscall")),
             "syscall {} should trap gracefully", num
         );
     }
@@ -847,7 +847,7 @@ fn test_syscall_218_traps_when_heap_exhausted() {
     emu.do_syscall(218);
     assert!(emu.trapped, "heap exhaustion must trap, not drop the writes");
     assert!(
-        emu.output.iter().any(|l| l.contains("heap exhausted")),
+        emu.output_text().iter().any(|l| l.contains("heap exhausted")),
         "expected a heap-exhaustion message, got {:?}",
         emu.output
     );
@@ -878,7 +878,7 @@ fn test_arithmetic_overflow_traps_instead_of_clamping() {
         let emu = run_one(op, T3_MAX, rhs);
         assert!(emu.trapped, "{name} past T3_MAX must trap, not clamp");
         assert!(
-            emu.output.iter().any(|l| l.contains("overflow")),
+            emu.output_text().iter().any(|l| l.contains("overflow")),
             "{name} overflow must say so, got {:?}",
             emu.output
         );
@@ -929,7 +929,7 @@ fn test_syscall_217_print_bool3_llvm_format() {
         let mut emu = Emulator::new();
         emu.regs[1] = val;
         emu.do_syscall(217);
-        assert_eq!(emu.output, vec![expect.to_string()]);
+        assert_eq!(emu.output_text(), vec![expect.to_string()]);
     }
 }
 
@@ -938,7 +938,7 @@ fn test_syscall_2_prints_float() {
     let mut emu = Emulator::new();
     emu.regs[1] = 2.5f64.to_bits() as i64;
     emu.do_syscall(2);
-    assert_eq!(emu.output, vec!["2.5".to_string()]);
+    assert_eq!(emu.output_text(), vec!["2.5".to_string()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -974,7 +974,7 @@ fn test_syscall_501_rejects_bad_buffer_lengths() {
         emu.regs[3] = bad_len; // used to abort with capacity overflow / OOM
         emu.do_syscall(501);
         assert_eq!(emu.regs[1], -1);
-        assert!(emu.output.iter().any(|l| l.contains("invalid buffer length")));
+        assert!(emu.output_text().iter().any(|l| l.contains("invalid buffer length")));
     }
 }
 
@@ -1004,7 +1004,10 @@ fn test_align_right_reads_lp_string_from_memory() {
     emu.regs[22] = '.' as i64;    // fill
     emu.do_syscall(15);
     let addr = emu.regs[1] as usize;
-    assert_eq!(emu.string_data.get(&addr).map(|s| s.as_str()), Some("...ab"));
+    assert_eq!(
+        emu.string_data.get(&addr).map(|s| String::from_utf8_lossy(s).into_owned()),
+        Some("...ab".to_string())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,7 +1022,7 @@ fn test_unknown_opcode_traps_instead_of_silent_skip() {
     emu.run();
     assert!(emu.halted);
     assert!(
-        emu.output.iter().any(|l| l.contains("TRAP: unknown opcode")),
+        emu.output_text().iter().any(|l| l.contains("TRAP: unknown opcode")),
         "invalid opcodes must trap, got: {:?}", emu.output
     );
 }

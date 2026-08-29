@@ -68,11 +68,12 @@ impl Emulator {
                 // fs_write(fd=R1, buf_ptr=R2) → R1 = bytes written
                 let fd = self.regs[1] as usize;
                 let addr = self.regs[2] as usize;
-                let s = if let Some(content) = self.string_data.get(&addr) {
-                    content.clone()
-                } else { self.read_lp_string(addr) };
+                // P82: fs_write writes the exact BYTES, not a lossy rendering
+                // of them — this is the one site in this file that is not
+                // about text.
+                let s = self.bytes_at(addr as i64);
                 if let Some(file) = self.files.get_mut(&fd) {
-                    let n = file.write(s.as_bytes()).unwrap_or(0);
+                    let n = file.write(&s).unwrap_or(0);
                     self.regs[1] = n as i64;
                 } else {
                     self.regs[1] = -1;
@@ -97,11 +98,9 @@ impl Emulator {
                 // fs_open(path_addr: R1, mode_addr: R2) -> R1 (fd or -1)
                 // mode string: "r"=read, "w"=write/create, "a"=append
                 let path_addr = self.regs[1] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
+                let path = self.str_at(path_addr as i64);
                 let mode_addr = self.regs[2] as usize;
-                let mode = self.string_data.get(&mode_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(mode_addr));
+                let mode = self.str_at(mode_addr as i64);
                 let file_result = match mode.trim() {
                     "w" | "wb" => std::fs::File::create(&path),
                     "a" | "ab" => std::fs::OpenOptions::new().append(true).create(true).open(&path),
@@ -158,15 +157,13 @@ impl Emulator {
             504 => {
                 // fs_exists(path_addr: R1) -> R1 (1 if exists, 0 if not)
                 let path_addr = self.regs[1] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
+                let path = self.str_at(path_addr as i64);
                 self.regs[1] = if std::path::Path::new(&path).exists() { 1 } else { 0 };
             }
             505 => {
                 // fs_read_all(path_addr: R1) -> R1 (str ptr or 0)
                 let path_addr = self.regs[1] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
+                let path = self.str_at(path_addr as i64);
                 self.regs[1] = match std::fs::read_to_string(&path) {
                     Ok(s) => self.heap_alloc_str(s) as i64,
                     Err(_) => 0,
@@ -176,10 +173,8 @@ impl Emulator {
                 // fs_write_all(path_addr: R1, content_addr: R2) -> R1 (1 on success, 0 on error)
                 let path_addr = self.regs[1] as usize;
                 let content_addr = self.regs[2] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
-                let content = self.string_data.get(&content_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(content_addr));
+                let path = self.str_at(path_addr as i64);
+                let content = self.str_at(content_addr as i64);
                 self.regs[1] = match std::fs::write(&path, content.as_bytes()) {
                     Ok(_) => 1,
                     Err(_) => 0,
@@ -190,10 +185,8 @@ impl Emulator {
                 use std::io::Write as W;
                 let path_addr = self.regs[1] as usize;
                 let content_addr = self.regs[2] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
-                let content = self.string_data.get(&content_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(content_addr));
+                let path = self.str_at(path_addr as i64);
+                let content = self.str_at(content_addr as i64);
                 let result = std::fs::OpenOptions::new()
                     .append(true)
                     .create(true)
@@ -204,8 +197,7 @@ impl Emulator {
             508 => {
                 // fs_delete(path_addr: R1) -> R1 (1 on success, 0 on error)
                 let path_addr = self.regs[1] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
+                let path = self.str_at(path_addr as i64);
                 self.regs[1] = match std::fs::remove_file(&path) {
                     Ok(_) => 1,
                     Err(_) => 0,
@@ -214,8 +206,7 @@ impl Emulator {
             509 => {
                 // fs_mkdir(path_addr: R1) -> R1 (1 on success, 0 on error)
                 let path_addr = self.regs[1] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
+                let path = self.str_at(path_addr as i64);
                 self.regs[1] = match std::fs::create_dir_all(&path) {
                     Ok(_) => 1,
                     Err(_) => 0,
@@ -224,8 +215,7 @@ impl Emulator {
             510 => {
                 // fs_list_dir(path_addr: R1) -> R1 (Vec handle of str ptrs, or 0)
                 let path_addr = self.regs[1] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
+                let path = self.str_at(path_addr as i64);
                 let entries: Vec<i64> = std::fs::read_dir(&path)
                     .map(|rd| {
                         rd.filter_map(|e| {
@@ -240,18 +230,15 @@ impl Emulator {
             511 => {
                 // fs_is_dir(path_addr: R1) -> R1 (1 if dir, 0 if not)
                 let path_addr = self.regs[1] as usize;
-                let path = self.string_data.get(&path_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(path_addr));
+                let path = self.str_at(path_addr as i64);
                 self.regs[1] = if std::path::Path::new(&path).is_dir() { 1 } else { 0 };
             }
             512 => {
                 // fs_rename(src_addr: R1, dst_addr: R2) -> R1 (1 on success, 0 on error)
                 let src_addr = self.regs[1] as usize;
                 let dst_addr = self.regs[2] as usize;
-                let src = self.string_data.get(&src_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(src_addr));
-                let dst = self.string_data.get(&dst_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(dst_addr));
+                let src = self.str_at(src_addr as i64);
+                let dst = self.str_at(dst_addr as i64);
                 self.regs[1] = match std::fs::rename(&src, &dst) {
                     Ok(_) => 1,
                     Err(_) => 0,
@@ -265,8 +252,7 @@ impl Emulator {
                 // net_tcp_connect(host_addr: R1, port: R2) -> R1 (fd or -1)
                 let host_addr = self.regs[1] as usize;
                 let port = self.regs[2] as u16;
-                let host = self.string_data.get(&host_addr).cloned()
-                    .unwrap_or_else(|| self.read_lp_string(host_addr));
+                let host = self.str_at(host_addr as i64);
                 let addr = format!("{}:{}", host, port);
                 self.regs[1] = match TcpStream::connect(&addr) {
                     Ok(stream) => {

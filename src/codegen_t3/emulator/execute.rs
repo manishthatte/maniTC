@@ -11,7 +11,7 @@ impl Emulator {
     pub(crate) fn trap(&mut self, msg: impl Into<String>) {
         // Output pieces are written raw and carry their own newlines, so a trap
         // message without one runs into whatever prints next.
-        self.output.push(format!("{}\n", msg.into()));
+        self.push_out(format!("{}\n", msg.into()));
         self.halted = true;
         self.trapped = true;
     }

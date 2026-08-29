@@ -10,17 +10,17 @@ impl Emulator {
                 // print trit
                 let t = self.regs[1];
                 let s = if t > 0 { "+".to_string() } else if t == 0 { "0".to_string() } else { "-".to_string() };
-                self.output.push(s);
+                self.push_out(s);
             }
             1 => {
                 // print int
-                self.output.push(self.regs[1].to_string());
+                self.push_out(self.regs[1].to_string());
             }
             2 => {
                 // print float — bitcast i64 → f64
                 let bits = self.regs[1] as u64;
                 let f = f64::from_bits(bits);
-                self.output.push(format!("{}", f));
+                self.push_out(format!("{}", f));
             }
             3 => {
                 // print string at R1 address
@@ -29,18 +29,20 @@ impl Emulator {
                     content.clone()
                 } else {
                     // Try null-terminated read from memory
-                    let mut buf = String::new();
+                    // P82: byte by byte. This is the printing path, and it is
+                    // where the divergence showed.
+                    let mut buf: Vec<u8> = Vec::new();
                     let mut a = addr;
                     while a < self.memory.len() && self.memory[a] != 0 {
-                        buf.push(self.memory[a] as u8 as char);
+                        buf.push(self.memory[a] as u8);
                         a += 1;
                     }
                     buf
                 };
-                self.output.push(s);
+                self.push_out(s);
             }
             4 => {
-                self.output.push("\n".to_string());
+                self.push_out("\n".to_string());
             }
             5 => {
                 // read int
@@ -165,11 +167,15 @@ impl Emulator {
                     content.clone()
                 } else {
                     // Same fallback as align_left (132): in-memory lp-string.
-                    self.read_lp_string(str_addr)
+                    self.bytes_at(str_addr as i64)
                 };
                 let padded = if s.len() < width {
-                    let pad: String = std::iter::repeat(fill).take(width - s.len()).collect();
-                    format!("{}{}", pad, s)
+                    let mut pad: Vec<u8> = Vec::new();
+                    let mut fb = [0u8; 4];
+                    let fs = fill.encode_utf8(&mut fb).as_bytes().to_vec();
+                    for _ in 0..(width - s.len()) { pad.extend_from_slice(&fs); }
+                    pad.extend_from_slice(&s);
+                    pad
                 } else {
                     s
                 };
@@ -179,7 +185,7 @@ impl Emulator {
             16 => {
                 // print_bool: R1 = 1 (true) or 0 (false), outputs "true"/"false"
                 let s = if self.regs[1] != 0 { "true".to_string() } else { "false".to_string() };
-                self.output.push(s);
+                self.push_out(s);
             }
 
             // ----------------------------------------------------------------
@@ -192,12 +198,13 @@ impl Emulator {
             }
             61 => {
                 // str_concat(p1=R1, p2=R2) → R1 = new ptr
-                let s1 = self.get_string_r1();
+                // P82: bytes. `str::to_upper` builds its result by
+                // concatenating one-byte strings, so this is on the critical
+                // path for the divergence P50 deferred.
+                let s1 = self.bytes_r1();
                 let addr2 = self.regs[2] as usize;
-                let s2 = if let Some(s) = self.string_data.get(&addr2) {
-                    s.clone()
-                } else { self.read_lp_string(addr2) };
-                let combined = format!("{}{}", s1, s2);
+                let s2 = self.bytes_at(addr2 as i64);
+                let combined = [s1, s2].concat();
                 let addr = self.heap_alloc_str(combined);
                 self.regs[1] = addr as i64;
             }
@@ -219,37 +226,36 @@ impl Emulator {
                 // is safe: the C runtime's `str_slice` is `manit_substr` over
                 // a `char*`, so LLVM has always sliced bytes.
                 //
-                // What this does NOT fix is §64's design question. The
-                // emulator holds strings as `String`, so a slice landing
-                // inside a character comes back with U+FFFD where LLVM keeps
-                // the raw bytes — still a divergence, just no longer a crash.
-                // Byte-exact parity means holding `Vec<u8>`, which is a
-                // representation change for the whole string surface.
-                let s = self.get_string_r1();
-                let bytes = s.as_bytes();
+                // P82 CLOSES WHAT P50 COULD NOT. P50's own note here read: "the
+                // emulator holds strings as `String`, so a slice landing inside
+                // a character comes back with U+FFFD where LLVM keeps the raw
+                // bytes — still a divergence, just no longer a crash. Byte-exact
+                // parity means holding `Vec<u8>`, which is a representation
+                // change for the whole string surface." That change is now made,
+                // so the slice is taken from the bytes and stays bytes.
+                //
+                // `str::reverse` is what shows it: ManiT source walking a string
+                // one index at a time, so on "aéb" it slices INSIDE the 'é' twice
+                // and used to hand back two U+FFFD.
+                let bytes = self.bytes_r1();
                 let end = (self.regs[3] as usize).min(bytes.len());
                 let start = (self.regs[2] as usize).min(end);
-                let sliced = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-                let addr = self.heap_alloc_str(sliced);
+                let addr = self.heap_alloc_str(bytes[start..end].to_vec());
                 self.regs[1] = addr as i64;
             }
             63 => {
                 // str_contains(p1=R1, p2=R2) → R1 = bool
-                let s1 = self.get_string_r1();
+                let s1 = self.bytes_r1();
                 let addr2 = self.regs[2] as usize;
-                let s2 = if let Some(s) = self.string_data.get(&addr2) {
-                    s.clone()
-                } else { self.read_lp_string(addr2) };
-                self.regs[1] = if s1.contains(s2.as_str()) { 1 } else { 0 };
+                let s2 = self.bytes_at(addr2 as i64);
+                self.regs[1] = if Self::bytes_find(&s1, &s2).is_some() { 1 } else { 0 };
             }
             64 => {
                 // str_find(p1=R1, p2=R2) → R1 = index or -1
-                let s1 = self.get_string_r1();
+                let s1 = self.bytes_r1();
                 let addr2 = self.regs[2] as usize;
-                let s2 = if let Some(s) = self.string_data.get(&addr2) {
-                    s.clone()
-                } else { self.read_lp_string(addr2) };
-                let idx = s1.find(s2.as_str()).map(|i| i as i64).unwrap_or(-1);
+                let s2 = self.bytes_at(addr2 as i64);
+                let idx = Self::bytes_find(&s1, &s2).map(|i| i as i64).unwrap_or(-1);
                 self.regs[1] = idx;
             }
             65 => {
@@ -266,15 +272,13 @@ impl Emulator {
             }
             67 => {
                 // str_split(ptr=R1, delim=R2) → R1 = Vec handle of str ptrs
-                let s = self.get_string_r1();
+                let s = self.bytes_r1();
                 let addr2 = self.regs[2] as usize;
-                let delim = if let Some(d) = self.string_data.get(&addr2) {
-                    d.clone()
-                } else { self.read_lp_string(addr2) };
-                let parts: Vec<i64> = s.split(delim.as_str())
+                let delim = self.bytes_at(addr2 as i64);
+                let parts: Vec<i64> = Self::bytes_split(&s, &delim).into_iter()
                     .map(|part| {
                         let a = self.heap_ptr;
-                        self.heap_alloc_str(part.to_string()) as i64;
+                        self.heap_alloc_str(part) as i64;
                         a as i64
                     })
                     .collect();
@@ -290,16 +294,12 @@ impl Emulator {
             }
             69 => {
                 // str_replace(ptr=R1, find=R2, replace=R3) → R1 = new ptr
-                let s = self.get_string_r1();
+                let s = self.bytes_r1();
                 let addr2 = self.regs[2] as usize;
                 let addr3 = self.regs[3] as usize;
-                let find_s = if let Some(d) = self.string_data.get(&addr2) {
-                    d.clone()
-                } else { self.read_lp_string(addr2) };
-                let repl_s = if let Some(d) = self.string_data.get(&addr3) {
-                    d.clone()
-                } else { self.read_lp_string(addr3) };
-                let result = s.replace(find_s.as_str(), repl_s.as_str());
+                let find_s = self.bytes_at(addr2 as i64);
+                let repl_s = self.bytes_at(addr3 as i64);
+                let result = Self::bytes_replace(&s, &find_s, &repl_s);
                 let addr = self.heap_alloc_str(result);
                 self.regs[1] = addr as i64;
             }
@@ -323,10 +323,18 @@ impl Emulator {
                 };
             }
             134 => {
-                // str_from_char(c=R1) → R1 = ptr to a one-char string
+                // str_from_char(c=R1) → R1 = ptr to a ONE-BYTE string.
+                //
+                // **P82: THIS IS THE SITE.** It built a `char` and formatted
+                // it, so `from_char(0xC3)` produced the TWO-byte UTF-8 encoding
+                // of U+00C3 rather than the single byte 0xC3. A char in maniT is
+                // an unsigned byte (P72) and the C runtime has always agreed —
+                // `str_from_char` there is `out[0] = (char)(c & 0xFF)`. The
+                // byte-exact `string_data` this change introduces is what makes
+                // storing one byte possible at all: a Rust `String` cannot hold
+                // 0xC3 on its own.
                 let c = self.regs[1];
-                let s = char::from_u32(c as u32).map(String::from).unwrap_or_default();
-                let addr = self.heap_alloc_str(s);
+                let addr = self.heap_alloc_str(vec![(c & 0xFF) as u8]);
                 self.regs[1] = addr as i64;
             }
             136 => {
@@ -368,11 +376,9 @@ impl Emulator {
             // ----------------------------------------------------------------
             200 => {
                 // str_eq(p1=R1, p2=R2) → R1 = 1 if equal, 0 if not
-                let s1 = self.get_string_r1();
+                let s1 = self.bytes_r1();
                 let addr2 = self.regs[2] as usize;
-                let s2 = if let Some(s) = self.string_data.get(&addr2) {
-                    s.clone()
-                } else { self.read_lp_string(addr2) };
+                let s2 = self.bytes_at(addr2 as i64);
                 self.regs[1] = if s1 == s2 { 1 } else { 0 };
             }
             201 => {
@@ -519,7 +525,7 @@ impl Emulator {
                 // (same wording as the LLVM backend's __manit_print_bool3).
                 let t = self.regs[1];
                 let s = if t > 0 { "true" } else if t < 0 { "false" } else { "unknown" };
-                self.output.push(s.to_string());
+                self.push_out(s.to_string());
             }
             220 => {
                 // fneg: R1 = -R1 (flip IEEE 754 sign bit, bit 63)
@@ -551,8 +557,11 @@ impl Emulator {
                 let arg_strs: Vec<String> = (0..placeholder_count).map(|i| {
                     let val = if i + 2 < self.regs.len() { self.regs[i + 2] } else { 0 };
                     let addr = val as usize;
-                    if let Some(s) = self.string_data.get(&addr) {
-                        s.clone()
+                    if self.string_data.contains_key(&addr) {
+                        // A `str` argument. Rendered as TEXT because the
+                        // template it lands in is text; P82 keeps the bytes
+                        // exact everywhere the value is not being formatted.
+                        self.str_at(val)
                     } else {
                         val.to_string()
                     }
@@ -598,14 +607,13 @@ impl Emulator {
                 let str_addr = self.regs[1] as usize;
                 let width = self.regs[21] as usize;
                 let fill = char::from_u32(self.regs[22] as u32).unwrap_or(' ');
-                let s = if let Some(content) = self.string_data.get(&str_addr) {
-                    content.clone()
-                } else {
-                    self.read_lp_string(str_addr)
-                };
+                let s = self.bytes_at(str_addr as i64);
                 let padded = if s.len() < width {
-                    let pad: String = std::iter::repeat(fill).take(width - s.len()).collect();
-                    format!("{}{}", s, pad)
+                    let mut out = s.clone();
+                    let mut fb = [0u8; 4];
+                    let fs = fill.encode_utf8(&mut fb).as_bytes().to_vec();
+                    for _ in 0..(width - s.len()) { out.extend_from_slice(&fs); }
+                    out
                 } else {
                     s
                 };

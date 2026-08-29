@@ -181,7 +181,7 @@ impl Emulator {
     /// "one backend ran and the other did not" branch and called it DIVERGENT —
     /// which reads as a compiler bug when nothing had gone wrong at all.
     fn stop_at_step_limit(&mut self, max_steps: usize) {
-        self.output.push(format!(
+        self.push_out(format!(
             "TRAP: step limit exceeded ({} steps; raise it with \
              `manitc run-t3 --max-steps N`)\n",
             max_steps,
@@ -206,7 +206,10 @@ impl Emulator {
 
             // Flush any output produced so far
             for piece in &self.output {
-                print!("{}", piece);
+                // P82: bytes straight out, so the debugger shows what the
+                // program actually emitted.
+                use std::io::Write as _;
+                let _ = std::io::stdout().write_all(piece);
             }
             self.output.clear();
             let _ = std::io::stdout().flush();
@@ -246,7 +249,10 @@ impl Emulator {
         }
     }
 
-    pub fn run_with_output(&mut self) -> Vec<String> {
+    /// P82: BYTES. maniT strings are byte strings and a `String` cannot hold
+    /// one that is not valid UTF-8; returning text here is where the emulator
+    /// used to lose the difference. Callers that want text decode explicitly.
+    pub fn run_with_output(&mut self) -> Vec<Vec<u8>> {
         self.run();
         self.output.clone()
     }
@@ -260,7 +266,7 @@ impl Default for Emulator {
 // Public API helper
 // ---------------------------------------------------------------------------
 
-pub fn run_emulator(words: Vec<i64>, string_data: HashMap<usize, String>, float_data: HashMap<usize, i64>) -> Vec<String> {
+pub fn run_emulator(words: Vec<i64>, string_data: HashMap<usize, String>, float_data: HashMap<usize, i64>) -> Vec<Vec<u8>> {
     run_emulator_with_exit(words, string_data, float_data).0
 }
 
@@ -270,7 +276,7 @@ pub fn run_emulator_with_exit(
     words: Vec<i64>,
     string_data: HashMap<usize, String>,
     float_data: HashMap<usize, i64>,
-) -> (Vec<String>, i64) {
+) -> (Vec<Vec<u8>>, i64) {
     run_emulator_with_exit_capped(words, string_data, float_data, DEFAULT_MAX_STEPS)
 }
 
@@ -280,7 +286,7 @@ pub fn run_emulator_with_exit_capped(
     string_data: HashMap<usize, String>,
     float_data: HashMap<usize, i64>,
     max_steps: usize,
-) -> (Vec<String>, i64) {
+) -> (Vec<Vec<u8>>, i64) {
     run_emulator_with_exit_capped_argv(words, string_data, float_data, max_steps,
                                        Emulator::new().argv)
 }
@@ -293,7 +299,7 @@ pub fn run_emulator_with_exit_capped_argv(
     float_data: HashMap<usize, i64>,
     max_steps: usize,
     argv: Vec<String>,
-) -> (Vec<String>, i64) {
+) -> (Vec<Vec<u8>>, i64) {
     let (out, code, _) =
         run_emulator_with_exit_capped_argv_profiled(words, string_data, float_data, max_steps, argv);
     (out, code)
@@ -316,10 +322,10 @@ pub fn run_emulator_with_exit_capped_argv_profiled(
     float_data: HashMap<usize, i64>,
     max_steps: usize,
     argv: Vec<String>,
-) -> (Vec<String>, i64, ExecProfile) {
+) -> (Vec<Vec<u8>>, i64, ExecProfile) {
     let mut emu = Emulator::new();
     emu.load_program(words);
-    emu.string_data = string_data;
+    emu.string_data = string_data.into_iter().map(|(k, v)| (k, v.into_bytes())).collect();
     emu.float_data = float_data;
     emu.max_steps = max_steps;
     emu.argv = argv;
@@ -383,7 +389,7 @@ pub fn run_emulator_debug(
     words: Vec<i64>,
     string_data: HashMap<usize, String>,
     float_data: HashMap<usize, i64>,
-) -> Vec<String> {
+) -> Vec<Vec<u8>> {
     run_emulator_debug_argv(words, string_data, float_data, Emulator::new().argv)
 }
 
@@ -393,10 +399,10 @@ pub fn run_emulator_debug_argv(
     string_data: HashMap<usize, String>,
     float_data: HashMap<usize, i64>,
     argv: Vec<String>,
-) -> Vec<String> {
+) -> Vec<Vec<u8>> {
     let mut emu = Emulator::new();
     emu.load_program(words);
-    emu.string_data = string_data;
+    emu.string_data = string_data.into_iter().map(|(k, v)| (k, v.into_bytes())).collect();
     emu.float_data = float_data;
     emu.debug = true;
     emu.argv = argv;
@@ -408,10 +414,10 @@ pub fn run_emulator_profiled(
     words: Vec<i64>,
     string_data: HashMap<usize, String>,
     float_data: HashMap<usize, i64>,
-) -> (Vec<String>, ExecProfile) {
+) -> (Vec<Vec<u8>>, ExecProfile) {
     let mut emu = Emulator::new();
     emu.load_program(words);
-    emu.string_data = string_data;
+    emu.string_data = string_data.into_iter().map(|(k, v)| (k, v.into_bytes())).collect();
     emu.float_data = float_data;
     emu.run();
     let profile = emu.profile.clone();

@@ -1227,6 +1227,46 @@ fn p69_reference_impl_method() {
 //     and a value assertion would pass while the defect stands.
 
 /// Run for T3 and LLVM and return both outputs.
+/// P82: both backends' stdout as RAW BYTES.
+///
+/// `both` decodes with `from_utf8_lossy`, which is right for every test that
+/// compares text and BLIND to the one property P82 is about: a maniT string is
+/// a byte string, and a harness that decodes before comparing cannot tell a
+/// byte the program emitted from the U+FFFD its own decoder produced. The first
+/// version of the reverse assertion failed against `both` while `od -c` showed
+/// the program's bytes were already correct — the test was measuring the
+/// harness. Same blindness the emulator had, one layer out.
+///
+/// The `[T3ISA]` banner is stripped by line, on bytes, for the same reason
+/// `behav.sh` strips it: it names a per-run output path.
+fn both_bytes(name: &str) -> (Vec<u8>, Vec<u8>) {
+    let out = tmp(&format!("{}_bytes", name));
+    let c = Command::new(manitc())
+        .args(["compile", fixture(name).to_str().unwrap(), "--target", "t3",
+               "-o", out.to_str().unwrap()])
+        .output().expect("compile t3");
+    assert!(c.status.success(), "{}: T3 compile failed", name);
+    let r = Command::new(manitc())
+        .args(["run-t3", out.with_extension("t3b").to_str().unwrap()])
+        .output().expect("run t3");
+    let mut t3: Vec<u8> = Vec::new();
+    for line in r.stdout.split(|&b| b == b'\n') {
+        if line.starts_with(b"[T3ISA]") || line.is_empty() {
+            continue;
+        }
+        t3.extend_from_slice(line);
+        t3.push(b'\n');
+    }
+    let binp = out.with_extension("bin");
+    let c2 = Command::new(manitc())
+        .args(["compile", fixture(name).to_str().unwrap(), "--target", "llvm",
+               "-o", binp.to_str().unwrap()])
+        .output().expect("compile llvm");
+    assert!(c2.status.success(), "{}: LLVM compile failed", name);
+    let r2 = Command::new(&binp).output().expect("run llvm");
+    (t3, r2.stdout)
+}
+
 fn both(name: &str) -> (String, String) {
     let out = tmp(name);
     let c = Command::new(manitc())
@@ -1260,10 +1300,15 @@ fn both(name: &str) -> (String, String) {
 /// Rust backtrace. Not a wrong answer and not a T3 trap: a crash of the
 /// toolchain, reachable from any program containing a non-ASCII literal.
 ///
-/// **The assertion is on `done`, not on the reversed string.** The mangled
-/// string is the symptom of §64's byte/scalar confusion, which is still open;
-/// the missing `done` was the finding. What this pins is that execution
-/// CONTINUES past the call.
+/// **The assertion was on `done`, not on the reversed string — and P82 removes
+/// the reason for that.** P50's note read: "the mangled string is the symptom
+/// of §64's byte/scalar confusion, which is still open". It is closed. The
+/// emulator holds `Vec<u8>`, so a slice landing inside a character keeps the
+/// raw bytes instead of yielding U+FFFD, and the two backends now agree BYTE
+/// FOR BYTE on a program that reverses a multi-byte string.
+///
+/// `str::reverse` is the sharpest case because it is ManiT source walking a
+/// string one index at a time: on `"aéb"` it slices INSIDE the `é` twice.
 #[test]
 fn s64_reverse_does_not_kill_the_emulator() {
     let (t3, ll) = both("s64_reverse_kills_t3");
@@ -1274,6 +1319,22 @@ fn s64_reverse_does_not_kill_the_emulator() {
         t3
     );
     assert!(ll.contains("done"), "LLVM lost its output too: {:?}", ll);
+    // P82: the STRING, byte for byte, through a byte-level harness — `both`
+    // decodes lossily and cannot see this.
+    let (t3b, llb) = both_bytes("s64_reverse_kills_t3");
+    assert_eq!(
+        t3b, llb,
+        "the two backends must agree byte for byte on a reversed multi-byte \
+         string; T3 used to yield U+FFFD where LLVM kept the raw bytes.\n\
+         T3:   {:?}\nLLVM: {:?}",
+        t3b, llb
+    );
+    assert!(
+        !t3b.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+        "T3 must not substitute U+FFFD (EF BF BD) for a byte it cannot \
+         decode: {:?}",
+        t3b
+    );
 }
 
 /// **`str::len` counts BYTES, and `str::char_count` counts characters.**
