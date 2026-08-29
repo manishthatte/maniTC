@@ -87,12 +87,9 @@ jobs:
             echo "::group::$ex"
             ./target/release/manitc compile "examples/$ex.mt" --target llvm -o "/tmp/$ex"
             test -x "/tmp/$ex"
-            # These examples return a nonzero exit status after running
-            # correctly (KNOWN_ISSUES.md), so the assertion is that they
-            # produce output and do not die on a signal.
             rc=0
             "/tmp/$ex" > "/tmp/$ex.llvm.out" 2>&1 || rc=$?
-            test "$rc" -lt 128
+            test "$rc" -eq 0
             test -s "/tmp/$ex.llvm.out"
             head -5 "/tmp/$ex.llvm.out"
             echo "::endgroup::"
@@ -120,9 +117,9 @@ jobs:
             ./target/release/manitc compile --lang v2 --target llvm "examples/$ex.mt" -o "/tmp/${ex}_v2.bin"
             lrc=0
             "/tmp/${ex}_v2.bin" > "/tmp/${ex}_v2.llvm.out" 2>&1 || lrc=$?
-            test "$lrc" -lt 128
+            test "$trc" -eq 0
+            test "$lrc" -eq 0
             diff -u "/tmp/${ex}_v2.t3.out" "/tmp/${ex}_v2.llvm.out"
-            test "$trc" -eq "$lrc"
             echo "::endgroup::"
           done
 
@@ -133,7 +130,7 @@ jobs:
             --target llvm -o /tmp/fib_minimal
           rc=0
           /tmp/fib_minimal > /tmp/fib_minimal.out 2>&1 || rc=$?
-          test "$rc" -lt 128
+          test "$rc" -eq 0
           head -3 /tmp/fib_minimal.out
 
   # Recommendation F-8. Section 48 (the T3 emitter panics on a 13-parameter
