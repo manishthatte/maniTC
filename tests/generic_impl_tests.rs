@@ -118,6 +118,31 @@ fn check_source(tag: &str, src: &str) -> bool {
         .success()
 }
 
+/// `manitc check`'s stderr for a source string, with the exit status.
+///
+/// P70 needs the diagnostic's LINE, not merely that one appeared: the whole
+/// claim is that the message moved from the use to the declaration, and an
+/// exit-status assertion is identical before and after for the ten names that
+/// were already refused.
+fn check_source_out(tag: &str, src: &str) -> (bool, String) {
+    let p = tmp(&format!("{}.mt", tag));
+    std::fs::write(&p, src).expect("write temp source");
+    let o = Command::new(manitc())
+        .args(["check", p.to_str().unwrap()])
+        .output()
+        .expect("check");
+    (o.status.success(), String::from_utf8_lossy(&o.stderr).into_owned())
+}
+
+/// The 1-based line a diagnostic points at, or `None` if it named none.
+fn diagnostic_line(stderr: &str) -> Option<u32> {
+    stderr
+        .lines()
+        .find_map(|l| l.split(".mt:").nth(1))
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|n| n.parse().ok())
+}
+
 fn assert_t3_value(name: &str) {
     let want = expected(name);
     match run_t3(name) {
@@ -126,11 +151,266 @@ fn assert_t3_value(name: &str) {
     }
 }
 
-/// payload variant CONSTRUCTED — the defect
+/// **A payload variant can be CONSTRUCTED.** report.txt P43, closed 29 August
+/// 2026.
+///
+/// The constructor emitted a call to a symbol nothing defines — `Undefined
+/// label: Shape::Circle` on T3, `use of undefined value '@Shape_Circle'` on
+/// LLVM — from a program `manitc check` exits 0 on. But the constructor was
+/// only the site with NO implementation; the two that had one **disagreed with
+/// each other**, the tag test reading the scrutinee as a bare integer and the
+/// pattern binder reading the same value as a pointer to `[tag, payload]`.
 #[test]
-#[ignore = "§61: payload variant CONSTRUCTED — the defect"]
 fn pe61_construct_payload() {
     assert_t3_value("pe61_construct_payload");
+}
+
+/// **The payload-enum representation, end to end.** report.txt P43.
+///
+/// `pe61_construct_payload` is the minimal repro; this is what the fix has to
+/// get right beyond it, and **every line of it fails to COMPILE on the control
+/// binary** — `Undefined label: Shape::Circle`.
+///
+///   * `Rect(w, h)` binds TWO fields. Both pattern binders read every field
+///     from word 1, so `w * h` was `w * w` — a silent wrong answer that could
+///     not be reached because nothing could construct a `Rect`. **A defect
+///     behind an unreachable one is still a defect**, and it becomes reachable
+///     the moment the outer one is fixed.
+///   * `Dot` is a plain variant of an enum that HAS payload variants, so it is
+///     a cell too. One representation per ENUM, not per variant: the tag test
+///     runs before the variant is known, so a scrutinee whose shape depended on
+///     its variant would be undecidable exactly where it is decided.
+///   * the value crosses a function boundary, lives in a variable, and is
+///     matched directly as a temporary.
+#[test]
+fn p43_payload_enum_end_to_end() {
+    assert_t3_value("p43_payload_enum");
+}
+
+/// **P43's three error paths, none of which was checked before.**
+///
+/// The constructor reached the lowerer without the analyzer having looked at
+/// it at all — it fell through to an empty parameter list, so arity and types
+/// were unchecked. `Shape::Circle` named on its own is the dangerous one: it
+/// used to build a cell nobody had written a payload into, and the `match`
+/// then bound `r` to 0 on BOTH backends.
+///
+/// The last two rows are controls: the callee position must still ACCEPT the
+/// name it rejects everywhere else, and a plain enum must be unaffected.
+#[test]
+fn p43_payload_variant_arity_and_types_are_checked() {
+    let head = "use std::io;\nenum Shape { Circle(int), Rect(int, int), Dot }\n";
+    let bad = |tag: &str, body: &str| {
+        assert!(
+            !check_source(tag, &format!("{}fn main() {{ {} }}\n", head, body)),
+            "should be refused: {}",
+            body
+        );
+    };
+    bad("p43_named_bare", "let s = Shape::Circle; io::print_int(1);");
+    bad("p43_too_many", "let s = Shape::Circle(1, 2); io::print_int(1);");
+    bad("p43_wrong_type", "let s = Shape::Circle(\"x\"); io::print_int(1);");
+    bad("p43_too_few", "let s = Shape::Rect(1); io::print_int(1);");
+    assert!(
+        check_source(
+            "p43_ok_ctor",
+            &format!("{}fn main() {{ let s = Shape::Circle(1); io::print_int(1); }}\n", head),
+        ),
+        "the callee position must still accept the name — otherwise the rule \
+         that a payload variant cannot be named bare has eaten the one place \
+         naming it is right"
+    );
+    assert!(
+        check_source(
+            "p43_plain_enum",
+            "use std::io;\nenum D { N, S }\nfn main() { let d = D::N; io::print_int(1); }\n",
+        ),
+        "an enum with no payload variants is untouched"
+    );
+}
+
+/// **A PATH-FORM call to a generic `impl<T>` method binds from the receiver.**
+/// report.txt P73, which P69 recorded as a limit and closed 29 August 2026.
+///
+/// `Box2::bigger(b)` arrives at the free-function call site, where the binding
+/// comes from the ARGUMENTS — and `self` is declared `Self`, which is not one
+/// of the impl's generics, so nothing bound and the call kept the erased body.
+/// The receiver IS the first argument, so P69's own mechanism applies; it was
+/// only reached through a different syntax.
+///
+/// **THE NEGATIVE PAIR IS THE TEST, AND THREE OF THE FOUR LINES ARE CONTROLS.**
+/// Positive doubles order the same way as their bit patterns, so `(1.5, 2.5)`
+/// answers 2.5 whether the comparison is a float compare or an integer one —
+/// P68's trap, one finding later. On the control binary this fixture prints
+/// `2.5 / -2.5 / -1.5 / 7` and only the second line moves.
+#[test]
+fn p73_path_form_impl_call_is_instantiated() {
+    assert_t3_value("p73_path_form_impl_call");
+}
+
+/// **A stack overflow names itself.** report.txt P76.
+///
+/// The stack grows DOWN from 60,000 and the code grows UP from 0, and nothing
+/// stopped them meeting: `STORE` had an upper bound and no lower one, so a deep
+/// enough recursion overwrote its own instructions and the emulator then
+/// executed them — `TRAP: register index 43 out of range (0..=26)`, which names
+/// the symptom and not the cause.
+///
+/// **The call-depth guard cannot catch it and that is the point: it counts
+/// FRAMES.** A 45-word frame overflows at depth ~1,300 while the guard waits
+/// for 10,000. P38 checked that the IMAGE fits below the stack; this is the
+/// same collision from the other side.
+///
+/// Built rather than shipped as a fixture, because the threshold is a function
+/// of the frame size and the image size and a hand-written file would pin
+/// neither. The assertion is on the MESSAGE: the trap already happened before
+/// this change, it just said something else.
+#[test]
+fn p76_a_stack_overflow_says_so() {
+    let mut src = String::from("use std::io;\nfn rec(n: int) -> int {\n    if n <= 0 { return 0; }\n");
+    for i in 0..60 {
+        src.push_str(&format!("    let v{}: int = n + {};\n", i, i));
+    }
+    src.push_str("    let s: int = ");
+    src.push_str(&(0..60).map(|i| format!("v{}", i)).collect::<Vec<_>>().join(" + "));
+    src.push_str(";\n    return 1 + rec(n - 1) + (s - s);\n}\n");
+    let run = |depth: u32| -> String {
+        let p = tmp(&format!("p76_{}.mt", depth));
+        std::fs::write(&p, format!("{}fn main() {{ io::print_int(rec({})); io::newline(); }}\n", src, depth))
+            .expect("write");
+        let out = tmp(&format!("p76_{}", depth));
+        let c = Command::new(manitc())
+            .args(["compile", p.to_str().unwrap(), "--target", "t3", "-o", out.to_str().unwrap()])
+            .output().expect("compile");
+        assert!(c.status.success(), "must compile");
+        let r = Command::new(manitc())
+            .args(["run-t3", out.with_extension("t3b").to_str().unwrap()])
+            .output().expect("run");
+        format!("{}{}", String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr))
+    };
+    // Shallow enough to fit: the value, not a trap.
+    let shallow = run(200);
+    assert!(shallow.contains("200"), "depth 200 must still run: {}", shallow);
+    assert!(!shallow.contains("TRAP"), "depth 200 must not trap: {}", shallow);
+    // Deep enough to collide: a trap that NAMES the collision.
+    let deep = run(4000);
+    assert!(
+        deep.contains("stack overflow") && deep.contains("inside the program image"),
+        "a stack/code collision must say so, not report a bogus register index: {}",
+        deep
+    );
+}
+
+/// **A diagnostic inside merged stdlib source names the stdlib file.**
+/// report.txt P8, closed 29 August 2026.
+///
+/// `stdlib_expand` parses each module with its OWN line numbering and appends
+/// the items to the user's program. `Span` carried a line and a column and
+/// nothing else, so every diagnostic was reported under the file the compiler
+/// was invoked on: a warning inside `fmt::to_radix` came out as
+/// `hello.mt:230:22` for a `hello.mt` FIVE LINES LONG. Right line, wrong file,
+/// on every diagnostic rather than one lint.
+///
+/// **AND FIXING THE NAME MADE THE SNIPPET WRONG — the mirror of the same
+/// defect.** The renderer cuts its source line out of the file the compiler was
+/// invoked on, indexed by the diagnostic's line number. With the name corrected
+/// and a long enough user file, `stdlib/fmt.mt:232` printed the user's
+/// `fn pad229()`. Both halves are asserted here, because either alone is a
+/// diagnostic that lies about where it points.
+#[test]
+fn p8_a_stdlib_diagnostic_names_the_stdlib_file_and_shows_its_line() {
+    // A user file long enough to HAVE a line 232, so a wrong snippet is
+    // available to be printed. The five-line version cannot tell the two
+    // fixes apart: it prints no snippet either way.
+    let mut src = String::from("use std::io;\nuse std::fmt;\n");
+    for i in 0..300 {
+        src.push_str(&format!("fn pad{}() -> int {{ return {}; }}\n", i, i));
+    }
+    src.push_str("fn main() { io::println(fmt::show_hex(255)); }\n");
+    let p = tmp("p8_long.mt");
+    std::fs::write(&p, &src).expect("write");
+    let o = Command::new(manitc())
+        .args(["check", "--warn", "division-semantics", p.to_str().unwrap()])
+        .output().expect("check");
+    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+
+    assert!(
+        text.contains("stdlib/fmt.mt:232"),
+        "a diagnostic inside merged stdlib source must name the stdlib file:\n{}",
+        text
+    );
+    assert!(
+        !text.contains("p8_long.mt:232"),
+        "it must not be attributed to the user's file:\n{}",
+        text
+    );
+    // The snippet must be the NAMED file's line, not the invoked file's.
+    assert!(
+        text.contains("v = v / base;"),
+        "the snippet must come from stdlib/fmt.mt, which is what the header \
+         names:\n{}",
+        text
+    );
+    assert!(
+        !text.contains("fn pad229()"),
+        "the snippet must NOT be the user's line 232 under a stdlib header:\n{}",
+        text
+    );
+    // Control: a diagnostic in the USER's own code still names the user's file
+    // and shows the user's line, so this is not "everything says stdlib now".
+    let up = tmp("p8_user.mt");
+    std::fs::write(&up, "use std::io;\nfn main() {\n    let a: int = 7;\n    let b: int = a / 2;\n    io::print_int(b);\n}\n")
+        .expect("write");
+    let uo = Command::new(manitc())
+        .args(["check", "--warn", "division-semantics", up.to_str().unwrap()])
+        .output().expect("check");
+    let utext = format!("{}{}", String::from_utf8_lossy(&uo.stdout), String::from_utf8_lossy(&uo.stderr));
+    assert!(utext.contains("p8_user.mt:4"), "user diagnostics keep the user's file:\n{}", utext);
+    assert!(utext.contains("let b: int = a / 2;"), "and the user's line:\n{}", utext);
+}
+
+/// **`recv` on an empty open channel: 0 on T3, DEADLOCK on LLVM.**
+/// report.txt P5.1 — "the sharpest divergence recorded in this file" — closed
+/// 29 August 2026.
+///
+/// One program, a wrong answer on one backend and SILENCE on the other: LLVM
+/// blocked on a condition variable nothing could signal, with stdout unflushed,
+/// so it printed nothing at all — including the line it had already produced
+/// before the recv.
+///
+/// **This is not the design decision P5 is parked on.** Making `recv` block
+/// needs a scheduler to block onto, and that choice is still open. Under the
+/// contract that exists — `spawn { B }` runs B in place and to completion, which
+/// `phase3_tests` pins — an OPEN empty channel has no possible sender, so the
+/// receive cannot be satisfied and both backends say so. It stops being
+/// reachable the day `spawn` starts a real task.
+///
+/// The CLOSED empty channel is deliberately untouched: that is the drain case
+/// `examples/concurrency.mt` relies on, and it still yields 0 on both.
+#[test]
+fn p5_1_recv_on_an_open_empty_channel_faults_on_both_backends() {
+    let src = "use std::io;\nfn main() {\n    io::println(\"before\");\n    \
+               let ch = channel<int>();\n    let v: int = ch.recv();\n    \
+               io::print_int(v);\n}\n";
+    let p = tmp("p5_1_recv.mt");
+    std::fs::write(&p, src).expect("write");
+
+    let out = tmp("p5_1_recv");
+    let c = Command::new(manitc())
+        .args(["compile", p.to_str().unwrap(), "--target", "t3", "-o", out.to_str().unwrap()])
+        .output().expect("compile");
+    assert!(c.status.success(), "must still compile");
+    let r = Command::new(manitc())
+        .args(["run-t3", out.with_extension("t3b").to_str().unwrap()])
+        .output().expect("run");
+    let t3 = format!("{}{}", String::from_utf8_lossy(&r.stdout), String::from_utf8_lossy(&r.stderr));
+    assert!(t3.contains("before"), "output before the recv must survive: {:?}", t3);
+    assert!(
+        t3.contains("recv on an empty channel that is still open"),
+        "T3 must fault rather than answer 0: {:?}",
+        t3
+    );
+    assert!(!t3.contains("got 0"), "T3 must not silently answer 0: {:?}", t3);
 }
 
 /// payload enum declared AND matched, never constructed — control
@@ -195,33 +475,40 @@ fn gs62_generic_freefn() {
 
 /// P67: RENAMING A STRUCT MUST NOT CHANGE WHAT A PROGRAM MEANS — and this
 /// records exactly which names still break that.
-///
-/// The test the defect deserved, rather than the one that found it. A program
+////// The test the defect deserved, rather than the one that found it. A program
 /// is compiled once per struct NAME, identical otherwise, and the answers are
 /// compared against a control name on no list.
 ///
 /// TWO SETS, AND THE DISTINCTION IS THE FINDING. `resolve_type` carries a
-/// hardcoded list of generic constructors, and a name on it shadows a user's
-/// own `struct <name><T>`: the ANNOTATION resolves to `Generic(name, [..])`
-/// while the LITERAL resolves to `Struct(name)`, and those do not unify.
+/// hardcoded list of generic constructors, and a name on it shadowed a user's
+/// own `struct <name><T>`: the ANNOTATION resolved to `Generic(name, [..])`
+/// while the LITERAL resolved to `Struct(name)`, and those do not unify.
 ///
 ///   * `Pair` was on that list with NOTHING BEHIND IT — no stdlib source, no
 ///     IR, no backend — so it shadowed a user struct for nothing. Removed
 ///     (report.txt P67), and it is asserted here to work.
 ///   * The other nine have real implementations, so shadowing them is a
 ///     genuine collision rather than a phantom, and "the built-in wins" is a
-///     defensible rule. They are listed below as still-shadowed, so this test
-///     ENCODES the current convention rather than imposing a new one — and it
-///     fails if the set changes in either direction.
+///     defensible rule. What was NOT defensible was that the collision was
+///     silent, and that is now P70's declaration-site diagnostic: they are
+///     asserted here to be refused, and `p70_*` below asserts WHERE.
 ///
-/// What is NOT defensible is that the collision is silent: the program is
-/// refused with `expected Vec<<unknown>>, found Vec`, which names neither the
-/// cause nor the remedy. That is recorded as P67's open half.
+/// THIS TEST WAS ITSELF AN INSTANCE OF THE RULE IT RECORDS, WHICH IS P70. Its
+/// original `FREE` list held `String`, on the strength of the program below
+/// compiling — and every program below is GENERIC. `struct String<T>` is
+/// genuinely free; `struct String` is shadowed by `str`, and no member of this
+/// family could see that, because `<T>` is what all thirteen of them hold
+/// fixed. P67's own rule — when a family of probes agrees, ask what every
+/// member HOLDS FIXED — applied one level up, to the test written to record
+/// it. `p70_*` therefore probes both spellings of every name.
 #[test]
 fn p67_a_struct_name_must_not_change_the_program() {
     // Names with no built-in behind them: a user struct must work.
-    const FREE: &[&str] = &["Duo", "Pair", "Task", "String"];
-    // Names whose built-in has an implementation, which currently wins.
+    // `String` is NOT here — see the note above; it is reserved in the plain
+    // spelling and this program is the generic one.
+    const FREE: &[&str] = &["Duo", "Pair", "Task"];
+    // Names whose built-in has an implementation, which wins — now with a
+    // diagnostic that says so.
     const SHADOWED: &[&str] = &[
         "Vec", "Map", "Set", "Deque", "TernaryTrie", "Channel", "Mutex",
         "Result", "Range",
@@ -261,6 +548,287 @@ fn p67_a_struct_name_must_not_change_the_program() {
          This half of the test exists to make the convention visible, not to \
          defend it.",
         no_longer_shadowed,
+    );
+}
+
+/// P70 — the reserved set is DERIVED from the compiler's own table, in both
+/// spellings, and the diagnostic must point at the DECLARATION.
+///
+/// P60's remedy applied to a third registry. The list is not copied here: the
+/// test iterates `SemanticAnalyzer::RESERVED_TYPE_NAMES` itself, so a name
+/// added to the table without a diagnostic, or a diagnostic without a table
+/// entry, fails — the two cannot drift the way `STDLIB_MODULES` and
+/// `SOURCE_MODULES` did.
+///
+/// THE ASSERTION IS THE LINE, NOT THE EXIT STATUS. Ten of these fifteen names
+/// were ALREADY refused before P70, so a status assertion is green either way
+/// and says nothing about the change. The claim is that the message moved from
+/// the use to the declaration, and only the line number can carry it.
+#[test]
+fn p70_a_reserved_name_is_refused_at_the_declaration_in_both_spellings() {
+    use manitc::semantic::analyzer::SemanticAnalyzer;
+
+    // Line 1 is the declaration; line 3 is the use. Kept to three lines so the
+    // number means something.
+    let generic = |n: &str| {
+        format!(
+            "struct {n}<T> {{ pub first: T, pub second: T }}\n\
+             fn swap<T>(p: {n}<T>) -> {n}<T> {{ {n} {{ first: p.second, second: p.first }} }}\n\
+             fn main() {{ let p = {n} {{ first: 1, second: 2 }}; io::println_int(swap(p).first); }}\n"
+        )
+    };
+    let plain = |n: &str| {
+        format!(
+            "struct {n} {{ pub first: int, pub second: int }}\n\
+             fn swap(p: {n}) -> {n} {{ {n} {{ first: p.second, second: p.first }} }}\n\
+             fn main() {{ let p = {n} {{ first: 1, second: 2 }}; io::println_int(swap(p).first); }}\n"
+        )
+    };
+
+    let mut wrong = Vec::new();
+    for (name, _, _) in SemanticAnalyzer::RESERVED_TYPE_NAMES {
+        for (form, src) in [("g", generic(name)), ("p", plain(name))] {
+            let (ok, err) = check_source_out(&format!("p70_{form}_{name}"), &src);
+            if ok {
+                wrong.push(format!("{name} ({form}): accepted"));
+            } else if diagnostic_line(&err) != Some(1) {
+                wrong.push(format!(
+                    "{name} ({form}): refused at line {:?}, not the declaration",
+                    diagnostic_line(&err)
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a reserved type name must be refused where it is DECLARED (line 1), \
+         in both the generic and the plain spelling — report.txt P70. \
+         Offending: {:#?}",
+        wrong,
+    );
+
+    // The other direction, and it is the half that keeps the table honest.
+    //
+    // `AtomicTrit`, `Barrier`, `Semaphore` and `MutexGuard` are answered early
+    // by `name_to_manitype` too — but they answer `Struct(name, [])`, which is
+    // exactly what the struct table would have given, so nothing shadows and
+    // they are deliberately ABSENT from the table. If someone adds them for
+    // symmetry, this fails and says why.
+    const FREE: &[&str] = &[
+        "Pair", "Duo", "Task", "Widget",
+        "AtomicTrit", "Barrier", "Semaphore", "MutexGuard", "RwLock", "Future",
+    ];
+    let mut refused = Vec::new();
+    for n in FREE {
+        for (form, src) in [("g", generic(n)), ("p", plain(n))] {
+            if !check_source(&format!("p70_free_{form}_{n}"), &src) {
+                refused.push(format!("{n} ({form})"));
+            }
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "these names are refused but are not in RESERVED_TYPE_NAMES, so the \
+         diagnostic is firing on something the table does not claim, or a \
+         resolver arm has grown without one — report.txt P70. Refused: {:?}",
+        refused,
+    );
+}
+
+/// P70 — `struct Self` was the only member of the set that did not end in a
+/// refusal, and it is the reason this is a defect rather than a diagnostic
+/// improvement.
+///
+/// `name_to_manitype("Self")` answers from `current_impl_type`, which is `None`
+/// at top level, so the annotation resolved to `Unknown` — compatible with
+/// everything. The program therefore TYPE-CHECKED, `manitc check` exited 0,
+/// and `p.second` read slot 0: measured, `1` on BOTH backends where it should
+/// print `2`. A debug compiler panics P44's assertion instead, which is how it
+/// surfaced.
+///
+/// Both halves are asserted: the refusal, and — since a refusal is cheap to
+/// get wrong — that it is the DECLARATION that is named.
+#[test]
+fn p70_struct_self_printed_the_wrong_field_and_is_now_refused() {
+    let src = "struct Self { pub first: int, pub second: int }\n\
+               fn swap(p: Self) -> int { p.second }\n\
+               fn main() { let p = Self { first: 1, second: 2 }; io::println_int(swap(p)); }\n";
+    let (ok, err) = check_source_out("p70_self", src);
+    assert!(
+        !ok,
+        "`struct Self` type-checks. It did before P70, and then printed 1 \
+         instead of 2 on both backends — report.txt P70."
+    );
+    assert_eq!(
+        diagnostic_line(&err),
+        Some(1),
+        "`struct Self` is refused, but not at its declaration:\n{}",
+        err
+    );
+    assert!(
+        err.contains("reserved type name"),
+        "`struct Self` is refused for some OTHER reason, which would make this \
+         row pass without covering P70:\n{}",
+        err
+    );
+}
+
+/// P70 — `lint allow(reserved-type-name);` is an exact restoration, not a
+/// softening.
+///
+/// The escape hatch matters because the two stdlib modules that declare `Vec`,
+/// `Map`, `Mutex` and the rest ARE the built-ins, and they use it. What `allow`
+/// must give back is the PREVIOUS compiler: the plain spelling compiled then
+/// and must compile now, and the generic spelling failed then — at the use —
+/// and must still fail there. Asserting only the first half would pass for a
+/// version that silently accepted the broken program too.
+#[test]
+fn p70_lint_allow_restores_the_previous_behaviour_exactly() {
+    let plain = "lint allow(reserved-type-name);\n\
+                 struct Vec { pub first: int, pub second: int }\n\
+                 fn swap(p: Vec) -> Vec { Vec { first: p.second, second: p.first } }\n\
+                 fn main() { let p = Vec { first: 1, second: 2 }; io::println_int(swap(p).first); }\n";
+    assert!(
+        check_source("p70_allow_plain", plain),
+        "`lint allow(reserved-type-name);` must restore the previous compiler, \
+         in which `struct Vec` (plain) compiled — report.txt P70."
+    );
+
+    let generic = "lint allow(reserved-type-name);\n\
+                   struct Vec<T> { pub first: T, pub second: T }\n\
+                   fn swap<T>(p: Vec<T>) -> Vec<T> { Vec { first: p.second, second: p.first } }\n\
+                   fn main() { let p = Vec { first: 1, second: 2 }; io::println_int(swap(p).first); }\n";
+    let (ok, err) = check_source_out("p70_allow_generic", generic);
+    assert!(
+        !ok,
+        "`allow` restored more than the previous behaviour: the generic \
+         spelling was refused before P70 and must still be. `allow` silences \
+         the declaration diagnostic; it does not make the shadowing go away."
+    );
+    assert_eq!(
+        diagnostic_line(&err),
+        Some(4),
+        "under `allow` the generic spelling must fail where it always did — at \
+         the USE, line 4 — not at the declaration:\n{}",
+        err
+    );
+}
+
+/// P70 — the stdlib's own `lint allow(reserved-type-name);` must not reach a
+/// program that uses the module.
+///
+/// P62's shape, and the reason it is pinned rather than reasoned about:
+/// `collections` and `sync` are not in `SOURCE_MODULES`, so they are never
+/// merged into a host program and their lint item cannot travel. That is an
+/// argument from a registry, and a registry can change — `tritfs` was moved
+/// INTO `SOURCE_MODULES` by P60 for exactly the reasons that would apply to
+/// these two. If either is ever expanded, a user's `struct Vec<T>` would
+/// silently stop being reported and this row is what says so.
+///
+/// A COMPOSITION FAILURE HAS NO PAIR TO COMPARE — both halves are correct on
+/// their own — so it has to be asserted as behaviour.
+#[test]
+fn p70_the_stdlib_lint_allow_does_not_travel_to_a_user_program() {
+    let src = "use std::collections;\n\
+               struct Vec<T> { pub first: T, pub second: T }\n\
+               fn main() { let v: Vec<int> = Vec { first: 1, second: 2 }; io::println_int(v.first); }\n";
+    let (ok, err) = check_source_out("p70_leak", src);
+    assert!(
+        !ok,
+        "a program that declares `struct Vec<T>` is accepted when it also says \
+         `use std::collections;` — the module's own `lint allow` has leaked \
+         into the host program. report.txt P70."
+    );
+    assert!(
+        err.contains("reserved type name"),
+        "refused, but not by the reserved-name diagnostic:\n{}",
+        err
+    );
+
+    // The control: using the module normally is untouched. Without this the
+    // row above passes for a version that broke `use std::collections;`
+    // outright.
+    let control = "use std::sync;\n\
+                   use std::collections;\n\
+                   fn main() { let v: Vec<int> = Vec::new(); io::println_int(Vec::len(v)); }\n";
+    assert!(
+        check_source("p70_leak_control", control),
+        "an ordinary user of std::collections and std::sync no longer compiles"
+    );
+}
+
+/// P70 — the reference's two tables must agree with the compiler's.
+///
+/// `docs/language-reference.md` §14 lists the reserved type names and §20
+/// lists the lints with their defaults. Both are registries describing another
+/// registry, which is P60's shape and the reason it is checked rather than
+/// proof-read: §14 carried a paragraph saying reserved names "say so badly"
+/// for as long as that was true and would have carried it afterwards, and §20's
+/// table was silently missing three lints when this was written —
+/// `literal-out-of-word`, `backend-unavailable-chain` and `reserved-type-name`
+/// itself.
+///
+/// A DOCUMENTATION DEFECT IN THIS CODEBASE HAS NEVER BEEN A FALSE SENTENCE
+/// (P51, P55, §14's refuted address explanation, and now this): it is an
+/// absence, a stale word, or a mechanism that was true when written. Prose
+/// review does not find those. An assertion does.
+#[test]
+fn p70_the_reference_tables_agree_with_the_compiler() {
+    use manitc::semantic::analyzer::SemanticAnalyzer;
+
+    let doc = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/language-reference.md"),
+    )
+    .expect("language reference");
+
+    let s14 = {
+        let i = doc.find("### Reserved type names").expect("§14 reserved-names section");
+        let j = doc[i..].find("## 15.").map(|k| i + k).unwrap_or(doc.len());
+        &doc[i..j]
+    };
+    let undocumented: Vec<&str> = SemanticAnalyzer::RESERVED_TYPE_NAMES
+        .iter()
+        .map(|(n, _, _)| *n)
+        .filter(|n| !s14.contains(&format!("`{n}`")))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "these names are reserved by the compiler and absent from \
+         language-reference.md §14's table, so a reader has no way to learn \
+         they are taken: {:?}",
+        undocumented,
+    );
+
+    let s20 = {
+        let i = doc.find("### The lints").expect("§20 lint table");
+        let j = doc[i..]
+            .find("`--warn-as-error` still means")
+            .map(|k| i + k)
+            .unwrap_or(doc.len());
+        &doc[i..j]
+    };
+    let mut wrong = Vec::new();
+    for (kind, name, level) in manitc::lint::LINTS {
+        let _ = kind;
+        let row = s20
+            .lines()
+            .find(|l| l.contains(&format!("`{name}`")) && l.starts_with('|'));
+        match row {
+            None => wrong.push(format!("{name}: absent from the table")),
+            Some(l) => {
+                let want = level.as_str();
+                if !l.split('|').nth(2).is_some_and(|c| c.trim() == want) {
+                    wrong.push(format!("{name}: default is `{want}`, table says `{}`",
+                        l.split('|').nth(2).unwrap_or("?").trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "language-reference.md §20's lint table disagrees with `lint::LINTS`: \
+         {:#?}",
+        wrong,
     );
 }
 
@@ -708,26 +1276,44 @@ fn s64_reverse_does_not_kill_the_emulator() {
     assert!(ll.contains("done"), "LLVM lost its output too: {:?}", ll);
 }
 
-/// **`str::len` counts BYTES, so it and `byte_len` are synonyms.** Open: the
-/// two functions assert a distinction their values do not have.
+/// **`str::len` counts BYTES, and `str::char_count` counts characters.**
+/// Closed by P48 (29 August 2026).
+///
+/// The `len`/`byte_len` synonymy is the DECISION — the whole `str` surface is
+/// byte-indexed, `slice` included (P50) — and what was actually missing was any
+/// way to ask the other question. This row used to be `#[ignore]`d expecting
+/// `len` to be 3, which contradicted `s64_char_as_int_sign`'s expectation that
+/// `char_at("é", 0)` is 195: a codepoint `len` sharing its index with a byte
+/// `char_at` cannot be looped over. Two ignored rows, each recording half of a
+/// design nobody had settled.
+///
+/// Asserted on both backends, because `char_count` is a new native and a new
+/// native is exactly where the two implementations can disagree.
 #[test]
-#[ignore = "§64/P48: str::len counts BYTES; it and byte_len are synonyms"]
-fn s64_len_counts_characters_not_bytes() {
-    let (t3, _) = both("s64_len_equals_bytelen");
-    assert_eq!(t3, expected("s64_len_equals_bytelen"), "str::len should count characters");
+fn s64_len_is_bytes_and_char_count_is_characters() {
+    let (t3, ll) = both("s64_len_equals_bytelen");
+    assert_eq!(t3, expected("s64_len_equals_bytelen"), "len/byte_len are bytes; char_count is characters");
+    assert_eq!(t3, ll, "the two backends must agree about both units");
 }
 
-/// **`char as int` is UNSIGNED on T3 and SIGNED on LLVM for any byte >= 128.**
+/// **`char as int` was UNSIGNED on T3 and SIGNED on LLVM for any byte >= 128.**
+/// Closed by P48 (29 August 2026).
 ///
-/// Asserted on AGREEMENT rather than on a value, and that is the point: T3
-/// alone gives 195, which is what `.expected` holds, so a value assertion
-/// against T3 would pass while the divergence stands. ASCII agrees on both,
-/// which is why nothing caught this — see the control below.
+/// Asserted on AGREEMENT **and** on the value, and the pair is the point.
+/// Agreement alone is satisfiable by making both backends wrong together —
+/// P44's lesson about the parity matrix — and a value assertion alone was
+/// green on T3 throughout, because `.expected` holds T3's answer. ASCII agrees
+/// on both and always did, which is why nothing caught this; see the control
+/// below.
 #[test]
-#[ignore = "§64/P48: char as int is UNSIGNED on T3 (195) and SIGNED on LLVM (-61)"]
 fn s64_char_as_int_agrees_across_backends() {
     let (t3, ll) = both("s64_char_as_int_sign");
     assert_eq!(t3, ll, "backends disagree on `char as int` for a byte >= 128");
+    assert_eq!(
+        t3,
+        expected("s64_char_as_int_sign"),
+        "a char is an UNSIGNED byte: 0xC3 is 195, not -61"
+    );
 }
 
 /// The same three calls on ASCII — control, so this is not `str` being broken
@@ -737,6 +1323,54 @@ fn s64_ascii_control() {
     let (t3, ll) = both("s64_ascii_control");
     assert_eq!(t3, expected("s64_ascii_control"), "ASCII must be correct");
     assert_eq!(t3, ll, "ASCII must agree across backends");
+}
+
+/// **A `char` is an UNSIGNED BYTE, and every operation on one must say so.**
+/// report.txt P48, closed 29 August 2026.
+///
+/// P48 recorded exactly one divergence — `char as int`. This fixture is one
+/// line per family, and on the pinned control `manitc-p71` **six of its seven
+/// lines answer differently on the two backends**; all seven agree after the
+/// fix. That is how the count was established rather than asserted.
+///
+/// **THE SEVENTH LINE IS THE ONE PARITY COULD NOT SEE, AND IT IS WHY THIS ROW
+/// ASSERTS A VALUE.** `trit(-1) as char` was **-1 on BOTH backends** — they
+/// agreed, on a value outside the type's own range, so a cross-backend check
+/// reports it as fine. It is 0 now, by the clamp rule. P44/P58: a shared
+/// lowering shares its bugs, and agreement between two implementations is weak
+/// evidence about a design they both got from the same place.
+///
+/// The four P48 did not record:
+///   * ORDERING. `c > 'a'` was 1 on T3 and 0 on LLVM, so every `str::`
+///     function that compares characters answered differently on non-ASCII.
+///   * `int as char` did not narrow AT ALL on T3 — `300 as char` stayed 300 —
+///     while LLVM truncated to 44 and `255 as char as int` came back -1.
+///   * `float as char` was not a conversion on T3: it handed back the raw
+///     IEEE-754 bit pattern.
+///   * the value crossing a call boundary or an array slot.
+///
+/// Line 6 and 7 are every OTHER cast that touches a char, and they are here
+/// because giving `char` its own IR type silently removed it from five
+/// or-patterns that listed `I8` — `is_scalar` (so no char local was promoted),
+/// `is_int` (so no char/float coercion), T3's int→trit clamp, T3's int→char
+/// clamp, and the byte clamp's treatment of `bool`. **The compiler reported
+/// none of them**, because every pattern stayed valid without the variant
+/// (report.txt P68's shape). `'Q' as trit` came out 81; `true as char` came out
+/// 0. `'Q' as float` is a different case again: it was ALREADY wrong on T3
+/// before any of this, and only probing the whole family found it.
+///
+/// Asserted on the VALUE and on AGREEMENT together. Agreement alone is
+/// satisfiable by making both backends wrong at once (P44); the value alone
+/// was green on T3 for three of the five lines throughout.
+#[test]
+fn p48_char_is_an_unsigned_byte_on_both_backends() {
+    let (t3, ll) = both("p48_char_is_an_unsigned_byte");
+    assert_eq!(
+        t3,
+        expected("p48_char_is_an_unsigned_byte"),
+        "T3: a char is an unsigned byte 0..=255, and `as char` clamps"
+    );
+    assert_eq!(t3, ll, "the backends must agree about every char operation");
 }
 
 /// Printing a multi-byte literal untouched — control, so the I/O path handles
@@ -1001,4 +1635,110 @@ fn p55_a_capturing_lambda_is_refused_with_a_useful_message() {
         text
     );
     assert!(text.contains("'k'"), "the message must name the captured variable:\n{}", text);
+}
+
+// ---------------------------------------------------------------------------
+// P71 — a DISCARDED instantiation still has a declared return type
+//
+// P65's design is that an instantiation whose BODY does not check is discarded
+// and the call keeps the erased path, which is what makes monomorphisation
+// unable to break a program. The defect is that the same verdict also gated the
+// RETURN TYPE, which is a function of the DECLARATION and not of the body: the
+// reader wrote `-> T` and it means `P` whether or not the body compiles at
+// `T = P`. Left `<unknown>`, a field read on the result takes slot 0.
+//
+// Both call sites carried it — free function and `impl<T>` method — and P69's
+// §6 recorded only the second.
+// ---------------------------------------------------------------------------
+
+/// P71: free-function half. `1 1` on the pre-P71 release compiler, an assertion
+/// panic on the pre-P71 debug compiler, `1 2` here.
+#[test]
+fn p71_failed_instantiation_still_types_the_return_freefn() {
+    assert_t3_value("p71_failed_inst_freefn");
+}
+
+/// P71: `impl<T>` method half, reached through the receiver rather than the
+/// arguments. Same value, a separate gate in the compiler.
+#[test]
+fn p71_failed_instantiation_still_types_the_return_impl_method() {
+    assert_t3_value("p71_failed_inst_impl_method");
+}
+
+/// **P71 IS A STRICTNESS CHANGE, AND THIS IS THE PROGRAM IT NEWLY REFUSES.**
+///
+/// `<unknown>` is compatible with everything, so binding a discarded
+/// instantiation's result to a mismatched annotation used to be accepted — and
+/// the program it accepted was assigning a struct address to an `int`. Pinned
+/// in both directions: the mismatched form must be refused, the matching form
+/// must still be accepted, so the row cannot go green by refusing everything.
+#[test]
+fn p71_a_failed_instantiations_result_is_no_longer_compatible_with_everything() {
+    let head = "use std::io;\n\
+                struct P { pub x: int }\n\
+                fn pick<T>(a: T, b: T) -> T { if a > b { a } else { a } }\n";
+    assert!(
+        !check_source(
+            "p71_strict_bad",
+            &format!("{}fn main() {{ let n: int = pick(P {{ x: 1 }}, P {{ x: 2 }}); io::print_int(n); }}\n", head),
+        ),
+        "binding a `P`-returning call to an `int` must be refused now that the \
+         return type is substituted"
+    );
+    assert!(
+        check_source(
+            "p71_strict_good",
+            &format!("{}fn main() {{ let n: P = pick(P {{ x: 1 }}, P {{ x: 2 }}); io::print_int(n.x); }}\n", head),
+        ),
+        "the correctly-annotated form must still be accepted — otherwise this \
+         row is green because nothing compiles"
+    );
+}
+
+/// **P71's LIMIT, recorded so it is not mistaken for fixed.**
+///
+/// Typing the return correctly is SUFFICIENT for a struct, whose erased
+/// representation — an address — is already its real one. It is only NECESSARY
+/// for a float: the discarded body still computed with integer semantics, so
+/// the caller reinterprets those bits and P65's denormal comes back. Measured
+/// byte-identical before and after P71, which is the argument that substituting
+/// the type onto an erased body is neutral rather than harmful.
+///
+/// `a | 1` is the body because it checks under the erasure and not at `float`;
+/// most float bodies instantiate fine, and one that does is no test of this.
+#[test]
+fn p71_a_failed_float_instantiation_still_returns_the_bit_pattern() {
+    let src = "use std::io;\n\
+               fn g<T>(a: T) -> T { let q = a | 1; a }\n\
+               fn main() { io::print_float(g(1.5)); io::newline(); }\n";
+    let p = tmp("p71_float_limit.mt");
+    std::fs::write(&p, src).expect("write");
+    let out = tmp("p71_float_limit");
+    let c = Command::new(manitc())
+        .args(["compile", p.to_str().unwrap(), "--target", "t3", "-o", out.to_str().unwrap()])
+        .output().expect("compile");
+    assert!(c.status.success(), "the erased path must still compile");
+    // The instantiation is DISCARDED — that is the precondition, and asserting
+    // it is what stops this row quietly becoming a test of a working case.
+    let ll = tmp("p71_float_limit_ll");
+    let _ = Command::new(manitc())
+        .args(["compile", p.to_str().unwrap(), "--target", "llvm", "-o", ll.to_str().unwrap()])
+        .output().expect("compile llvm");
+    if let Ok(text) = std::fs::read_to_string(ll.with_extension("ll")) {
+        assert!(
+            !text.contains("@g$float"),
+            "precondition: this body must FAIL to instantiate at `float`; if it \
+             now succeeds, the row is testing nothing and needs a new body"
+        );
+    }
+    let r = Command::new(manitc())
+        .args(["run-t3", out.with_extension("t3b").to_str().unwrap()])
+        .output().expect("run");
+    let got: String = String::from_utf8_lossy(&r.stdout)
+        .lines().filter(|l| !l.starts_with("[T3ISA]")).collect::<Vec<_>>().join("");
+    assert!(
+        got.starts_with("0.0000") && got.ends_with("5"),
+        "P65's denormal is the documented remaining behaviour here; got {:?}",
+        got
+    );
 }

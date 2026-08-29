@@ -347,10 +347,29 @@ impl Emulator {
                 }
             }
             72 => {
-                // channel_recv(handle=R1) → R1 = value or 0
+                // channel_recv(handle=R1) → R1 = value, or a TRAP on an open
+                // empty channel.
+                //
+                // P81: this returned 0 and carried on, while LLVM blocked
+                // forever on a condition variable nothing could signal. Under
+                // the current contract `spawn { B }` runs B in place, so an
+                // OPEN empty channel has no possible sender and the receive
+                // cannot be satisfied. Both backends now say so. A CLOSED empty
+                // channel still yields 0 — that is the drain case, and it is
+                // what `examples/concurrency.mt` relies on.
                 let h = self.regs[1] as usize;
                 let val = match self.heap_objs.get_mut(&h) {
-                    Some(HeapObj::Channel(ch)) => ch.pop_front().unwrap_or(0),
+                    Some(HeapObj::Channel(ch)) => match ch.pop_front() {
+                        Some(v) => v,
+                        None => {
+                            self.trap(
+                                "TRAP: recv on an empty channel that is still \
+                                 open: nothing can send to it, because `spawn` \
+                                 runs its block in place",
+                            );
+                            return;
+                        }
+                    },
                     Some(HeapObj::ClosedChannel(ch)) => ch.pop_front().unwrap_or(0),
                     _ => 0,
                 };

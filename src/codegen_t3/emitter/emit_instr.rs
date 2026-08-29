@@ -1190,6 +1190,9 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "str_char_at" | "str::char_at" => {
                     emit_syscall_2arg_ret(em, args, dst, 133, "str_char_at");
                 }
+                "str_char_count" | "str::char_count" => {
+                    emit_syscall_1arg_ret(em, args, dst, 136, "str_char_count");
+                }
                 "str_from_char" | "str::from_char" => {
                     emit_syscall_1arg_ret(em, args, dst, 134, "str_from_char");
                 }
@@ -1670,7 +1673,17 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
         // ------------------------------------------------------------------ Cast
         IRInstr::Cast { dst, src, from_ty, to_ty } => {
             match (from_ty, to_ty) {
-                (IRType::I64, IRType::F64) | (IRType::I32, IRType::F64) => {
+                // P48 adds `Char`, and note `I8` was ALREADY missing here before
+                // that: `<i8-typed> as float` fell to the bare `MOV` and handed
+                // back the operand unconverted. That is why `'Q' as float`
+                // printed a denormal on T3 against LLVM's 81 on the PRE-CHANGE
+                // binary too — a pre-existing gap in the same family, found by
+                // probing every cast the new variant touches rather than only
+                // the ones the finding named.
+                (IRType::I64, IRType::F64)
+                | (IRType::I32, IRType::F64)
+                | (IRType::I8, IRType::F64)
+                | (IRType::Char, IRType::F64) => {
                     // int→float: syscall 210
                     // IMPORTANT: rescue BEFORE dst_reg so rescue doesn't move dst after rd is captured
                     let rd = em.dst_reg(dst);   // re-query after rescue
@@ -1695,12 +1708,54 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 // Two instructions, no branch. TMIN/TMAX are NUMERIC min/max
                 // on a whole register here, and both take a 3-trit immediate,
                 // so ±1 encode directly.
-                (IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64, IRType::Trit) => {
+                // P48: `Char` is listed because it used to BE `I8` and this arm
+                // covered it. Giving it its own IR variant made `'Q' as trit`
+                // fall to the bare `MOV` below and evaluate to 81.
+                (
+                    IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 | IRType::Char,
+                    IRType::Trit,
+                ) => {
                     let rd = em.dst_reg(dst);
                     let rs = em.val_reg(src);
                     let (d, s) = (AsmEmitter::rn(rd), AsmEmitter::rn(rs));
                     em.emit(format!("    TMIN  {}, {}, #1   ; int->trit clamp (upper)", d, s));
                     em.emit(format!("    TMAX  {}, {}, #-1  ; int->trit clamp (lower)", d, d));
+                }
+                // P48: integer → char CLAMPS to 0..=255, exactly as the arm
+                // above clamps to a trit and for the same reason — T3 fell
+                // through to the bare `MOV` below, so `300 as char` stayed
+                // **300 on T3** while LLVM answered 44. A value outside the
+                // type's own carrier set, on the backend whose whole point is
+                // that the carrier set is the hardware's. A3's finding, one
+                // type along.
+                //
+                // 255 does NOT fit a 3-trit immediate (range ±13), so the
+                // upper bound is materialised with TLIT and the pair is
+                // TLIT + TMIN + TMAX rather than the trit arm's two.
+                (
+                    IRType::I8
+                    | IRType::I16
+                    | IRType::I32
+                    | IRType::I64
+                    | IRType::Trit
+                    | IRType::Bool,
+                    IRType::Char,
+                ) => {
+                    let rd = em.dst_reg(dst);
+                    let rs = em.val_reg(src);
+                    // 255 does not fit a 3-trit immediate (range ±13), so the
+                    // upper bound needs a register. It must be a SCRATCH one:
+                    // materialising it into `rd` would destroy the operand
+                    // whenever the allocator gave `rd` and `rs` the same
+                    // register, and `scratch()` is documented as never
+                    // allocated to a temp. (The int->trit arm above has no such
+                    // hazard: ±1 are immediates, so its first instruction reads
+                    // the source and writes the destination in one operation.)
+                    let hi = em.scratch();
+                    let (d, s, h) = (AsmEmitter::rn(rd), AsmEmitter::rn(rs), AsmEmitter::rn(hi));
+                    em.emit(format!("    TLIT  {}, #255      ; int->char clamp (upper bound)", h));
+                    em.emit(format!("    TMIN  {}, {}, {}  ; int->char clamp (upper)", d, s, h));
+                    em.emit(format!("    TMAX  {}, {}, #0    ; int->char clamp (lower)", d, d));
                 }
                 (IRType::F64, IRType::I64) | (IRType::F64, IRType::I32) => {
                     // float→int truncating: syscall 211
@@ -1709,6 +1764,28 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     if rs != 1 { em.emit(format!("    MOV   R1, {}  ; ftoi input", AsmEmitter::rn(rs))); }
                     em.emit("    SYSCALL #211  ; ftoi (float_bits→int, truncate)".to_string());
                     if rd != 1 { em.emit(format!("    MOV   {}, R1  ; ftoi result", AsmEmitter::rn(rd))); }
+                }
+                // P48: float → char is the int conversion followed by the same
+                // clamp. Without it this fell to the bare `MOV`, so
+                // `3.9 as char as int` handed back the RAW IEEE-754 BIT PATTERN
+                // — 4615964438073389875 — where LLVM said 3. Not a rounding
+                // difference: no conversion happened at all.
+                (IRType::F64, IRType::Char) => {
+                    let rd = em.dst_reg(dst);
+                    let rs = em.val_reg(src);
+                    if rs != 1 { em.emit(format!("    MOV   R1, {}  ; ftoi input", AsmEmitter::rn(rs))); }
+                    em.emit("    SYSCALL #211  ; ftoi (float_bits→int, truncate)".to_string());
+                    let d = AsmEmitter::rn(rd);
+                    if rd != 1 { em.emit(format!("    MOV   {}, R1  ; ftoi result", d)); }
+                    // A scratch register, not R23: R23 is reserved for a
+                    // spilled DESTINATION (`DST_SCRATCH`), so borrowing it here
+                    // would collide with the store this instruction's own
+                    // result may need.
+                    let hi = em.scratch();
+                    let h = AsmEmitter::rn(hi);
+                    em.emit(format!("    TLIT  {}, #255     ; float->char clamp (upper bound)", h));
+                    em.emit(format!("    TMIN  {}, {}, {}  ; float->char clamp (upper)", d, d, h));
+                    em.emit(format!("    TMAX  {}, {}, #0    ; float->char clamp (lower)", d, d));
                 }
                 _ => {
                     let rd = em.dst_reg(dst);

@@ -95,10 +95,18 @@ impl IRLowerer {
                     // Check if this is an enum variant constructor: "EnumName::VariantName"
                     let mut parts = name.splitn(2, "::");
                     if let (Some(enum_name), Some(variant_name)) = (parts.next(), parts.next()) {
-                        if let Some(variants) = self.enum_variants.get(enum_name).cloned() {
-                            if let Some(idx) = variants.iter().position(|v| v == variant_name) {
-                                return IRValue::Const(IRConst::Int(idx as i64));
+                        if let Some((idx, _)) = self.enum_variant_info(enum_name, variant_name) {
+                            // P43: a variant of a BOXED enum is a cell even when
+                            // this particular variant carries nothing — the enum
+                            // has one representation, not one per variant. The
+                            // payload words are left at whatever the allocation
+                            // gives, because no arm of a `match` can reach them
+                            // for a variant that declares none.
+                            if self.enum_is_boxed(enum_name) {
+                                let words = self.enum_cell_words(enum_name);
+                                return self.build_enum_cell(idx as i64, &[], words);
                             }
+                            return IRValue::Const(IRConst::Int(idx as i64));
                         }
                     }
                     self.lower_global_read(name)
@@ -656,6 +664,31 @@ impl IRLowerer {
             }
 
             TypedExprKind::Call(callee, args) => {
+                // P43: a payload-carrying enum constructor — `Shape::Circle(2)`.
+                //
+                // It reaches here as an ordinary Call, and before this it stayed
+                // one: the backends emitted a call to `@Shape_Circle`, which
+                // nothing defines, from a program `manitc check` exits 0 on. The
+                // constructor was the only one of the three sites that had no
+                // implementation at all; the other two disagreed with each other
+                // (see `enum_is_boxed`).
+                if let TypedExprKind::Ident(name) = &callee.kind {
+                    if let Some((enum_name, variant_name)) = name.split_once("::") {
+                        if let Some((idx, arity)) = self.enum_variant_info(enum_name, variant_name)
+                        {
+                            if self.enum_is_boxed(enum_name) {
+                                let vals: Vec<IRValue> = args
+                                    .iter()
+                                    .take(arity)
+                                    .map(|a| self.lower_expr(a))
+                                    .collect();
+                                let words = self.enum_cell_words(enum_name);
+                                return self.build_enum_cell(idx as i64, &vals, words);
+                            }
+                        }
+                    }
+                }
+
                 // Detect print intrinsics. Bare `print`/`println` are
                 // variadic line-printers: every argument is printed in
                 // order by its type, followed by one newline (all example
@@ -670,11 +703,19 @@ impl IRLowerer {
                                 ManiType::Float => self.emit(IRInstr::PrintFloat(val)),
                                 ManiType::Bool3 => self.emit(IRInstr::PrintBool3(val)),
                                 ManiType::Trit => self.emit(IRInstr::PrintTrit(val)),
-                                // A char is a Unicode scalar, so printing one
-                                // prints the character — not its codepoint.
-                                // Routed through str::from_char rather than a
-                                // new IR instruction so both backends share
-                                // the single primitive added for str::.
+                                // Printing a char prints the CHARACTER, not the
+                                // number. Routed through str::from_char rather
+                                // than a new IR instruction so both backends
+                                // share the single primitive added for str::.
+                                //
+                                // P48: a char is a BYTE, not a Unicode scalar —
+                                // this comment used to say the opposite while
+                                // `str_from_char` masked with `& 0xFF` two
+                                // files away. Printing one byte of a multi-byte
+                                // character therefore emits that byte, which is
+                                // what makes `from_char` compose with
+                                // `char_at` into the byte-exact round trip the
+                                // rest of `str::` is built on.
                                 ManiType::Char => {
                                     let t = self.fresh_temp();
                                     self.emit(IRInstr::Call {
@@ -1621,4 +1662,46 @@ impl IRLowerer {
         );
         slot.unwrap_or(0) as i64
     }
+
+    /// P43: allocate and fill a boxed enum's cell — `[tag, field0, field1, …]`.
+    ///
+    /// The layout is fixed by `lower_pattern_match` (which loads word 0 to test
+    /// the tag) and by the pattern binders (which read field *i* at word 1+i).
+    /// It is the layout `Result` has always used, one word wider where a
+    /// variant carries more than one field.
+    ///
+    /// Returns the cell's ADDRESS, which is what a `match` scrutinee is.
+    pub(super) fn build_enum_cell(
+        &mut self,
+        tag: i64,
+        vals: &[IRValue],
+        words: usize,
+    ) -> IRValue {
+        let cell = self.fresh_temp();
+        self.emit(IRInstr::Alloca {
+            dst: cell.clone(),
+            ty: IRType::Array(Box::new(IRType::I64), words),
+        });
+        self.emit(IRInstr::Store {
+            ptr: IRValue::Temp(cell.clone()),
+            val: IRValue::Const(IRConst::Int(tag)),
+            ty: IRType::I64,
+        });
+        for (i, v) in vals.iter().enumerate() {
+            let fp = self.fresh_temp();
+            self.emit(IRInstr::GetPtr {
+                dst: fp.clone(),
+                ptr: IRValue::Temp(cell.clone()),
+                idx: IRValue::Const(IRConst::Int(i as i64 + 1)),
+                ty: IRType::I64,
+            });
+            self.emit(IRInstr::Store {
+                ptr: IRValue::Temp(fp),
+                val: v.clone(),
+                ty: IRType::I64,
+            });
+        }
+        IRValue::Temp(cell)
+    }
+
 }

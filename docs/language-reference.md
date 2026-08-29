@@ -601,9 +601,31 @@ Used as iterable in `for` loops.
 
 ```
 let f = 3.14;
-let i = f as int;    // 3
+let i = f as int;    // 3      — saturating: NaN is 0, out of range is the bound
 let t = i as trit;   // clamps to {−1, 0, +1}
+let c = 300 as char; // clamps to 0..=255, so 255
 ```
+
+**`as` CLAMPS AT A BOUNDARY; IT DOES NOT WRAP.** All three narrowing casts
+saturate to the nearest representable value rather than truncating bits, which
+is the rule to predict from when a case is not listed here. `float as int` uses
+`llvm.fptosi.sat` on LLVM and Rust's `as` on T3 so the two agree by
+construction (report.txt P23).
+
+> **`as char` clamped on neither backend before 29 August 2026**, and they were
+> wrong in different directions: T3 did not narrow at all — `300 as char` stayed
+> **300**, a value outside the type — while LLVM, where a `char` was an `i8`,
+> truncated to **44** and made `255 as char as int` come back **−1**
+> (report.txt P48).
+
+A `char` is an **unsigned byte, 0..=255**, so `str::char_at(s, i) as int` is
+195 for the first byte of `é` and never a negative number.
+
+> **It was 195 on T3 and −61 on LLVM until 29 August 2026**, and so was every
+> ORDERING between characters: `c > 'a'` answered differently on the two
+> backends for any byte ≥ 128, which reached every `str::` function that
+> compares characters. ASCII agreed throughout, which is why no corpus caught
+> it (report.txt P48).
 
 ### Question operator
 
@@ -1304,11 +1326,24 @@ One limit remains:
 * **A generic body that does not type-check for the concrete type falls back**
   to the older, erased compilation rather than reporting. So a `<T>` with no
   bound continues to accept whatever it accepted before — bounds remain opt-in
-  — and the price is that the error is not reported either. **A method
-  returning `T` has a sharper corollary**: when the fallback is taken the
-  call's type stays unknown, so `let q = p.bigger(); q.x` reads the WRONG
-  FIELD — slot 0, whatever was asked for — rather than being refused
-  (report.txt P69).
+  — and the price is that the error is not reported either.
+
+  **The fallback still knows what the function RETURNS.** `-> T` is part of the
+  declaration, so under `T = P` the call has type `P` whether or not the body
+  compiled at `P`, and `let q = p.bigger(); q.x` reads the field asked for.
+
+  > **Until 29 August 2026 it did not**, and the wrong field was returned
+  > silently on both backends: the call's type stayed unknown, a field lookup
+  > on an unknown type matched no struct, and every read took slot 0 — so
+  > `q.x` and `q.y` both answered `q`'s first field. It applied to generic free
+  > functions as well as to methods (report.txt P71).
+
+  **What the fallback does NOT recover is the VALUE, when the type's
+  representation is not a machine word.** For a struct that costs nothing —
+  the erased form is an address, which is what a struct already is. For a
+  `float` it is P65's denormal again, because the discarded body computed with
+  integer semantics; naming the return type is necessary there and not
+  sufficient (report.txt P71).
 
 ### Trait bounds
 
@@ -1425,13 +1460,51 @@ io::print_float(p.bigger());          // -1.5
 > type arguments, positionally, so `impl<A, B> Two<A, B>` on a `Two<int, float>`
 > gives `A = int` and `B = float`.
 
-One limit remains, pinned by a test:
+### Reserved type names
 
-* **Some struct names are reserved and say so badly.** Declaring
-  `struct Vec<T>`, or `Map`, `Set`, `Deque`, `TernaryTrie`, `Channel`,
-  `Mutex`, `Result` or `Range`, is shadowed by the built-in of that name, and
-  the program is then refused with a type error naming neither the cause nor
-  the remedy. Pick another name (report.txt P67).
+Fifteen names are the compiler's own, and a `struct` or `enum` may not take
+one. The declaration itself is refused, naming what the name already means:
+
+```
+struct Vec<T> { pub first: T, pub second: T }
+// error: `Vec` is a reserved type name, so this struct cannot be reached
+// through it: the annotation `Vec<...>` resolves to the built-in `Vec<T>`,
+// never to this declaration. Rename the struct.
+```
+
+| | |
+|---|---|
+| `Vec` `Map` `Set` `Deque` `TernaryTrie` `Channel` `Mutex` `Result` `Range` `Option` | built-in generic types |
+| `i64` `f64` `String` | aliases for `int`, `float` and `str` |
+| `bool` | the boolean type |
+| `Self` | the enclosing `impl` block's type |
+
+The sixteen primitive spellings the lexer reserves — `int`, `float`, `str`,
+`char`, `void`, `trit`, `tryte`, `t9`, `t27`, `word`, `t54`, `trint`,
+`tfloat`, `bool3`, `tribool`, `T3Bool` — are keywords, so `struct int` is a
+parse error rather than this one.
+
+`lint allow(reserved-type-name);` turns the check off for one module. It
+restores the previous compiler exactly, which is to say the collision becomes
+silent again rather than going away: the declaration is still unreachable
+through its own name. The two standard-library modules that declare `Vec`,
+`Map`, `Mutex` and the rest use it, because those declarations *are* the
+built-ins.
+
+> **Until 27 August 2026 the collision was not reported at all** (report.txt
+> P70). Which spelling broke depended on which of the compiler's two
+> name-resolution tables answered: the first ten shadowed only
+> `struct Name<T>`, so `struct Vec` was fine; `i64`, `f64`, `String` and `bool`
+> shadowed only the plain form, so `struct String<T>` was fine. Either way the
+> program was refused at its *use*, with a message naming neither cause nor
+> remedy — `expected Vec<<unknown>>, found Vec<int>`, and for `bool` the
+> uninterpretable `expected bool, found bool`.
+>
+> `struct Self` was worse and is why this is a defect rather than a wording
+> fix. It resolved to `<unknown>`, which is compatible with everything, so the
+> program type-checked, `manitc check` exited 0, and the field read took slot 0:
+> `struct Self { first, second }` printed `1` for `p.second` on **both**
+> backends.
 
 ### Generic types in the standard library
 
@@ -1695,8 +1768,17 @@ lint deny(shadowing, unknown-type);
 | `backend-unavailable` | allow | an extern not `available` on this backend |
 | `division-semantics`  | allow | a `/` or `%` whose meaning depends on the language version |
 | `unsatisfied-bound`   | deny  | a generic argument that fails a trait bound |
+| `literal-out-of-word` | allow | an `int` literal outside the 27-trit range (v1 only) |
+| `backend-unavailable-chain` | deny | a call chain that cannot run on this backend |
+| `reserved-type-name`  | deny  | a `struct` or `enum` declared under a name the compiler owns |
 
 `--warn-as-error` still means "raise everything to deny".
+
+`reserved-type-name` is reported only at `deny` or above, and the reason is
+worth knowing because it is a property of the compiler rather than of the
+lint: a recorded warning is printed after analysis finishes, and every program
+this lint fires on also fails analysis, so a `warn`-level report would be
+discarded before anyone saw it. See §14.
 
 ### The manifest
 

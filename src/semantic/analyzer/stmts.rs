@@ -49,7 +49,7 @@ impl SemanticAnalyzer {
                 let span = stmt.span();
                 self.warnings.push(CompileWarning::new(
                     WarningKind::UnreachableCode,
-                    &self.file, span.line, span.col,
+                    &self.dfile(span), span.line, span.col,
                     "unreachable code after return/break/continue",
                 ));
             }
@@ -80,7 +80,7 @@ impl SemanticAnalyzer {
                     if let Some(_existing) = self.symbols.lookup(&ls.name) {
                         self.warnings.push(CompileWarning::new(
                             WarningKind::Shadowing,
-                            &self.file, ls.span.line, ls.span.col,
+                            &self.dfile(ls.span), ls.span.line, ls.span.col,
                             format!("variable '{}' shadows a previous binding", ls.name),
                         ));
                     }

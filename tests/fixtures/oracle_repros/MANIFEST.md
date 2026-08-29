@@ -250,3 +250,36 @@ type-erasure defect has to make the program DO something the erased type gets
 wrong, and for a type parameter that means a COMPARISON. **Run every new row
 against the previous pinned binary before believing it**: that is P40's
 "reintroduce the defect" for the price of one command.
+
+---
+
+## P71 addendum — 29 August
+
+| file | finding | status | what it is |
+|---|---|---|---|
+| `p71_failed_inst_freefn.mt` | P71 | **PASSES** | a generic free function whose instantiation is DISCARDED still has a declared return type. `1 1` before, `1 2` now |
+| `p71_failed_inst_impl_method.mt` | P71 | **PASSES** | the same through an `impl<T>` method. P69's §6 recorded only this half; the free-function site carried it too |
+
+**Both arms of `pick`/`first` return the SAME operand on purpose.** The
+comparison that makes the instantiation fail is `>` on a struct, which is A4's
+open address comparison and picks a different struct on each backend — T3 and
+LLVM print `4` and `2` for the same program if the arms differ. Returning
+`self.a` from both makes the VALUE determinate while leaving the failure that
+the fixture exists to trigger in place, so the row tests the field slot and not
+A4. The first draft of this fixture did not do that and was cross-backend
+divergent for a reason that had nothing to do with P71.
+
+---
+
+## P72 addendum — 29 August, closing P48
+
+| file | finding | status | what it is |
+|---|---|---|---|
+| `p48_char_is_an_unsigned_byte.mt` | P48/P72 | **PASSES** | one line per divergence family. **All five lines answered differently on the two backends before the fix and all five agree after it** — that is how the count was established rather than asserted |
+| `s64_char_as_int_sign.mt` | P48/P72 | **PASSES** (was `#[ignore]`d) | the one divergence P48 recorded |
+| `s64_len_equals_bytelen.mt` | P48/P72 | **PASSES** (was `#[ignore]`d) | **REWRITTEN.** It expected `len` to be 3 — codepoints — which contradicts `s64_char_as_int_sign` expecting `char_at("é", 0)` to be 195: a codepoint `len` sharing its index with a byte `char_at` cannot be looped over. **Two ignored rows, each holding half of a design nobody had settled, and neither looking wrong alone.** Rewritten under P45's rule that a fixture's expected output is a report of what someone wanted, not a specification; it now asserts 4/4/3 and gets the codepoint count from the new `str::char_count` |
+
+**The `p48_*` fixture asserts the VALUE and AGREEMENT together.** Agreement
+alone is satisfiable by making both backends wrong at once (P44); the value
+alone was green on T3 for three of the five lines throughout, because T3 was
+the backend that already had the signedness right.

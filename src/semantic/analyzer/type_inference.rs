@@ -582,7 +582,7 @@ impl SemanticAnalyzer {
                     .unwrap_or_default();
                 self.warnings.push(CompileWarning::new(
                     WarningKind::UnknownType,
-                    &self.file, span.line, span.col,
+                    &self.dfile(span), span.line, span.col,
                     format!(
                         "unknown method '{}' on '{}'{} — type inferred as Unknown",
                         method, gname, hint

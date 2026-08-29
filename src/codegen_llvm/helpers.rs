@@ -13,6 +13,17 @@ pub(crate) fn llvm_type(ty: &IRType) -> String {
         IRType::I32 => "i32".to_string(),
         IRType::Bool => "i1".to_string(),
         IRType::Trit => "i8".to_string(), // stored as -1, 0, +1
+        // P48: a `char` is an unsigned byte 0..=255, CARRIED IN A MACHINE
+        // WORD. The byte-ness lives in the cast (`int as char` masks); the
+        // width does not, and that is deliberate. Spelled `i8` it needed a
+        // correct sign choice at every widening and every comparison, and
+        // those are selected from a STRING shadow of the type system in
+        // which `char` and `trit` are both "i8" — the same trap this file
+        // already records for `i8 signext` (see `strip_abi_attrs`). As a
+        // machine word there is nothing to extend, so no site can get the
+        // extension wrong. It is also what T3 has always done: the emulator
+        // puts the byte in a 64-bit register.
+        IRType::Char => "i64".to_string(),
         IRType::Void => "void".to_string(),
         IRType::Ptr(_inner) => "ptr".to_string(), // opaque pointer, LLVM 15+
         IRType::Array(elem, n) => format!("[{} x {}]", n, llvm_type(elem)),
@@ -38,6 +49,7 @@ pub(crate) fn llvm_align(ty: &IRType) -> &'static str {
         IRType::I32 => "4",
         IRType::I16 => "2",
         IRType::I8 | IRType::Trit => "1",
+        IRType::Char => "8", // a machine word — see `llvm_type`
         IRType::Bool => "1",
         IRType::Ptr(_) => "8",
         _ => "8",
@@ -196,12 +208,19 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
         | (IRType::Trit, IRType::I32)
         | (IRType::Trit, IRType::I64) => "sext",
 
+        // Char → a NARROWER integer truncates; Char → I64 is the identity and
+        // never reaches here (`cast_sequence` takes the same-width branch).
+        // A `char` already holds 0..=255, so no extension is involved either
+        // way — that is the point of carrying it in a machine word (P48).
+        (IRType::Char, IRType::I16) | (IRType::Char, IRType::I32) => "trunc",
+
         // Bool (i1) → integer: zero-extend (true=1, false=0).
         // Bool → Trit is also zext: true → +1, false → 0.
         (IRType::Bool, IRType::I8)
         | (IRType::Bool, IRType::I16)
         | (IRType::Bool, IRType::I32)
         | (IRType::Bool, IRType::I64)
+        | (IRType::Bool, IRType::Char)
         | (IRType::Bool, IRType::Trit) => "zext",
 
         // Truncation / narrowing
@@ -220,7 +239,9 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
         | (IRType::Trit, IRType::F64) => "sitofp",
 
         // Bool → float: false → 0.0, true → 1.0
-        (IRType::Bool, IRType::F64) => "uitofp",
+        // Char → float: a char is 0..=255, so signed and unsigned agree; this
+        // is `uitofp` to say which one is meant rather than to change a value.
+        (IRType::Bool, IRType::F64) | (IRType::Char, IRType::F64) => "uitofp",
 
         // Float → integer
         (IRType::F64, IRType::I64)
@@ -229,10 +250,13 @@ pub(crate) fn pick_cast_op(from: &IRType, to: &IRType) -> &'static str {
         | (IRType::F64, IRType::I8) => "fptosi",
 
         // Pointer ↔ integer (both ops accept any integer width)
-        (IRType::Ptr(_), IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8) => "ptrtoint",
-        (IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8 | IRType::Trit, IRType::Ptr(_)) => {
-            "inttoptr"
+        (IRType::Ptr(_), IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8 | IRType::Char) => {
+            "ptrtoint"
         }
+        (
+            IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8 | IRType::Char | IRType::Trit,
+            IRType::Ptr(_),
+        ) => "inttoptr",
 
         // Pointer ↔ pointer (same under opaque ptrs, but bitcast is still valid)
         (IRType::Ptr(_), IRType::Ptr(_)) => "bitcast",
@@ -279,14 +303,65 @@ fn fptosi_sat(dst: &str, src: &str, to_s: &str) -> String {
     )
 }
 
+/// `<integer> as char`, CLAMPED to 0..=255.
+///
+/// P48. A `char` is an unsigned byte carried in a machine word, so the
+/// byte-ness has to be imposed HERE — it is the one place the width is not
+/// implied by the storage. Without it `300 as char` stayed 300 on T3, which
+/// never narrowed at all, while LLVM — where a char was an `i8` — truncated to
+/// 44.
+///
+/// **CLAMP AND NOT WRAP, AND THE LANGUAGE CHOSE THAT BEFORE THIS CAST EXISTED.**
+/// The two boundary behaviours the reference documents both clamp: `i as trit`
+/// "clamps to {-1, 0, +1}", and `float as int` SATURATES (P23 picked
+/// `llvm.fptosi.sat` precisely so the backends would agree by construction).
+/// Truncating to 44 would be C's answer, not this language's, and a reader
+/// predicting from the two documented cases would predict 255. Matching LLVM's
+/// old i8 truncation would have been matching an accident of the storage.
+fn clamp_to_byte(dst: &str, src: &str, from_s: &str) -> String {
+    let w = if from_s == "i64" {
+        src.to_string()
+    } else {
+        // Widen first so the clamp is applied at machine width.
+        return format!(
+            "%{d}__cw = sext {ft} {s} to i64\n  {rest}",
+            d = dst,
+            ft = from_s,
+            s = src,
+            rest = clamp_to_byte(dst, &format!("%{}__cw", dst), "i64")
+        );
+    };
+    format!(
+        "%{dst}__lo = icmp slt i64 {w}, 0\n  \
+         %{dst}__c1 = select i1 %{dst}__lo, i64 0, i64 {w}\n  \
+         %{dst}__hi = icmp sgt i64 %{dst}__c1, 255\n  \
+         %{dst} = select i1 %{dst}__hi, i64 255, i64 %{dst}__c1",
+        dst = dst,
+        w = w
+    )
+}
+
 pub(crate) fn cast_sequence(dst: &str, src: &str, from: &IRType, to: &IRType) -> String {
     let from_s = llvm_type(from);
     let to_s = llvm_type(to);
 
+    // `<integer> as char` clamps to a byte. BEFORE the same-width branch below,
+    // which would otherwise make `int as char` the identity now that a char is
+    // a machine word (P48).
+    // `Bool` is excluded because it is ALREADY 0 or 1 and because clamping it
+    // would widen it with `sext`, and `sext i1 true` is -1 — which then clamps
+    // to 0, so `true as char` came out 0. That is the exact rule `widen_op`
+    // documents ten lines up, reproduced by a new caller within the hour.
+    if matches!(to, IRType::Char)
+        && !matches!(from, IRType::Char | IRType::F64 | IRType::Ptr(_) | IRType::Bool)
+    {
+        return clamp_to_byte(dst, src, &from_s);
+    }
+
     // Identity at the LLVM level (e.g. Trit → I8 for `trit as bool3`, both
     // i8 with the same {-1,0,+1} encoding — but int-like i8 → Trit clamps).
     if from_s == to_s {
-        if matches!(from, IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64)
+        if matches!(from, IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 | IRType::Char)
             && matches!(to, IRType::Trit)
         {
             return clamp_to_trit(dst, src, &from_s);
@@ -300,9 +375,10 @@ pub(crate) fn cast_sequence(dst: &str, src: &str, from: &IRType, to: &IRType) ->
 
     match (from, to) {
         // Anything integer-like → Bool: nonzero is true.
-        (IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 | IRType::Trit, IRType::Bool) => {
-            format!("%{} = icmp ne {} {}, 0", dst, from_s, src)
-        }
+        (
+            IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 | IRType::Char | IRType::Trit,
+            IRType::Bool,
+        ) => format!("%{} = icmp ne {} {}, 0", dst, from_s, src),
         // Float → Bool: 0.0 (and NaN) → false.
         (IRType::F64, IRType::Bool) => {
             format!("%{} = fcmp one double {}, 0.0", dst, src)
@@ -311,10 +387,21 @@ pub(crate) fn cast_sequence(dst: &str, src: &str, from: &IRType, to: &IRType) ->
         (IRType::F64, IRType::I64 | IRType::I32 | IRType::I16 | IRType::I8) => {
             fptosi_sat(dst, src, &to_s)
         }
-        // Integer → Trit: clamp to {-1, 0, +1} per the language reference.
-        (IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64, IRType::Trit) => {
-            clamp_to_trit(dst, src, &from_s)
+        // Float → Char: saturate to a machine word the way every other
+        // float→integer cast does (P23), then impose the byte (P48).
+        (IRType::F64, IRType::Char) => {
+            let itmp = format!("{}__ftoi", dst);
+            format!(
+                "{}\n  {}",
+                fptosi_sat(&itmp, src, "i64"),
+                clamp_to_byte(dst, &format!("%{}", itmp), "i64")
+            )
         }
+        // Integer → Trit: clamp to {-1, 0, +1} per the language reference.
+        (
+            IRType::I8 | IRType::I16 | IRType::I32 | IRType::I64 | IRType::Char,
+            IRType::Trit,
+        ) => clamp_to_trit(dst, src, &from_s),
         // Float → Trit: truncate to int, then clamp.
         (IRType::F64, IRType::Trit) => {
             let itmp = format!("{}__ftoi", dst);
@@ -529,7 +616,7 @@ declare void @io_print_int(i64)
 declare void @io_println_int(i64)
 declare void @io_print_float(double)
 declare void @io_println_float(double)
-declare void @io_print_char(i8 signext)
+declare void @io_print_char(i64)
 declare void @io_print_trit(i8 signext)
 declare void @io_print_bool3(i8 signext)
 declare void @io_print_tryte(i8 signext)
@@ -562,7 +649,8 @@ declare i64 @math_trit_count(i64)
 
 ; ---- str ----
 declare i64 @str_len(ptr)
-declare signext i8 @str_char_at(ptr, i64)
+declare i64 @str_char_at(ptr, i64)
+declare i64 @str_char_count(ptr)
 declare ptr @str_concat(ptr, ptr)
 declare i1 @str_contains(ptr, ptr)
 declare i64 @str_find(ptr, ptr)

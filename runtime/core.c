@@ -279,7 +279,11 @@ void io_print_float(double f) {
     manit_format_float(f, buf, sizeof buf);
     printf("%s", buf);
 }
-void io_print_char(int8_t c) { printf("%c", (char)c); }
+/* P48: a `char` is an unsigned byte carried in a machine word, so both
+ * char-typed natives take/return int64_t. As int8_t the return was
+ * SIGN-extended by the caller and `str::char_at("\xc3\xa9", 0) as int`
+ * came back -61 on LLVM against T3's 195. */
+void io_print_char(int64_t c) { printf("%c", (char)(c & 0xFF)); }
 void io_print_trit(int8_t t) {
     if (t > 0) printf("+");
     else if (t < 0) printf("-");
@@ -479,9 +483,26 @@ int64_t math_trit_count(int64_t n) {
 /* ======================== str ======================== */
 
 int64_t str_len(const char* s) { return (int64_t)strlen(s); }
-int8_t  str_char_at(const char* s, int64_t i) {
+/* str_char_count — the number of Unicode scalar values in a UTF-8 string.
+ *
+ * P48. `str_len` is strlen, i.e. BYTES, and the whole str surface is indexed
+ * by bytes; this is what makes `byte_len` a distinction rather than a synonym.
+ * A UTF-8 continuation byte is 10xxxxxx, so the scalars are the bytes that are
+ * NOT continuations — no decoding required, and malformed input degrades to a
+ * byte count rather than reading past anything. */
+int64_t str_char_count(const char* s) {
+    if (!s) return 0;
+    int64_t n = 0;
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        if ((*p & 0xC0) != 0x80) n++;
+    }
+    return n;
+}
+int64_t str_char_at(const char* s, int64_t i) {
     if (!s || i < 0 || i >= (int64_t)strlen(s)) return 0;
-    return (int8_t)s[i];
+    /* (unsigned char) FIRST: plain `char` is signed on x86-64, so casting
+     * straight to int64_t sign-extends every byte >= 128 (report.txt P48). */
+    return (int64_t)(unsigned char)s[i];
 }
 char*   str_concat(const char* a, const char* b) { return fmt_concat(a, b); }
 

@@ -186,6 +186,25 @@ void channel_send(ManitChan* c, int64_t v) {
 int64_t channel_recv(ManitChan* c) {
     if (!c) return 0;
     pthread_mutex_lock(&c->lock);
+    /* P81. An OPEN, EMPTY channel can never be filled under the current
+     * contract: `spawn { B }` runs B in place and to completion, so there is no
+     * other task and never will be (report.txt P5, docs/memory-model.md). The
+     * wait below is therefore a guaranteed deadlock — and it deadlocked in the
+     * worst available way, blocking with stdout unflushed so the program
+     * printed NOTHING AT ALL, including everything it had produced before the
+     * recv. T3 meanwhile returned 0 and carried on. One program, a wrong answer
+     * on one backend and silence on the other.
+     *
+     * Faulting is not a decision about cooperative vs pre-emptive scheduling —
+     * that is what P5 is parked on. It is the two backends agreeing about a
+     * program that cannot make progress, and it stops being reachable the day
+     * `spawn` starts a real task. A CLOSED empty channel is untouched: that is
+     * the drain case, and it already returns 0 here without waiting. */
+    if (c->count == 0 && !c->closed) {
+        pthread_mutex_unlock(&c->lock);
+        manit_fault("recv on an empty channel that is still open: nothing can "
+                    "send to it, because `spawn` runs its block in place");
+    }
     while (c->count == 0 && !c->closed) {
         pthread_cond_wait(&c->not_empty, &c->lock);
     }

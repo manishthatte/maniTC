@@ -31,7 +31,17 @@ pub struct IRLowerer {
     // struct name → ordered list of (field_name, field_type)
     structs: std::collections::HashMap<String, Vec<(String, IRType)>>,
     // enum name → ordered variant names (variant index = integer tag)
-    enum_variants: std::collections::HashMap<String, Vec<String>>,
+    /// Every enum's variants, in declaration order, with the PAYLOAD ARITY of
+    /// each.
+    ///
+    /// P43: the arity used to be discarded here, and three places then
+    /// disagreed about what a payload-carrying variant even IS — the
+    /// constructor emitted a call to a symbol nothing defines, the tag test
+    /// compared the scrutinee as a bare integer, and the pattern binder read it
+    /// as a pointer to `[tag, value]`. Carrying the arity in the SAME map that
+    /// carries the names is deliberate: a second registry for "does this enum
+    /// have payloads" would be one more thing to keep in agreement (P60).
+    enum_variants: std::collections::HashMap<String, Vec<(String, usize)>>,
     // function name → positions of `[T]` (unsized array) parameters.
     // Unsized arrays are bare pointers with no runtime length, so every
     // such parameter gets a hidden trailing `__len_<name>` i64 parameter;
@@ -479,7 +489,10 @@ impl IRLowerer {
         let from_ir = IRType::from_mani(from);
         let to_ir = IRType::from_mani(to);
         let is_float = |t: &IRType| matches!(t, IRType::F64);
-        let is_int = |t: &IRType| matches!(t, IRType::I64 | IRType::I8 | IRType::Trit);
+        // P48: `Char` belongs here. It used to be spelled `I8` and was covered
+        // by that arm; giving it its own variant removed it silently.
+        let is_int =
+            |t: &IRType| matches!(t, IRType::I64 | IRType::I8 | IRType::Trit | IRType::Char);
         if (is_float(&from_ir) && is_int(&to_ir)) || (is_int(&from_ir) && is_float(&to_ir)) {
             let dst = self.fresh_temp();
             self.emit(IRInstr::Cast {
@@ -533,8 +546,8 @@ impl IRLowerer {
         let mut globals = Vec::new();
 
         for enum_def in &typed_program.enums {
-            let variants: Vec<String> = enum_def.variants.iter()
-                .map(|v| v.name.clone())
+            let variants: Vec<(String, usize)> = enum_def.variants.iter()
+                .map(|v| (v.name.clone(), v.fields.len()))
                 .collect();
             lowerer.enum_variants.insert(enum_def.name.clone(), variants);
         }
@@ -670,6 +683,49 @@ impl IRLowerer {
                 e.describe(),
             ),
         }
+    }
+
+    /// P43: does this enum need a heap cell, or is it a bare integer?
+    ///
+    /// **A cell if ANY variant carries a payload, and then for EVERY variant of
+    /// that enum.** Uniform within the enum is not a convenience: a `match`
+    /// tests the tag before it knows which variant it has, so a scrutinee whose
+    /// representation depended on the variant would be undecidable at exactly
+    /// the point the test happens. `enum Shape { Circle(int), Dot }` is that
+    /// case, and it compiled before only because nothing constructed `Circle`.
+    ///
+    /// An enum with no payload variants is untouched — still a bare integer,
+    /// which is what every enum in both repos and all 1,147 corpus files is.
+    pub(super) fn enum_is_boxed(&self, enum_name: &str) -> bool {
+        self.enum_variants
+            .get(enum_name)
+            .map(|vs| vs.iter().any(|(_, arity)| *arity > 0))
+            .unwrap_or(false)
+    }
+
+    /// The declaration index and payload arity of `variant` within `enum_name`.
+    pub(super) fn enum_variant_info(
+        &self,
+        enum_name: &str,
+        variant: &str,
+    ) -> Option<(usize, usize)> {
+        let vs = self.enum_variants.get(enum_name)?;
+        vs.iter()
+            .position(|(n, _)| n == variant)
+            .map(|i| (i, vs[i].1))
+    }
+
+    /// Words in a boxed enum's cell: one tag plus the WIDEST variant's payload.
+    ///
+    /// One size for the whole enum, because a `match` arm reads a field before
+    /// the cell's own variant is known to the allocator, and because the value
+    /// is assigned to one variable whatever variant it holds.
+    pub(super) fn enum_cell_words(&self, enum_name: &str) -> usize {
+        1 + self
+            .enum_variants
+            .get(enum_name)
+            .map(|vs| vs.iter().map(|(_, a)| *a).max().unwrap_or(0))
+            .unwrap_or(0)
     }
 
     /// One folded constant as an IR value, in the representation the runtime

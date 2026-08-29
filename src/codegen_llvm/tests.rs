@@ -529,10 +529,19 @@ fn runtime_trit_declares_carry_signext() {
     // 20 August 2026: both are three-armed `tif` expressions in stdlib/fmt.mt
     // now, their C bodies are deleted, and a trit that never reaches C cannot
     // be sign-extended wrongly on the way.
+    //
+    // **`io_print_char` and `str_char_at` LEFT ON 29 AUGUST 2026, AND THIS
+    // LIST'S OWN TITLE IS WHAT THE FINDING WAS.** It said "scalar trit/char",
+    // and a trit and a char want OPPOSITE answers: a trit is signed and -1 must
+    // stay -1, while a char is an unsigned byte and 0xC3 must stay 195. Holding
+    // both to `signext` is what made `str::char_at("é", 0) as int` come back
+    // -61 on LLVM against T3's 195 (report.txt P48). Both natives now cross as
+    // `i64` carrying a value 0..=255, so there is no scalar i8 to sign-extend
+    // and no declare left to check — the same kind of departure as the four
+    // above, by a different route.
     for name in [
         "ternary_trit_to_int",
-        "io_print_trit", "io_print_bool3", "io_print_char", "io_print_tryte",
-        "str_char_at",
+        "io_print_trit", "io_print_bool3", "io_print_tryte",
         "AtomicTrit_new", "AtomicTrit_get", "AtomicTrit_set", "AtomicTrit_swap",
         "AtomicTrit_fetch_and", "AtomicTrit_fetch_or", "AtomicTrit_fetch_neg",
         "AtomicTrit_compare_exchange",
@@ -650,5 +659,11 @@ fn runtime_declares_match_the_abi_clang_actually_emits() {
     // were deleted from runtime/core.c and reimplemented in ManiT. Lower it
     // only alongside such a removal — a drop with no explanation means the
     // scan silently stopped finding things, which is the failure this guards.
-    assert!(checked >= 14, "expected the whole trit runtime surface, checked {}", checked);
+    //
+    // 14 → 12 on 29 August 2026: `io_print_char` and `str_char_at` now take and
+    // return `int64_t`, so a scalar i8 no longer crosses for either (P48). The
+    // drop is exactly two and it is derived independently of the list above —
+    // this scan reads the C runtime clang actually compiled, that list is
+    // hand-written, and both moved by the same two names.
+    assert!(checked >= 12, "expected the whole trit runtime surface, checked {}", checked);
 }

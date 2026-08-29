@@ -297,14 +297,15 @@ String inspection and manipulation. The ten primitives are native; the other for
 | Function | Signature | Body | Works | Description |
 |---|---|---|---|---|
 | `str::byte_len` | `(s: str) -> int` | ManiT | yes | Return the number of bytes in the UTF-8 encoding of `s`. |
-| `str::center` | `(s: str, width: int, pad_char: char) -> str` | ManiT | yes | Center `s` within `width` codepoints, padding both sides with `pad_char`. An odd remainder goes to the right, so center("hi", 5, '-') is "-hi--". |
-| `str::char_at` | `(s: str, i: int) -> char` | native | yes | Return the codepoint at position `i` (0-indexed).  Panics on out-of-bounds. |
+| `str::center` | `(s: str, width: int, pad_char: char) -> str` | ManiT | yes | Center `s` within `width` BYTES, padding both sides with `pad_char`.  P48. An odd remainder goes to the right, so center("hi", 5, '-') is "-hi--". |
+| `str::char_at` | `(s: str, i: int) -> char` | native | yes | Return the BYTE at position `i` (0-indexed), as an unsigned value 0..=255. Out of range gives 0.  P48: this is a byte, not a codepoint — for "aéb" the four indices give 97, 195, 169, 98. |
+| `str::char_count` | `(s: str) -> int` | native | yes | P48: the only function here that does not count bytes, and the one to reach for when the question is "how many characters".  It is not an index — no function in this module takes a codepoint offset. |
 | `str::concat` | `(a: str, b: str) -> str` | native | yes | Concatenate two strings. |
 | `str::contains` | `(s: str, needle: str) -> bool` | native | yes | Return true if `s` contains the sub-string `needle`. |
 | `str::count` | `(s: str, needle: str) -> int` | ManiT | yes | Count non-overlapping occurrences of `needle` in `s`. |
-| `str::drop` | `(s: str, n: int) -> str` | ManiT | yes | Return all but the first `n` codepoints of `s`.  Panics if n > len(s). |
+| `str::drop` | `(s: str, n: int) -> str` | ManiT | yes | Return all but the first `n` BYTES of `s`.  Panics if n > len(s).  P48: a byte count, so on a multi-byte character this can split it. |
 | `str::ends_with` | `(s: str, suffix: str) -> bool` | ManiT | yes | Return true if `s` ends with `suffix`. |
-| `str::find` | `(s: str, needle: str) -> int` | native | yes | Return the codepoint index of the first occurrence of `needle` in `s`, or -1 if not found. |
+| `str::find` | `(s: str, needle: str) -> int` | native | yes | Return the BYTE index of the first occurrence of `needle` in `s`, or -1 if not found.  P48. |
 | `str::from_bool` | `(b: bool) -> str` | ManiT | yes | Convert a bool to "true" or "false". |
 | `str::from_bool3` | `(b: bool3) -> str` | ManiT | yes | Convert a bool3 to "True", "Unknown", or "False". |
 | `str::from_char` | `(c: char) -> str` | native | yes | One of only two primitives in this module that touch a char — `char_at` is the other. Every char-dependent function above (to_upper, to_lower, pad_left, pad_right, center) is written in ManiT on top of these two, so each has exactly one implementation and the two backends cannot diverge. |
@@ -312,13 +313,13 @@ String inspection and manipulation. The ten primitives are native; the other for
 | `str::from_int` | `(n: int) -> str` | ManiT | yes | Convert an int to its decimal string representation. |
 | `str::from_ternary` | `(n: t27) -> str` | ManiT | yes | MST-first with no leading zeros, so it is the exact inverse of parse_ternary above — verified as a round trip, not assumed. |
 | `str::from_trit` | `(t: trit) -> str` | ManiT | yes | Convert a trit to "+", "0", or "-". |
-| `str::is_alpha` | `(s: str) -> bool` | ManiT | yes | Return true if every codepoint in `s` is an ASCII letter. The empty string is false — see is_numeric. |
-| `str::is_alphanumeric` | `(s: str) -> bool` | ManiT | yes | Return true if every codepoint in `s` is an ASCII letter or digit. The empty string is false — see is_numeric. |
+| `str::is_alpha` | `(s: str) -> bool` | ManiT | yes | Return true if every BYTE of `s` is an ASCII letter.  P48. The empty string is false — see is_numeric. |
+| `str::is_alphanumeric` | `(s: str) -> bool` | ManiT | yes | Return true if every BYTE of `s` is an ASCII letter or digit.  P48. The empty string is false — see is_numeric. |
 | `str::is_blank` | `(s: str) -> bool` | ManiT | yes | Whitespace is space, tab, newline and carriage return — exactly the four that trim() strips, so `is_blank(s)` and `is_empty(trim(s))` always agree. Vertical tab and form feed are deliberately NOT included: widening the set here would make a string that is blank but does not trim away to nothing. |
-| `str::is_empty` | `(s: str) -> bool` | ManiT | yes | Return true if `s` has zero codepoints. |
-| `str::is_numeric` | `(s: str) -> bool` | ManiT | yes | The empty string is FALSE here, not vacuously true. Read literally, "every codepoint is a digit" is true of a string with no codepoints, but these three predicates exist to validate input and "" is not a number, a word, or an identifier. is_blank below is the deliberate opposite — "" IS blank — which is why the choice is spelled out on each rather than left to the reader. |
+| `str::is_empty` | `(s: str) -> bool` | ManiT | yes | Return true if `s` has zero bytes. |
+| `str::is_numeric` | `(s: str) -> bool` | ManiT | yes | The empty string is FALSE here, not vacuously true. Read literally, "every byte is a digit" is true of a string with no bytes, but these three predicates exist to validate input and "" is not a number, a word, or an identifier. is_blank below is the deliberate opposite — "" IS blank — which is why the choice is spelled out on each rather than left to the reader. |
 | `str::join` | `(parts: Vec<str>, sep: str) -> str` | ManiT | not probed | The separator goes BEFORE every element except the first, rather than after every element except the last. Both read the same in prose; only the first survives an empty Vec without a trailing separator to strip. |
-| `str::len` | `(s: str) -> int` | native | yes | Return the number of Unicode codepoints in `s`. |
+| `str::len` | `(s: str) -> int` | native | yes | Return the number of BYTES in the UTF-8 encoding of `s`. For the number of characters, see `char_count`. |
 | `str::lines` | `(s: str) -> Vec<str>` | ManiT | yes | Split `s` into individual lines (splitting on "\n" and "\r\n"). |
 | `str::pad_left` | `(s: str, width: int, pad_char: char) -> str` | ManiT | yes | Pad `s` on the left with `pad_char` until its length is at least `width`. Returns `s` unchanged when it is already at least `width` long. |
 | `str::pad_right` | `(s: str, width: int, pad_char: char) -> str` | ManiT | yes | Pad `s` on the right with `pad_char` until its length is at least `width`. Returns `s` unchanged when it is already at least `width` long. |
@@ -328,8 +329,8 @@ String inspection and manipulation. The ten primitives are native; the other for
 | `str::repeat` | `(s: str, n: int) -> str` | ManiT | yes | Repeat `s` exactly `n` times, concatenating the copies. |
 | `str::replace` | `(s: str, from: str, to: str) -> str` | native | yes | Replace every non-overlapping occurrence of `from` with `to`. |
 | `str::replace_first` | `(s: str, from: str, to: str) -> str` | ManiT | yes | Replace only the first occurrence of `from` with `to`. |
-| `str::reverse` | `(s: str) -> str` | ManiT | yes | Reverse the codepoint order of `s`. |
-| `str::rfind` | `(s: str, needle: str) -> int` | ManiT | yes | Return the codepoint index of the last occurrence of `needle` in `s`, or -1 if not found. |
+| `str::reverse` | `(s: str) -> str` | ManiT | yes | Reverse the BYTE order of `s`.  P48: on a multi-byte character this reverses its bytes, which is not a character reversal; see the module header.  Reversing ASCII is exact. |
+| `str::rfind` | `(s: str, needle: str) -> int` | ManiT | yes | Return the BYTE index of the last occurrence of `needle` in `s`, or -1 if not found.  P48. |
 | `str::slice` | `(s: str, start: int, end: int) -> str` | native | yes | Return a sub-string of `s` from index `start` up to (not including) `end`. |
 | `str::split` | `(s: str, delim: str) -> Vec<str>` | native | yes | Split `s` on every occurrence of `delim`, returning a Vec of sub-strings. Consecutive delimiters produce empty strings in the result. |
 | `str::split_head` | `(s: str, sep: str) -> str` | ManiT | yes | Return the substring before the first occurrence of `sep`. Returns the whole string if `sep` is not found. |
@@ -337,7 +338,7 @@ String inspection and manipulation. The ten primitives are native; the other for
 | `str::splitn` | `(s: str, delim: str, n: int) -> Vec<str>` | ManiT | yes | Split `s` into at most `n` parts on `delim`. |
 | `str::starts_with` | `(s: str, prefix: str) -> bool` | ManiT | yes | Return true if `s` begins with `prefix`. |
 | `str::substr` | `(s: str, start: int, n: int) -> str` | ManiT | yes | Return a sub-string of `s` starting at byte offset `start` with length `len`. |
-| `str::take` | `(s: str, n: int) -> str` | ManiT | yes | Return the first `n` codepoints of `s`.  Panics if n > len(s). |
+| `str::take` | `(s: str, n: int) -> str` | ManiT | yes | Return the first `n` BYTES of `s`.  Panics if n > len(s).  P48: a byte count, so on a multi-byte character this can split it. |
 | `str::to_lower` | `(s: str) -> str` | ManiT | yes | Convert all ASCII letters to lowercase. |
 | `str::to_upper` | `(s: str) -> str` | ManiT | yes | Convert all ASCII letters to uppercase. |
 | `str::trim` | `(s: str) -> str` | native | yes | Remove leading and trailing ASCII whitespace. |
@@ -642,7 +643,7 @@ Assertions. Pure ManiT over `io::println` and `env::exit`, so it needs nothing f
 
 ## Census
 
-**329 declarations** across 13 modules: **229 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **63 do not work on at least one backend**.
+**330 declarations** across 13 modules: **230 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **63 do not work on at least one backend**.
 
 The *Works* column records whether a one-line program calling the function compiles and links on each backend. It is a test of existence, not of correctness: a function marked `yes` has a body on both sides, which is exactly what `fmt::`'s twenty-five documented-but-undefined entries did not. A `not probed` row is an admission, not a pass.
 

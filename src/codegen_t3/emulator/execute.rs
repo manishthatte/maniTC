@@ -401,6 +401,25 @@ impl Emulator {
             Opcode::Store => {
                 // encoding: STORE r1, [r2 + imm]
                 let addr = (self.regs[sr2] + imm) as usize;
+                // P76: a store BELOW the program image is the stack having grown
+                // down into the code, and it was unbounded. The upper bound has
+                // always been here; the lower one had not, so a deep enough
+                // recursion overwrote its own instructions and the emulator then
+                // executed them — reported as
+                // `TRAP: register index 43 out of range (0..=26)`, which names
+                // the symptom and not the cause. P38 checked that the IMAGE fits
+                // below the stack; nothing checked that the STACK stays above
+                // the image, and the call-depth guard cannot: it counts FRAMES,
+                // so a 45-word frame overflows at depth ~1,300 while the guard
+                // waits for 10,000.
+                if addr < self.profile.program_words {
+                    self.trap(format!(
+                        "TRAP: stack overflow — store to {} is inside the program \
+                         image (0..{}); the stack has grown down into the code",
+                        addr, self.profile.program_words
+                    ));
+                    return;
+                }
                 if addr < self.memory.len() {
                     self.memory[addr] = self.regs[sr1];
                 }

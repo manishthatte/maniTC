@@ -102,10 +102,43 @@ fn run_llvm(path: &PathBuf, lang: reference::Lang) -> Option<Behaviour> {
                "--lang", lang_flag(lang),
                "-o", bin.to_str().unwrap()])
         .output().expect("compile");
+    // P78: **THIS IS P47's DEFECT, IN THE FILE P47 DID NOT REACH.** The guard
+    // here used to be `if stderr.contains("clang") { return None }`, meaning
+    // "no toolchain in this environment", and it is exactly backwards: when
+    // clang is genuinely ABSENT the compiler SUCCEEDS — it prints
+    // `[LLVM] clang not found`, writes the .ll and exits 0 — so a FAILED
+    // compile whose stderr mentions clang can only be clang REJECTING THE
+    // MODULE, which is precisely what a conformance test exists to catch.
+    // Every caller spells the result `if let Some(..)`, so a wrong `None` is a
+    // silent pass.
+    //
+    // P47 fixed `tests/phase4_tests.rs`. **The defect was not unknown here, it
+    // was unpropagated** (P56's lesson: grep the SHAPE, not the symbol), and
+    // this is the file that decides whether the two backends and the reference
+    // interpreter agree.
     if !c.status.success() {
-        let blob = String::from_utf8_lossy(&c.stderr).to_string();
-        if blob.contains("clang") { return None; }
-        panic!("LLVM compile failed:\n{}", blob);
+        panic!(
+            "LLVM compile failed:\n{}{}",
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+    }
+    if !bin.exists() {
+        // The assertion at the REPORTING BOUNDARY, stated against an
+        // environment fact rather than against the branch that computed it:
+        // `find_clang` is the same discovery the compiler itself uses, so a
+        // missing binary with clang available is a real failure and never a
+        // skip.
+        assert!(
+            manitc::runtime_link::find_clang().is_none(),
+            "no binary at {} although clang IS available ({:?}) — a real \
+             failure being reported as an absent toolchain\n{}{}",
+            bin.display(),
+            manitc::runtime_link::find_clang(),
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+        return None;
     }
     let r = Command::new(&bin).output().expect("run");
     Some(from_process(&String::from_utf8_lossy(&r.stdout),
@@ -666,6 +699,42 @@ fn main() {
     io::println("unreachable");
 }
 "#);
+}
+
+#[test]
+fn p79_v1_overflow_divergence_is_the_documented_behaviour() {
+    // **A TEST THAT ASSERTS A DIVERGENCE, AND THAT IS THE POINT.**
+    //
+    // docs/semantics.md §10.1 says that under **v1** `int` overflow past the
+    // 27-trit word TRAPS ON T3 AND DOES NOT ON LLVM — "the behaviour v1 had and
+    // is left alone on purpose" — and that v2 is where both trap. The v2 half is
+    // pinned by the two rows above. **The v1 half was pinned by nothing**, and
+    // the neighbouring test says why in as many words: it "cannot be a `conform`
+    // (v1) test, because under v1 the LLVM backend is still allowed to
+    // disagree". Allowed to disagree is not the same as unobserved: if LLVM ever
+    // started trapping under v1 that would be a silent behaviour change for
+    // every v1 user, §10.1 would quietly become false, and the conformance suite
+    // — whose whole job is to notice — would not.
+    //
+    // report.txt P21 cluster 1's remaining half is this case. It was DECIDED,
+    // and this is the decision held to.
+    let p = tmp("p79_v1_overflow");
+    std::fs::write(&p, "use std::io;\nfn main() {\n    let m: int = 3812798742493;\n    io::println_int(m + 1);\n}\n")
+        .expect("write");
+    let t3 = run_t3(&p, reference::Lang::V1);
+    assert!(t3.trapped, "§10.1: T3 must trap on 27-trit overflow under v1");
+    if let Some(ll) = run_llvm(&p, reference::Lang::V1) {
+        assert!(
+            !ll.trapped,
+            "§10.1 says LLVM does NOT trap under v1 — if this now traps, the \
+             document is out of date and v1 users have a behaviour change"
+        );
+        assert!(
+            ll.out.contains("3812798742494"),
+            "§10.1 records LLVM's v1 answer as 3812798742494, got {:?}",
+            ll.out
+        );
+    }
 }
 
 #[test]

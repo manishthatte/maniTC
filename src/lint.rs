@@ -151,6 +151,21 @@ pub const LINTS: &[(WarningKind, &str, LintLevel)] = &[
     // it the way it rejects any literal that does not fit its type. A lint
     // level cannot allow away a value that does not exist.
     (WarningKind::LiteralOutOfWord, "literal-out-of-word", LintLevel::Allow),
+    // P70. A `struct` or `enum` declared under a name the type resolver
+    // answers before it ever consults the struct table.
+    //
+    // `deny` by default, and it is the only level that reports it at all — see
+    // the note in `analyzer::reserved_type_name`. The reason is not severity
+    // in the abstract: a warning is DROPPED when the compilation also errors,
+    // and every observable case of this defect errors, so a `warn` default
+    // would be silent in exactly the case that motivated the lint.
+    //
+    // `allow` is an exact restoration of the pre-P70 compiler rather than a
+    // softening, which is what makes it a safe escape hatch: nothing is
+    // checked differently, the declaration simply stops being reported.
+    // `stdlib/collections.mt` and `stdlib/sync.mt` use it because their
+    // declarations ARE the built-ins this lint protects.
+    (WarningKind::ReservedTypeName, "reserved-type-name", LintLevel::Deny),
 ];
 
 /// Resolve a lint name to its kind. `None` for an unknown name.

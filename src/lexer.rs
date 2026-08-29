@@ -258,6 +258,8 @@ pub struct Lexer {
     line: usize,
     col: usize,
     file: String,
+    /// P8: the merged stdlib module being lexed, stamped onto every span.
+    module: Option<&'static str>,
 }
 
 impl Lexer {
@@ -268,6 +270,7 @@ impl Lexer {
             line: 1,
             col: 1,
             file: String::from("<input>"),
+            module: None,
         }
     }
 
@@ -277,10 +280,20 @@ impl Lexer {
         l
     }
 
+    /// P8: lex merged stdlib source, stamping every span with its module.
+    pub fn with_module(source: &str, module: &'static str) -> Self {
+        let mut l = Lexer::new(source);
+        l.file = format!("stdlib/{}.mt", module);
+        l.module = Some(module);
+        l
+    }
+
     // --- position helpers ---
 
     fn current_span(&self) -> Span {
-        Span { line: self.line, col: self.col }
+        // P8: stamp the merged-stdlib module, so a diagnostic inside one names
+        // its own file instead of the user's.
+        Span { line: self.line, col: self.col, module: self.module }
     }
 
     fn peek(&self) -> Option<char> {

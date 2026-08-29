@@ -329,6 +329,18 @@ impl Emulator {
                 let addr = self.heap_alloc_str(s);
                 self.regs[1] = addr as i64;
             }
+            136 => {
+                // str_char_count(ptr=R1) → R1 = number of Unicode scalar values
+                //
+                // P48. `str::len` is BYTES — that is what the whole `str`
+                // surface is indexed by — so this is the function that makes
+                // `byte_len`'s existence mean something instead of being a
+                // synonym for `len`. It is deliberately NOT an index: nothing
+                // takes a codepoint offset, and offering one would invite a
+                // loop that mixes the two.
+                let s = self.get_string_r1();
+                self.regs[1] = s.chars().count() as i64;
+            }
             135 => {
                 // ternary_int_to_trits(n=R1, width=R2) → R1 = ptr to a
                 // length-prefixed array of exactly `width` trits, LST-first,

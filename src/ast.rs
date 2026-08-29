@@ -6,15 +6,44 @@
 pub struct Span {
     pub line: usize,
     pub col: usize,
+    /// P8: the merged stdlib module this span came from, if any.
+    ///
+    /// `stdlib_expand` parses each ManiT-source stdlib module with its OWN line
+    /// numbering and appends the items to the user's program. A span carried a
+    /// line and a column and nothing else, and every diagnostic was reported
+    /// under the analyzer's `self.file` — so a warning inside `fmt::to_radix`
+    /// came out as `hello.mt:230:22` for a `hello.mt` five lines long. Right
+    /// line, wrong file, and it affects EVERY diagnostic rather than one lint.
+    ///
+    /// `&'static str` rather than an interned index or an `Rc<str>` because the
+    /// only files a span can come from other than the one being compiled are
+    /// the stdlib modules, whose names are `&'static str` in `STDLIB_SOURCES`
+    /// already. That keeps `Span: Copy`, which every expression in the AST
+    /// relies on.
+    pub module: Option<&'static str>,
 }
 
 impl Span {
     pub fn zero() -> Self {
-        Span { line: 0, col: 0 }
+        Span { line: 0, col: 0, module: None }
     }
 
     pub fn new(line: usize, col: usize) -> Self {
-        Span { line, col }
+        Span { line, col, module: None }
+    }
+
+    /// P8: a span inside merged stdlib source.
+    pub fn in_module(line: usize, col: usize, module: &'static str) -> Self {
+        Span { line, col, module: Some(module) }
+    }
+
+    /// P8: the file a diagnostic at this span should name, given the file the
+    /// compiler was invoked on. A merged stdlib span names its own source.
+    pub fn file_or(&self, current: &str) -> String {
+        match self.module {
+            Some(m) => format!("stdlib/{}.mt", m),
+            None => current.to_string(),
+        }
     }
 }
 

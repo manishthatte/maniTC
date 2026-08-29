@@ -156,6 +156,19 @@ pub enum IRType {
     I32,
     Bool,
     Trit, // stored as i8: -1, 0, +1
+    /// A `char`: stored as i8, but holding an UNSIGNED byte 0..=255.
+    ///
+    /// P48. It shares its storage with `Trit` and `Bool3` and its SIGNEDNESS
+    /// with neither, which is exactly why it needs its own variant rather than
+    /// riding on `I8`: every widening and every comparison in the LLVM backend
+    /// is selected from the IR type, so a `char` spelled `I8` sign-extends
+    /// (`0xC3` → -61) and compares signed. T3 holds the byte in a 64-bit
+    /// register and answers 195, so the two backends disagreed about the value
+    /// AND about the ordering of every non-ASCII character.
+    ///
+    /// `Trit` is the precedent, not the exception: it exists for the same
+    /// reason — "stored as i8" is not "means a signed i8".
+    Char,
     Ptr(Box<IRType>),
     Array(Box<IRType>, usize),
     Struct(String),
@@ -177,7 +190,7 @@ impl IRType {
             // ManiType::Trint is merged into T54 (both map to I64)
             ManiType::Tfloat => IRType::F64,
             ManiType::Str => IRType::Ptr(Box::new(IRType::I8)),
-            ManiType::Char => IRType::I8,
+            ManiType::Char => IRType::Char,
             ManiType::Void => IRType::Void,
             ManiType::Array(elem, Some(n)) => {
                 IRType::Array(Box::new(IRType::from_mani(elem)), *n)

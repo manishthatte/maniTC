@@ -849,6 +849,10 @@ pub fn is_scalar(ty: &IRType) -> bool {
             | IRType::I32
             | IRType::Bool
             | IRType::Trit
+            // P48: `Char` is a scalar. It used to be spelled `I8`; giving it
+            // its own variant silently stopped every char local from being
+            // promoted, which no test would have reported as a failure.
+            | IRType::Char
             | IRType::Ptr(_)
     )
 }

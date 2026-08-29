@@ -168,6 +168,25 @@ fn caret_padding(line_text: &str, col: usize) -> String {
 }
 
 /// Render a compile error with source-line context, caret underline, and color.
+/// P8: the text a diagnostic's SNIPPET should be cut from.
+///
+/// `source` is the file the compiler was invoked on. A diagnostic can now name
+/// a DIFFERENT file — merged stdlib source carries its own provenance — and
+/// indexing the wrong text by the right line number is how `stdlib/fmt.mt:232`
+/// came out under the user's `fn pad229()`. Right file, wrong snippet, which is
+/// the mirror of the defect P8 was.
+///
+/// The stdlib text comes from the compiler's own `include_str!` copy rather
+/// than from disk: that is the source it actually compiled.
+fn snippet_source<'a>(file: &str, source: Option<&'a str>) -> Option<&'a str> {
+    if let Some(embedded) = crate::semantic::analyzer::embedded_source_for(file) {
+        return Some(embedded);
+    }
+    // Not a file we carry: the invoked file is the only text we have, and it is
+    // the right one exactly when the diagnostic names no other.
+    source
+}
+
 pub fn render_error(err: &CompileError, source: Option<&str>) -> String {
     let c = Colors::for_stderr();
     let d = err.diagnostic();
@@ -186,7 +205,7 @@ pub fn render_error(err: &CompileError, source: Option<&str>) -> String {
     );
 
     // Show source line if available
-    if let Some(src) = source {
+    if let Some(src) = snippet_source(&d.file, source) {
         if d.line > 0 {
             if let Some(line_text) = src.lines().nth(d.line - 1) {
                 let line_num = format!("{}", d.line);
@@ -240,7 +259,7 @@ pub fn render_lint(warn: &CompileWarning, source: Option<&str>, as_error: bool) 
         c.cyan, crate::lint::lint_name(&warn.kind), c.reset
     );
 
-    if let Some(src) = source {
+    if let Some(src) = snippet_source(&d.file, source) {
         if d.line > 0 {
             if let Some(line_text) = src.lines().nth(d.line - 1) {
                 let line_num = format!("{}", d.line);
@@ -295,6 +314,10 @@ pub enum WarningKind {
     /// C4/R2: a `/` or `%` on an integer type, whose meaning differs between
     /// language versions. The migration backlog for the division change.
     DivisionSemantics,
+    /// P70: a `struct` or `enum` declared under a name the type resolver
+    /// answers WITHOUT consulting the struct table, so the declaration cannot
+    /// be reached through that spelling.
+    ReservedTypeName,
     /// A2: a function is unavailable on the selected backend because something
     /// in its reachable call graph is. Reported with the call chain.
     ///

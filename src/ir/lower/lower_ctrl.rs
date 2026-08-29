@@ -411,14 +411,32 @@ impl IRLowerer {
                     };
 
                 // Check if this is a known custom enum
-                if let Some(variants) = self.enum_variants.get(enum_type_name).cloned() {
-                    // Custom enum: scrutinee is an integer tag stored directly
-                    if let Some(idx) = variants.iter().position(|v| v == variant_name) {
+                if self.enum_variants.contains_key(enum_type_name) {
+                    if let Some((idx, _)) = self.enum_variant_info(enum_type_name, variant_name) {
+                        // P43: a BOXED enum's scrutinee is the cell's address,
+                        // so the tag has to be LOADED. This arm used to compare
+                        // the scrutinee itself against the index in every case —
+                        // which is right for a bare-integer enum and cannot be
+                        // right for one whose payload the binder below reads
+                        // through the very same value as a pointer. The two
+                        // halves of one `match` disagreed about what they were
+                        // looking at.
+                        let lhs = if self.enum_is_boxed(enum_type_name) {
+                            let tag_t = self.fresh_temp();
+                            self.emit(IRInstr::Load {
+                                dst: tag_t.clone(),
+                                ptr: scrutinee.clone(),
+                                ty: IRType::I64,
+                            });
+                            IRValue::Temp(tag_t)
+                        } else {
+                            scrutinee.clone()
+                        };
                         let cmp_t = self.fresh_temp();
                         self.emit(IRInstr::BinOp {
                             dst: cmp_t.clone(),
                             op: IRBinOp::IEq,
-                            lhs: scrutinee.clone(),
+                            lhs,
                             rhs: IRValue::Const(IRConst::Int(idx as i64)),
                             ty: IRType::Bool,
                         });
@@ -547,15 +565,19 @@ impl IRLowerer {
                 self.locals.insert(name.clone(), (alloca, ty));
             }
             Pattern::Enum(_, _, fields, _) => {
-                // scrutinee is a pointer to [tag, value].
-                // Bind each Ident field to the value word (offset 1).
-                for field in fields {
+                // scrutinee is a pointer to [tag, field0, field1, …].
+                //
+                // P43: field *i* lives at word 1+i. Every field used to be read
+                // from word 1, so `Rect(w, h) => w * h` bound BOTH names to the
+                // first payload word and squared it. Invisible because nothing
+                // could construct a `Rect` to begin with.
+                for (fi, field) in fields.iter().enumerate() {
                     if let Pattern::Ident(name, _) = field {
                         let val_ptr_t = self.fresh_temp();
                         self.emit(IRInstr::GetPtr {
                             dst: val_ptr_t.clone(),
                             ptr: scrutinee.clone(),
-                            idx: IRValue::Const(IRConst::Int(1)),
+                            idx: IRValue::Const(IRConst::Int(fi as i64 + 1)),
                             ty: IRType::I64,
                         });
                         let val_t = self.fresh_temp();
@@ -724,15 +746,16 @@ impl IRLowerer {
                 }
             }
             Pattern::Enum(_, _, fields, _) => {
-                // scrutinee is a pointer to [tag, value]; payload lives at offset 1.
-                for field in fields {
+                // scrutinee is a pointer to [tag, field0, field1, …]; field *i*
+                // is at word 1+i (P43 — see `bind_pattern_locals`).
+                for (fi, field) in fields.iter().enumerate() {
                     if let Pattern::Ident(name, _) = field {
                         if let Some(slot) = slots.get(name) {
                             let val_ptr_t = self.fresh_temp();
                             self.emit(IRInstr::GetPtr {
                                 dst: val_ptr_t.clone(),
                                 ptr: scrutinee.clone(),
-                                idx: IRValue::Const(IRConst::Int(1)),
+                                idx: IRValue::Const(IRConst::Int(fi as i64 + 1)),
                                 ty: IRType::I64,
                             });
                             let val_t = self.fresh_temp();

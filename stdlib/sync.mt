@@ -12,6 +12,21 @@
 //   use std::sync;
 //   let m: Mutex<int> = Mutex::new(0);
 
+// P70. THESE DECLARATIONS ARE THE BUILT-INS, WHICH IS THE ONE CASE THE
+// `reserved-type-name` LINT MUST NOT REPORT. The lint refuses a `struct` or
+// `enum` declared under a name the type resolver answers before it consults
+// the struct table — because such a declaration cannot be reached through its
+// own name. That is a defect in a user's program and it is the definition of
+// this file: `Mutex`, `MutexGuard` and `Channel` here document the shape of
+// types the backends implement natively, and nothing in this module
+// has a body.
+//
+// `allow` is an exact restoration of the pre-P70 compiler, not a weakening of
+// a check: the resolver behaves identically either way. This module is not in
+// `SOURCE_MODULES`, so it is never merged into a user's program and this item
+// cannot lower a level the user set.
+lint allow(reserved-type-name);
+
 // ---------------------------------------------------------------------------
 // Mutex<T> — exclusive mutual exclusion lock
 // ---------------------------------------------------------------------------

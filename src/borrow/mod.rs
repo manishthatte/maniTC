@@ -616,7 +616,7 @@ mod tests {
         TypedExpr {
             kind: TypedExprKind::Ident(name.to_string()),
             ty,
-            span: Span { line: 1, col: 1 },
+            span: Span::new(1, 1),
         }
     }
 
@@ -625,7 +625,7 @@ mod tests {
         TypedExpr {
             kind: TypedExprKind::Lit(Lit::Int(val)),
             ty: ManiType::Int,
-            span: Span { line: 1, col: 1 },
+            span: Span::new(1, 1),
         }
     }
 
@@ -638,7 +638,7 @@ mod tests {
             init: Some(TypedExpr {
                 kind: TypedExprKind::Lit(Lit::Str(val.to_string())),
                 ty: ManiType::Str,
-                span: Span { line: 1, col: 1 },
+                span: Span::new(1, 1),
             }),
             mutable: false,
         })
@@ -714,12 +714,12 @@ mod tests {
                     cond: Box::new(TypedExpr {
                         kind: TypedExprKind::Lit(Lit::Bool(true)),
                         ty: ManiType::Bool,
-                        span: Span { line: 1, col: 1 },
+                        span: Span::new(1, 1),
                     }),
                     body: loop_body,
                 }),
                 ty: ManiType::Void,
-                span: Span { line: 1, col: 1 },
+                span: Span::new(1, 1),
             }),
         ];
         let result = check_stmts(stmts);
@@ -740,12 +740,12 @@ mod tests {
                 cond: Box::new(TypedExpr {
                     kind: TypedExprKind::Lit(Lit::Bool(true)),
                     ty: ManiType::Bool,
-                    span: Span { line: 1, col: 1 },
+                    span: Span::new(1, 1),
                 }),
                 body: loop_body,
             }),
             ty: ManiType::Void,
-            span: Span { line: 1, col: 1 },
+            span: Span::new(1, 1),
         })];
         assert!(check_stmts(stmts).is_ok(), "loop-local move must be accepted");
     }
@@ -766,7 +766,7 @@ mod tests {
     fn test_tresult_arms_fork_moved_set() {
         // S16: a move in the ok arm must not poison the err arm — the three
         // arms are mutually exclusive at runtime.
-        let span = Span { line: 1, col: 1 };
+        let span = Span::new(1, 1);
         let arm_block = |dst: &str| TypedBlock {
             stmts: vec![let_move(dst, "s")],
             ty: ManiType::Void,
@@ -805,7 +805,7 @@ mod tests {
             TypedStmt::Expr(TypedExpr {
                 kind: TypedExprKind::Block(inner),
                 ty: ManiType::Void,
-                span: Span { line: 1, col: 1 },
+                span: Span::new(1, 1),
             }),
             let_move("u", "s"),
         ];
@@ -826,7 +826,7 @@ mod tests {
             TypedStmt::Expr(TypedExpr {
                 kind: TypedExprKind::Block(inner),
                 ty: ManiType::Void,
-                span: Span { line: 1, col: 1 },
+                span: Span::new(1, 1),
             }),
             let_move("u", "s"),
         ];
@@ -847,7 +847,7 @@ mod tests {
                 value: TypedExpr {
                     kind: TypedExprKind::Lit(Lit::Str("b".to_string())),
                     ty: ManiType::Str,
-                    span: Span { line: 3, col: 1 },
+                    span: Span::new(3, 1),
                 },
                 op: None,
             }),

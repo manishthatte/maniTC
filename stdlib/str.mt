@@ -1,40 +1,68 @@
 // stdlib/std/str.mt
 // String utilities for maniT.
 //
-// maniT strings are UTF-8 encoded, immutable byte sequences.  All index and
-// length values are measured in Unicode scalar values (codepoints), not raw
-// bytes, unless the function name explicitly mentions "bytes".
+// maniT strings are UTF-8 encoded, immutable byte sequences.  ALL index and
+// length values in this module are measured in BYTES.  `char_at` returns the
+// byte at an index, `slice` takes a byte range, and `len` is the byte count.
 //
 // Usage:
 //   use std::str;
-//   let n = str::len("hello");  // 5
+//   let n = str::len("hello");       // 5  — bytes
+//   let m = str::char_count("aéb");  // 3  — Unicode scalar values
+//   let b = str::len("aéb");         // 4  — bytes
+//
+// CORRECTED 29 August 2026 (report.txt P48).  The three sentences above used
+// to claim the opposite — "measured in Unicode scalar values (codepoints), not
+// raw bytes" — while `byte_len` fifteen lines below said "ManiT strings are
+// byte strings today".  The module contradicted itself and the implementation
+// was bytes throughout, so a reader who believed the header wrote a loop that
+// was right for ASCII and wrong for everything else.  `char_count` is new, and
+// is what makes `byte_len` a distinction rather than a synonym for `len`.
+//
+// Bytes is not a placeholder for a codepoint API: `slice` has been byte-ranged
+// on both backends since 19 August (report.txt P50 brought T3 to the C
+// runtime's rule), and an index that means one thing in `len` and another in
+// `slice` cannot be looped over safely.  `char_count` is deliberately a COUNT
+// and not an index, for the same reason.
 
 // ---------------------------------------------------------------------------
 // Inspection
 // ---------------------------------------------------------------------------
 
-// Return the number of Unicode codepoints in `s`.
+// Return the number of BYTES in the UTF-8 encoding of `s`.
+// For the number of characters, see `char_count`.
 fn len(s: str) -> int ;  // native
+
+// Return the number of Unicode scalar values (characters) in `s`.
+//
+// P48: the only function here that does not count bytes, and the one to reach
+// for when the question is "how many characters".  It is not an index — no
+// function in this module takes a codepoint offset.
+fn char_count(s: str) -> int ;  // native
 
 // Return the number of bytes in the UTF-8 encoding of `s`.
 fn byte_len(s: str) -> int {
-    // ManiT strings are byte strings today, so this is len(). Kept as a
-    // separate name so it stays correct if `len` ever becomes a char count.
+    // maniT strings ARE byte strings, so this is len() and says so. Kept as a
+    // name because it states at the call site which unit was meant, which the
+    // bare `len` does not — see `char_count` for the other unit (P48).
     return len(s);
 }
 
-// Return true if `s` has zero codepoints.
+// Return true if `s` has zero bytes.
 fn is_empty(s: str) -> bool {
     return len(s) == 0;
 }
 
-// Return the codepoint at position `i` (0-indexed).  Panics on out-of-bounds.
+// Return the BYTE at position `i` (0-indexed), as an unsigned value 0..=255.
+// Out of range gives 0.  P48: this is a byte, not a codepoint — for "aéb" the
+// four indices give 97, 195, 169, 98.
 fn char_at(s: str, i: int) -> char ;  // native
 
 // Return a sub-string of `s` from index `start` up to (not including) `end`.
 fn slice(s: str, start: int, end: int) -> str ;  // native
 
-// Return the first `n` codepoints of `s`.  Panics if n > len(s).
+// Return the first `n` BYTES of `s`.  Panics if n > len(s).  P48: a byte
+// count, so on a multi-byte character this can split it.
 fn take(s: str, n: int) -> str {
     let l: int = len(s);
     let mut k: int = n;
@@ -43,7 +71,8 @@ fn take(s: str, n: int) -> str {
     return slice(s, 0, k);
 }
 
-// Return all but the first `n` codepoints of `s`.  Panics if n > len(s).
+// Return all but the first `n` BYTES of `s`.  Panics if n > len(s).  P48: a
+// byte count, so on a multi-byte character this can split it.
 fn drop(s: str, n: int) -> str {
     let l: int = len(s);
     let mut k: int = n;
@@ -70,12 +99,12 @@ fn ends_with(s: str, suffix: str) -> bool {
     return slice(s, ls - lx, ls) == suffix;
 }
 
-// Return the codepoint index of the first occurrence of `needle` in `s`,
-// or -1 if not found.
+// Return the BYTE index of the first occurrence of `needle` in `s`,
+// or -1 if not found.  P48.
 fn find(s: str, needle: str) -> int ;  // native
 
-// Return the codepoint index of the last occurrence of `needle` in `s`,
-// or -1 if not found.
+// Return the BYTE index of the last occurrence of `needle` in `s`,
+// or -1 if not found.  P48.
 fn rfind(s: str, needle: str) -> int {
     let ls: int = len(s);
     let ln: int = len(needle);
@@ -222,7 +251,9 @@ fn replace_first(s: str, from: str, to: str) -> str {
     return concat(concat(head, to), tail);
 }
 
-// Reverse the codepoint order of `s`.
+// Reverse the BYTE order of `s`.  P48: on a multi-byte character this
+// reverses its bytes, which is not a character reversal; see the module
+// header.  Reversing ASCII is exact.
 fn reverse(s: str) -> str {
     let l: int = len(s);
     let mut out: str = "";
@@ -255,7 +286,7 @@ fn pad_right(s: str, width: int, pad_char: char) -> str {
     return concat(s, repeat(from_char(pad_char), width - l));
 }
 
-// Center `s` within `width` codepoints, padding both sides with `pad_char`.
+// Center `s` within `width` BYTES, padding both sides with `pad_char`.  P48.
 // An odd remainder goes to the right, so center("hi", 5, '-') is "-hi--".
 fn center(s: str, width: int, pad_char: char) -> str {
     let l: int = len(s);
@@ -632,10 +663,11 @@ fn from_ternary(n: t27) -> str {
 // Character classification helpers
 // ---------------------------------------------------------------------------
 
-// Return true if every codepoint in `s` is an ASCII digit.
+// Return true if every BYTE of `s` is an ASCII digit.  P48: a non-ASCII
+// character fails, which is the intended answer for an ASCII predicate.
 //
 // The empty string is FALSE here, not vacuously true. Read literally, "every
-// codepoint is a digit" is true of a string with no codepoints, but these three
+// byte is a digit" is true of a string with no bytes, but these three
 // predicates exist to validate input and "" is not a number, a word, or an
 // identifier. is_blank below is the deliberate opposite — "" IS blank — which is
 // why the choice is spelled out on each rather than left to the reader.
@@ -651,7 +683,7 @@ fn is_numeric(s: str) -> bool {
     return true;
 }
 
-// Return true if every codepoint in `s` is an ASCII letter.
+// Return true if every BYTE of `s` is an ASCII letter.  P48.
 // The empty string is false — see is_numeric.
 fn is_alpha(s: str) -> bool {
     let n: int = len(s);
@@ -667,7 +699,7 @@ fn is_alpha(s: str) -> bool {
     return true;
 }
 
-// Return true if every codepoint in `s` is an ASCII letter or digit.
+// Return true if every BYTE of `s` is an ASCII letter or digit.  P48.
 // The empty string is false — see is_numeric.
 fn is_alphanumeric(s: str) -> bool {
     let n: int = len(s);

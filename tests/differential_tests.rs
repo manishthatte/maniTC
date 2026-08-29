@@ -278,10 +278,30 @@ fn run_llvm(src: &PathBuf) -> Option<Vec<Vec<i64>>> {
         .args(["compile", src.to_str().unwrap(), "--target", "llvm",
                "-o", bin.to_str().unwrap()])
         .output().expect("compile llvm");
+    // P78: P47's defect, unpropagated. `if stderr.contains("clang") { return
+    // None }` reads "no toolchain here" and is exactly backwards: when clang is
+    // genuinely ABSENT the compiler SUCCEEDS (prints `[LLVM] clang not found`,
+    // writes the .ll, exits 0), so a FAILED compile mentioning clang can only
+    // be clang REJECTING THE MODULE — the very thing this file exists to catch.
+    // Tell the two apart by the ARTEFACT, never by the message.
     if !c.status.success() {
-        let blob = String::from_utf8_lossy(&c.stderr).to_string();
-        if blob.contains("clang") { return None; }
-        panic!("LLVM compile failed:\n{}", blob);
+        panic!(
+            "LLVM compile failed:\n{}{}",
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+    }
+    if !bin.exists() {
+        assert!(
+            manitc::runtime_link::find_clang().is_none(),
+            "no binary at {} although clang IS available ({:?}) — a real \
+             failure being reported as an absent toolchain\n{}{}",
+            bin.display(),
+            manitc::runtime_link::find_clang(),
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+        return None;
     }
     let r = Command::new(&bin).output().expect("run llvm");
     Some(parse(&String::from_utf8_lossy(&r.stdout)))

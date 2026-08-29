@@ -193,13 +193,16 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
     let mut queue: Vec<String> = used.iter().map(|s| s.to_string()).collect();
     let mut seen: HashSet<String> = queue.iter().cloned().collect();
     while let Some(name) = queue.pop() {
-        let src = SOURCE_MODULES
+        // P8: the STATIC name, not the queued `String`. A span's provenance is
+        // `&'static str` so that `Span` stays `Copy`, and `SOURCE_MODULES`
+        // already holds the only names it can be.
+        let (static_name, src) = SOURCE_MODULES
             .iter()
             .find(|(n, _)| *n == name)
-            .map(|(_, s)| *s)
+            .map(|(n, s)| (*n, *s))
             .expect("queued module is always in SOURCE_MODULES");
-        let file = format!("<std::{}>", name);
-        let mut lexer = crate::lexer::Lexer::with_file(src, &file);
+        let file = format!("stdlib/{}.mt", static_name);
+        let mut lexer = crate::lexer::Lexer::with_module(src, static_name);
         let tokens = lexer.tokenize()?;
         let mut parser = crate::parser::Parser::with_file(tokens, &file);
         let module = parser.parse()?;

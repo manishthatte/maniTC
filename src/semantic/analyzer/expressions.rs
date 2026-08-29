@@ -27,7 +27,23 @@ impl SemanticAnalyzer {
                         ret.clone()
                     }
                 } else if let Some(enum_name) = self.enum_variant_path(name) {
-                    // EnumName::Variant
+                    // EnumName::Variant.
+                    //
+                    // P43: a variant that DECLARES fields cannot be named
+                    // without them. It used to be accepted, and constructed a
+                    // cell whose payload nobody had written — `Shape::Circle`
+                    // then matched `Shape::Circle(r)` and bound `r` to 0 on
+                    // both backends. That is a silent wrong answer reachable
+                    // from a one-word typo.
+                    if let Some(n) = self.enum_variant_arity(name) {
+                        if n > 0 {
+                            return Err(self.err(span, format!(
+                                "enum variant '{}' carries {} value(s), so it cannot be                                  named on its own — write `{}({})`",
+                                name, n, name,
+                                std::iter::repeat("…").take(n).collect::<Vec<_>>().join(", "),
+                            )));
+                        }
+                    }
                     ManiType::Enum(enum_name)
                 } else if let Some(pos) = name.rfind("::") {
                     // Unresolved `::` path.
@@ -78,7 +94,7 @@ impl SemanticAnalyzer {
                             }
                             self.warnings.push(CompileWarning::new(
                                 WarningKind::UnknownType,
-                                &self.file, span.line, span.col,
+                                &self.dfile(span), span.line, span.col,
                                 format!("std module '{}' has no item '{}'{}", bare_mod, item, hint),
                             ));
                         }
@@ -92,7 +108,7 @@ impl SemanticAnalyzer {
                         let hint = did_you_mean(item, candidates).unwrap_or_default();
                         self.warnings.push(CompileWarning::new(
                             WarningKind::UnknownType,
-                            &self.file, span.line, span.col,
+                            &self.dfile(span), span.line, span.col,
                             format!("module '{}' has no item '{}'{}", prefix, item, hint),
                         ));
                     } else {
@@ -108,7 +124,7 @@ impl SemanticAnalyzer {
                         if self.enums.contains_key(first) {
                             self.warnings.push(CompileWarning::new(
                                 WarningKind::UnknownType,
-                                &self.file, span.line, span.col,
+                                &self.dfile(span), span.line, span.col,
                                 format!("enum '{}' has no variant '{}'", first, item),
                             ));
                         } else if !BUILTIN_NAMESPACES.contains(&first)
@@ -119,7 +135,7 @@ impl SemanticAnalyzer {
                         {
                             self.warnings.push(CompileWarning::new(
                                 WarningKind::UnknownType,
-                                &self.file, span.line, span.col,
+                                &self.dfile(span), span.line, span.col,
                                 format!("unknown module or type '{}' in path '{}'", first, name),
                             ));
                         }
@@ -253,7 +269,7 @@ impl SemanticAnalyzer {
                         if *f == 0.0 {
                             self.warnings.push(CompileWarning::new(
                                 WarningKind::DivisionByZero,
-                                &self.file, span.line, span.col,
+                                &self.dfile(span), span.line, span.col,
                                 "division by zero",
                             ));
                         }
@@ -278,7 +294,19 @@ impl SemanticAnalyzer {
             }
 
             Expr::Call(callee, args, _) => {
-                let mut tcallee = self.check_expr(callee, None)?;
+                // P43: an enum-variant callee is built here rather than through
+                // `check_expr`, because the rule that a payload variant cannot
+                // be NAMED without its values must not fire on the one position
+                // where naming it is exactly right — as the callee of the call
+                // that supplies them.
+                let mut tcallee = match &**callee {
+                    Expr::Ident(n, sp) if self.enum_variant_path(n).is_some() => TypedExpr {
+                        kind: TypedExprKind::Ident(n.clone()),
+                        ty: ManiType::Enum(self.enum_variant_path(n).unwrap()),
+                        span: *sp,
+                    },
+                    _ => self.check_expr(callee, None)?,
+                };
                 // Try to resolve function name or fn-type for type lookup.
                 // `enforce` is set only when the signature is trustworthy:
                 // fn-typed values and user-defined functions always are; builtin
@@ -343,7 +371,28 @@ impl SemanticAnalyzer {
                             } else if self.is_native(&n) {
                                 self.note_undeclared_native(&n, span);
                             }
-                            if let Some((pts, rt)) = self.functions.get(name) {
+                            if let Some(enum_name) = self.enum_variant_path(name) {
+                                // P43: a payload-variant CONSTRUCTOR. Routed
+                                // through the ordinary parameter machinery
+                                // rather than special-cased, so it gets the
+                                // arity diagnostic, the argument type checks and
+                                // the right result type from one place. Before
+                                // this it fell to `(vec![], Unknown)` below and
+                                // was checked for nothing at all —
+                                // `Shape::Circle(1, 2)` and `Shape::Circle("x")`
+                                // were both accepted on a one-`int` variant.
+                                let fields = self
+                                    .enums
+                                    .get(&enum_name)
+                                    .and_then(|vs| {
+                                        let v = &name[name.find("::").unwrap() + 2..];
+                                        vs.iter().find(|(n, _)| n == v).map(|(_, f)| f.clone())
+                                    })
+                                    .unwrap_or_default();
+                                display_name = name.clone();
+                                enforce = true;
+                                (fields, ManiType::Enum(enum_name))
+                            } else if let Some((pts, rt)) = self.functions.get(name) {
                                 display_name = name.clone();
                                 enforce = !self.builtin_names.contains(name)
                                     || pts.iter().all(|t| t.is_known());
@@ -356,9 +405,17 @@ impl SemanticAnalyzer {
                     },
                 };
                 if enforce && args.len() != param_tys.len() {
+                    // P43: say WHAT it is. An enum variant now reaches this
+                    // check, and calling one a "function" sends the reader to
+                    // look for a `fn` that does not exist.
+                    let what = if self.enum_variant_path(&display_name).is_some() {
+                        "enum variant"
+                    } else {
+                        "function"
+                    };
                     return Err(self.err(span, format!(
-                        "function '{}' expects {} argument(s), found {}",
-                        display_name, param_tys.len(), args.len()
+                        "{} '{}' expects {} argument(s), found {}",
+                        what, display_name, param_tys.len(), args.len()
                     )));
                 }
                 let mut typed_args = Vec::new();
@@ -429,11 +486,46 @@ impl SemanticAnalyzer {
                     // result arriving as `Unknown` at the caller — that is the
                     // half responsible for `id(p).second` reading slot 0,
                     // since a field lookup on `<unknown>` finds no struct.
-                    if let Some(binding) = self.mono_binding_for(&name, &arg_tys) {
-                        if self.ensure_mono(&name, &binding) {
-                            if let Some(rt) = self.mono_ret_ty(&name, &binding) {
-                                ret_ty = rt;
+                    //
+                    // P71: the two halves are gated SEPARATELY, and which
+                    // gate belongs to which is the whole finding. `ensure_mono`
+                    // judges the BODY. The NAME must wait on that verdict — a
+                    // discarded instantiation defines no symbol, so pointing at
+                    // it would fail at link. The RETURN TYPE must NOT: it is a
+                    // function of the DECLARATION, which the reader wrote and
+                    // which says `-> T` whatever the body does. Gating it on
+                    // the body left `pick(P{..}, P{..})` typed `<unknown>`,
+                    // and a field read on that takes slot 0.
+                    //
+                    // P73: a PATH-FORM call to a generic `impl<T>` method —
+                    // `Box2::bigger(b)` rather than `b.bigger()`. It arrives
+                    // here rather than at the method-call site, and the binding
+                    // cannot come from the arguments the way it does for a free
+                    // function: `self` is declared `Self`, which is not one of
+                    // the impl's generics, so `mono_binding_for` bound nothing
+                    // and the call kept the erased body. The receiver IS the
+                    // first argument, so the binding is `mono_binding_for_impl`
+                    // applied to its type arguments — P69's mechanism reached
+                    // through a different syntax.
+                    let binding = self
+                        .generic_impl_owner
+                        .get(&name)
+                        .and_then(|_| match arg_tys.first() {
+                            Some(ManiType::Struct(_, sargs))
+                                if !sargs.is_empty()
+                                    && sargs.iter().all(|a| a.fully_known()) =>
+                            {
+                                self.mono_binding_for_impl(&name, sargs)
                             }
+                            _ => None,
+                        })
+                        .or_else(|| self.mono_binding_for(&name, &arg_tys));
+                    if let Some(binding) = binding {
+                        let body_ok = self.ensure_mono(&name, &binding);
+                        if let Some(rt) = self.mono_ret_ty(&name, &binding) {
+                            ret_ty = rt;
+                        }
+                        if body_ok {
                             tcallee.kind =
                                 TypedExprKind::Ident(Self::mono_name(&name, &binding));
                         }
@@ -526,11 +618,17 @@ impl SemanticAnalyzer {
                 if let ManiType::Struct(sname, sargs) = &tobj.ty {
                     if !sargs.is_empty() && sargs.iter().all(|a| a.fully_known()) {
                         let qname = format!("{}::{}", sname, method);
+                        //
+                        // P71 splits the gate here for the same reason it does
+                        // at the free-function site: the RETURN TYPE comes from
+                        // the declaration, the NAME and the CALLEE from the
+                        // body's verdict.
                         if let Some(binding) = self.mono_binding_for_impl(&qname, sargs) {
-                            if self.ensure_mono(&qname, &binding) {
-                                if let Some(rt) = self.mono_ret_ty(&qname, &binding) {
-                                    ret_ty = rt;
-                                }
+                            let body_ok = self.ensure_mono(&qname, &binding);
+                            if let Some(rt) = self.mono_ret_ty(&qname, &binding) {
+                                ret_ty = rt;
+                            }
+                            if body_ok {
                                 mono_callee = Some(Self::mono_name(&qname, &binding));
                             }
                         }
@@ -1209,6 +1307,17 @@ impl SemanticAnalyzer {
     // -----------------------------------------------------------------------
     // Condition / branch-type helpers
     // -----------------------------------------------------------------------
+
+    /// P43: how many values `EnumName::Variant` carries, if it names one.
+    pub(crate) fn enum_variant_arity(&self, name: &str) -> Option<usize> {
+        let sep = name.find("::")?;
+        let variants = self.enums.get(&name[..sep])?;
+        let variant_name = &name[sep + 2..];
+        variants
+            .iter()
+            .find(|(v, _)| v == variant_name)
+            .map(|(_, fields)| fields.len())
+    }
 
     /// If `name` is an `EnumName::Variant` path of a known enum, return the
     /// enum's name.

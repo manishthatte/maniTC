@@ -257,6 +257,17 @@ pub struct ExternSig {
 
 /// Embedded stdlib sources, scanned (textually, so files with known parse
 /// gaps still contribute) for their top-level item names.
+/// P8: the embedded source behind a diagnostic's file name, for the snippet.
+///
+/// `stdlib/fmt.mt` names a module the compiler carries via `include_str!`, so
+/// the snippet comes from the text that was actually COMPILED rather than from
+/// a disk copy that may differ. Returns `None` for anything else, including the
+/// user's own file — the renderer already has that.
+pub fn embedded_source_for(file: &str) -> Option<&'static str> {
+    let name = file.strip_prefix("stdlib/")?.strip_suffix(".mt")?;
+    STDLIB_SOURCES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
+
 const STDLIB_SOURCES: &[(&str, &str)] = &[
     ("async",       include_str!("../../../stdlib/async.mt")),
     ("bridge",      include_str!("../../../stdlib/bridge.mt")),
@@ -495,7 +506,7 @@ impl SemanticAnalyzer {
         );
         self.warnings.push(CompileWarning::new(
             WarningKind::DivisionSemantics,
-            &self.file,
+            &self.dfile(span),
             span.line,
             span.col,
             msg,
@@ -579,7 +590,7 @@ impl SemanticAnalyzer {
         }
         self.warnings.push(CompileWarning::new(
             WarningKind::LiteralOutOfWord,
-            &self.file,
+            &self.dfile(span),
             span.line,
             span.col,
             format!(
@@ -771,7 +782,127 @@ impl SemanticAnalyzer {
     }
 
     fn err(&self, span: Span, msg: impl Into<String>) -> CompileError {
-        CompileError::type_err(&self.file, span.line, span.col, msg)
+        CompileError::type_err(&self.dfile(span), span.line, span.col, msg)
+    }
+
+    /// P8: the file a diagnostic AT THIS SPAN should name.
+    ///
+    /// Every diagnostic used to pass `&self.file` — the file the compiler was
+    /// invoked on — whatever the span pointed at. Merged stdlib source is
+    /// parsed with its own line numbering and appended to the user's program,
+    /// so a warning inside `fmt::to_radix` came out as `hello.mt:230:22` for a
+    /// `hello.mt` five lines long. Right line, wrong file.
+    pub(crate) fn dfile(&self, span: Span) -> String {
+        span.file_or(&self.file)
+    }
+
+    /// P70: every name the type resolver answers WITHOUT consulting the struct
+    /// table, with what the name already means and which spelling is shadowed.
+    ///
+    /// TWO TABLES ASK ONE QUESTION AND NEITHER CONSULTS `self.structs` FIRST.
+    /// `resolve_type`'s `Type::Generic` arm and `name_to_manitype` both map a
+    /// name to a type before reaching the `_` arm that looks a user struct up,
+    /// so a declaration under one of these names is registered and then never
+    /// reached through that spelling. P67 removed ONE entry — `Pair`, which
+    /// had no implementation behind it at all — and left the rest silent.
+    ///
+    /// THE TWO GROUPS ARE MIRROR IMAGES, AND WHICH TABLE ANSWERS DECIDES WHICH
+    /// SPELLING BREAKS. A name in the first group is answered only for a
+    /// GENERIC annotation, so `struct Vec<T>` is unusable and `struct Vec` is
+    /// fine; a name in the second is answered only for a PLAIN one, so
+    /// `struct String` is unusable and `struct String<T>` is fine. That is why
+    /// P67's own test could not see the second group: every program in it is
+    /// generic, and `<T>` is what all thirteen of its names hold fixed.
+    ///
+    /// THE SECOND GROUP IS EXACTLY THE UNRESERVED SPELLINGS. The lexer makes
+    /// sixteen type names keywords (`int`, `float`, `str`, `trit`, `t27`,
+    /// `void` …), and `struct int` is a parse error naming the declaration —
+    /// which is the right shape and was already here. `name_to_manitype`
+    /// recognises four more that the lexer does not: the aliases `i64`, `f64`
+    /// and `String`, whose canonical spellings ARE keywords, and `bool`, which
+    /// has no keyword spelling at all. The lexer's table and this one are two
+    /// registries for "this name means a primitive", and they disagree on
+    /// precisely those four rows.
+    ///
+    /// `AtomicTrit`, `Barrier`, `Semaphore` and `MutexGuard` are deliberately
+    /// ABSENT. They are answered early too, but they answer
+    /// `Struct(name, [])` — the same thing the struct table would give — so
+    /// the declaration is reached and nothing shadows. Measured, in both
+    /// spellings, rather than assumed.
+    pub const RESERVED_TYPE_NAMES: &'static [(&'static str, &'static str, &'static str)] = &[
+        // Answered by `resolve_type`'s `Type::Generic` arm.
+        ("Vec", "the built-in `Vec<T>`", "Vec<...>"),
+        ("Map", "the built-in `Map<K, V>`", "Map<...>"),
+        ("Set", "the built-in `Set<T>`", "Set<...>"),
+        ("Deque", "the built-in `Deque<T>`", "Deque<...>"),
+        ("TernaryTrie", "the built-in `TernaryTrie<V>`", "TernaryTrie<...>"),
+        ("Channel", "the built-in `Channel<T>`", "Channel<...>"),
+        ("Mutex", "the built-in `Mutex<T>`", "Mutex<...>"),
+        ("Result", "the built-in `Result<T, E>`", "Result<...>"),
+        ("Range", "the built-in `Range<T>`, which is what `..` produces", "Range<...>"),
+        ("Option", "a name this language refuses outright in favour of `Result<T, E>`", "Option<...>"),
+        // Answered by `name_to_manitype`.
+        ("i64", "`int`, for which it is an alias", "i64"),
+        ("f64", "`float`, for which it is an alias", "f64"),
+        ("String", "`str`, for which it is an alias", "String"),
+        ("bool", "the built-in `bool`", "bool"),
+        // `Self` is the worst of the three and the only one that does not end
+        // in a refusal. It is answered from `current_impl_type`, which is
+        // `None` outside an impl block, so the annotation resolves to
+        // `Unknown` — compatible with everything, so the program TYPE-CHECKS
+        // and then reads the wrong field. Measured: `struct Self { first,
+        // second }` with `p.second` prints 1 on both backends where it should
+        // print 2, and `manitc check` exits 0.
+        ("Self", "the enclosing `impl` block's own type", "Self"),
+    ];
+
+    /// What `name` already means, if the type resolver answers it before ever
+    /// consulting the struct table. `None` for a name a declaration can claim.
+    fn reserved_type_name(name: &str) -> Option<(&'static str, &'static str)> {
+        Self::RESERVED_TYPE_NAMES
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, means, spelling)| (*means, *spelling))
+    }
+
+    /// P70: refuse a `struct` or `enum` declared under a reserved name, AT THE
+    /// DECLARATION.
+    ///
+    /// WHY THIS IS AN ERROR RATHER THAN A RECORDED WARNING, WHICH IS THE ONE
+    /// DESIGN DECISION HERE. `Warnings::push` collects; `main` prints the
+    /// collection only AFTER `analyze` returns, so `analyze`'s own `?` on the
+    /// first type error discards every warning gathered on the way. Measured:
+    /// a program with an unused variable AND a type error prints the error and
+    /// not the warning. Every observable case of this defect ends in a type
+    /// error — that is what the shadowing DOES — so a warning would be silent
+    /// in exactly the case it exists for. Returning `Err` here instead makes
+    /// this diagnostic the one the reader gets, because `collect_declarations`
+    /// runs before any body is checked.
+    ///
+    /// The lint level is still what decides: `allow` restores the previous
+    /// compiler exactly, and it is how `stdlib/collections.mt` and
+    /// `stdlib/sync.mt` keep declaring the types they are the declarations of.
+    fn check_reserved_type_name(&self, name: &str, kind: &str, span: Span) -> CompileResult<()> {
+        let Some((means, spelling)) = Self::reserved_type_name(name) else {
+            return Ok(());
+        };
+        if !self
+            .warnings
+            .effective_level(&WarningKind::ReservedTypeName)
+            .is_error()
+        {
+            return Ok(());
+        }
+        Err(self.err(
+            span,
+            format!(
+                "`{name}` is a reserved type name, so this {kind} cannot be reached \
+                 through it: the annotation `{spelling}` resolves to {means}, never \
+                 to this declaration. Rename the {kind}. \
+                 (`lint allow(reserved-type-name);` restores the previous behaviour, \
+                 in which the collision was silent.)"
+            ),
+        ))
     }
 
     // Convert AST type to ManiType
@@ -967,7 +1098,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
     fn apply_lint_decl(&mut self, decl: &ast::LintDecl) -> CompileResult<()> {
         let Some(level) = crate::lint::LintLevel::from_name(&decl.level) else {
             return Err(CompileError::Type(crate::error::Diagnostic::new(
-                &self.file,
+                &self.dfile(decl.span),
                 decl.span.line,
                 decl.span.col,
                 format!(
@@ -979,7 +1110,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         for name in &decl.lints {
             self.warnings.lints.set(name, level).map_err(|e| {
                 CompileError::Type(crate::error::Diagnostic::new(
-                    &self.file,
+                    &self.dfile(decl.span),
                     decl.span.line,
                     decl.span.col,
                     e,
@@ -1000,7 +1131,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
     fn collect_extern_decl(&mut self, decl: &ast::ExternDecl) -> CompileResult<()> {
         if let Some(prev) = self.externs.get(&decl.name) {
             return Err(CompileError::Type(crate::error::Diagnostic::new(
-                &self.file,
+                &self.dfile(decl.span),
                 decl.span.line,
                 decl.span.col,
                 format!(
@@ -1028,7 +1159,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             for b in backends {
                 if !matches!(b.as_str(), "llvm" | "t3") {
                     return Err(CompileError::Type(crate::error::Diagnostic::new(
-                        &self.file,
+                        &self.dfile(decl.span),
                         decl.span.line,
                         decl.span.col,
                         format!(
@@ -1588,7 +1719,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 };
                 self.warnings.push(CompileWarning::new(
                     WarningKind::UnsatisfiedBound,
-                    &self.file,
+                    &self.dfile(span),
                     span.line,
                     span.col,
                     msg,
@@ -1626,7 +1757,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         }
         self.warnings.push(CompileWarning::new(
             WarningKind::UndeclaredNative,
-            &self.file,
+            &self.dfile(span),
             span.line,
             span.col,
             format!(
@@ -1645,7 +1776,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         if let Some(msg) = sig.deprecated.clone() {
             self.warnings.push(CompileWarning::new(
                 WarningKind::DeprecatedNative,
-                &self.file,
+                &self.dfile(span),
                 span.line,
                 span.col,
                 format!("'{}' is deprecated: {}", name, msg),
@@ -1661,7 +1792,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 if !avail.contains(&target) {
                     self.warnings.push(CompileWarning::new(
                         WarningKind::BackendUnavailable,
-                        &self.file,
+                        &self.dfile(span),
                         span.line,
                         span.col,
                         format!(
@@ -1979,7 +2110,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     .unwrap_or_else(|| name.clone());
                 assertion_failures.push(CompileWarning::new(
                     WarningKind::BackendUnavailableChain,
-                    &self.file,
+                    &self.dfile(*span),
                     span.line,
                     span.col,
                     format!(
@@ -2061,7 +2192,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             };
             self.warnings.push(CompileWarning::new(
                 WarningKind::BackendUnavailableChain,
-                &self.file,
+                &self.dfile(span),
                 span.line,
                 span.col,
                 format!(
@@ -2128,7 +2259,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                         node,
                         where_
                     ),
-                    first_span.unwrap_or_else(|| crate::ast::Span { line: 1, col: 1 }),
+                    first_span.unwrap_or_else(|| crate::ast::Span::new(1, 1)),
                 ));
             }
             let Some(edges) = self.call_graph.get(&node) else {
@@ -2210,6 +2341,10 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         for item in &program.items {
             match item {
                 Item::StructDef(s) => {
+                    // P70, before anything is registered: a name the resolver
+                    // answers ahead of this table cannot reach what we are
+                    // about to put in it.
+                    self.check_reserved_type_name(&s.name, "struct", s.span)?;
                     let mut fields = Vec::new();
                     let mut pub_fields = Vec::new();
                     for f in &s.fields {
@@ -2231,6 +2366,13 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     }
                 }
                 Item::EnumDef(e) => {
+                    // P70. An enum reaches `name_to_manitype`'s `self.enums`
+                    // lookup by the same `_` arm a struct does, and it is
+                    // shadowed by the same names — measured: `enum String`
+                    // gives "expected `str`, found `String`". The generic
+                    // group cannot reach an enum, because `enum Name<T>` is a
+                    // parse error: this language's enums are not generic.
+                    self.check_reserved_type_name(&e.name, "enum", e.span)?;
                     let mut variants = Vec::new();
                     for v in &e.variants {
                         let field_tys: CompileResult<Vec<ManiType>> =
@@ -2631,7 +2773,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             };
             self.warnings.push(CompileWarning::new(
                 WarningKind::UnusedVariable,
-                &self.file, u.span.line, u.span.col, msg,
+                &self.dfile(u.span), u.span.line, u.span.col, msg,
             ));
         }
 
