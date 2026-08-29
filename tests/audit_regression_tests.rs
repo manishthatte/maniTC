@@ -4038,3 +4038,177 @@ fn p63_the_heap_holds_exactly_what_the_memory_map_says() {
         o2
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// P91 — a sub-word STRUCT FIELD in an if/tif EXPRESSION emitted a phi whose
+// operands were wider than itself, and clang refused the module.
+//
+// A struct field is a machine-word SLOT (`lower::helpers::slot_access_ty`), so
+// reading a `trit` field yields an i64 temp; the phi is typed from the source
+// EXPRESSION, which is `trit` — i8. Nothing else noticed: `check` passed,
+// `--verify-ssa` reported 0 violations twice (it verifies SSA FORM, not operand
+// TYPE agreement), and T3 compiled the same program and printed the right
+// answer. Two live thatteOS kernel modules were unbuildable on LLVM because of
+// it, and neither was in any build script, so nobody was told.
+//
+// Every row runs BOTH backends and requires them to agree. A row that only
+// asserted "LLVM compiles" could not tell a fix from a change of answer, which
+// matters here because the repair widens a phi and a widened phi that dropped a
+// sign would still compile.
+// ---------------------------------------------------------------------------
+
+/// The reported case: a `trit` struct field in an `if`-EXPRESSION.
+#[test]
+fn p91_a_trit_struct_field_in_an_if_expression_compiles_on_both_backends() {
+    let ((c3, o3), (cl, ol)) = run_both_backends(
+        "p91_trit_field_if.mt",
+        "use std::io;\n\
+         struct S { pub sel: int, pub a: trit, pub b: trit }\n\
+         fn main() {\n\
+         \x20   let s = S { sel: 0, a: +, b: - };\n\
+         \x20   let p = if s.sel == 0 { s.a } else { s.b };\n\
+         \x20   io::print_trit(p); io::println(\"\");\n\
+         }\n",
+    );
+    assert_eq!(cl, 0, "llvm must build and run: {}", ol);
+    assert_eq!(c3, 0, "t3 must build and run: {}", o3);
+    assert_eq!(ol.trim(), "+", "llvm printed {:?}", ol);
+    assert_eq!(o3.trim(), "+", "t3 printed {:?}", o3);
+}
+
+/// `bool` is the OTHER sub-word type and takes the same slot, so it fails the
+/// same way. Probing only the reported spelling would have fixed half of it —
+/// report.txt P70's rule, and this is the second time it has paid.
+#[test]
+fn p91_a_bool_struct_field_in_an_if_expression_compiles_on_both_backends() {
+    let ((c3, o3), (cl, ol)) = run_both_backends(
+        "p91_bool_field_if.mt",
+        "use std::io;\n\
+         struct S { pub sel: int, pub a: bool, pub b: bool }\n\
+         fn main() {\n\
+         \x20   let s = S { sel: 0, a: true, b: false };\n\
+         \x20   let p = if s.sel == 0 { s.a } else { s.b };\n\
+         \x20   io::println(if p { \"T\" } else { \"F\" });\n\
+         }\n",
+    );
+    assert_eq!(cl, 0, "llvm must build and run: {}", ol);
+    assert_eq!(c3, 0, "t3 must build and run: {}", o3);
+    assert_eq!(ol.trim(), "T", "llvm printed {:?}", ol);
+    assert_eq!(o3.trim(), "T", "t3 printed {:?}", o3);
+}
+
+/// `tif` reaches the same phi by a three-armed route.
+#[test]
+fn p91_a_trit_struct_field_in_a_tif_expression_compiles_on_both_backends() {
+    let ((c3, o3), (cl, ol)) = run_both_backends(
+        "p91_trit_field_tif.mt",
+        "use std::io;\n\
+         struct S { pub a: trit, pub b: trit }\n\
+         fn main() {\n\
+         \x20   let s = S { a: +, b: - };\n\
+         \x20   let p = tif s.a { + => s.a, 0 => s.b, - => s.b };\n\
+         \x20   io::print_trit(p); io::println(\"\");\n\
+         }\n",
+    );
+    assert_eq!(cl, 0, "llvm must build and run: {}", ol);
+    assert_eq!(c3, 0, "t3 must build and run: {}", o3);
+    assert_eq!(ol.trim(), "+", "llvm printed {:?}", ol);
+    assert_eq!(o3.trim(), "+", "t3 printed {:?}", o3);
+}
+
+/// The MIXED arm shape, and it is the one that actually occurs in the field:
+/// a field-load arm beside CONSTANT arms. It is what `attenuate` in thatteOS's
+/// `security/capability.mt` lowers to, and it is the row that ruled out the
+/// first two attempts at this repair.
+///
+/// Both of those tried to reconcile the types AT THE PHI, by widening it to
+/// its operands. The mixed case is why that cannot work. Widening changes how
+/// a CONSTANT arm must be spelled — LLVM writes an i1 as `true`/`false`, legal
+/// at that width and nowhere else, so `phi i64 [ true, ... ]` is rejected as
+/// loudly as the mismatch being repaired. And when one arm is a wide field
+/// load while another is a genuinely narrow temp, no single phi type satisfies
+/// both, because neither operand can carry a conversion. Reconciling at the
+/// DEFINITION has none of these cases: there is exactly one value to convert
+/// and one place to put the conversion.
+#[test]
+fn p91_a_field_load_beside_constant_arms_compiles_on_both_backends() {
+    let ((c3, o3), (cl, ol)) = run_both_backends(
+        "p91_mixed_arms.mt",
+        "use std::io;\n\
+         struct S { pub p: trit }\n\
+         fn attenuate(s: S, req: trit) -> trit {\n\
+         \x20   return tif req { + => s.p, 0 => -, - => - };\n\
+         }\n\
+         struct B { pub f: bool }\n\
+         fn pick(b: B, sel: int) -> bool {\n\
+         \x20   return if sel == 0 { b.f } else { true };\n\
+         }\n\
+         fn main() {\n\
+         \x20   io::print_trit(attenuate(S { p: + }, +));\n\
+         \x20   io::print_trit(attenuate(S { p: + }, 0));\n\
+         \x20   io::println(\"\");\n\
+         \x20   io::println(if pick(B { f: true }, 0) { \"T\" } else { \"F\" });\n\
+         }\n",
+    );
+    assert_eq!(cl, 0, "llvm must build and run: {}", ol);
+    assert_eq!(c3, 0, "t3 must build and run: {}", o3);
+    assert_eq!(ol.trim(), o3.trim(), "backends disagree: llvm {:?} t3 {:?}", ol, o3);
+    assert_eq!(ol.trim(), "+-\nT", "got {:?}", ol);
+}
+
+/// The NEGATIVE control. An array element, a plain local and a multi-`return`
+/// function all compiled before the repair and must still. Without this row the
+/// suite cannot tell "the widening is correctly scoped" from "the widening
+/// happens to fire everywhere and nothing has noticed yet".
+#[test]
+fn p91_the_shapes_that_already_worked_still_do() {
+    let ((c3, o3), (cl, ol)) = run_both_backends(
+        "p91_negative_control.mt",
+        "use std::io;\n\
+         struct S { pub sel: int, pub a: trit, pub b: trit }\n\
+         fn pick(s: S) -> trit { if s.sel == 0 { return s.a; } else { return s.b; } }\n\
+         fn main() {\n\
+         \x20   let arr: [trit; 3] = [+, 0, -];\n\
+         \x20   let i = 0;\n\
+         \x20   io::print_trit(if i == 0 { arr[0] } else { arr[1] });\n\
+         \x20   let a: trit = +; let b: trit = -;\n\
+         \x20   io::print_trit(if i == 0 { a } else { b });\n\
+         \x20   io::print_trit(pick(S { sel: 0, a: +, b: - }));\n\
+         \x20   io::println(\"\");\n\
+         }\n",
+    );
+    assert_eq!(cl, 0, "llvm must build and run: {}", ol);
+    assert_eq!(c3, 0, "t3 must build and run: {}", o3);
+    assert_eq!(ol.trim(), "+++", "llvm printed {:?}", ol);
+    assert_eq!(o3.trim(), "+++", "t3 printed {:?}", o3);
+}
+
+/// A LOOP carrying a narrow value across its back edge. This is the row that
+/// exists because the first repair broke it: a phi on a back edge references a
+/// temp defined AFTER it, `actual_type_of` answers for an unrecorded temp with
+/// a GUESS of i64, and taking the guess as fact widened the phi against a
+/// definition that turned out to be i8 — "instruction forward referenced with
+/// type i64". The repair therefore requires a RECORDED type, not an answer.
+#[test]
+fn p91_a_narrow_value_carried_across_a_loop_back_edge_still_compiles() {
+    let ((c3, o3), (cl, ol)) = run_both_backends(
+        "p91_loop_back_edge.mt",
+        "use std::io;\n\
+         struct S { pub a: trit }\n\
+         fn main() {\n\
+         \x20   let s = S { a: + };\n\
+         \x20   let mut carry: trit = -;\n\
+         \x20   let mut i = 0;\n\
+         \x20   while i < 3 {\n\
+         \x20       carry = if i == 1 { s.a } else { carry };\n\
+         \x20       i = i + 1;\n\
+         \x20   }\n\
+         \x20   io::print_trit(carry); io::println(\"\");\n\
+         }\n",
+    );
+    assert_eq!(cl, 0, "llvm must build and run: {}", ol);
+    assert_eq!(c3, 0, "t3 must build and run: {}", o3);
+    assert_eq!(ol.trim(), o3.trim(), "backends disagree: llvm {:?} t3 {:?}", ol, o3);
+    assert_eq!(ol.trim(), "+", "got {:?}", ol);
+}

@@ -1187,11 +1187,60 @@ impl IRLowerer {
                     ty: IRType::I64,
                 });
                 let dst = self.fresh_temp();
+                let slot_ty = slot_access_ty(&ty);
                 self.emit(IRInstr::Load {
                     dst: dst.clone(),
                     ptr: IRValue::Temp(ptr_t),
-                    ty: slot_access_ty(&ty),
+                    ty: slot_ty.clone(),
                 });
+                // P91: the SLOT is a machine word, the FIELD may be narrower,
+                // and the two have to be reconciled HERE, at the definition,
+                // rather than left for each use to sort out.
+                //
+                // Leaving them apart worked everywhere a use can carry a
+                // conversion, and failed at the one construct that cannot: a
+                // phi takes its type from the IR, and LLVM requires an incoming
+                // value to be available in the PREDECESSOR block, so there is
+                // nowhere to put a `trunc`. `if s.sel == 0 { s.a } else { s.b }`
+                // on `trit` fields emitted `phi i8` with i64 operands and clang
+                // refused the module — while `check` passed, `--verify-ssa`
+                // reported 0 violations, and T3 compiled it and printed the
+                // right answer.
+                //
+                // Reconciling at the DEFINITION is the shape report.txt P13 and
+                // P46 already established for a call whose declared return
+                // disagrees with the IR. This is the same disagreement one
+                // instruction earlier, and doing it here fixes every consumer
+                // at once — including the mixed case a phi-side repair cannot
+                // reach, where one arm is a wide field load and the other a
+                // genuinely narrow temp, so neither widening nor narrowing the
+                // phi can satisfy both operands.
+                //
+                // The condition names the five SUB-WORD types explicitly
+                // instead of asking `slot_ty != ty`, because that inequality is
+                // true of far more than it looks. `slot_access_ty` answers I64
+                // for everything it does not special-case, ARRAYS included — a
+                // `[trit; 27]` field is a pointer living in a word — so the
+                // loose test emitted `cast i64 to [27 x i8]` and took four
+                // `crypto::` functions off the LLVM backend entirely. `char` is
+                // excluded on purpose and is not an oversight: P48 carries it in
+                // a machine word deliberately, so its slot and its value are the
+                // same width and there is nothing to reconcile.
+                if slot_ty == IRType::I64
+                    && matches!(
+                        ty,
+                        IRType::Trit | IRType::Bool | IRType::I8 | IRType::I16 | IRType::I32
+                    )
+                {
+                    let narrowed = self.fresh_temp();
+                    self.emit(IRInstr::Cast {
+                        dst: narrowed.clone(),
+                        src: IRValue::Temp(dst),
+                        from_ty: slot_ty,
+                        to_ty: ty.clone(),
+                    });
+                    return IRValue::Temp(narrowed);
+                }
                 IRValue::Temp(dst)
             }
 
