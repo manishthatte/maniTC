@@ -730,8 +730,15 @@ impl SemanticAnalyzer {
                 };
                 let mut covered = std::collections::HashSet::new();
                 for arm in arms {
-                    if let Pattern::Enum(variant, _, _, _) = &arm.pattern {
-                        covered.insert(variant.as_str());
+                    if let Pattern::Enum(variant, _, fields, _) = &arm.pattern {
+                        // P90: an arm covers its variant only when it accepts
+                        // EVERY value of it. `Circle(9)` is one circle, not
+                        // the `Circle` case, and counting it as the case is
+                        // how a match with no remaining arm for `Circle`
+                        // compiled and then matched nothing at run time.
+                        if fields.iter().all(|f| f.is_irrefutable()) {
+                            covered.insert(variant.as_str());
+                        }
                     }
                 }
                 let missing: Vec<&str> = all_variants.iter()
@@ -793,7 +800,14 @@ impl SemanticAnalyzer {
             ManiType::Generic(g, _) if g == "Result" => {
                 let mut covered: Vec<&str> = Vec::new();
                 for arm in &arms {
-                    if let Pattern::Enum(variant, enum_name, _, _) = &arm.pattern {
+                    if let Pattern::Enum(variant, enum_name, fields, _) = &arm.pattern {
+                        // P90, as for a user enum just above: `Err("closed")`
+                        // covers one error, not `Err`. This is the arm that
+                        // let `examples/concurrency.mt` compile with its only
+                        // `Err` arm testing a payload.
+                        if !fields.iter().all(|f| f.is_irrefutable()) {
+                            continue;
+                        }
                         // The parser encodes bare `Unknown(msg)` as
                         // Enum("Result", Some("Unknown"), ..); normalise it the
                         // same way define_pattern_bindings does.

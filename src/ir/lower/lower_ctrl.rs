@@ -395,7 +395,7 @@ impl IRLowerer {
                 // Binding pattern — always matches, bind the variable
                 IRValue::Const(IRConst::Bool(true))
             }
-            crate::ast::Pattern::Enum(variant, enum_name, _, _) => {
+            crate::ast::Pattern::Enum(variant, enum_name, fields, _) => {
                 // Parser produces Pattern::Enum(variant_name, Some(enum_type_name), ...) for
                 // "EnumType::VariantName" patterns. e.g. "Direction::North" →
                 // Pattern::Enum("North", Some("Direction"), [], _).
@@ -440,7 +440,12 @@ impl IRLowerer {
                             rhs: IRValue::Const(IRConst::Int(idx as i64)),
                             ty: IRType::Bool,
                         });
-                        return IRValue::Temp(cmp_t);
+                        return self.and_payload_tests(
+                            IRValue::Temp(cmp_t),
+                            fields,
+                            scrutinee,
+                            _scrutinee_ty,
+                        );
                     }
                     // Variant not found in this enum — wildcard (always match)
                     return IRValue::Const(IRConst::Bool(true));
@@ -473,7 +478,33 @@ impl IRLowerer {
                     rhs: IRValue::Const(IRConst::Int(expected_tag)),
                     ty: IRType::Bool,
                 });
-                IRValue::Temp(cmp_t)
+                self.and_payload_tests(IRValue::Temp(cmp_t), fields, scrutinee, _scrutinee_ty)
+            }
+            crate::ast::Pattern::Tuple(elems, _) => {
+                // P90. A tuple has no tag: the scrutinee points straight at
+                // `[e0, e1, ...]`, one word per element, which is the layout
+                // `TypedExprKind::Tuple` builds. So the test is the AND of the
+                // element tests, with no guard needed — every element is
+                // present whatever the value is.
+                let mut result: IRValue = IRValue::Const(IRConst::Bool(true));
+                for (i, sub_pat) in elems.iter().enumerate() {
+                    if sub_pat.is_irrefutable() {
+                        continue;
+                    }
+                    let elem_val = self.load_slot(scrutinee, i as i64);
+                    let sub_result =
+                        self.lower_pattern_match(sub_pat, &elem_val, _scrutinee_ty);
+                    let and_t = self.fresh_temp();
+                    self.emit(IRInstr::BinOp {
+                        dst: and_t.clone(),
+                        op: IRBinOp::And,
+                        lhs: result,
+                        rhs: sub_result,
+                        ty: IRType::Bool,
+                    });
+                    result = IRValue::Temp(and_t);
+                }
+                result
             }
             crate::ast::Pattern::Or(alts, _) => {
                 let mut result = IRValue::Const(IRConst::Bool(false));
@@ -498,34 +529,22 @@ impl IRLowerer {
 
                 let mut result: IRValue = IRValue::Const(IRConst::Bool(true));
                 for (field_name, sub_pat) in field_pats {
-                    let always_true = matches!(
-                        sub_pat,
-                        crate::ast::Pattern::Ident(_, _) | crate::ast::Pattern::Wildcard(_)
-                    );
-                    if always_true {
+                    // P90: one shared predicate rather than a local `matches!`.
+                    // The local one named Ident and Wildcard only, so a nested
+                    // `(a, b)` or `a | b` sub-pattern was tested when it need
+                    // not be — and, worse, the checker used a DIFFERENT rule.
+                    if sub_pat.is_irrefutable() {
                         continue;
                     }
 
                     let idx = field_defs.iter().position(|n| n == field_name)
                         .unwrap_or(0) as i64;
 
-                    let field_ptr = self.fresh_temp();
-                    self.emit(IRInstr::GetPtr {
-                        dst: field_ptr.clone(),
-                        ptr: scrutinee.clone(),
-                        idx: IRValue::Const(IRConst::Int(idx)),
-                        ty: IRType::I64,
-                    });
-                    let field_val = self.fresh_temp();
-                    self.emit(IRInstr::Load {
-                        dst: field_val.clone(),
-                        ptr: IRValue::Temp(field_ptr),
-                        ty: IRType::I64,
-                    });
+                    let field_val = self.load_slot(scrutinee, idx);
 
                     let sub_result = self.lower_pattern_match(
                         sub_pat,
-                        &IRValue::Temp(field_val),
+                        &field_val,
                         _scrutinee_ty,
                     );
 
@@ -541,8 +560,113 @@ impl IRLowerer {
                 }
                 result
             }
-            _ => IRValue::Const(IRConst::Bool(true)),
+            // NO CATCH-ALL. Every `Pattern` variant is handled above, and the
+            // `_ => true` that used to sit here is precisely what made P90
+            // silent: an unhandled pattern did not fail to compile, it
+            // compiled into "matches everything". A new variant must now be
+            // given a test deliberately, and rustc names the site.
         }
+    }
+
+    /// Load word `idx` of an aggregate the scrutinee points at.
+    ///
+    /// The uniform one-word slot convention every aggregate in this lowerer
+    /// uses: tuples index from 0, a boxed enum's payload from 1 (word 0 is the
+    /// tag), a struct by declaration order.
+    fn load_slot(&mut self, base: &IRValue, idx: i64) -> IRValue {
+        let ptr_t = self.fresh_temp();
+        self.emit(IRInstr::GetPtr {
+            dst: ptr_t.clone(),
+            ptr: base.clone(),
+            idx: IRValue::Const(IRConst::Int(idx)),
+            ty: IRType::I64,
+        });
+        let val_t = self.fresh_temp();
+        self.emit(IRInstr::Load {
+            dst: val_t.clone(),
+            ptr: IRValue::Temp(ptr_t),
+            ty: IRType::I64,
+        });
+        IRValue::Temp(val_t)
+    }
+
+    /// AND the payload sub-pattern tests onto an enum arm's tag test (P90).
+    ///
+    /// **The payload tests are GUARDED BY THE TAG, and that is the whole
+    /// design.** Testing them eagerly and ANDing the results is one line
+    /// shorter and it segfaults: matching `Err("closed")` against an `Ok(5)`
+    /// would load word 1 of the cell — the integer 5 — and hand it to
+    /// `StrEq`, which dereferences it as a `char*`. The tag says the payload
+    /// is not a string; the payload test must not run before the tag is
+    /// known. `cross_variant` in the tests is exactly that program, and it is
+    /// the row that separates this design from the eager one.
+    ///
+    /// Built from `BinBranch`, `Jump` and `Phi` — no new IR instruction, no
+    /// new terminator and no new kind of CFG edge, so no pass needed auditing
+    /// (P72's hazard, avoided by construction rather than survived).
+    fn and_payload_tests(
+        &mut self,
+        tag_ok: IRValue,
+        fields: &[crate::ast::Pattern],
+        scrutinee: &IRValue,
+        scrutinee_ty: &ManiType,
+    ) -> IRValue {
+        if fields.iter().all(|f| f.is_irrefutable()) {
+            // `Ok(v)`, `Err(_)`, `North` — the tag test IS the answer, and the
+            // emitted code is what it was before this change, instruction for
+            // instruction.
+            return tag_ok;
+        }
+
+        let payload_label = self.fresh_label("pat_payload");
+        let join_label = self.fresh_label("pat_join");
+        let tag_block = self.blocks[self.current_block].label.clone();
+        self.set_term(IRTerminator::BinBranch {
+            cond: tag_ok,
+            true_label: payload_label.clone(),
+            false_label: join_label.clone(),
+        });
+
+        let payload_idx = self.new_block(payload_label);
+        self.switch_to(payload_idx);
+        let mut acc: IRValue = IRValue::Const(IRConst::Bool(true));
+        for (fi, field) in fields.iter().enumerate() {
+            if field.is_irrefutable() {
+                continue;
+            }
+            // Payload word *i* is at slot 1+i — the SAME arithmetic
+            // `bind_pattern_locals` uses. P43 is the record of what it costs
+            // when the test and the binder disagree about where a field is.
+            let field_val = self.load_slot(scrutinee, fi as i64 + 1);
+            let sub = self.lower_pattern_match(field, &field_val, scrutinee_ty);
+            let and_t = self.fresh_temp();
+            self.emit(IRInstr::BinOp {
+                dst: and_t.clone(),
+                op: IRBinOp::And,
+                lhs: acc,
+                rhs: sub,
+                ty: IRType::Bool,
+            });
+            acc = IRValue::Temp(and_t);
+        }
+        // Read the label AFTER the loop: a nested enum sub-pattern runs this
+        // same function and leaves the cursor in its own join block, so the
+        // phi's incoming edge is not the block this one started in.
+        let payload_end = self.blocks[self.current_block].label.clone();
+        self.set_term(IRTerminator::Jump(join_label.clone()));
+
+        let join_idx = self.new_block(join_label);
+        self.switch_to(join_idx);
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::Phi {
+            dst: dst.clone(),
+            ty: IRType::Bool,
+            incoming: vec![
+                (IRValue::Const(IRConst::Bool(false)), tag_block),
+                (acc, payload_end),
+            ],
+        });
+        IRValue::Temp(dst)
     }
 
     /// Inject pattern-bound variables as locals aliased to `scrutinee`.
@@ -598,8 +722,32 @@ impl IRLowerer {
                         });
                         self.locals.insert(name.clone(), (bound_alloca, IRType::I64));
                     } else {
-                        self.bind_pattern_locals(field, scrutinee);
+                        // P90: hand DOWN the payload word, not the cell. This
+                        // branch passed `scrutinee` — the enum cell — so a
+                        // nested `Ok((a, b))` or `Ok(Point { x, y })` read its
+                        // parts from `[tag, payload]` and bound the TAG. It
+                        // was unreachable while no nested pattern bound
+                        // anything at all (there was no Tuple arm, and a
+                        // Struct payload is not constructible), so the two
+                        // defects hid each other.
+                        let payload = self.load_slot(scrutinee, fi as i64 + 1);
+                        self.bind_pattern_locals(field, &payload);
                     }
+                }
+            }
+            Pattern::Tuple(elems, _) => {
+                // P90's second half. There was no arm here at all, so
+                // `Ok((a, b))` bound NEITHER name: `a` and `b` resolved to
+                // globals and the failure surfaced past codegen -- as
+                // `Cannot resolve: a` from the T3 assembler and `global
+                // variable reference must have pointer type` from clang.
+                // `manitc check` said OK, because the analyzer's
+                // `define_pattern_bindings` has handled tuples all along. This
+                // arm restores agreement between the two rather than adding a
+                // capability.
+                for (i, sub_pat) in elems.iter().enumerate() {
+                    let elem_val = self.load_slot(scrutinee, i as i64);
+                    self.bind_pattern_locals(sub_pat, &elem_val);
                 }
             }
             Pattern::Struct(struct_name, field_pats, _) => {
@@ -709,6 +857,11 @@ impl IRLowerer {
                     out.extend(Self::pattern_bound_names(f));
                 }
             }
+            Pattern::Tuple(elems, _) => {
+                for p in elems {
+                    out.extend(Self::pattern_bound_names(p));
+                }
+            }
             Pattern::Struct(_, field_pats, _) => {
                 for (_, p) in field_pats {
                     out.extend(Self::pattern_bound_names(p));
@@ -771,8 +924,20 @@ impl IRLowerer {
                             });
                         }
                     } else {
-                        self.bind_pattern_into(field, scrutinee, slots);
+                        // P90, as in `bind_pattern_locals`: the payload word,
+                        // not the cell.
+                        let payload = self.load_slot(scrutinee, fi as i64 + 1);
+                        self.bind_pattern_into(field, &payload, slots);
                     }
+                }
+            }
+            Pattern::Tuple(elems, _) => {
+                // P90: the or-pattern path needs the same arm, or
+                // `Ok((a, b)) | Err((a, b))` allocates slots for `a` and `b`
+                // (pattern_bound_names finds them) and then writes to neither.
+                for (i, sub_pat) in elems.iter().enumerate() {
+                    let elem_val = self.load_slot(scrutinee, i as i64);
+                    self.bind_pattern_into(sub_pat, &elem_val, slots);
                 }
             }
             Pattern::Struct(struct_name, field_pats, _) => {

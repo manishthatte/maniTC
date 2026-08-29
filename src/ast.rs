@@ -587,6 +587,34 @@ pub enum Pattern {
     Or(Vec<Pattern>, Span),
 }
 
+impl Pattern {
+    /// Whether this pattern matches every value of its type.
+    ///
+    /// P90: the answer decides two things that must agree, and did not. The
+    /// lowerer uses it to decide whether a sub-pattern needs a runtime test,
+    /// and `check_exhaustiveness` uses it to decide whether an arm covers its
+    /// whole variant. When the lowerer silently answered "irrefutable" for a
+    /// literal and the checker silently agreed, `Err("closed")` both matched
+    /// every `Err` and counted as covering `Err`, so the wrong arm ran and no
+    /// arm was missing. One predicate, so the two cannot drift apart again.
+    ///
+    /// `Struct` is deliberately NOT irrefutable even when all its fields are:
+    /// a struct pattern names a type, and the lowerer emits a test for it.
+    /// Answering `true` here would suppress that test.
+    pub fn is_irrefutable(&self) -> bool {
+        match self {
+            Pattern::Wildcard(_) | Pattern::Ident(_, _) => true,
+            // A tuple is irrefutable exactly when every element is: there is
+            // no tag to test, only the elements.
+            Pattern::Tuple(elems, _) => elems.iter().all(Pattern::is_irrefutable),
+            // One irrefutable alternative makes the whole alternation match
+            // everything, whatever the others test.
+            Pattern::Or(alts, _) => alts.iter().any(Pattern::is_irrefutable),
+            Pattern::Lit(_, _) | Pattern::Struct(_, _, _) | Pattern::Enum(_, _, _, _) => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
