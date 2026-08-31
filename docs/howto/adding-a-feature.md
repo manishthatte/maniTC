@@ -4,6 +4,19 @@ This guide explains how to extend the maniT compiler with a new language constru
 It walks through every layer of the pipeline using a concrete example: adding a
 `repeat N { body }` loop construct that executes `body` exactly N times.
 
+> **Corrected 1 September 2026.** This guide named five compiler modules as
+> `.rs` files — `semantic/analyzer.rs`, `ir/lower.rs`, `codegen_llvm.rs`,
+> `codegen_t3/emitter.rs` and `codegen_t3/emulator.rs` — at nineteen sites,
+> including two of its six "Open `<path>`" instructions. **All five have been directories
+> since the initial public release `94b46b8`**, so a contributor following this
+> guide opened nothing. Two steps also named a function that does not exist:
+> `handle_syscall` is `do_syscall(num)`, in
+> `codegen_t3/emulator/syscalls.rs`. The second of those two was missed by the
+> first pass of this very correction and found only by the general test below —
+> *grep the SHAPE, not the symbol*, one more time. Paths now point at the specific file that
+> holds the code each step describes, and are pinned by
+> `tests/audit_regression_tests.rs::documented_source_paths_exist`.
+
 ---
 
 ## Overview of the layers
@@ -14,10 +27,10 @@ Adding any syntactic feature requires touching these files in order:
 2. **`ast.rs`** — new AST node
 3. **`parser/stmts.rs`** or **`parser/exprs.rs`** — parse the new syntax
 4. **`semantic/types.rs`** — new `TypedExprKind` or `TypedStmtKind` variant
-5. **`semantic/analyzer.rs`** — type-check the new construct
-6. **`ir/lower.rs`** — lower to IR basic blocks
-7. **`codegen_llvm.rs`** — LLVM emission (if applicable)
-8. **`codegen_t3/emitter.rs`** — T3ISA emission (if applicable)
+5. **`semantic/analyzer/`** — type-check the new construct
+6. **`ir/lower/`** — lower to IR basic blocks
+7. **`codegen_llvm/`** — LLVM emission (if applicable)
+8. **`codegen_t3/emitter/`** — T3ISA emission (if applicable)
 
 ---
 
@@ -90,7 +103,7 @@ RepeatLoop(Box<TypedExpr>, TypedBlock),
 
 ## Step 5 — Type-check the new construct
 
-Open `maniTC/src/semantic/analyzer.rs`.
+Open `maniTC/src/semantic/analyzer/expressions.rs`.
 
 In `check_expr()`, add a case for `Expr::RepeatLoop`:
 
@@ -118,7 +131,7 @@ Expr::RepeatLoop(count_expr, body, _) => {
 
 ## Step 6 — Lower to IR
 
-Open `maniTC/src/ir/lower.rs`.
+Open `maniTC/src/ir/lower/lower_expr.rs`.
 
 In `lower_expr()`, add a case for `TypedExprKind::RepeatLoop`:
 
@@ -241,10 +254,10 @@ Also test edge cases:
 - [ ] New `Expr` / `Stmt` / `Item` variant in `ast.rs`
 - [ ] Parser case in the appropriate `parse_*` function
 - [ ] New `TypedExprKind` / `TypedStmtKind` variant in `semantic/types.rs`
-- [ ] Type-checking case in `semantic/analyzer.rs`
-- [ ] IR lowering case in `ir/lower.rs`
-- [ ] LLVM emission case in `codegen_llvm.rs` (if targeting LLVM)
-- [ ] T3ISA emission case in `codegen_t3/emitter.rs` (if targeting T3)
+- [ ] Type-checking case in `semantic/analyzer/expressions.rs`
+- [ ] IR lowering case in `ir/lower/lower_expr.rs`
+- [ ] LLVM emission case in `codegen_llvm/emit_instr.rs` (if targeting LLVM)
+- [ ] T3ISA emission case in `codegen_t3/emitter/mod.rs` (if targeting T3)
 - [ ] Test program written and passing
 - [ ] Edge cases considered (zero, negative, large values)
 
@@ -257,7 +270,7 @@ registered programmatically.
 
 ### Step 1 — Register in SemanticAnalyzer
 
-In `semantic/analyzer.rs`, `register_builtins()`:
+In `semantic/analyzer/mod.rs`, `register_builtins()`:
 
 ```rust
 // io::my_new_function(n: int) -> str
@@ -269,7 +282,7 @@ self.functions.insert(
 
 ### Step 2 — Handle in T3 emitter
 
-In `codegen_t3/emitter.rs`, in the built-in call dispatch section:
+In `codegen_t3/emitter/mod.rs`, in the built-in call dispatch section:
 
 ```rust
 "io::my_new_function" => {
@@ -282,7 +295,7 @@ In `codegen_t3/emitter.rs`, in the built-in call dispatch section:
 
 ### Step 3 — Handle in T3 emulator
 
-In `codegen_t3/emulator.rs`, `handle_syscall(n)`:
+In `codegen_t3/emulator/syscalls.rs`, `do_syscall(num)`:
 
 ```rust
 200 => {
@@ -297,7 +310,7 @@ In `codegen_t3/emulator.rs`, `handle_syscall(n)`:
 
 ### Step 4 — Handle in LLVM emitter (optional)
 
-In `codegen_llvm.rs`, in the call emission:
+In `codegen_llvm/emit_instr.rs`, in the call emission:
 
 ```rust
 "io::my_new_function" => {
@@ -347,7 +360,7 @@ TokenKind::MyTypeKw => Some("mytype".to_string()),
 
 ### Step 4 — Map in semantic analyser
 
-In `semantic/analyzer.rs`, `name_to_manitype()`:
+In `semantic/analyzer/mod.rs`, `name_to_manitype()`:
 
 ```rust
 "mytype" => Ok(ManiType::MyNewType),
@@ -355,7 +368,7 @@ In `semantic/analyzer.rs`, `name_to_manitype()`:
 
 ### Step 5 — Map to IR type
 
-In `ir/lower.rs` or `ir/types.rs`, add `IRType::MyNewType` and update
+In `ir/lower/` or `ir/types.rs`, add `IRType::MyNewType` and update
 `manitype_to_irtype()`:
 
 ```rust
@@ -368,6 +381,6 @@ ManiType::MyNewType => IRType::I64,  // or whatever suits
 
 1. Choose a syscall number not in the [existing table](../t3isa-reference.md#8-syscall-table).
 2. Register the function in `register_builtins()`.
-3. Emit `SYSCALL #N` in `emitter.rs` for the function.
-4. Handle `N =>` in `emulator.rs` `handle_syscall()`.
-5. Optionally emit a C call in `codegen_llvm.rs`.
+3. Emit `SYSCALL #N` in `codegen_t3/emitter/mod.rs` for the function.
+4. Handle `N =>` in `codegen_t3/emulator/syscalls.rs`, `do_syscall(num)`.
+5. Optionally emit a C call in `codegen_llvm/emit_instr.rs`.

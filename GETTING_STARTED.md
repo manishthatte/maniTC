@@ -108,7 +108,7 @@ Three ideas to absorb:
 | Want to… | Go to |
 |----------|-------|
 | Learn the language properly | [docs/language-reference.md](docs/language-reference.md) |
-| See what the stdlib offers (12 modules) | [docs/stdlib-reference.md](docs/stdlib-reference.md) |
+| See what the stdlib offers (18 modules) | [docs/stdlib-reference.md](docs/stdlib-reference.md) |
 | Read 17 worked examples | [examples/](examples/) + [docs/examples.md](docs/examples.md) |
 | Understand the instruction set | [docs/t3isa-reference.md](docs/t3isa-reference.md) |
 | Hack on the compiler itself | [docs/compiler-internals.md](docs/compiler-internals.md) + [docs/howto/](docs/howto/) |

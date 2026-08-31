@@ -4212,3 +4212,564 @@ fn p91_a_narrow_value_carried_across_a_loop_back_edge_still_compiles() {
     assert_eq!(ol.trim(), o3.trim(), "backends disagree: llvm {:?} t3 {:?}", ol, o3);
     assert_eq!(ol.trim(), "+", "got {:?}", ol);
 }
+
+// ---------------------------------------------------------------------------
+// The examples walkthrough must agree with the examples directory
+// ---------------------------------------------------------------------------
+// `docs/examples.md` opened with "The `examples/` directory contains seven
+// programs" and `docs/index.md` billed it as a walkthrough of "all seven
+// example programs". The directory holds seventeen, and has since long before
+// either sentence was read again. Both were true when written.
+//
+// That is the class permanent rule 6 exists for: three documentation defects
+// have been fixed in this repository and NONE was a false sentence — an
+// absence, a single word, and a mechanism that was true when written. A count
+// is the fourth shape, and it is the one prose review is worst at, because
+// nothing about the sentence looks wrong. The obvious repair is wrong too:
+// changing `index.md`'s "seven" to "seventeen" turns a stale claim into a
+// false one, since the walkthrough really does cover seven.
+//
+// So this test pins CONSISTENCY, not completeness. Walking through a subset is
+// a choice and stays available; what may not happen again is a document
+// asserting a count that the directory has moved past, or walking through a
+// program that is not shipped.
+
+/// English for the small counts these two documents spell out. Deliberately
+/// narrow: an out-of-range count should fail loudly rather than be papered
+/// over, because it means the directory has grown past what the prose form
+/// here can express and a human should choose the new wording.
+fn number_word(n: usize) -> String {
+    const WORDS: [&str; 21] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+        "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+        "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+    ];
+    assert!(
+        n < WORDS.len(),
+        "examples/ now holds {} programs, past the range this test can spell. \
+         Update number_word() and the prose in docs/examples.md and docs/index.md.",
+        n,
+    );
+    WORDS[n].to_string()
+}
+
+#[test]
+fn examples_walkthrough_matches_the_examples_directory() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // The set that actually ships, read from disk — not from any list.
+    let mut on_disk: Vec<String> = std::fs::read_dir(root.join("examples"))
+        .expect("examples/ must exist")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter_map(|f| f.strip_suffix(".mt").map(str::to_string))
+        .collect();
+    on_disk.sort();
+    assert!(
+        !on_disk.is_empty(),
+        "no .mt programs found in examples/ — the test is measuring nothing"
+    );
+
+    let walkthrough = std::fs::read_to_string(root.join("docs/examples.md"))
+        .expect("docs/examples.md must exist");
+
+    // Every "## <name>.mt" section heading is one program walked through.
+    let mut documented: Vec<String> = walkthrough
+        .lines()
+        .filter_map(|l| l.strip_prefix("## "))
+        .filter_map(|h| h.split_whitespace().next())
+        .filter_map(|w| w.strip_suffix(".mt"))
+        .map(str::to_string)
+        .collect();
+    documented.sort();
+    documented.dedup();
+    assert!(
+        !documented.is_empty(),
+        "no '## <name>.mt' sections found in docs/examples.md — the heading \
+         format changed and this test is now blind. Fix the extraction, do not \
+         delete the test."
+    );
+
+    // (1) The walkthrough may cover a subset, but every program it covers must
+    //     be one that ships. A section for a deleted example documents nothing.
+    let phantom: Vec<&String> = documented.iter().filter(|d| !on_disk.contains(d)).collect();
+    assert!(
+        phantom.is_empty(),
+        "docs/examples.md walks through {:?}, which are not in examples/",
+        phantom,
+    );
+
+    // (2) The count the prose states must be the count on disk. This is the
+    //     half that went stale: seventeen programs described as seven.
+    let total = number_word(on_disk.len());
+    assert!(
+        walkthrough.contains(&format!("contains **{}** programs", total)),
+        "docs/examples.md must say it contains **{}** programs — examples/ holds \
+         {} ({:?}). Update the opening paragraph.",
+        total,
+        on_disk.len(),
+        on_disk,
+    );
+
+    // (3) And the number it claims to walk through must be the number it does.
+    let covered = number_word(documented.len());
+    assert!(
+        walkthrough.contains(&format!("through {} of them", covered)),
+        "docs/examples.md walks through {} programs ({:?}) but does not say \
+         'through {} of them'.",
+        documented.len(),
+        documented,
+        covered,
+    );
+
+    // (4) docs/index.md carried the same count and additionally claimed the
+    //     walkthrough was of ALL of them. Both halves are pinned here, because
+    //     the index is where a reader decides whether to open the file at all.
+    let index = std::fs::read_to_string(root.join("docs/index.md"))
+        .expect("docs/index.md must exist");
+    let row = index
+        .lines()
+        .find(|l| l.contains("[examples.md](examples.md)"))
+        .expect("docs/index.md must have a row for examples.md");
+    assert!(
+        row.contains(&format!("{} of the {} example programs", covered, total)),
+        "docs/index.md's examples.md row must read '{} of the {} example \
+         programs'; it reads:\n  {}",
+        covered,
+        total,
+        row,
+    );
+    assert!(
+        !row.contains("all "),
+        "docs/index.md must not bill the walkthrough as covering ALL the \
+         examples — it covers {} of {}. Row:\n  {}",
+        documented.len(),
+        on_disk.len(),
+        row,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The documentation must agree with the repository it describes
+// ---------------------------------------------------------------------------
+// The walkthrough count above was one instance of a wider shape. Sweeping the
+// same question across every tracked document found, in seven more files:
+// thirty-two references to source paths that do not exist, three to a function
+// that does not exist, seven wrong line counts, two wrong module counts, one
+// wrong file count, and an index omitting six of the documents it claims to
+// list. The sweep also separated two defects that look identical in prose:
+//
+//   * README.md's "(12 modules)" was EXACTLY RIGHT when it was written.
+//     `STDLIB_MODULES` held twelve at the initial public release `94b46b8`;
+//     six modules were added afterwards and the sentence was never reopened.
+//     That is `examples.md`'s stale count again.
+//
+//   * `docs/compiler-internals.md` — billed by the index as covering "every
+//     source file" — has NEVER been accurate in this repository's public
+//     history. All five of its `**File:**` line counts were already wrong at
+//     `94b46b8` (main.rs claimed 303, measured 456, measures 1,181 today), and
+//     all five paths it names as `.rs` files were already DIRECTORIES then.
+//     Not stale: wrong from the first public commit.
+//
+// Both read correctly in isolation, which is the whole difficulty, and only
+// measurement tells them apart. These tests take every number and every path
+// from disk, never from a list, so neither class can recur silently.
+//
+// Dated notices are exempt BY CONSTRUCTION: rule 7 keeps the retired wording in
+// place, so a blockquote line is allowed to quote a path that no longer exists.
+// That is why the extractors skip lines beginning with '>'. `docs/history/` is
+// skipped for the same reason — its documents are byte-unchanged records.
+
+/// Every `.md` this repository maintains as current documentation.
+fn current_docs(root: &std::path::Path) -> Vec<PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for e in entries.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                // Superseded records, kept byte-unchanged on purpose.
+                if p.file_name().is_some_and(|n| n == "history") {
+                    continue;
+                }
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "md") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join("docs"), &mut out);
+    out.push(root.join("README.md"));
+    out.push(root.join("GETTING_STARTED.md"));
+    out.sort();
+    out
+}
+
+/// Path-shaped tokens in a markdown HEADER, which carries no backticks.
+///
+/// This helper exists because the first version of
+/// `documented_source_paths_exist` read backticked tokens only — and the
+/// control PASSED with `### ir/lower.rs` reintroduced, because four of the five
+/// original stale paths were section headings. A test that cannot see the form
+/// the defect actually took is hollow; rule 9 is what caught it.
+fn header_tokens(line: &str) -> Vec<String> {
+    let t = line.trim_start();
+    if !t.starts_with('#') || t.starts_with(">") {
+        return Vec::new();
+    }
+    t.trim_start_matches('#')
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| c == ',' || c == ':'))
+        .filter(|w| w.ends_with(".rs") || w.ends_with('/'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Backtick-quoted tokens on a line, ignoring dated-notice blockquotes.
+fn backtick_tokens(line: &str) -> Vec<String> {
+    if line.trim_start().starts_with('>') {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(a) = rest.find('`') {
+        let after = &rest[a + 1..];
+        match after.find('`') {
+            Some(b) => {
+                out.push(after[..b].to_string());
+                rest = &after[b + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+#[test]
+fn documented_source_paths_exist() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // Output directories a build tool creates; not source paths.
+    const NOT_SOURCE: [&str; 1] = ["build/"];
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for doc in current_docs(&root) {
+        let text = std::fs::read_to_string(&doc).expect("doc must be readable");
+        let rel = doc.strip_prefix(&root).unwrap_or(&doc).display().to_string();
+
+        for (n, line) in text.lines().enumerate() {
+            let mut toks = backtick_tokens(line);
+            toks.extend(header_tokens(line));
+            for tok in toks {
+                let is_path = tok.ends_with(".rs") || tok.ends_with('/');
+                let has_name = tok.chars().any(|c| c.is_ascii_alphanumeric());
+                if !is_path || !has_name || tok.contains(' ') || NOT_SOURCE.contains(&tok.as_str())
+                {
+                    continue;
+                }
+                checked += 1;
+
+                let t = tok.strip_prefix("maniTC/").unwrap_or(&tok);
+                // Qualified: resolve from the repo root or from src/.
+                if root.join(t).exists() || root.join("src").join(t).exists() {
+                    continue;
+                }
+                // Bare `foo.rs` in prose: accept it if exactly that file exists
+                // somewhere under src/.
+                if !t.contains('/') {
+                    let mut hits = Vec::new();
+                    fn find(dir: &std::path::Path, name: &str, out: &mut Vec<PathBuf>) {
+                        if let Ok(rd) = std::fs::read_dir(dir) {
+                            for e in rd.filter_map(|e| e.ok()) {
+                                let p = e.path();
+                                if p.is_dir() {
+                                    find(&p, name, out);
+                                } else if p.file_name().is_some_and(|f| f == name) {
+                                    out.push(p);
+                                }
+                            }
+                        }
+                    }
+                    find(&root.join("src"), t, &mut hits);
+                    if !hits.is_empty() {
+                        continue;
+                    }
+                }
+                missing.push(format!("{}:{}  `{}`", rel, n + 1, tok));
+            }
+        }
+    }
+
+    assert!(
+        checked > 40,
+        "only {} source paths extracted from the documentation — the extractor \
+         has gone blind. Fix it, do not delete the test.",
+        checked,
+    );
+    assert!(
+        missing.is_empty(),
+        "{} documented source path(s) do not exist. Five module paths were \
+         named as `.rs` files while being DIRECTORIES since the initial public \
+         release, at thirty-two sites across four documents; this is that \
+         class. Name the file or directory that actually holds the code:\n  {}",
+        missing.len(),
+        missing.join("\n  "),
+    );
+}
+
+#[test]
+fn documented_line_counts_match_the_source_files() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut wrong: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    let count_lines = |p: &std::path::Path| -> Option<usize> {
+        if p.is_file() {
+            return Some(std::fs::read_to_string(p).ok()?.lines().count());
+        }
+        if p.is_dir() {
+            fn total(d: &std::path::Path, ext: &str) -> usize {
+                let mut n = 0;
+                if let Ok(rd) = std::fs::read_dir(d) {
+                    for e in rd.filter_map(|e| e.ok()) {
+                        let p = e.path();
+                        if p.is_dir() {
+                            n += total(&p, ext);
+                        } else if p.extension().is_some_and(|x| x == ext) {
+                            n += std::fs::read_to_string(&p).map(|s| s.lines().count()).unwrap_or(0);
+                        }
+                    }
+                }
+                n
+            }
+            return Some(total(p, "rs"));
+        }
+        None
+    };
+
+    for doc in current_docs(&root) {
+        let text = std::fs::read_to_string(&doc).expect("doc must be readable");
+        let rel = doc.strip_prefix(&root).unwrap_or(&doc).display().to_string();
+
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with('>') || !line.starts_with("**File:**") {
+                continue;
+            }
+            let toks = backtick_tokens(line);
+            let Some(path_tok) = toks.first() else { continue };
+
+            // "... (1,181 lines)" or "... — 4 files, 4,622 lines"
+            let Some(pre) = line.rsplit_once(" lines") else { continue };
+            let claimed: String = pre
+                .0
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            let Ok(claimed) = claimed.chars().rev().collect::<String>().parse::<usize>() else {
+                continue;
+            };
+            checked += 1;
+
+            let t = path_tok.strip_prefix("maniTC/").unwrap_or(path_tok);
+            let target = if root.join(t).exists() {
+                root.join(t)
+            } else {
+                root.join("src").join(t)
+            };
+            match count_lines(&target) {
+                Some(actual) if actual == claimed => {}
+                Some(actual) => wrong.push(format!(
+                    "{}:{}  `{}` claims {} lines, measures {}",
+                    rel,
+                    n + 1,
+                    path_tok,
+                    claimed,
+                    actual
+                )),
+                None => wrong.push(format!(
+                    "{}:{}  `{}` does not exist",
+                    rel,
+                    n + 1,
+                    path_tok
+                )),
+            }
+        }
+    }
+
+    assert!(
+        checked >= 12,
+        "only {} '**File:** ... (N lines)' claims found — the format changed and \
+         this test is now blind. Fix the extraction, do not delete the test.",
+        checked,
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} documented line count(s) disagree with the source. Every one of \
+         compiler-internals.md's five was wrong at the initial public release \
+         and none has ever been accurate, so these go stale silently. Update \
+         the number in the document:\n  {}",
+        wrong.len(),
+        wrong.join("\n  "),
+    );
+}
+
+#[test]
+fn documented_stdlib_module_counts_match_the_registry() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // The authoritative list: what the analyzer will accept a call into.
+    let analyzer = std::fs::read_to_string(root.join("src/semantic/analyzer/mod.rs"))
+        .expect("src/semantic/analyzer/mod.rs must exist");
+    let start = analyzer
+        .find("const STDLIB_MODULES:")
+        .expect("STDLIB_MODULES must exist — if it was renamed, update this test");
+    let body = &analyzer[start..];
+    let end = body.find("];").expect("STDLIB_MODULES must be a closed slice");
+    let registry: Vec<&str> = body[..end]
+        .match_indices('"')
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .filter(|c| c.len() == 2)
+        .map(|c| &body[c[0] + 1..c[1]])
+        .collect();
+    assert!(
+        registry.len() > 5,
+        "parsed only {} modules out of STDLIB_MODULES — the extraction broke",
+        registry.len(),
+    );
+
+    // Every document that states the size of the standard library.
+    let expected = format!("({} modules)", registry.len());
+    for rel in ["README.md", "GETTING_STARTED.md"] {
+        let text = std::fs::read_to_string(root.join(rel)).expect("document must exist");
+        let stated: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('>'))
+            .filter(|l| l.contains(" modules)"))
+            .collect();
+        assert!(
+            !stated.is_empty(),
+            "{} no longer states a stdlib module count; if the sentence was \
+             removed, remove it from this test's list too",
+            rel,
+        );
+        for line in stated {
+            assert!(
+                line.contains(&expected),
+                "{} must say '{}' — STDLIB_MODULES holds {} ({:?}). It reads:\n  {}",
+                rel,
+                expected,
+                registry.len(),
+                registry,
+                line.trim(),
+            );
+        }
+    }
+}
+
+#[test]
+fn the_documentation_index_lists_every_document() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let index_path = root.join("docs/index.md");
+    let index = std::fs::read_to_string(&index_path).expect("docs/index.md must exist");
+
+    // Every markdown link target in the index, as written.
+    let mut linked: Vec<String> = Vec::new();
+    let mut rest = index.as_str();
+    while let Some(a) = rest.find("](") {
+        let after = &rest[a + 2..];
+        match after.find(')') {
+            Some(b) => {
+                linked.push(after[..b].to_string());
+                rest = &after[b + 1..];
+            }
+            None => break,
+        }
+    }
+
+    let docs_dir = root.join("docs");
+    let mut unlisted: Vec<String> = Vec::new();
+    let mut total = 0usize;
+
+    for doc in current_docs(&root) {
+        if !doc.starts_with(&docs_dir) || doc == index_path {
+            continue;
+        }
+        let rel = doc.strip_prefix(&docs_dir).unwrap().display().to_string();
+        total += 1;
+        // Listed directly, or reachable through its directory's own README.
+        let via_readme = doc.parent().map(|d| d.join("README.md")).is_some_and(|r| {
+            r.exists()
+                && r != doc
+                && linked.contains(
+                    &r.strip_prefix(&docs_dir).unwrap().display().to_string(),
+                )
+        });
+        if !linked.contains(&rel) && !via_readme {
+            unlisted.push(rel);
+        }
+    }
+
+    assert!(
+        total > 8,
+        "only {} documents found under docs/ — the walk is measuring nothing",
+        total,
+    );
+    assert!(
+        unlisted.is_empty(),
+        "docs/index.md is headed \"Documents in this directory\" but does not \
+         list {} of the {} documents under docs/: {:?}. It once omitted \
+         semantics.md, the NORMATIVE specification. Add a row, or link the \
+         directory's own README.",
+        unlisted.len(),
+        total,
+        unlisted,
+    );
+
+    // A row may describe a subset — that is a choice. What it may not do is
+    // bill a subset as everything. This is P93's "all seven" one site along:
+    // the compiler-internals row read "Every source file ... in the compiler"
+    // while the document names 25 of 66.
+    let row = index
+        .lines()
+        .find(|l| l.contains("[compiler-internals.md](compiler-internals.md)"))
+        .expect("docs/index.md must have a row for compiler-internals.md");
+    if row.contains("Every source file") {
+        let doc = std::fs::read_to_string(docs_dir.join("compiler-internals.md"))
+            .expect("docs/compiler-internals.md must exist");
+        let named = doc
+            .lines()
+            .filter_map(|l| l.strip_prefix("#"))
+            .flat_map(|h| h.split_whitespace())
+            .filter(|w| w.ends_with(".rs"))
+            .count();
+        let mut on_disk = 0usize;
+        fn count_rs(d: &std::path::Path, n: &mut usize) {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    let p = e.path();
+                    if p.is_dir() {
+                        count_rs(&p, n);
+                    } else if p.extension().is_some_and(|x| x == "rs") {
+                        *n += 1;
+                    }
+                }
+            }
+        }
+        count_rs(&root.join("src"), &mut on_disk);
+        panic!(
+            "docs/index.md bills compiler-internals.md as covering EVERY source \
+             file. It names {} in headings; src/ holds {}. Either document them \
+             all, or word the row for what it delivers.",
+            named, on_disk,
+        );
+    }
+}

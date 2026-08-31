@@ -3,6 +3,11 @@
 This guide covers how to diagnose and fix errors at each layer of the maniT
 compiler pipeline.
 
+> **Corrected 1 September 2026.** Two references to `codegen_llvm.rs` are now
+> `codegen_llvm/` and `codegen_llvm/mod.rs`; the LLVM backend has been a
+> directory since the initial public release. Same correction, thirty other
+> sites: see `docs/compiler-internals.md`.
+
 ---
 
 ## Table of contents
@@ -363,7 +368,7 @@ to completion before other tasks get a chance to run.
 error: instruction requires the same type for all operands and result
 ```
 
-The LLVM IR emitted by `codegen_llvm.rs` has a type inconsistency. Use
+The LLVM IR emitted by `codegen_llvm/` has a type inconsistency. Use
 `--emit-ir` to inspect the IR and cross-reference with the LLVM IR in `a.ll`.
 
 ### clang not found
@@ -400,7 +405,7 @@ error: use of undefined value '@__maniT_println'
 ```
 
 A stdlib function call in the IR references a helper function that wasn't
-declared. In `codegen_llvm.rs`, find where `declare` lines are emitted in
+declared. In `codegen_llvm/mod.rs`, find where `declare` lines are emitted in
 `emit_module()` and add the missing declaration.
 
 ---

@@ -19,8 +19,16 @@ with two backends:
 
 This is not a binary language with ternary bolted on. `t27` words, trytes and
 trits, Kleene three-valued logic, `tif` three-way branching, balanced ternary
-floating point (T27F), and a ternary-native standard library (12 modules) are
+floating point (T27F), and a ternary-native standard library (18 modules) are
 the ground floor.
+
+> **Corrected 1 September 2026.** This paragraph read *"(12 modules)"* from the
+> initial public release until now. Twelve was accurate on the day it was
+> written — `SemanticAnalyzer::STDLIB_MODULES` held exactly twelve then — and
+> six modules (`t27f`, `crypto`, `bridge`, `tritfs`, `test`, `trit`) were added
+> afterwards without the sentence being reopened. The count is now taken from
+> that registry rather than from prose, and pinned by
+> `tests/audit_regression_tests.rs::documented_stdlib_module_counts_match_the_registry`.
 
 ## Quick start
 

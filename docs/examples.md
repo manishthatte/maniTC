@@ -1,8 +1,33 @@
 # Example programs walkthrough
 
-The `examples/` directory contains seven programs that demonstrate the full
-range of maniT language features. Each is self-contained and compiles against
-both backends.
+The `examples/` directory contains **seventeen** programs. This document walks
+through seven of them, chosen to cover the range of maniT language features.
+Each is self-contained and compiles against both backends.
+
+> **Corrected 30 August 2026.** This paragraph previously read *"The
+> `examples/` directory contains seven programs"*. It contains seventeen —
+> counted on disk rather than from the list below. The count was true when this
+> document was written and the other ten arrived without it being revisited;
+> nothing said here about the seven that ARE walked through was wrong, which is
+> why prose review does not catch this class. The ten with no section below are
+> `bridge_demo`, `capability_demo`, `crypto_demo`, `database`, `float_demo`,
+> `neural_net`, `patent_classify`, `stream_demo`, `ternary_calculator` and
+> `ternary_sort` — every one of them shipped and a subject of the parity
+> matrix, and `ternary_sort` is one of the four examples whose `.t3l` is
+> tracked. `docs/index.md` carried the same count and additionally called this
+> a walkthrough of *all* of them; it now says seven of seventeen. Both claims
+> are pinned by
+> `tests/audit_regression_tests.rs::examples_walkthrough_matches_the_examples_directory`,
+> because a count written into prose goes stale in silence.
+>
+> **Added 1 September 2026.** Sweeping the same shape across the repository
+> found two more stale counts *in this document*: `fibonacci.mt` was billed at
+> 139 lines and measures 148, and `three_valued_logic.mt` at 490 against 510.
+> The other five `**File:**` counts here are exact. That the correction above
+> did not prompt a check of the seven line counts twelve lines below it is the
+> repository's own rule — *a fix is not done when the reported site is fixed* —
+> applied to the fix that recorded it. All seven are now pinned by
+> `tests/audit_regression_tests.rs::documented_line_counts_match_the_source_files`.
 
 ```bash
 # Compile and run any example
@@ -82,7 +107,7 @@ by zero in ternary context").
 
 ## fibonacci.mt — Algorithms and Result
 
-**File:** `examples/fibonacci.mt` (139 lines)
+**File:** `examples/fibonacci.mt` (148 lines)
 
 Demonstrates multiple implementations of the same algorithm and the use of
 `Result` for safe computation.
@@ -217,7 +242,7 @@ Balanced ternary stores more information per digit than binary:
 
 ## three_valued_logic.mt — Kleene logic
 
-**File:** `examples/three_valued_logic.mt` (490 lines)
+**File:** `examples/three_valued_logic.mt` (510 lines)
 
 Deep dive into three-valued logic theory with practical applications.
 

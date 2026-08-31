@@ -15,9 +15,35 @@ structures, key functions, and how the pieces fit together.
 6. [parser/ — parsing](#6-parser--parsing)
 7. [semantic/ — type checking](#7-semantic--type-checking)
 8. [ir/ — intermediate representation](#8-ir--intermediate-representation)
-9. [codegen_llvm.rs — LLVM backend](#9-codegen_llvmrs--llvm-backend)
+9. [codegen_llvm/ — LLVM backend](#9-codegen_llvm--llvm-backend)
 10. [codegen_t3/ — T3ISA backend](#10-codegen_t3--t3isa-backend)
 11. [Data flow between modules](#11-data-flow-between-modules)
+
+---
+
+> **Corrected 1 September 2026.** Three classes of claim in this document were
+> measured against the source tree and every one of them was wrong.
+>
+> - **Five `**File:**` line counts** (`main.rs` 303, `error.rs` 86, `lexer.rs`
+>   767, `ast.rs` 419, `codegen_llvm.rs` 1153). Unlike the stale count corrected
+>   in `examples.md`, **not one of these was ever accurate**: at the initial
+>   public release `94b46b8` they measured 456, 283, 827, 452 and 2,474. They
+>   are now 1,181 / 480 / 1,005 / 681 / 4,622.
+> - **Five paths named as `.rs` files that are directories** — `codegen_llvm.rs`,
+>   `semantic/analyzer.rs`, `ir/lower.rs`, `codegen_t3/emitter.rs` and
+>   `codegen_t3/emulator.rs`. **None has ever existed as a file in this
+>   repository's public history**; all five were already directories at
+>   `94b46b8`. The same five paths were repeated across `docs/index.md` and both
+>   `docs/howto/` guides — thirty-two sites in all.
+> - **"split into three files"** for a parser of four, contradicted twenty lines
+>   later by this document's own four subsections.
+>
+> Kept as a notice rather than a silent rewrite because the measurement is the
+> point: a document can be *billed* as covering every source file and be wrong
+> from its first public commit, with every sentence reading correctly in
+> isolation. Pinned by `tests/audit_regression_tests.rs` —
+> `documented_line_counts_match_the_source_files` and
+> `documented_source_paths_exist`.
 
 ---
 
@@ -56,7 +82,7 @@ output.
 
 ## 2. main.rs — CLI and orchestration
 
-**File:** `maniTC/src/main.rs` (303 lines)
+**File:** `maniTC/src/main.rs` (1,181 lines)
 
 ### CLI definition
 
@@ -100,7 +126,7 @@ of `addr:content` pairs.
 
 ## 3. error.rs — diagnostics
 
-**File:** `maniTC/src/error.rs` (86 lines)
+**File:** `maniTC/src/error.rs` (480 lines)
 
 ### `Diagnostic`
 
@@ -153,7 +179,7 @@ CompileError::codegen(msg)                  // from backends (no location)
 
 ## 4. lexer.rs — tokenisation
 
-**File:** `maniTC/src/lexer.rs` (767 lines)
+**File:** `maniTC/src/lexer.rs` (1,005 lines)
 
 ### `Span`
 
@@ -234,7 +260,7 @@ Accumulates `digit * 3^position`.
 
 ## 5. ast.rs — abstract syntax tree
 
-**File:** `maniTC/src/ast.rs` (419 lines)
+**File:** `maniTC/src/ast.rs` (681 lines)
 
 The AST represents the programmer's source code **after parsing** but **before**
 type checking. Every node carries a `Span` for error reporting.
@@ -426,7 +452,7 @@ look up the variant's integer index.
 
 ## 6. parser/ — parsing
 
-The parser is a hand-written recursive-descent parser split into three files:
+The parser is a hand-written recursive-descent parser split into four files:
 
 ### parser/mod.rs — driver
 
@@ -596,7 +622,7 @@ pub struct SymbolTable { scopes: Vec<Scope> }
 `define(name, ty, is_mut)` adds to the current (innermost) scope.
 `lookup(name)` searches from innermost to outermost; returns `None` if not found.
 
-### semantic/analyzer.rs — the heart of the type checker
+### semantic/analyzer/ — the heart of the type checker
 
 **`SemanticAnalyzer` fields:**
 
@@ -794,7 +820,7 @@ pub enum IRType {
 }
 ```
 
-### ir/lower.rs — IR lowerer
+### ir/lower/ — IR lowerer
 
 **`IRLowerer` struct:**
 
@@ -905,9 +931,9 @@ is a narrowing. Removing the memory operation removes the coercion with it, so
 
 ---
 
-## 9. codegen_llvm.rs — LLVM backend
+## 9. codegen_llvm/ — LLVM backend
 
-**File:** `maniTC/src/codegen_llvm.rs` (1153 lines)
+**File:** `maniTC/src/codegen_llvm/` — 4 files, 4,622 lines
 
 Entry point: `emit_llvm_ir(module: &IRModule) -> String`
 
@@ -1066,7 +1092,7 @@ functions. `TBRANCH` pseudo-instruction expands to three real words:
 **`write_t3_binary` / `read_t3_binary`:** Simple 8-byte-per-word little-endian
 binary file I/O.
 
-### codegen_t3/emitter.rs
+### codegen_t3/emitter/
 
 **Entry:** `emit_t3_asm(module: &IRModule) -> String`
 
@@ -1125,9 +1151,9 @@ FunctionName:
 | 110–111 | `AtomicTrit::get / set` |
 | … | many more |
 
-See `emitter.rs` for the complete syscall table.
+See `codegen_t3/emitter/` for the complete syscall table.
 
-### codegen_t3/emulator.rs
+### codegen_t3/emulator/
 
 **Entry:** `run_emulator(words: Vec<i64>, str_data: HashMap<usize, String>) -> Vec<String>`
 
@@ -1192,7 +1218,7 @@ loop {
         Store → memory[(regs[r1] + imm) as usize] = regs[r2]
         Call  → { call_stack.push(pc+1); pc = label_addr }
         Ret   → { pc = call_stack.pop() }
-        Syscall → handle_syscall(imm)
+        Syscall → do_syscall(imm)
         ...
     }
 }
@@ -1221,7 +1247,7 @@ semantic/       consumes:  &Program
 ir/             consumes:  &TypedProgram
                 produces:  IRModule
                              │
-codegen_llvm.rs consumes:  &IRModule
+codegen_llvm/   consumes:  &IRModule
                 produces:  String (LLVM IR text)
                              │
 codegen_t3/     consumes:  &IRModule
@@ -1230,7 +1256,7 @@ codegen_t3/     consumes:  &IRModule
 assembler.rs    consumes:  &str (ASM text)
                 produces:  (Vec<i64>, HashMap<usize,String>)
                              │
-emulator.rs     consumes:  Vec<i64> + HashMap<usize,String>
+emulator/       consumes:  Vec<i64> + HashMap<usize,String>
                 produces:  Vec<String> (output)
 ```
 
