@@ -80,10 +80,28 @@ pub(crate) fn irconst_to_string(c: &IRConst, hint_ty: &IRType) -> String {
             IRType::F64 => format!("0x{:016X}", (*n as f64).to_bits()),
             _ => format!("{}", n),
         },
-        IRConst::Float(f) => {
-            // Emit as LLVM hex double (0x...) to preserve exact bit pattern.
-            format!("0x{:016X}", f.to_bits())
-        }
+        IRConst::Float(f) => match hint_ty {
+            // P92. The uniform one-word slot — an enum payload, `Result`
+            // included — holds a float as its f64 BIT PATTERN. That is what
+            // the T3 emitter has always written (measured: `Ok(1.5)` puts
+            // 4609434218613702656 in the payload word and reads back 1.5), and
+            // in an integer slot the constant must therefore be spelled as a
+            // DECIMAL integer. `0x...` is FLOATING-POINT syntax in LLVM IR, so
+            // `store i64 0x3FF8000000000000` is not a wrong value, it is not a
+            // module: clang rejects it outright.
+            //
+            // This is the mirror of the `IRConst::Int` arm above, which exists
+            // because an int constant in a double context must be spelled as a
+            // float. That direction was written; this one was not.
+            //
+            // `as i64` is the correct cast and not a truncation: LLVM writes
+            // integer constants as SIGNED decimal, so a bit pattern above
+            // i64::MAX — every negative float, whose sign bit is set — must
+            // appear as its two's-complement negative.
+            IRType::I64 => format!("{}", f.to_bits() as i64),
+            // Everywhere else the hex double preserves the exact bit pattern.
+            _ => format!("0x{:016X}", f.to_bits()),
+        },
         IRConst::Bool(b) => match hint_ty {
             // `true`/`false` are only valid spellings for i1 — in a wider
             // integer context the constant must be numeric.

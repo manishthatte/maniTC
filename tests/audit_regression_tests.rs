@@ -4563,8 +4563,21 @@ fn documented_line_counts_match_the_source_files() {
             let toks = backtick_tokens(line);
             let Some(path_tok) = toks.first() else { continue };
 
-            // "... (1,181 lines)" or "... — 4 files, 4,622 lines"
+            // "... (~1,200 lines)" or "... — 4 files, ~4,700 lines" or the
+            // exact "(103 lines)". A leading `~` is the document STATING its
+            // own precision, and the test holds it to exactly that: an
+            // approximate claim is checked to +/-10 %, an exact one to the
+            // digit.
+            //
+            // The two precisions are not a convenience. An exact count of
+            // actively-developed source is a claim nobody maintains by hand —
+            // all five in compiler-internals.md were wrong on the day they were
+            // published and had drifted 2-4x — and pinning it exactly made this
+            // row fire twice in one hour of ordinary compiler work. Example
+            // PROGRAMS do not move, so those stay exact.
             let Some(pre) = line.rsplit_once(" lines") else { continue };
+            let approx = pre.0.trim_end_matches(|c: char| c.is_ascii_digit() || c == ',')
+                .ends_with('~');
             let claimed: String = pre
                 .0
                 .chars()
@@ -4583,13 +4596,22 @@ fn documented_line_counts_match_the_source_files() {
             } else {
                 root.join("src").join(t)
             };
+            let ok = |actual: usize| -> bool {
+                if approx {
+                    let tol = (claimed as f64 * 0.10).max(1.0);
+                    ((actual as f64) - (claimed as f64)).abs() <= tol
+                } else {
+                    actual == claimed
+                }
+            };
             match count_lines(&target) {
-                Some(actual) if actual == claimed => {}
+                Some(actual) if ok(actual) => {}
                 Some(actual) => wrong.push(format!(
-                    "{}:{}  `{}` claims {} lines, measures {}",
+                    "{}:{}  `{}` claims {}{} lines, measures {}",
                     rel,
                     n + 1,
                     path_tok,
+                    if approx { "~" } else { "" },
                     claimed,
                     actual
                 )),

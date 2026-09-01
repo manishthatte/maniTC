@@ -659,6 +659,81 @@ impl LLVMEmitter {
         format!("{}{} = icmp {} {} {}, {}", prefix, dst_name, cmp_kind, cmp_ty, l_final, r_final)
     }
 
+    /// The float sibling of `emit_icmp_coerced` (P92).
+    ///
+    /// An `fcmp` needs both operands typed `double`, and one of them may be a
+    /// TYPE-ERASED machine word: the uniform one-word payload slot of an enum
+    /// or a `Result` is loaded as `i64`, because that is what the slot is. So
+    /// `match r { Ok(2.5) => .. }` emitted
+    /// `fcmp oeq double %t7, 0x4004...` with `%t7` an `i64`, and clang refused
+    /// the module with "defined with type 'i64' but expected 'double'".
+    ///
+    /// A `bitcast` and not a conversion: the word HOLDS the f64 bit pattern,
+    /// so `sitofp` would turn 1.5 into 4.6e18. The call-argument path has
+    /// carried exactly this bitcast since 20 August for exactly this reason —
+    /// the comparison boundary is the same situation and never got it, which
+    /// is this repository's own rule about fixing the reported site only.
+    ///
+    /// The integer comparisons have had `emit_icmp_coerced` throughout; the
+    /// six float ones went through a bare `resolve_pair`. Routing all six here
+    /// means a payload word compares correctly whichever predicate is used,
+    /// rather than only for the one a test happened to exercise.
+    /// Resolve a float operand pair, bitcasting either side that is actually a
+    /// TYPE-ERASED machine word. Returns `(prefix, lhs, rhs)`.
+    ///
+    /// The uniform one-word payload slot of an enum or a `Result` is loaded as
+    /// `i64`, because that is what the slot is — so a float that came out of
+    /// one arrives at an `fadd` or an `fcmp` still typed `i64`, and clang
+    /// refuses the module: "defined with type 'i64' but expected 'double'".
+    ///
+    /// A `bitcast` and NOT a conversion: the word HOLDS the f64 bit pattern,
+    /// so `sitofp` would turn 1.5 into 4.6e18. The call-argument path has
+    /// carried exactly this bitcast since 20 August for exactly this reason
+    /// (see `emit_instr.rs`); the comparison and arithmetic boundaries are the
+    /// same situation and never got it. P92.
+    pub(super) fn resolve_float_pair(
+        &mut self,
+        lhs: &IRValue,
+        rhs: &IRValue,
+        tag: &str,
+    ) -> (String, String, String) {
+        let mut prefix = String::new();
+        let (l_str, r_str) = self.resolve_pair(lhs, rhs, &IRType::F64);
+        let l_actual = self.actual_type_of(lhs);
+        let r_actual = self.actual_type_of(rhs);
+
+        let cast = |actual: &str, val: &str, side: &str, prefix: &mut String| -> String {
+            if actual == "i64" {
+                let name = format!("%{}__{}fb", tag, side);
+                prefix.push_str(&format!("{} = bitcast i64 {} to double\n  ", name, val));
+                name
+            } else {
+                val.to_string()
+            }
+        };
+        let l_final = cast(&l_actual, &l_str, "l", &mut prefix);
+        let r_final = cast(&r_actual, &r_str, "r", &mut prefix);
+        (prefix, l_final, r_final)
+    }
+
+    /// The float sibling of `emit_icmp_coerced` (P92).
+    ///
+    /// The integer comparisons have had `emit_icmp_coerced` throughout; the
+    /// six float ones went through a bare `resolve_pair`. Routing all six here
+    /// means a payload word compares correctly whichever predicate is used,
+    /// rather than only for the one a test happened to exercise.
+    fn emit_fcmp_coerced(
+        &mut self,
+        dst_name: &str,
+        pred: &str,
+        lhs: &IRValue,
+        rhs: &IRValue,
+    ) -> String {
+        let tag = dst_name.trim_start_matches('%').to_string();
+        let (prefix, l, r) = self.resolve_float_pair(lhs, rhs, &tag);
+        format!("{}{} = fcmp {} double {}, {}", prefix, dst_name, pred, l, r)
+    }
+
     // -----------------------------------------------------------------------
     // Instruction → single String (may contain embedded "\n  " for multi-line)
     // -----------------------------------------------------------------------

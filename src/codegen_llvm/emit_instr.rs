@@ -174,7 +174,14 @@ impl LLVMEmitter {
                             return format!("{} = call ptr @str_concat(ptr {}, ptr {})", dst_name, l, r);
                         }
                         if is_float {
-                            let (l, r) = self.resolve_pair(lhs, rhs, ty);
+                            // P92: either operand may be a TYPE-ERASED payload
+                            // word loaded as i64, which needs a bitcast — not a
+                            // conversion — to double. The INTEGER branch below
+                            // has had `resolve_with_coerce` throughout; this one
+                            // went through a bare `resolve_pair`, which is the
+                            // same asymmetry the float comparisons had.
+                            let (pfx, l, r) =
+                                self.resolve_float_pair(lhs, rhs, &format!("{}_a", dst.0));
                             let op_name = match op {
                                 IRBinOp::Add => "fadd",
                                 IRBinOp::Sub => "fsub",
@@ -183,7 +190,7 @@ impl LLVMEmitter {
                                 IRBinOp::Rem => "frem",
                                 _ => unreachable!(),
                             };
-                            format!("{} = {} {} {}, {}", dst_name, op_name, ty_str, l, r)
+                            format!("{}{} = {} {} {}, {}", pfx, dst_name, op_name, ty_str, l, r)
                         } else {
                             let op_name = match op {
                                 IRBinOp::Add => "add",
@@ -245,12 +252,11 @@ impl LLVMEmitter {
                         self.emit_icmp_coerced(&dst_name, "sge", lhs, rhs, &llvm_type(&op_ty))
                     }
                     // --- Float comparisons ---
-                    IRBinOp::FEq => {
-                        let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
-                        format!("{} = fcmp oeq double {}, {}", dst_name, l, r)
-                    }
+                    // All six go through `emit_fcmp_coerced` (P92): either
+                    // operand may be a TYPE-ERASED payload word loaded as i64,
+                    // which needs a bitcast — not a conversion — to double.
+                    IRBinOp::FEq => self.emit_fcmp_coerced(&dst_name, "oeq", lhs, rhs),
                     IRBinOp::FNe => {
-                        let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
                         // `une`, not `one` (P20). IEEE-754 says `!=` is TRUE
                         // when either operand is a NaN, and it is the ONE
                         // comparison of the six for which that is so — the
@@ -258,24 +264,12 @@ impl LLVMEmitter {
                         // false on a NaN, which is the right answer for them.
                         // `one` is ORDERED not-equal and returned false, so
                         // `nan != 1.0` was false on LLVM.
-                        format!("{} = fcmp une double {}, {}", dst_name, l, r)
+                        self.emit_fcmp_coerced(&dst_name, "une", lhs, rhs)
                     }
-                    IRBinOp::FLt => {
-                        let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
-                        format!("{} = fcmp olt double {}, {}", dst_name, l, r)
-                    }
-                    IRBinOp::FGt => {
-                        let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
-                        format!("{} = fcmp ogt double {}, {}", dst_name, l, r)
-                    }
-                    IRBinOp::FLe => {
-                        let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
-                        format!("{} = fcmp ole double {}, {}", dst_name, l, r)
-                    }
-                    IRBinOp::FGe => {
-                        let (l, r) = self.resolve_pair(lhs, rhs, &IRType::F64);
-                        format!("{} = fcmp oge double {}, {}", dst_name, l, r)
-                    }
+                    IRBinOp::FLt => self.emit_fcmp_coerced(&dst_name, "olt", lhs, rhs),
+                    IRBinOp::FGt => self.emit_fcmp_coerced(&dst_name, "ogt", lhs, rhs),
+                    IRBinOp::FLe => self.emit_fcmp_coerced(&dst_name, "ole", lhs, rhs),
+                    IRBinOp::FGe => self.emit_fcmp_coerced(&dst_name, "oge", lhs, rhs),
                     // --- Logical / bitwise ---
                     IRBinOp::And => {
                         let (l, r) = self.resolve_pair(lhs, rhs, ty);
@@ -1407,7 +1401,20 @@ impl LLVMEmitter {
         target_ty: &str,
         suffix: &str,
     ) -> (String, String) {
-        let resolved = self.resolve_val(val, &IRType::I64);
+        // The hint matters for CONSTANTS, and it began to matter for FLOAT
+        // constants with P92: `irconst_to_string` now spells a float as a
+        // decimal bit pattern under an integer hint (the type-erased one-word
+        // payload slot) and as an LLVM hex double otherwise. Resolving a
+        // DOUBLE-targeted operand under a hardcoded i64 hint therefore emitted
+        // `@llvm.fptosi.sat.i64.f64(double 4615964438073389875)`, which clang
+        // rejects: "integer constant must have integer type".
+        //
+        // The hardcoded i64 was harmless for exactly as long as no arm of
+        // `irconst_to_string` distinguished the two — which is this repo's own
+        // note that teaching a type to CARRY something leaves every reader of
+        // it newly incomplete, and the compiler cannot say so.
+        let hint = if target_ty == "double" { IRType::F64 } else { IRType::I64 };
+        let resolved = self.resolve_val(val, &hint);
         let actual = self.actual_type_of(val);
 
         // No coercion needed if types match, or if we're dealing with

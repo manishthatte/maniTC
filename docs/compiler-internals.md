@@ -24,11 +24,20 @@ structures, key functions, and how the pieces fit together.
 > **Corrected 1 September 2026.** Three classes of claim in this document were
 > measured against the source tree and every one of them was wrong.
 >
-> - **Five `**File:**` line counts** (`main.rs` 303, `error.rs` 86, `lexer.rs`
->   767, `ast.rs` 419, `codegen_llvm.rs` 1153). Unlike the stale count corrected
->   in `examples.md`, **not one of these was ever accurate**: at the initial
->   public release `94b46b8` they measured 456, 283, 827, 452 and 2,474. They
->   are now 1,181 / 480 / 1,005 / 681 / 4,622.
+> - **Five `**File:**` line counts**, now stated with a `~` and pinned to ±10 %
+>   rather than exactly. That precision is the finding's own conclusion, not a
+>   convenience: an exact count of actively-developed source is a claim nobody
+>   can maintain by hand, which is why all five were wrong on the day they were
+>   published and drifted to 2–4× since. The pinning test fired **twice within
+>   an hour** of ordinary compiler work before this was changed. A `~` claim
+>   still catches the defect that occurred — 303 against 1,181 — while an
+>   ordinary edit no longer falsifies the document. The exact form is kept for
+>   `examples.md`, whose programs do not move.
+>
+>   The retired figures were `main.rs` 303, `error.rs` 86, `lexer.rs` 767,
+>   `ast.rs` 419 and `codegen_llvm.rs` 1153. Unlike the stale count corrected in
+>   `examples.md`, **not one of them was ever accurate**: at the initial public
+>   release `94b46b8` those files measured 456, 283, 827, 452 and 2,474.
 > - **Five paths named as `.rs` files that are directories** — `codegen_llvm.rs`,
 >   `semantic/analyzer.rs`, `ir/lower.rs`, `codegen_t3/emitter.rs` and
 >   `codegen_t3/emulator.rs`. **None has ever existed as a file in this
@@ -82,7 +91,7 @@ output.
 
 ## 2. main.rs — CLI and orchestration
 
-**File:** `maniTC/src/main.rs` (1,181 lines)
+**File:** `maniTC/src/main.rs` (~1,200 lines)
 
 ### CLI definition
 
@@ -126,7 +135,7 @@ of `addr:content` pairs.
 
 ## 3. error.rs — diagnostics
 
-**File:** `maniTC/src/error.rs` (480 lines)
+**File:** `maniTC/src/error.rs` (~480 lines)
 
 ### `Diagnostic`
 
@@ -179,7 +188,7 @@ CompileError::codegen(msg)                  // from backends (no location)
 
 ## 4. lexer.rs — tokenisation
 
-**File:** `maniTC/src/lexer.rs` (1,005 lines)
+**File:** `maniTC/src/lexer.rs` (~1,000 lines)
 
 ### `Span`
 
@@ -260,7 +269,7 @@ Accumulates `digit * 3^position`.
 
 ## 5. ast.rs — abstract syntax tree
 
-**File:** `maniTC/src/ast.rs` (681 lines)
+**File:** `maniTC/src/ast.rs` (~680 lines)
 
 The AST represents the programmer's source code **after parsing** but **before**
 type checking. Every node carries a `Span` for error reporting.
@@ -933,7 +942,7 @@ is a narrowing. Removing the memory operation removes the coercion with it, so
 
 ## 9. codegen_llvm/ — LLVM backend
 
-**File:** `maniTC/src/codegen_llvm/` — 4 files, 4,622 lines
+**File:** `maniTC/src/codegen_llvm/` — 4 files, ~4,700 lines
 
 Entry point: `emit_llvm_ir(module: &IRModule) -> String`
 

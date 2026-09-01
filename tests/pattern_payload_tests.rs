@@ -149,13 +149,18 @@ fn main() {
 
 #[test]
 fn p90_float_literal_payload_selects_the_right_arm() {
-    // T3 ONLY, and the reason is a SEPARATE pre-existing defect rather than
-    // this one: constructing a `Result` with a FLOAT payload emits
-    // `store i64 0x3FF8000000000000`, and `0x...` is floating-point syntax in
-    // LLVM IR, invalid for `i64`. clang rejects the module. It fails
-    // identically on the control binary and with no literal pattern present
-    // at all, so it is not P90 and not this fix.
-    let out = run_t3(r#"
+    // WAS T3-ONLY UNTIL P92 WAS FIXED (1 September 2026), and the reason was a
+    // SEPARATE pre-existing defect rather than P90: constructing a `Result`
+    // with a FLOAT payload emitted `store i64 0x3FF8000000000000`, and `0x...`
+    // is floating-point syntax in LLVM IR, invalid for `i64`, so clang
+    // rejected the module. It failed identically on the control binary and
+    // with no literal pattern present at all.
+    //
+    // The observation is kept rather than deleted (rule 7): what made this row
+    // one-backend was never P90, and a row that quietly became `both()` would
+    // no longer say so. `irconst_to_string` now spells a float constant in an
+    // integer slot as a decimal bit pattern, which is what T3 always wrote.
+    both(r#"
 fn main() {
     let r: Result<float, str> = Ok(1.5);
     match r {
@@ -165,8 +170,93 @@ fn main() {
         Err(e)     => io::println("err"),
     }
 }
-"#);
-    assert!(out.contains("other"), "float literal payload: T3 gave {out:?}");
+"#, "other", "float literal payload");
+}
+
+// ---------------------------------------------------------------------------
+// P92 — a float in a one-word payload slot must survive to the other side
+// ---------------------------------------------------------------------------
+// The uniform payload slot holds a float as its f64 BIT PATTERN. T3 has always
+// written that pattern as a decimal word and read back the right number; the
+// LLVM emitter printed the same bits in FLOAT hex syntax against `store i64`,
+// which is not a wrong value but an unparseable module.
+//
+// THE NEGATIVE CASE IS THE TEST AND THE POSITIVE ONE HIDES IT. A positive
+// double's bit pattern is below i64::MAX, so it prints identically whether the
+// emitter treats the word as signed or unsigned; only a NEGATIVE float, whose
+// sign bit is set, needs the two's-complement spelling. That is P68's lesson
+// verbatim — its `impl` row went green over a live defect because positive
+// doubles order the same as their bit patterns.
+//
+// Asserts the VALUE, not that the program compiles (rule 8): a module that
+// links but reinterprets the word wrongly would pass an exit-status check.
+
+#[test]
+fn p92_a_float_payload_round_trips_through_a_result_on_both_backends() {
+    both(r#"
+fn show(r: Result<float, str>) {
+    match r {
+        Ok(v)      => { io::print_float(v); io::println(""); }
+        Unknown(m) => io::println("unknown"),
+        Err(e)     => io::println("err"),
+    }
+}
+fn main() {
+    show(Ok(1.5));
+    show(Ok(-1.5));
+    show(Ok(0.0));
+}
+"#, "-1.5", "float Result payload, negative");
+}
+
+#[test]
+fn p92_a_float_payload_survives_arithmetic_and_comparison_on_both_backends() {
+    // THE THIRD OPERATION CLASS, and the one the reported finding did not
+    // name. P92 was recorded as a CONSTRUCTION defect ("emits an unparseable
+    // module"). Fixing construction made the next one reachable — the payload
+    // word arrives at `fcmp` and at `fadd` still typed i64 — which is this
+    // repository's own note that a defect behind an unreachable one is still a
+    // defect (P43/P74).
+    //
+    // The asymmetry was structural and sat in three places at once: the
+    // INTEGER comparison path had `emit_icmp_coerced` and the float one did
+    // not; integer arithmetic had `resolve_with_coerce` and float arithmetic
+    // did not; and `irconst_to_string` consulted its type hint in every arm
+    // except `Float`. Each was the same missing question — "is this operand
+    // actually a machine word?" — asked on the integer side and not the float.
+    both(r#"
+fn main() {
+    let r: Result<float, str> = Ok(1.5);
+    match r {
+        Ok(v)      => { io::print_float(v + 1.0); io::println(""); }
+        Unknown(m) => io::println("u"),
+        Err(e)     => io::println("e"),
+    }
+    let q: Result<float, str> = Ok(2.5);
+    match q {
+        Ok(v)      => { if v > 2.0 { io::println("gt"); } else { io::println("le"); } }
+        Unknown(m) => io::println("u"),
+        Err(e)     => io::println("e"),
+    }
+}
+"#, "2.5", "float payload arithmetic");
+}
+
+#[test]
+fn p92_a_float_payload_round_trips_through_a_user_enum_on_both_backends() {
+    // Not just `Result`. P92 was recorded as a `Result` defect; probing the
+    // family measured the user-enum path too, which reaches the payload
+    // through a BOXED cell (P43) and is a different construct entirely.
+    both(r#"
+enum E { V(float), N }
+fn main() {
+    let e = E::V(-2.25);
+    match e {
+        E::V(x) => { io::print_float(x); io::println(""); }
+        E::N    => io::println("n"),
+    }
+}
+"#, "-2.25", "float user-enum payload, negative");
 }
 
 #[test]
