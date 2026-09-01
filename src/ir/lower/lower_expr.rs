@@ -744,9 +744,29 @@ impl IRLowerer {
                 }
 
                 // Check if callee is an fn-type variable (indirect call).
+                //
+                // P53/P54: this used to infer "variable" from the TYPE being
+                // `ManiType::Fn`, which worked only because a bare function
+                // name used to type as its RETURN type — so an `Ident` of
+                // function type could only be a variable, and the two spellings
+                // it had to exclude were a hoisted lambda and a qualified name.
+                // Now that a function name types as its function type, that
+                // inference calls every direct call indirect, which silently
+                // drops the flat-array parameter expansion and the declared
+                // parameter coercion: `fn pack(a: [trit])` is emitted as
+                // `@pack(ptr, i64)` and the call site passed one argument.
+                //
+                // Ask the question directly instead. A LOCAL — which includes
+                // parameters, inserted alongside them above — holds a function
+                // pointer and is called indirectly; a bare name is a direct
+                // call to a symbol, whatever its type now says. That answers
+                // identically to the old test on every previous case (a
+                // parameter and a lambda binding are locals, `__lambda_*` and
+                // `mod::fn` are not) and differs only on the case the old one
+                // could not see.
                 let is_indirect = if let ManiType::Fn(..) = &callee.ty {
                     if let TypedExprKind::Ident(n) = &callee.kind {
-                        !n.starts_with("__lambda_") && !n.contains("::")
+                        self.locals.contains_key(n)
                     } else {
                         true
                     }

@@ -18,14 +18,39 @@ impl SemanticAnalyzer {
                 let ty = if let Some(sym) = self.symbols.lookup(name) {
                     sym.ty.clone()
                 } else if let Some((params, ret)) = self.functions.get(name) {
-                    // A bare function name in a context expecting a fn type is
-                    // a function reference; otherwise keep the legacy view
-                    // (the function's return type).
-                    if matches!(hint, Some(ManiType::Fn(_, _))) {
-                        ManiType::Fn(params.clone(), Box::new(ret.clone()))
-                    } else {
-                        ret.clone()
-                    }
+                    // P53/P54: a bare function name is a function REFERENCE.
+                    //
+                    // This used to answer the function's RETURN type unless the
+                    // context supplied a `fn`-typed hint — its own comment
+                    // called that "the legacy view" — and the two open findings
+                    // it produced are one defect wearing two costumes.
+                    //
+                    // P53: `let f = dbl;` has no hint, so `f` was typed `int`,
+                    // `dbl`'s return type. The lowerer then emitted a call to
+                    // the BINDING's name and neither backend had an `@f`.
+                    // `let f: fn(int) -> int = dbl;` worked because the
+                    // ANNOTATION IS THE HINT, which is exactly why annotating
+                    // was a complete workaround. A lambda worked by
+                    // coincidence: it is emitted under the name it is bound to,
+                    // so `@f` happened to resolve — and `let dbl2 = dbl;`
+                    // failed while `let dbl = dbl;` ran, which is that
+                    // coincidence stated as an experiment.
+                    //
+                    // P54: the CALLEE of `pick()` is checked with no hint, so
+                    // `pick` was typed as its return type `fn(int) -> int`, and
+                    // the call checker's first arm then read that type's
+                    // parameters as `pick`'s own — "function 'pick' expects 1
+                    // argument(s), found 0", where the `int` belongs to the
+                    // return type. With a zero-argument return type there was
+                    // nothing to absorb, so arity passed and the RESULT was
+                    // mistyped instead: `fn pick() -> fn() -> int` checks
+                    // clean and dies in the assembler.
+                    //
+                    // A function whose return type is not itself a function is
+                    // unaffected either way, which is why this survived: the
+                    // call checker's first arm only matches when the answer is
+                    // already a `ManiType::Fn`.
+                    ManiType::Fn(params.clone(), Box::new(ret.clone()))
                 } else if let Some(enum_name) = self.enum_variant_path(name) {
                     // EnumName::Variant.
                     //
@@ -319,8 +344,26 @@ impl SemanticAnalyzer {
                 // `self.functions` and `display_name` stays "<fn>" — which is
                 // why the P24 check below cannot key on it.
                 let mut callee_name = String::new();
+                // P53/P54: a bare function name now types as its FUNCTION
+                // type, so without this guard the arm below would swallow every
+                // direct call — and with it everything the `Ident` arm does
+                // besides choosing a signature: A2's call-graph edge,
+                // `check_extern_call_site`, `note_undeclared_native`, the
+                // enum-variant constructor path, and the `enforce` rule that
+                // exempts a builtin whose parameters are `Unknown`
+                // (`println` and `fmt::format` are variadic-ish, S53). A direct
+                // call therefore stays on the path it has always taken, and
+                // this arm keeps exactly its old population: values of function
+                // type that are NOT the bare name of a declared function — a
+                // local, a parameter, a field, a call result.
+                let callee_is_declared_fn_name = match &tcallee.kind {
+                    TypedExprKind::Ident(n) => {
+                        self.symbols.lookup(n).is_none() && self.functions.contains_key(n)
+                    }
+                    _ => false,
+                };
                 let (param_tys, ret_ty) = match &tcallee.ty {
-                    ManiType::Fn(pts, rt) => {
+                    ManiType::Fn(pts, rt) if !callee_is_declared_fn_name => {
                         enforce = true;
                         if let TypedExprKind::Ident(n) = &tcallee.kind {
                             display_name = n.clone();
