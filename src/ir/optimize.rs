@@ -24,6 +24,16 @@ pub struct PassOptions {
     /// pre-F-1 compiler's output byte for byte, which is what dates a defect as
     /// pre-existing rather than newly introduced — keep it working.
     pub mem2reg: bool,
+    /// P36: materialise a loop-invariant constant once in the preheader
+    /// instead of at every use inside the loop.
+    ///
+    /// **T3 only.** It exists because of a T3ISA encoding fact — a constant
+    /// outside `-13..=13` does not fit the 3-trit immediate field and is
+    /// materialised with a `TLIT` at each use — and on LLVM a constant operand
+    /// costs nothing, so running it there would move the emitted `.ll` for no
+    /// gain and break the byte-for-byte comparison `--no-mem2reg` exists to
+    /// give. Set from the selected target, not from a default.
+    pub hoist_constants: bool,
 
     /// Print how many instructions each pass removes, to stderr (F-2).
     ///
@@ -96,6 +106,7 @@ impl Default for PassOptions {
             rounds: 1,
             inline_limit: super::inline::SIZE_LIMIT,
             merge_blocks: true,
+            hoist_constants: false,
         }
     }
 }
@@ -215,6 +226,15 @@ pub fn run_passes_with(module: &mut IRModule, opts: PassOptions) {
     // each one over the whole module in turn: they are independent per
     // function, so accumulating differences preserves the order each function
     // actually sees while still giving a per-pass total.
+    // P36. LAST, and after the per-function passes rather than among them:
+    // constant folding and propagation are what PRODUCE the final constants,
+    // so hoisting earlier would lift values that later collapse and miss the
+    // ones that later appear. Dead-code elimination has already run, and the
+    // definitions this pass inserts are used by construction, so nothing
+    // removes them.
+    //
+    // It is also why it is not in the `rounds` loop: it only ever adds
+    // instructions, so iterating it would not converge on a fixed point.
     const FN_PASSES: [&str; 6] = [
         "constant-fold",
         "constant-propagate",
@@ -270,6 +290,18 @@ pub fn run_passes_with(module: &mut IRModule, opts: PassOptions) {
         }
     }
     dead_block_eliminate(module);
+
+    // P36, and LAST of all. It only ever adds instructions, so it must not be
+    // followed by a pass that would judge the function's size, and it must
+    // follow `dead_block_eliminate` so that no preheader it writes into turns
+    // out to be unreachable.
+    if opts.hoist_constants {
+        let n = super::hoist_const::run(module);
+        if opts.pass_stats {
+            eprintln!("pass-stats  {:<22} {:>9}  values", "hoist-constants", n);
+            module_marks.push(("hoist-constants", count_module(module)));
+        }
+    }
 
     if opts.pass_stats {
         let end = count_module(module);

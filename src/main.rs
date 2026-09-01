@@ -131,6 +131,17 @@ enum Commands {
         #[arg(long = "no-merge-blocks")]
         no_merge_blocks: bool,
 
+        /// Turn P36 constant hoisting OFF, re-materialising every
+        /// loop-invariant constant at each use.
+        ///
+        /// T3 only — the pass never runs for the LLVM backend, where a constant
+        /// operand costs nothing. It exists for the same reason
+        /// `--no-merge-blocks` does: the pass can then be measured against
+        /// itself on one binary, which is what turns "something got faster"
+        /// into a number attributable to this change.
+        #[arg(long = "no-hoist-constants")]
+        no_hoist_constants: bool,
+
         /// How `spawn { B }` is compiled: `inline` (the default) or
         /// `cooperative` (§11 of docs/semantics.md).
         ///
@@ -485,6 +496,7 @@ fn run_compile(
     rounds: usize,
     inline_limit: usize,
     merge_blocks: bool,
+    hoist_constants: bool,
     sched: manitc::ir::lower::SchedMode,
 ) -> CompileResult<()> {
     let source = read_source(file).map_err(|e| CompileError::Lex(
@@ -544,7 +556,18 @@ fn run_compile(
     }
     ir::optimize::run_passes_with(
         &mut ir_module,
-        ir::optimize::PassOptions { mem2reg, pass_stats, rounds, inline_limit, merge_blocks },
+        ir::optimize::PassOptions {
+            mem2reg,
+            pass_stats,
+            rounds,
+            inline_limit,
+            merge_blocks,
+            // P36 is a T3ISA encoding fact — a constant outside the 3-trit
+            // immediate field is materialised at every use — so the pass runs
+            // for that target and no other. On LLVM it would move the emitted
+            // `.ll` for no gain.
+            hoist_constants: hoist_constants && target == "t3",
+        },
     );
     if verify_ssa {
         report_ssa(&ir_module, "after optimisation");
@@ -1119,7 +1142,7 @@ fn run() {
             file, target, output, emit_ir, warn_as_error,
             allow, warn, deny, forbid, print_lints, target_triple, lang, verify_ssa,
             mem2reg, no_mem2reg, pass_stats, rounds, inline_limit, no_inline,
-            no_merge_blocks, sched,
+            no_merge_blocks, no_hoist_constants, sched,
         } => {
             let flags = LintFlags {
                 allow: allow.clone(), warn: warn.clone(),
@@ -1135,7 +1158,7 @@ fn run() {
                     &flags, *print_lints, target_triple.as_deref(), lang, *verify_ssa,
                     !*no_mem2reg, *pass_stats, *rounds,
                     if *no_inline { 0 } else { *inline_limit },
-                    !*no_merge_blocks, sc,
+                    !*no_merge_blocks, !*no_hoist_constants, sc,
                 ))
         }
         Commands::Check {
