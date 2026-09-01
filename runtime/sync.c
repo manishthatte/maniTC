@@ -139,6 +139,11 @@ typedef struct {
     pthread_cond_t not_empty;
     pthread_cond_t not_full;
     int closed;
+    /* §11.3's B(c): the tasks waiting to receive, LONGEST-WAITING FIRST.
+     * Owned here because a channel is where a waiter waits, but ordered and
+     * moved only by `sched.c`, which is the one place that knows what R is. */
+    void* waiters;
+    void* waiters_tail;
 } ManitChan;
 
 ManitChan* channel_bounded(int64_t capacity);
@@ -159,6 +164,8 @@ ManitChan* channel_bounded(int64_t capacity) {
     c->head = 0;
     c->tail = 0;
     c->closed = 0;
+    c->waiters = NULL;
+    c->waiters_tail = NULL;
     pthread_mutex_init(&c->lock, NULL);
     pthread_cond_init(&c->not_empty, NULL);
     pthread_cond_init(&c->not_full, NULL);
@@ -179,6 +186,15 @@ void channel_send(ManitChan* c, int64_t v) {
     c->buffer[c->tail] = v;
     c->tail = (c->tail + 1) % c->capacity;
     c->count++;
+    if (manit_sched_active()) {
+        /* §11.5 (SEND) and (SEND-WAKE). The value is appended and AT MOST ONE
+         * waiter is woken — the longest-waiting, to the BACK of R. `send` does
+         * not yield (§11.4), because §11.1 leaves channels unbounded, so the
+         * spawner simply continues. */
+        pthread_mutex_unlock(&c->lock);
+        manit_sched_wake_one(&c->waiters, &c->waiters_tail);
+        return;
+    }
     pthread_cond_signal(&c->not_empty);
     pthread_mutex_unlock(&c->lock);
 }
@@ -200,7 +216,24 @@ int64_t channel_recv(ManitChan* c) {
      * program that cannot make progress, and it stops being reachable the day
      * `spawn` starts a real task. A CLOSED empty channel is untouched: that is
      * the drain case, and it already returns 0 here without waiting. */
-    if (c->count == 0 && !c->closed) {
+    if (manit_sched_active()) {
+        /* §11.5 (RECV) and (RECV-BLOCK). An empty queue is the second of
+         * §11.4's three yield points: the task leaves R and joins B(c). The
+         * LOOP is the specification rather than defensive coding — §11.7 says
+         * a woken receiver re-executes its `recv`, and that is exactly what
+         * makes a wake-all bug invisible to a test that counts wakes.
+         *
+         * P81's fault below does not apply here and must not: it exists
+         * because `spawn` ran its block in place, so an open empty channel
+         * could never be filled. Under §11 there may be a task that has not
+         * run yet, and the case where there genuinely is not is §11.6's
+         * deadlock trap, raised by the scheduler when R empties. */
+        while (c->count == 0 && !c->closed) {
+            pthread_mutex_unlock(&c->lock);
+            manit_sched_block_on(&c->waiters, &c->waiters_tail);
+            pthread_mutex_lock(&c->lock);
+        }
+    } else if (c->count == 0 && !c->closed) {
         pthread_mutex_unlock(&c->lock);
         manit_fault("recv on an empty channel that is still open: nothing can "
                     "send to it, because `spawn` runs its block in place");

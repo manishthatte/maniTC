@@ -14,12 +14,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The complete runtime, embedded. `manit_runtime.c` is only an aggregator —
-/// it `#include`s the other six — so all of them have to be written out
-/// together for a manitc binary distributed without its source tree to work.
-const RUNTIME_FILES: [(&str, &str); 7] = [
+/// it `#include`s every other entry here — so all of them have to be written
+/// out together for a manitc binary distributed without its source tree to
+/// work.
+///
+/// The count in the type is the only place it is written down. It used to be
+/// spelled again in this comment ("the other six"), which is P93's defect
+/// class: a count in prose that was true when written. The array length is
+/// checked by the compiler; a sentence is not.
+const RUNTIME_FILES: [(&str, &str); 8] = [
     ("manit_runtime.c", include_str!("../runtime/manit_runtime.c")),
     ("core.c", include_str!("../runtime/core.c")),
     ("collections.c", include_str!("../runtime/collections.c")),
+    // §11's cooperative scheduler. Included by the aggregator BEFORE sync.c,
+    // which asks it whether a channel should block a task or a condvar.
+    ("sched.c", include_str!("../runtime/sched.c")),
     ("sync.c", include_str!("../runtime/sync.c")),
     ("system.c", include_str!("../runtime/system.c")),
     ("net.c", include_str!("../runtime/net.c")),
@@ -122,7 +131,8 @@ pub fn resolve_source(
     Ok(written)
 }
 
-/// Write the embedded runtime — all seven files — into a temporary directory
+/// Write the embedded runtime — every entry of `RUNTIME_FILES` — into a
+/// temporary directory
 /// and return the path to the aggregator. Write errors propagate to the
 /// caller: silently returning a path to files that were never written would
 /// surface later as a baffling clang error.

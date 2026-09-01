@@ -35,6 +35,9 @@ static void Vec_push_internal(ManitVec* v, int64_t x);
 
 #include "core.c"
 #include "collections.c"
+/* The cooperative scheduler (docs/semantics.md §11) comes BEFORE sync.c, which
+ * asks it whether a channel should block a task or a condition variable. */
+#include "sched.c"
 #include "sync.c"
 #include "system.c"
 #include "net.c"
