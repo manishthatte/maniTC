@@ -260,18 +260,31 @@ pub struct Lexer {
     file: String,
     /// P8: the merged stdlib module being lexed, stamped onto every span.
     module: Option<&'static str>,
+    /// A21: `lex_number` folded a preceding unary minus into the literal.
+    neg_folded: bool,
 }
 
 impl Lexer {
     pub fn new(source: &str) -> Self {
         Lexer {
             source: source.chars().collect(),
+            neg_folded: false,
             pos: 0,
             line: 1,
             col: 1,
             file: String::from("<input>"),
             module: None,
         }
+    }
+
+    /// A21: set by `lex_number` when it folded a preceding unary minus into
+    /// the literal, so `tokenize` knows to drop that `-` from the stream.
+    ///
+    /// A flag rather than an inference from the VALUE, because `i64::MIN` can
+    /// also arrive from a binary or ternary literal and popping the minus there
+    /// would silently change what that program means.
+    fn neg_was_folded(&self) -> bool {
+        self.neg_folded
     }
 
     pub fn with_file(source: &str, file: impl Into<String>) -> Self {
@@ -394,7 +407,7 @@ impl Lexer {
 
     // --- number lexing ---
 
-    fn lex_number(&mut self, span: Span) -> CompileResult<Token> {
+    fn lex_number(&mut self, span: Span, allow_neg: bool) -> CompileResult<Token> {
         // Check for 0t (ternary literal) or 0x / 0b / 0o
         if self.peek() == Some('0') {
             match self.peek2() {
@@ -540,7 +553,48 @@ impl Lexer {
             let v: f64 = s.parse().map_err(|_| self.err_at(span, format!("invalid float literal: {}", s)))?;
             Ok(Token::new(TokenKind::Float(v), span))
         } else {
-            let v: i64 = s.parse().map_err(|_| self.err_at(span, format!("invalid integer literal: {}", s)))?;
+            // A21: `i64::MIN` has no positive magnitude, so a decimal literal
+            // spelling it is rejected here before the parser ever sees the
+            // unary minus that makes it representable —
+            // `let x: t54 = -9223372036854775808;` was
+            // "invalid integer literal: 9223372036854775808", and
+            // `stdlib/math.mt` declared `INT_MIN` exactly that way, which is
+            // why that file had never passed `check`. (Half of that is stale:
+            // under N5 an `int` IS 27 trits, so `INT_MIN` is now the 27-trit
+            // minimum and the declaration was wrong independently. What remains
+            // is that a `t54` or `--lang v1` context still cannot spell the
+            // most negative machine word. `i64::MAX` itself is fine.)
+            //
+            // Folding is attempted ONLY when the unsigned parse overflows and
+            // the signed one succeeds, which is true of exactly one magnitude,
+            // 2^63 — and that magnitude is an error today. So the blast radius
+            // is one literal that no program can currently contain. Every other
+            // negative literal keeps its `Minus` token, which matters:
+            // `parse_unary_expr` reads `-` followed by a delimiter as the trit
+            // literal `-1`, and folding eagerly would take that away.
+            let v: i64 = match s.parse::<i64>() {
+                Ok(v) => v,
+                Err(_) if allow_neg => {
+                    let signed = format!("-{}", s);
+                    match signed.parse::<i64>() {
+                        Ok(v) => {
+                            self.neg_folded = true;
+                            v
+                        }
+                        Err(_) => {
+                            return Err(self.err_at(
+                                span,
+                                format!("invalid integer literal: {}", s),
+                            ))
+                        }
+                    }
+                }
+                Err(_) => {
+                    return Err(
+                        self.err_at(span, format!("invalid integer literal: {}", s))
+                    )
+                }
+            };
             Ok(Token::new(TokenKind::Int(v), span))
         }
     }
@@ -628,7 +682,38 @@ impl Lexer {
             let tok = match ch {
                 // Number
                 c if c.is_ascii_digit() => {
-                    self.lex_number(span)?
+                    // A21: a decimal literal may absorb an immediately
+                    // preceding unary minus, and ONLY when that is the
+                    // difference between a value and an error. `allow_neg` asks
+                    // whether the `-` is in prefix position, decided from the
+                    // token BEFORE it: after an identifier, a literal, a `)` or
+                    // a `]` the minus is subtraction, so `x - 9223372036854775808`
+                    // keeps its error rather than quietly becoming
+                    // `x - (-9223372036854775808)`.
+                    let allow_neg = matches!(
+                        tokens.last().map(|t| &t.kind),
+                        Some(TokenKind::Minus)
+                    ) && !matches!(
+                        tokens.get(tokens.len().wrapping_sub(2)).map(|t| &t.kind),
+                        Some(TokenKind::Ident(_))
+                            | Some(TokenKind::Int(_))
+                            | Some(TokenKind::Float(_))
+                            | Some(TokenKind::TernaryInt(_))
+                            | Some(TokenKind::Str(_))
+                            | Some(TokenKind::Char(_))
+                            | Some(TokenKind::Bool(_))
+                            | Some(TokenKind::RParen)
+                            | Some(TokenKind::RBracket)
+                    );
+                    self.neg_folded = false;
+                    let t = self.lex_number(span, allow_neg)?;
+                    if self.neg_was_folded() {
+                        // The `-` is part of the literal now, so it must not
+                        // also become a `UnOp::Neg` around it — that would
+                        // negate `i64::MIN` and overflow.
+                        tokens.pop();
+                    }
+                    t
                 }
 
                 // Identifier or keyword

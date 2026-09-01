@@ -156,7 +156,24 @@ impl SemanticAnalyzer {
                     let lit_val = match &te.kind {
                         TypedExprKind::Lit(Lit::Int(v)) => Some(*v),
                         TypedExprKind::UnOp(UnOpKind::Neg, inner) => match &inner.kind {
-                            TypedExprKind::Lit(Lit::Int(v)) => Some(-*v),
+                            // A21: `checked_neg`, because a literal CAN now be
+                            // `i64::MIN`. Folding a unary minus into a decimal
+                            // literal made that value writable for the first
+                            // time, and `-(-9223372036854775808)` reached this
+                            // line and panicked the compiler with "attempt to
+                            // negate with overflow". Unreachable before, which
+                            // is the whole of why it was written this way — a
+                            // defect behind an unreachable one is still a
+                            // defect, and it becomes reachable the moment the
+                            // outer one is fixed.
+                            //
+                            // `None` rather than an error: this is the
+                            // range check for a ternary-typed binding, and a
+                            // value it cannot even compute is not one it can
+                            // rule on. The overflow is caught by
+                            // `const_fold`'s own `checked_neg`, which has
+                            // returned `ConstError::Overflow` for it all along.
+                            TypedExprKind::Lit(Lit::Int(v)) => v.checked_neg(),
                             _ => None,
                         },
                         _ => None,
