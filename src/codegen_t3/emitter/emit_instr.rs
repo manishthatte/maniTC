@@ -463,22 +463,39 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             // grew down over it as it read: `(11,22,33)` came back `11 22 22`,
             // `(11,22,33,44,55)` came back `11 22 33 33 22`. Found by the
             // regression test for ORACLE_FINDINGS.md Section 10.
-            if let IRType::Struct(name) = ty {
-                let n = em
-                    .struct_sizes
-                    .get(name)
-                    .copied()
-                    .or_else(|| crate::ir::types::tuple_arity_from_name(name));
-                if let Some(n) = n {
-                    let n = n.max(1);
-                    em.emit(format!("    TLIT  R1, #{}  ; heap alloca {} ({} words)", n, name, n));
-                    em.emit("    SYSCALL #218  ; heap_alloc_words".to_string());
-                    let rd = em.dst_reg(dst);
-                    if rd != 1 {
-                        em.emit(format!("    MOV   {}, R1  ; heap alloca base", AsmEmitter::rn(rd)));
-                    }
-                    return;
+            //
+            // And ARRAYS take it as of P94, which is the same sentence a third
+            // time: `fn f() -> [int]` handed back nine words of a frame the
+            // `RET` had just popped, and the next callee's frame push wrote
+            // over its tail. The LLVM backend has always mallocked an array
+            // alloca for precisely this reason; the argument was written down
+            // on one side of the split and acted on by one backend.
+            //
+            // Whether an ARRAY takes it is not a property of the type — an
+            // array used only inside the frame that builds it is safe there
+            // and costs nothing, and heap-allocating every one of them was
+            // MEASURED to be unaffordable: a 400-iteration loop over a
+            // function with an 8-word local array exhausts the whole
+            // 2,536-word heap, because this allocator has no free. So the
+            // decision comes from `regalloc::heap_allocas`, computed once per
+            // function, and the size from `alloca_words` — the frame layout
+            // uses both, and a disagreement between the two places
+            // desynchronises every frame offset from the address actually
+            // used, which is P15.
+            if em.heap_allocas.contains(&dst.0) {
+                let n = alloca_words(ty, &em.struct_sizes);
+                let what = match ty {
+                    IRType::Struct(name) => name.clone(),
+                    IRType::Array(_, len) => format!("[_; {}]", len),
+                    other => format!("{:?}", other),
+                };
+                em.emit(format!("    TLIT  R1, #{}  ; heap alloca {} ({} words)", n, what, n));
+                em.emit("    SYSCALL #218  ; heap_alloc_words".to_string());
+                let rd = em.dst_reg(dst);
+                if rd != 1 {
+                    em.emit(format!("    MOV   {}, R1  ; heap alloca base", AsmEmitter::rn(rd)));
                 }
+                return;
             }
 
             // Arrays need n words; structs need n_fields words; everything else needs 1 word.

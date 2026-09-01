@@ -409,7 +409,7 @@ fn call_sites(func: &IRFunction, block_start: &[usize]) -> Vec<usize> {
 fn abi_clobber_sites(
     func: &IRFunction,
     block_start: &[usize],
-    struct_sizes: &HashMap<String, usize>,
+    heap: &HashSet<String>,
 ) -> Vec<usize> {
     // A float literal is materialised with `TLIT R1, #addr; SYSCALL #219`
     // wherever it appears, so an operand can clobber R1 on its own.
@@ -427,7 +427,7 @@ fn abi_clobber_sites(
                 // the entry block is to alloca the storage a parameter is about
                 // to be stored into, so the syscall lands inside the
                 // parameter's live range, between its arrival and its store.
-                IRInstr::Alloca { ty, .. } => is_heap_alloca(ty, struct_sizes),
+                IRInstr::Alloca { dst, .. } => heap.contains(&dst.0),
                 // The bounds check is SYSCALL #560.
                 IRInstr::BoundsCheck { .. } => true,
                 IRInstr::BinOp { op, lhs, rhs, ty, .. } => {
@@ -479,14 +479,17 @@ fn abi_clobber_sites(
     out
 }
 
-/// Whether `emit_instr`'s `Alloca` arm will put this type on the HEAP rather
-/// than in the frame.
+/// Whether this type is heap-allocated NO MATTER what the function does with
+/// it — the storage-class decision that needs no analysis.
 ///
 /// Named structs and tuples escape — returning one is often the whole point —
-/// so they cannot live in a frame that gets popped. The predicate lives here
-/// so the frame layout, the emitter and this analysis cannot drift apart:
-/// disagreeing about which allocas are heap ones desynchronises the frame
-/// offsets from the addresses actually used.
+/// so they cannot live in a frame that gets popped.
+///
+/// This is only half the answer. The other half is `escaping_allocas`, and
+/// callers want `heap_allocas`, which is both. The predicate lives here so the
+/// frame layout, the emitter and this analysis cannot drift apart: disagreeing
+/// about which allocas are heap ones desynchronises the frame offsets from the
+/// addresses actually used, which is P15.
 pub fn is_heap_alloca(ty: &IRType, struct_sizes: &HashMap<String, usize>) -> bool {
     match ty {
         IRType::Struct(name) => {
@@ -495,6 +498,268 @@ pub fn is_heap_alloca(ty: &IRType, struct_sizes: &HashMap<String, usize>) -> boo
         }
         _ => false,
     }
+}
+
+/// The alloca temps in `func` whose ADDRESS can outlive the frame (P94).
+///
+/// An array alloca used only inside the frame that builds it is safe there and
+/// costs nothing; one whose address gets out is a pointer to memory the `RET`
+/// has already released. Before this analysis existed, `is_heap_alloca`
+/// answered from the TYPE alone, so a struct survived being returned and an
+/// array beside it did not — `fn f() -> [int]` handed back nine words below
+/// the restored `R26`, and the next `CALL`'s frame push landed on their tail:
+/// `-1 -2 -3 -4 -5 -6 -7 59990 8` against the LLVM backend's `-1 … -9`, with
+/// the number of corrupt elements equal to the NEXT callee's frame size
+/// counted from the end, independent of the array's length. Progressive, too:
+/// successive frames write more of the corpse, so two reads of the same
+/// expression disagree and it presents as flakiness rather than as a dangling
+/// pointer.
+///
+/// **Three sinks, and the third is the one that is easy to leave out.** An
+/// address escapes if it reaches
+///
+///   1. a `Return` operand — but only when the caller will NOT copy it; see
+///      below,
+///   2. a `Store` into anything that is not itself a live frame alloca — a
+///      heap struct's field, a global, or memory reached through a parameter,
+///   3. a `Call`/`CallIndirect` ARGUMENT.
+///
+/// (3) is not conservatism for its own sake and it was MEASURED rather than
+/// assumed: a callee may store the pointer into a heap cell of its own, and
+/// then the caller's frame is dead while a live heap object points into it.
+/// `fn caller() { let a = [..]; return keep(a); }` — where `keep` builds a
+/// struct around its parameter — is `71 12 12 12 …` without it, and the array
+/// appears in no `Return` and no `Store` in the function that owns it. Passing
+/// an address DOWN and never letting the callee keep it is the common case and
+/// is perfectly safe, so (3) over-approximates; making it exact is
+/// interprocedural and is not what this buys.
+///
+/// **Why (2) needs a points-to map and not just "was it stored".** A `let`
+/// binding of an array lowers to TWO allocas — a slot for the variable and the
+/// literal's storage — and the second's address is Stored into the first.
+/// Treating every `Store` of an address as an escape therefore heap-allocates
+/// every array in the language, which is exactly the version measured to
+/// exhaust the 2,536-word heap in a 400-iteration loop. Storing INTO a frame
+/// alloca is not an escape; storing into one that itself escapes is. Hence the
+/// fixpoint over both maps at once, and hence `Load` propagates: reading the
+/// pointer back out of that slot is how the literal reaches a `Return` or a
+/// call in the first place.
+///
+/// Struct and tuple allocas are seeded as escaped because they ARE on the
+/// heap — anything stored into one outlives this frame by construction. That
+/// does not change how they are allocated; it is what makes the transitive
+/// rule uniform.
+///
+/// **A `Return` is not automatically an escape, and the reason is a contract
+/// this compiler already keeps.** `lower::lower_array_call` copies an
+/// array-returning call's result into a CALLER-owned buffer, element by
+/// element, with no intervening `CALL` — "This also gives arrays the same
+/// value semantics as structs", and it has done so since arrays got those
+/// semantics. Where that copy happens the callee's storage is consumed at the
+/// call boundary and never needs to outlive the frame, so returning it is
+/// safe in a frame slot and costs nothing.
+///
+/// The copy is reached exactly when the declared return type is a SIZED
+/// `IRType::Array`. An unsized `[T]` is `IRType::Ptr` after
+/// `IRType::from_mani` — not an array at all — so it reaches neither the copy
+/// nor any other array-shaped reasoning in the pipeline, and its callers get
+/// the raw pointer. **That is the whole of P94's mechanism**: not an escape
+/// analysis nobody wrote, but a repair that was written, is correct, and is
+/// invisible to the one spelling of the type that needs it most. The caller
+/// cannot copy what it has no length for, so for that spelling the storage
+/// must genuinely outlive — hence the heap.
+///
+/// Making the condition uniform instead (every `Return` escapes) was built and
+/// MEASURED: it is correct, and it costs a returned `[trit; 54]` called
+/// twenty-seven times in a loop 1,458 heap words of 2,536, so
+/// `p56_binary_to_word_round_trips_the_whole_27_trit_range` dies of heap
+/// exhaustion. This allocator has no free.
+///
+/// **The coupling is real and is pinned rather than described** (permanent
+/// rule 5): this predicate is only sound while EVERY sized-array return is
+/// copied by its caller. The indirect path did not copy until P94 fixed it,
+/// and `t3_array_value_semantics_hold_through_a_fn_pointer` is the row that
+/// fails if either half moves.
+pub fn escaping_allocas(
+    func: &IRFunction,
+    struct_sizes: &HashMap<String, usize>,
+) -> HashSet<String> {
+    // A sized-array return is copied by the caller (`lower_array_call`), so
+    // the returned storage is consumed at the boundary. An unsized `[T]` is
+    // `IRType::Ptr` here and gets no copy, so returning one really does let
+    // the address out.
+    let caller_copies_return = matches!(func.ret_ty, IRType::Array(..));
+    // temp → the allocas whose ADDRESS it may hold.
+    let mut alias: HashMap<String, HashSet<String>> = HashMap::new();
+    // alloca → the alloca addresses that may have been stored INSIDE it.
+    let mut pts: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut escaped: HashSet<String> = HashSet::new();
+
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let IRInstr::Alloca { dst, ty } = instr {
+                alias.entry(dst.0.clone()).or_default().insert(dst.0.clone());
+                if is_heap_alloca(ty, struct_sizes) {
+                    escaped.insert(dst.0.clone());
+                }
+            }
+        }
+    }
+    if alias.is_empty() {
+        return HashSet::new();
+    }
+
+    fn of(alias: &HashMap<String, HashSet<String>>, v: &IRValue) -> HashSet<String> {
+        match v {
+            IRValue::Temp(t) => alias.get(&t.0).cloned().unwrap_or_default(),
+            _ => HashSet::new(),
+        }
+    }
+    fn merge(
+        map: &mut HashMap<String, HashSet<String>>,
+        key: &str,
+        src: HashSet<String>,
+        changed: &mut bool,
+    ) {
+        if src.is_empty() {
+            return;
+        }
+        let e = map.entry(key.to_string()).or_default();
+        for a in src {
+            *changed |= e.insert(a);
+        }
+    }
+
+    // A phi can be reached by a back edge and a store can precede the load
+    // that reads it back, so one pass in block order is not enough.
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match instr {
+                    IRInstr::Assign { dst, src, .. } | IRInstr::Cast { dst, src, .. } => {
+                        let s = of(&alias, src);
+                        merge(&mut alias, &dst.0, s, &mut changed);
+                    }
+                    IRInstr::GetPtr { dst, ptr, .. } => {
+                        let s = of(&alias, ptr);
+                        merge(&mut alias, &dst.0, s, &mut changed);
+                    }
+                    IRInstr::Phi { dst, incoming, .. } => {
+                        let mut s = HashSet::new();
+                        for (v, _) in incoming {
+                            s.extend(of(&alias, v));
+                        }
+                        merge(&mut alias, &dst.0, s, &mut changed);
+                    }
+                    IRInstr::Load { dst, ptr, .. } => {
+                        let mut s = HashSet::new();
+                        for b in of(&alias, ptr) {
+                            if let Some(inner) = pts.get(&b) {
+                                s.extend(inner.iter().cloned());
+                            }
+                        }
+                        merge(&mut alias, &dst.0, s, &mut changed);
+                    }
+                    IRInstr::Store { ptr, val, .. } => {
+                        let vs = of(&alias, val);
+                        if vs.is_empty() {
+                            continue;
+                        }
+                        let ds = of(&alias, ptr);
+                        if ds.is_empty() {
+                            // Not a frame alloca we can account for: a global,
+                            // a heap cell, or memory reached through a
+                            // parameter. All of them outlive this frame.
+                            for v in vs {
+                                changed |= escaped.insert(v);
+                            }
+                        } else {
+                            for d in ds {
+                                merge(&mut pts, &d, vs.clone(), &mut changed);
+                                if escaped.contains(&d) {
+                                    for v in vs.iter() {
+                                        changed |= escaped.insert(v.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    IRInstr::Call { args, .. } => {
+                        for a in args {
+                            for v in of(&alias, a) {
+                                changed |= escaped.insert(v);
+                            }
+                        }
+                    }
+                    IRInstr::CallIndirect { fn_ptr, args, .. } => {
+                        for a in args.iter().chain(std::iter::once(fn_ptr)) {
+                            for v in of(&alias, a) {
+                                changed |= escaped.insert(v);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let IRTerminator::Return(Some(v)) = &block.term {
+                if !caller_copies_return {
+                    for a in of(&alias, v) {
+                        changed |= escaped.insert(a);
+                    }
+                }
+            }
+        }
+        // An alloca can be marked escaped AFTER something was stored into it,
+        // so close the containment relation on every round rather than
+        // depending on the order the stores appear in.
+        let newly: Vec<String> = pts
+            .iter()
+            .filter(|(d, _)| escaped.contains(*d))
+            .flat_map(|(_, vs)| vs.iter().cloned())
+            .collect();
+        for v in newly {
+            changed |= escaped.insert(v);
+        }
+        if !changed {
+            break;
+        }
+    }
+    escaped
+}
+
+/// Every alloca in `func` that lives on the HEAP rather than in the frame.
+///
+/// The ONE answer, computed once and consulted by all three places that need
+/// it — this module's clobber analysis, the frame layout and the emitter's
+/// `Alloca` arm. They used to share a predicate over the TYPE; that is no
+/// longer enough to decide an array (P94), and a set is what makes the three
+/// unable to disagree even in principle rather than only by convention.
+pub fn heap_allocas(
+    func: &IRFunction,
+    struct_sizes: &HashMap<String, usize>,
+) -> HashSet<String> {
+    let escaping = escaping_allocas(func, struct_sizes);
+    let mut out = HashSet::new();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let IRInstr::Alloca { dst, ty } = instr {
+                let heap = match ty {
+                    // An array goes to the heap only if its address gets out.
+                    // Unconditionally heap-allocating them is correct and was
+                    // measured to be unaffordable: a 400-iteration loop over a
+                    // function with an 8-word local array exhausts the whole
+                    // 2,536-word heap, because this allocator has no free.
+                    IRType::Array(..) => escaping.contains(&dst.0),
+                    other => is_heap_alloca(other, struct_sizes),
+                };
+                if heap {
+                    out.insert(dst.0.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +793,8 @@ pub fn allocate_with(func: &IRFunction, struct_sizes: &HashMap<String, usize>) -
     solve_liveness(&mut info);
     let intervals = intervals_of(func, &info, &block_start, &block_end);
     let calls = call_sites(func, &block_start);
-    let abi_clobbers = abi_clobber_sites(func, &block_start, struct_sizes);
+    let abi_clobbers =
+        abi_clobber_sites(func, &block_start, &heap_allocas(func, struct_sizes));
 
     // Order by start, then by end, then by name — the last only so that two
     // identical intervals resolve the same way on every run. Register choice

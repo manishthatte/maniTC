@@ -812,6 +812,12 @@ impl IRLowerer {
                             ret_ty: IRType::Void,
                         });
                         IRValue::Void
+                    } else if let IRType::Array(_, _) = ty {
+                        // P94: an array returned through a function pointer
+                        // needs the same caller-owned copy the direct path
+                        // makes, or it is a pointer into the callee's popped
+                        // frame.
+                        self.lower_array_call_indirect(fn_ptr, arg_vals, ty)
                     } else {
                         let dst = self.fresh_temp();
                         self.emit(IRInstr::CallIndirect {

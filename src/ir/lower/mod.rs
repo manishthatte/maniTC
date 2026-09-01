@@ -265,12 +265,6 @@ impl IRLowerer {
         arg_vals: Vec<IRValue>,
         arr_ty: IRType,
     ) -> IRValue {
-        let IRType::Array(ref elem, n) = arr_ty else {
-            unreachable!("lower_array_call requires an array type");
-        };
-        let elem_ty = (**elem).clone();
-        let buf = self.fresh_temp();
-        self.emit(IRInstr::Alloca { dst: buf.clone(), ty: arr_ty.clone() });
         let call_dst = self.fresh_temp();
         self.emit(IRInstr::Call {
             dst: Some(call_dst.clone()),
@@ -278,6 +272,48 @@ impl IRLowerer {
             args: arg_vals,
             ret_ty: arr_ty.clone(),
         });
+        self.copy_array_result(call_dst, arr_ty)
+    }
+
+    /// P94: the same copy, for a call made through a function POINTER.
+    ///
+    /// The indirect path emitted a bare `CallIndirect` and handed the callee's
+    /// raw pointer straight to the caller, so
+    /// `let f: fn() -> [int; 6] = mk; let v = f();` read the next callee's
+    /// frame — `8 8 8 8 8 8`, which is literally `deep(8)`'s locals. The
+    /// direct path has copied since arrays were given value semantics; only
+    /// this one was left, and `regalloc::escaping_allocas` now RELIES on every
+    /// sized-array return being copied by its caller, so the two halves have
+    /// to hold together. `t3_array_value_semantics_hold_through_a_fn_pointer`
+    /// is the row that says so.
+    fn lower_array_call_indirect(
+        &mut self,
+        fn_ptr: IRValue,
+        arg_vals: Vec<IRValue>,
+        arr_ty: IRType,
+    ) -> IRValue {
+        let call_dst = self.fresh_temp();
+        self.emit(IRInstr::CallIndirect {
+            dst: Some(call_dst.clone()),
+            fn_ptr,
+            args: arg_vals,
+            ret_ty: arr_ty.clone(),
+        });
+        self.copy_array_result(call_dst, arr_ty)
+    }
+
+    /// Copy an array a call just returned into a caller-owned buffer.
+    ///
+    /// Shared by the direct and indirect paths so the two cannot diverge; the
+    /// copy must contain no CALL of its own, or the frame it is reading would
+    /// be overwritten underneath it.
+    fn copy_array_result(&mut self, call_dst: IRTemp, arr_ty: IRType) -> IRValue {
+        let IRType::Array(ref elem, n) = arr_ty else {
+            unreachable!("copy_array_result requires an array type");
+        };
+        let elem_ty = (**elem).clone();
+        let buf = self.fresh_temp();
+        self.emit(IRInstr::Alloca { dst: buf.clone(), ty: arr_ty.clone() });
         // Element-typed access: arrays index by their element width on both
         // backends (unlike the uniform 8-byte struct slots). Nested arrays
         // store their elements as pointers.

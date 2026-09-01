@@ -33,7 +33,7 @@ use emit_instr::{emit_instr, emit_term};
 use crate::codegen_t3::regalloc::{self, Allocation, Loc};
 use crate::ir::*;
 use crate::error::{CompileError, CompileResult, Diagnostic};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Registers emission may use as scratch, in the order they are handed out.
 ///
@@ -89,6 +89,13 @@ struct AsmEmitter {
     float_literals: Vec<(String, i64)>,
     /// Module global variables: name → absolute memory address.
     global_addrs: HashMap<String, i64>,
+    /// The alloca temps that live on the HEAP rather than in the frame (P94).
+    ///
+    /// `regalloc::heap_allocas` is the single authority; this is the same set,
+    /// carried so the `Alloca` arm and the frame layout above cannot answer
+    /// differently. They used to share a predicate over the TYPE, which no
+    /// longer decides an array.
+    heap_allocas: HashSet<String>,
 }
 
 impl AsmEmitter {
@@ -108,6 +115,7 @@ impl AsmEmitter {
             current_block_label: String::new(),
             float_literals: Vec::new(),
             global_addrs: HashMap::new(),
+            heap_allocas: HashSet::new(),
         }
     }
 
@@ -797,12 +805,13 @@ fn emit_function(
     //    temp consulted `alloca_off` (the frame). The two never met in code the
     //    lowerer emits, so it cost wasted frame rather than wrong answers — but
     //    one predicate in two places, disagreeing, is how P15 happened.
+    let heap_allocas = regalloc::heap_allocas(func, &struct_sizes);
     let mut alloca_off: HashMap<String, usize> = HashMap::new();
     let mut off = alloc.n_slots;
     for block in &func.blocks {
         for instr in &block.instrs {
             if let IRInstr::Alloca { dst, ty } = instr {
-                if regalloc::is_heap_alloca(ty, &struct_sizes) {
+                if heap_allocas.contains(&dst.0) {
                     continue;
                 }
                 let w = alloca_words(ty, &struct_sizes);
@@ -818,6 +827,7 @@ fn emit_function(
     em.fn_name = func.name.clone();
     em.global_addrs = global_addrs;
     em.alloca_off = alloca_off;
+    em.heap_allocas = heap_allocas;
 
     // Phi copies, indexed by the edge they travel on.
     for block in &func.blocks {

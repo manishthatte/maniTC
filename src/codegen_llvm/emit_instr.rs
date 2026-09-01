@@ -1148,7 +1148,21 @@ impl LLVMEmitter {
 
                 // Resolve the function-pointer operand.
                 let fp_s = self.resolve_ptr_val(fn_ptr);
-                let ret_str = llvm_type(ret_ty);
+                // P94: an array-returning function is DEFINED as returning
+                // `ptr` (the `Alloca` arm mallocs arrays, and `emit_function`
+                // returns that pointer), and the direct `Call` arm above gets
+                // that from the declared signature. An indirect call has no
+                // signature to consult and fell through to `llvm_type`, which
+                // renders `[int; 6]` as `[6 x i64]` — so the module said
+                // `%t3 = call [6 x i64] @mk()` against `define ptr @mk()` and
+                // clang refused it. Pre-existing and independent of the
+                // storage-class work: `manitc check` exited 0, T3 ran the
+                // program and printed the callee's dead frame, and LLVM would
+                // not link it at all.
+                let ret_str = match ret_ty {
+                    IRType::Array(..) => "ptr".to_string(),
+                    other => llvm_type(other),
+                };
 
                 // Record return type for dst.
                 if let Some(d) = dst {
