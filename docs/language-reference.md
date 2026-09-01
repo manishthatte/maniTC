@@ -1771,14 +1771,28 @@ lint deny(shadowing, unknown-type);
 | `literal-out-of-word` | allow | an `int` literal outside the 27-trit range (v1 only) |
 | `backend-unavailable-chain` | deny | a call chain that cannot run on this backend |
 | `reserved-type-name`  | deny  | a `struct` or `enum` declared under a name the compiler owns |
+| `undeclared-type`     | deny  | a type name that is declared nowhere at all |
 
 `--warn-as-error` still means "raise everything to deny".
 
-`reserved-type-name` is reported only at `deny` or above, and the reason is
-worth knowing because it is a property of the compiler rather than of the
-lint: a recorded warning is printed after analysis finishes, and every program
-this lint fires on also fails analysis, so a `warn`-level report would be
-discarded before anyone saw it. See §14.
+`reserved-type-name` and `undeclared-type` are reported only at `deny` or
+above, and the reason is worth knowing because it is a property of the compiler
+rather than of the lint: a recorded warning is printed after analysis finishes,
+and a program these lints fire on typically fails analysis too, so a
+`warn`-level report would be discarded before anyone saw it. See §14.
+
+> **Added 1 September 2026 (P95).** `undeclared-type` is the reverse of the
+> entry above it. `reserved-type-name` catches a name you DID declare that the
+> compiler answers for first; `undeclared-type` catches a name nothing declares
+> at all. Both used to resolve to the unknown type, which is compatible with
+> everything — so `struct Holder { pub a: NoSuchType, pub b: int }` type-checked,
+> `manitc check` exited 0, and both backends ran the program with the field
+> holding whatever it was given. Measured in thirteen type positions: a struct
+> field, a parameter, a return type, a `let` annotation, an enum variant
+> payload, an array element, a generic argument, a tuple element, a function
+> type's parameter, an `impl` target, a cast target, a global's annotation and a
+> generic struct's argument. `lint allow(undeclared-type);` restores the
+> previous behaviour exactly.
 
 ### The manifest
 

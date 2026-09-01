@@ -102,6 +102,18 @@ pub struct SemanticAnalyzer {
     pub(crate) trait_impls: std::collections::HashSet<(String, String)>,
     // Generic type parameters in current scope: param_name → resolved_type
     pub(crate) type_params: HashMap<String, ManiType>,
+    /// P95: type names the resolver could not account for, with the span that
+    /// wrote them.
+    ///
+    /// `resolve_type` takes `&self` — it is called from a dozen `&self`
+    /// contexts — so the refusal cannot be raised where it is discovered.
+    /// Collecting and reporting once, at the end of `analyze`, is also the
+    /// only correct ORDER: `register_native_module_sigs` resolves every native
+    /// stdlib signature against tables holding only the user's declarations,
+    /// which is 3,850 resolutions per compilation that must not be refused.
+    /// Those are excluded by their span's module (P80/P95), and this list only
+    /// ever holds names written in the file being compiled.
+    undeclared_types: std::cell::RefCell<Vec<(String, Span)>>,
     // Struct field pub visibility: struct_name → [(field_name, is_pub)]
     pub(crate) struct_pub_fields: HashMap<String, Vec<(String, bool)>>,
     // The type of `self` in the current impl block (for `Self` resolution)
@@ -402,6 +414,7 @@ impl SemanticAnalyzer {
             trait_defs: HashMap::new(),
             trait_impls: std::collections::HashSet::new(),
             type_params: HashMap::new(),
+            undeclared_types: std::cell::RefCell::new(Vec::new()),
             struct_pub_fields: HashMap::new(),
             current_impl_type: None,
             source_dir: std::path::PathBuf::from("."),
@@ -987,7 +1000,10 @@ impl SemanticAnalyzer {
                         if self.structs.contains_key(name.as_str()) {
                             Ok(ManiType::Struct(name.clone(), resolved_args.clone()))
                         } else {
-                            // Permissive: treat as unknown generic
+                            // Permissive: treat as unknown generic. See the
+                            // `name_to_manitype` fallback for why this stays
+                            // permissive and where the refusal lives instead.
+                            self.note_undeclared_type(name, *_span);
                             Ok(ManiType::Generic(name.clone(), resolved_args))
                         }
                     }
@@ -1012,6 +1028,136 @@ impl SemanticAnalyzer {
             Type::Ptr(inner, _, _) => self.resolve_type(inner),
             Type::Infer(_) => Ok(ManiType::Unknown),
         }
+    }
+
+    /// P95: remember a type name nothing could account for.
+    ///
+    /// Filtered HERE rather than at the report, on the one property that
+    /// distinguishes a name the author wrote from a name the compiler resolved
+    /// on their behalf: `Span::module`. A span carries `None` only for the file
+    /// being compiled; every stdlib module stamps its own (P80, and P95 closed
+    /// the second site — `register_native_module_sigs` used `Lexer::with_file`,
+    /// which sets the file name and leaves the module `None`, so all 3,850 of
+    /// its resolutions claimed to be the user's).
+    fn note_undeclared_type(&self, name: &str, span: Span) {
+        if span.module.is_some() {
+            return;
+        }
+        self.undeclared_types
+            .borrow_mut()
+            .push((name.to_string(), span));
+    }
+
+    /// Names this compiler answers for without any declaration.
+    ///
+    /// Two groups, and they are the two match statements above rather than a
+    /// hand-written list: the spellings `name_to_manitype` maps to a primitive,
+    /// and the constructors `resolve_type`'s `Type::Generic` arm knows. The
+    /// duplication is real and is PINNED rather than described (permanent rule
+    /// 5) — `registry_tests::every_builtin_type_name_resolves` asserts that
+    /// every name here is one the resolver actually answers, and that no name
+    /// the resolver answers is missing from here. Two registries that must
+    /// agree get a test.
+    const BUILTIN_TYPE_NAMES: &'static [&'static str] = &[
+        // name_to_manitype
+        "Self", "int", "i64", "float", "f64", "bool", "bool3", "tribool",
+        "T3Bool", "trit", "tryte", "t9", "t27", "word", "t54", "trint",
+        "tfloat", "str", "String", "char", "void", "()",
+        "AtomicTrit", "Barrier", "Semaphore", "MutexGuard",
+        // resolve_type's Generic arm
+        "Result", "Option", "Vec", "Map", "Set", "Deque", "TernaryTrie",
+        "Channel", "Mutex", "Range",
+        // opaque handles the backends hand back as one word
+        "Task",
+    ];
+
+    /// Struct and enum names any EMBEDDED stdlib module declares.
+    ///
+    /// Read from the library the binary already carries rather than listed
+    /// (P85's rule), so a module gaining a type cannot silently fall out of
+    /// step. It matters for two cases: a stdlib source compiled directly as a
+    /// program — `stdlib/async.mt` names `Stdout`, which `stdlib/io.mt`
+    /// declares — and a program using a native signature whose module was not
+    /// expanded.
+    fn stdlib_declared_type(name: &str) -> bool {
+        STDLIB_SOURCES.iter().any(|(_, src)| {
+            src.lines().any(|l| {
+                let l = l.trim_start();
+                for kw in ["struct ", "enum "] {
+                    if let Some(rest) = l.strip_prefix(kw) {
+                        let ident: String = rest
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if ident == name {
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+        })
+    }
+
+    /// P95: refuse a type name that is declared nowhere.
+    ///
+    /// `struct Holder { pub a: NoSuchType, pub b: int }` type-checked, `manitc
+    /// check` exited 0, and both backends ran the program — the name resolved
+    /// to `ManiType::Unknown`, which is compatible with everything, so nothing
+    /// downstream objected either and the field simply held whatever it was
+    /// given. Measured in THIRTEEN type positions, not the four reported: a
+    /// struct field, a parameter, a return type, a `let` annotation, an enum
+    /// variant payload, an array element, a generic argument, a tuple element,
+    /// a function type's parameter, an `impl` target, a cast target, a global's
+    /// annotation, and a generic struct's argument.
+    ///
+    /// `Unknown` is the type this compiler's findings keep arriving at — P65 (a
+    /// generic body erased to a machine word), P71 (a failed instantiation's
+    /// return type), P44 (`field_slot_index` taking slot 0), P70 (`struct Self`
+    /// reading slot 0). A misspelled type name is the one source of `Unknown`
+    /// the front end can refuse outright, before any of that machinery is
+    /// reached.
+    ///
+    /// Returned as an `Err` rather than pushed as a warning, for P70's measured
+    /// reason: `main` prints warnings only after `analyze` RETURNS, so
+    /// `analyze`'s `?` on the first type error discards them. The lint level is
+    /// what decides, and `lint allow(undeclared-type);` restores the previous
+    /// compiler exactly.
+    fn report_undeclared_types(&self) -> CompileResult<()> {
+        if !self
+            .warnings
+            .effective_level(&WarningKind::UndeclaredType)
+            .is_error()
+        {
+            return Ok(());
+        }
+        let pending = self.undeclared_types.borrow();
+        let Some((name, span)) = pending.iter().find(|(n, _)| {
+            !Self::BUILTIN_TYPE_NAMES.contains(&n.as_str())
+                && !self.structs.contains_key(n.as_str())
+                && !self.enums.contains_key(n.as_str())
+                && !self.type_params.contains_key(n.as_str())
+                && !self.trait_defs.contains_key(n.as_str())
+                && !Self::stdlib_declared_type(n)
+                && !n.contains("::")
+        }) else {
+            return Ok(());
+        };
+        let hint = did_you_mean(
+            name,
+            self.structs
+                .keys()
+                .chain(self.enums.keys())
+                .cloned()
+                .chain(Self::BUILTIN_TYPE_NAMES.iter().map(|s| s.to_string())),
+        )
+        .unwrap_or_default();
+        Err(self.err(
+            *span,
+            format!(
+                "`{name}` names no type: it is not a primitive, not a built-in                  generic, and no struct, enum or type parameter of that name is                  declared{hint}. It used to resolve to the unknown type, which                  is compatible with everything, so the program type-checked and                  the field or binding simply held whatever it was given.                  (`lint allow(undeclared-type);` restores the previous                  behaviour, in which this was silent.)"
+            ),
+        ))
     }
 
     fn name_to_manitype(&self, name: &str, _span: Span) -> CompileResult<ManiType> {
@@ -1047,8 +1193,18 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 } else if self.enums.contains_key(name) {
                     Ok(ManiType::Enum(name.to_string()))
                 } else {
-                    // Unknown type — emit Unknown to allow partial compilation
-                    // In strict mode this would be an error
+                    // Unknown type — emit Unknown to allow partial compilation.
+                    //
+                    // P95: this arm used to carry the comment "In strict mode
+                    // this would be an error", and no strict mode was ever
+                    // built. It stays permissive and RECORDS instead, because
+                    // it is reached 3,850 times per compilation by
+                    // `register_native_module_sigs`, which resolves every
+                    // native stdlib signature against tables that hold only the
+                    // user's declarations — refusing here would reject the
+                    // stdlib. `report_undeclared_types` raises it once, at the
+                    // end, from the names written in the user's own file.
+                    self.note_undeclared_type(name, _span);
                     Ok(ManiType::Unknown)
                 }
             }
@@ -1816,8 +1972,17 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         const SIG_MODULES: &[&str] = &["str", "fmt", "math", "ternary"];
 
         for (module, src) in STDLIB_SOURCES {
-            let file = format!("<std::{}>", module);
-            let Ok(tokens) = crate::lexer::Lexer::with_file(src, &file).tokenize() else {
+            // P95: `with_module`, not `with_file`. P80 gave a span its module so
+            // a diagnostic inside a stdlib module names its own file instead of
+            // the user's, and it fixed the MERGED path (`stdlib_expand`); this
+            // scan lexes the same sources through the other constructor, which
+            // sets the file NAME and leaves `Span::module` as `None`. Every one
+            // of the 4,202 type resolutions this pass performs therefore claimed
+            // to come from the user's file. It was invisible because the only
+            // consumer swallowed its errors (`Err(_) => all_resolved = false`) —
+            // and it stops being invisible the moment anything here reports.
+            let file = format!("stdlib/{}.mt", module);
+            let Ok(tokens) = crate::lexer::Lexer::with_module(src, module).tokenize() else {
                 continue;
             };
             let Ok(program) = crate::parser::Parser::with_file(tokens, &file).parse() else {
@@ -1885,6 +2050,17 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         // First pass: collect type definitions and function signatures
         self.collect_declarations(program)?;
 
+        // P95: every declaration is registered, so a name that reached the
+        // resolver's fallback from the user's own file really is declared
+        // nowhere. Raised BEFORE the bodies are checked, so a bad SIGNATURE is
+        // named as such rather than as the first thing that goes wrong because
+        // of it. It runs a second time after the bodies, below: a `let`
+        // annotation, a cast target, an array element, a tuple element, a
+        // generic argument and a function type's parameter are resolved only
+        // while checking a body, and six of the thirteen positions this defect
+        // reaches are among them.
+        self.report_undeclared_types()?;
+
         // Second pass: type-check function bodies
         let mut typed_fns = Vec::new();
         let mut typed_globals = Vec::new();
@@ -1908,6 +2084,23 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                         // Check under the qualified name so IR sees TypeName::method
                         let mut qm = method.clone();
                         qm.name = format!("{}::{}", imp.ty, method.name);
+                        // P95: the impl's generics are in scope for its
+                        // methods. `check_fn` opens with
+                        // `std::mem::take(&mut self.type_params)` — it
+                        // deliberately clears the scope so a function sees only
+                        // its own parameters — so binding them around this loop
+                        // does nothing, and they have to arrive ON the method.
+                        // This is the same composition pass 2 already performs
+                        // for `generic_fn_asts`, impl parameters first; and it
+                        // is behaviour-identical, because `check_fn` pushes an
+                        // unbound parameter as `Unknown`, which is exactly what
+                        // `name_to_manitype`'s fallback returned for it.
+                        qm.generics = imp
+                            .generics
+                            .iter()
+                            .chain(method.generics.iter())
+                            .cloned()
+                            .collect();
                         typed_fns.push(self.check_fn(&qm)?);
                     }
                     // Feature 3: for methods in the trait that the impl doesn't override,
@@ -1993,6 +2186,14 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 Item::ExternDecl(_) | Item::LintDecl(_) => {}
             }
         }
+
+        // P95, second call: the six positions that resolve only inside a body
+        // — a `let` annotation, a cast target, an array element, a tuple
+        // element, a generic argument, a function type's parameter — have now
+        // been through the resolver. Running it once at the end alone would
+        // work but would report a bad SIGNATURE only after the body that uses
+        // it has failed for a consequential reason.
+        self.report_undeclared_types()?;
 
         // Append any lambdas discovered during type-checking
         typed_fns.append(&mut self.lambda_fns);
@@ -2328,11 +2529,45 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     }
                 }
                 Item::ImplBlock(imp) => {
+                    // P95: an impl target is a bare `String` on the AST, not a
+                    // `Type`, so it never reaches `resolve_type` and no
+                    // fallback could record it. `impl NoSuchType { .. }` was
+                    // accepted in silence and its methods registered against a
+                    // type that does not exist.
+                    if !imp.generics.contains(&imp.ty) {
+                        self.note_undeclared_type(&imp.ty, imp.span);
+                    }
                     for m in &imp.methods {
                         if m.body.is_some() {
                             self.bodied_fns.insert(format!("{}::{}", imp.ty, m.name));
                         }
                     }
+                }
+                _ => {}
+            }
+        }
+
+        // P98: every struct and enum NAME is registered before any FIELD is
+        // resolved, so a declaration may refer to one that appears later in the
+        // file. Without this the loop below resolved `pub b: B` against a table
+        // that did not yet hold `B`, got `ManiType::Unknown` from
+        // `name_to_manitype`'s fallback, and stored it — `manitc check` then
+        // exited 0 and `field_slot_index` panicked on `<unknown>` in debug
+        // (P44's assertion) or read slot 0 in release. No shipped `.mt` file
+        // forward-references a struct, which is why it was never seen: a defect
+        // with a population of zero is not absent, it is unwritten.
+        //
+        // The placeholder entries carry no fields. Nothing reads a struct's
+        // FIELDS during this window — resolving `pub b: B` asks only whether
+        // the NAME is declared — and the real entry replaces the placeholder in
+        // the same pass.
+        for item in &program.items {
+            match item {
+                Item::StructDef(s) => {
+                    self.structs.entry(s.name.clone()).or_default();
+                }
+                Item::EnumDef(e) => {
+                    self.enums.entry(e.name.clone()).or_default();
                 }
                 _ => {}
             }
@@ -2347,11 +2582,23 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     self.check_reserved_type_name(&s.name, "struct", s.span)?;
                     let mut fields = Vec::new();
                     let mut pub_fields = Vec::new();
+                    // P95: the struct's OWN generics are in scope while its
+                    // fields are resolved. This is behaviour-identical — a
+                    // parameter bound to `Unknown` resolves to exactly what
+                    // `name_to_manitype`'s fallback returned for it, which is
+                    // why P68 had to keep the field AST to recover which
+                    // parameter each field was — and it is what stops
+                    // `pub first: A` being reported as an undeclared type.
+                    let saved_tp = self.type_params.clone();
+                    for gp in &s.generics {
+                        self.type_params.insert(gp.clone(), ManiType::Unknown);
+                    }
                     for f in &s.fields {
                         let ty = self.resolve_type(&f.ty)?;
                         fields.push((f.name.clone(), ty));
                         pub_fields.push((f.name.clone(), f.is_pub));
                     }
+                    self.type_params = saved_tp;
                     self.structs.insert(s.name.clone(), fields);
                     self.struct_pub_fields.insert(s.name.clone(), pub_fields);
                     // P68: keep the declaration for generic structs. The
@@ -2430,7 +2677,23 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         for item in &program.items {
             if let Item::ImplBlock(imp) = item {
                 self.current_impl_type = Some(imp.ty.clone());
+                // P95: the impl's own generics are in scope for every method
+                // signature it registers, and so are the METHOD's — a body-less
+                // native like `fn map<U>(self, f: fn(T) -> U) -> Vec<U>;` never
+                // reaches `check_fn`, which is the only other place a method's
+                // parameters are pushed, so `U` was resolved through the
+                // fallback here. Behaviour-identical for the same reason as the
+                // struct case above: a parameter bound to `Unknown` resolves to
+                // exactly what the fallback returned for it.
+                let saved_impl_tp = self.type_params.clone();
+                for gp in &imp.generics {
+                    self.type_params.insert(gp.clone(), ManiType::Unknown);
+                }
                 for method in &imp.methods {
+                    let saved_method_tp = self.type_params.clone();
+                    for gp in &method.generics {
+                        self.type_params.insert(gp.clone(), ManiType::Unknown);
+                    }
                     // Register under the qualified name TypeName::method_name
                     let mut qm = method.clone();
                     qm.name = format!("{}::{}", imp.ty, method.name);
@@ -2476,6 +2739,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                             .or_default()
                             .insert(method.name.clone(), method.params.len() - 1);
                     }
+                    self.type_params = saved_method_tp;
                 }
                 // Validate trait implementation: every required method must be present
                 if let Some(trait_name) = &imp.trait_ {
@@ -2501,6 +2765,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     }
                     self.trait_impls.insert((imp.ty.clone(), trait_name.clone()));
                 }
+                self.type_params = saved_impl_tp;
                 self.current_impl_type = None;
             }
         }

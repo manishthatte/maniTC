@@ -318,6 +318,13 @@ pub enum WarningKind {
     /// answers WITHOUT consulting the struct table, so the declaration cannot
     /// be reached through that spelling.
     ReservedTypeName,
+    /// P95: a type name that is declared nowhere at all.
+    ///
+    /// P70's mechanism with the sign reversed — that was a declared name a
+    /// built-in silently shadowed; this is a name nothing declares. Both
+    /// resolve to `ManiType::Unknown`, which is compatible with everything, so
+    /// the program type-checks and both backends run it.
+    UndeclaredType,
     /// A2: a function is unavailable on the selected backend because something
     /// in its reachable call graph is. Reported with the call chain.
     ///

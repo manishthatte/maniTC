@@ -166,6 +166,16 @@ pub const LINTS: &[(WarningKind, &str, LintLevel)] = &[
     // `stdlib/collections.mt` and `stdlib/sync.mt` use it because their
     // declarations ARE the built-ins this lint protects.
     (WarningKind::ReservedTypeName, "reserved-type-name", LintLevel::Deny),
+    // P95. `deny` for exactly P70's measured reason, one entry above: the
+    // diagnostic is returned as an Err rather than pushed as a warning, because
+    // `main` prints warnings only after `analyze` RETURNS and `analyze`'s `?`
+    // on the first type error discards them — so a `warn` default would be
+    // silent in a large share of the cases that motivate the lint.
+    //
+    // `allow` is an exact restoration of the pre-P95 compiler: the name still
+    // resolves to `Unknown` and nothing is checked differently, it simply stops
+    // being reported.
+    (WarningKind::UndeclaredType, "undeclared-type", LintLevel::Deny),
 ];
 
 /// Resolve a lint name to its kind. `None` for an unknown name.
