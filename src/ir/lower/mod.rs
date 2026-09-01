@@ -66,6 +66,16 @@ pub struct IRLowerer {
     /// lowered. Default `Inline`, which is `docs/memory-model.md` §4 and what
     /// every ManiT program has always done.
     sched: SchedMode,
+    /// P99: outlined `spawn` bodies, awaiting the module's function list.
+    ///
+    /// Collected rather than pushed directly because a spawn is lowered in the
+    /// middle of building another function, and `self.blocks` belongs to that
+    /// one at the time.
+    pending_fns: Vec<IRFunction>,
+    /// Names outlined spawn bodies `__spawn_body_0`, `_1`, … MODULE-wide, not
+    /// per function: two functions each spawning would otherwise emit the same
+    /// symbol, and the LLVM backend would refuse the module.
+    spawn_counter: usize,
 }
 
 /// What `spawn { B }` means at lowering time.
@@ -81,8 +91,60 @@ pub enum SchedMode {
     /// `spawn { B }` evaluates `B` in place. `docs/memory-model.md` §4.
     #[default]
     Inline,
-    /// §11: `spawn { B }` creates a task. T3 only, for now.
+    /// §11 on T3: `spawn { B }` is a FORK (P89). Syscall 80 returns 0 in the
+    /// child and the task id in the parent, so the body is reached by an
+    /// ordinary branch and the child gets its enclosing locals by sharing the
+    /// frame layout — it IS the same frame, one copy later.
     Cooperative,
+    /// §11 on LLVM: `spawn { B }` OUTLINES `B` and hands it §11.2's copy of the
+    /// store explicitly (P99).
+    ///
+    /// A different lowering for the same section, because a task's continuation
+    /// on that backend is a C call stack and a hosted process does not own its
+    /// stack — P88's reason for not moving one, with more force. The two
+    /// backends reach §11 by different routes, which is what the parity matrix
+    /// is for.
+    CooperativeOutlined,
+}
+
+impl SchedMode {
+    /// Whether `spawn` creates a task at all, under either lowering.
+    pub fn is_cooperative(self) -> bool {
+        matches!(self, SchedMode::Cooperative | SchedMode::CooperativeOutlined)
+    }
+}
+
+/// P99 / §11.6: make `main` task 0 and keep the process alive until the run
+/// queue empties.
+///
+/// `__task_bootstrap` goes at the very top of the entry block, before anything
+/// the body does, because a `spawn` reached before it would run in place and
+/// the program would interleave differently from that point on. Every `Return`
+/// becomes a call to `__task_main_done` first — EVERY one, not just the last:
+/// `main` may return early, and §11.6 says the remaining tasks still run.
+fn bracket_main_with_scheduler(f: &mut IRFunction) {
+    if f.blocks.is_empty() {
+        return;
+    }
+    f.blocks[0].instrs.insert(
+        0,
+        IRInstr::Call {
+            dst: None,
+            func: "__task_bootstrap".to_string(),
+            args: Vec::new(),
+            ret_ty: IRType::Void,
+        },
+    );
+    for b in &mut f.blocks {
+        if matches!(b.term, IRTerminator::Return(_)) {
+            b.instrs.push(IRInstr::Call {
+                dst: None,
+                func: "__task_main_done".to_string(),
+                args: Vec::new(),
+                ret_ty: IRType::Void,
+            });
+        }
+    }
 }
 
 impl IRLowerer {
@@ -369,6 +431,8 @@ impl IRLowerer {
             current_fn_ret: ManiType::Void,
             lang: LangVersion::default(),
             sched: SchedMode::default(),
+            pending_fns: Vec::new(),
+            spawn_counter: 0,
         }
     }
 
@@ -691,8 +755,19 @@ impl IRLowerer {
             lowerer.label_counter = 0;
             lowerer.blocks = Vec::new();
             lowerer.locals = std::collections::HashMap::new();
-            let ir_fn = lowerer.lower_fn(f);
+            let mut ir_fn = lowerer.lower_fn(f);
+            // §11.6: `main` returning does not end the program — it is a task
+            // like any other and the remaining tasks run. The bootstrap makes
+            // the process's own stack task 0; without it the whole scheduler is
+            // inert and `__task_spawn` runs its body in place, which is
+            // `docs/memory-model.md` §4 (P99).
+            if lowerer.sched == SchedMode::CooperativeOutlined && f.name == "main" {
+                bracket_main_with_scheduler(&mut ir_fn);
+            }
             functions.push(ir_fn);
+            // P99: outlined spawn bodies. AFTER their enclosing function, so
+            // the module reads in the order it was written.
+            functions.extend(std::mem::take(&mut lowerer.pending_fns));
         }
 
         let string_literals = lowerer.string_literals.clone();

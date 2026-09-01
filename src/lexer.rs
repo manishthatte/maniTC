@@ -38,6 +38,11 @@ pub enum TokenKind {
     Match,
     In,
     Return,
+    /// §11.4's first yield point. A keyword rather than a function so the
+    /// surface matches `docs/semantics.md` §11.5's `⟨yield; s, σ⟩`; safe
+    /// because no `.mt` in either repository or the model corpus uses `yield`
+    /// as an identifier — measured, and every corpus hit is inside a string.
+    Yield,
     Break,
     Continue,
     Use,
@@ -195,6 +200,7 @@ fn keyword_or_ident(s: &str) -> TokenKind {
         "match" => TokenKind::Match,
         "in" => TokenKind::In,
         "return" => TokenKind::Return,
+        "yield" => TokenKind::Yield,
         "break" => TokenKind::Break,
         "continue" => TokenKind::Continue,
         "use" => TokenKind::Use,

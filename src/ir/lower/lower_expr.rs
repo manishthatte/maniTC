@@ -1527,7 +1527,27 @@ impl IRLowerer {
 
             TypedExprKind::Await(inner) => self.lower_expr(inner),
 
-            TypedExprKind::Spawn(block) => {
+            // §11.4's first yield point. Under `inline` there is one task and
+            // nothing to yield to, so it lowers to nothing at all — the same
+            // reasoning `spawn` uses there (`docs/memory-model.md` §4).
+            //
+            // Both cooperative lowerings emit the SAME call. On T3 the emitter
+            // turns `__task_yield` into `SYSCALL #81`, which the emulator has
+            // had since P88; on LLVM it is the C function P99 added. One IR
+            // instruction, two backends, which is the shape §11 wants.
+            TypedExprKind::Yield => {
+                if self.sched.is_cooperative() {
+                    self.emit(IRInstr::Call {
+                        dst: None,
+                        func: "__task_yield".to_string(),
+                        args: Vec::new(),
+                        ret_ty: IRType::Void,
+                    });
+                }
+                IRValue::Void
+            }
+
+            TypedExprKind::Spawn(block, captures) => {
                 match self.sched {
                     // `docs/memory-model.md` §4, and what every ManiT program
                     // has always done: evaluate the block in place.
@@ -1535,6 +1555,9 @@ impl IRLowerer {
                         self.lower_block(block);
                     }
                     SchedMode::Cooperative => self.lower_spawn_as_fork(block),
+                    SchedMode::CooperativeOutlined => {
+                        self.lower_spawn_outlined(block, captures)
+                    }
                 }
                 IRValue::Void
             }
@@ -1814,6 +1837,158 @@ impl IRLowerer {
     /// So the graph gains nothing new at all, and the passes need no changes.
     /// `B` is lowered by the same `lower_block` the inline path uses, so it
     /// optimises identically and there is no second lowering to keep in step.
+    /// Read a local's VALUE, the way the `Ident` arm does.
+    ///
+    /// Separate rather than reusing `lower_expr`, because a capture is a NAME
+    /// and there is no `TypedExpr` for it at the spawn site. A real struct
+    /// local is its own address (the alloca IS the data), which is the one case
+    /// where the load must not happen — the same exception the `Ident` arm
+    /// makes twenty lines above.
+    fn lower_local_read(&mut self, name: &str) -> IRValue {
+        let Some((alloca, var_ty)) = self.locals.get(name).cloned() else {
+            return IRValue::Const(IRConst::Int(0));
+        };
+        if let IRType::Struct(sname) = &var_ty {
+            if self.is_real_struct(sname) {
+                return IRValue::Temp(alloca);
+            }
+        }
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::Load {
+            dst: dst.clone(),
+            ptr: IRValue::Temp(alloca),
+            ty: array_value_ty(&var_ty),
+        });
+        IRValue::Temp(dst)
+    }
+
+    /// P99 / §11 on LLVM: outline the spawn body and hand it §11.2's copy of
+    /// the store.
+    ///
+    /// **Why not the fork the T3 backend uses.** There, `spawn` is syscall 80
+    /// returning 0 in the child, so the body is reached by an ordinary branch
+    /// and finds its enclosing locals because it IS the same frame, one copy
+    /// later. A task's continuation on this backend is a C call stack, and P88
+    /// is the reason that cannot be copied: a copied frame can hold the address
+    /// of one of its own slots, and T3 only escapes that by keeping every stack
+    /// at the SAME addresses and swapping the live window — which the emulator
+    /// can do because it owns its memory map, and a hosted process cannot.
+    ///
+    /// So the body becomes a function, and the values it reads from the
+    /// enclosing scope travel in an env array. That is CLOSER to §11.2 than the
+    /// fork: the fork copies a whole frame and relies on the child not writing
+    /// what the parent reads, while this copies exactly the values §11.2 names.
+    ///
+    /// **The env is untyped memory on purpose.** Each slot is stored and loaded
+    /// at the capture's OWN `IRType`, so a float capture is a `store double` /
+    /// `load double` pair on the same word — no conversion anywhere, which is
+    /// what P92 established a payload word needs. Reading it back at the wrong
+    /// type would be the defect P92 fixed, one construct along.
+    ///
+    /// The runtime owns the env and frees it when the body returns (P99), so
+    /// nothing is emitted here to release it.
+    pub(super) fn lower_spawn_outlined(
+        &mut self,
+        block: &crate::semantic::TypedBlock,
+        captures: &[(String, crate::semantic::ManiType)],
+    ) {
+        let name = format!("__spawn_body_{}", self.spawn_counter);
+        self.spawn_counter += 1;
+
+        // ---- at the call site, while the spawner's locals are still in scope
+        let n = captures.len().max(1);
+        let env = self.fresh_temp();
+        self.emit(IRInstr::Alloca {
+            dst: env.clone(),
+            ty: IRType::Array(Box::new(IRType::I64), n),
+        });
+        for (i, (cname, cty)) in captures.iter().enumerate() {
+            let val = self.lower_local_read(cname);
+            let slot = self.fresh_temp();
+            self.emit(IRInstr::GetPtr {
+                dst: slot.clone(),
+                ptr: IRValue::Temp(env.clone()),
+                idx: IRValue::Const(IRConst::Int(i as i64)),
+                ty: IRType::I64,
+            });
+            self.emit(IRInstr::Store {
+                ptr: IRValue::Temp(slot),
+                val,
+                ty: IRType::from_mani(cty),
+            });
+        }
+        self.emit(IRInstr::Call {
+            dst: None,
+            func: "__task_spawn".to_string(),
+            args: vec![IRValue::Global(name.clone()), IRValue::Temp(env)],
+            ret_ty: IRType::Void,
+        });
+
+        // ---- the outlined body, built in its own function context
+        let saved_blocks = std::mem::take(&mut self.blocks);
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_block = self.current_block;
+        let saved_ret = self.current_fn_ret.clone();
+        let saved_temp = self.temp_counter;
+        let saved_label = self.label_counter;
+        // Counters restart because this is a separate function and its temp
+        // names live in their own namespace; `string_literals` and
+        // `static_structs` deliberately do NOT, being module-level.
+        self.temp_counter = 0;
+        self.label_counter = 0;
+        self.current_fn_ret = crate::semantic::ManiType::Int;
+        self.new_block("entry".to_string());
+        self.current_block = 0;
+
+        let env_param = IRValue::Temp(IRTemp::new("param___env".to_string()));
+        for (i, (cname, cty)) in captures.iter().enumerate() {
+            let ity = IRType::from_mani(cty);
+            let slot = self.fresh_temp();
+            self.emit(IRInstr::GetPtr {
+                dst: slot.clone(),
+                ptr: env_param.clone(),
+                idx: IRValue::Const(IRConst::Int(i as i64)),
+                ty: IRType::I64,
+            });
+            let v = self.fresh_temp();
+            self.emit(IRInstr::Load {
+                dst: v.clone(),
+                ptr: IRValue::Temp(slot),
+                ty: ity.clone(),
+            });
+            // Into an alloca like any other local, so the rest of the lowerer
+            // treats a captured name exactly as it treats a `let`.
+            let home = self.fresh_temp();
+            self.emit(IRInstr::Alloca { dst: home.clone(), ty: ity.clone() });
+            self.emit(IRInstr::Store {
+                ptr: IRValue::Temp(home.clone()),
+                val: IRValue::Temp(v),
+                ty: ity.clone(),
+            });
+            self.locals.insert(cname.clone(), (home, ity));
+        }
+
+        self.lower_block(block);
+        if matches!(self.blocks[self.current_block].term, IRTerminator::Unreachable) {
+            self.set_term(IRTerminator::Return(Some(IRValue::Const(IRConst::Int(0)))));
+        }
+        let body_fn = IRFunction {
+            name,
+            params: vec![("__env".to_string(), IRType::Ptr(Box::new(IRType::I64)))],
+            ret_ty: IRType::I64,
+            blocks: std::mem::take(&mut self.blocks),
+            is_extern: false,
+        };
+        self.pending_fns.push(body_fn);
+
+        self.blocks = saved_blocks;
+        self.locals = saved_locals;
+        self.current_block = saved_block;
+        self.current_fn_ret = saved_ret;
+        self.temp_counter = saved_temp;
+        self.label_counter = saved_label;
+    }
+
     pub(super) fn lower_spawn_as_fork(&mut self, block: &crate::semantic::TypedBlock) {
         let id = self.fresh_temp();
         self.emit(IRInstr::Call {

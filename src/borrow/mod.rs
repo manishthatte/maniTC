@@ -502,7 +502,9 @@ fn check_expr_borrows(
         }
 
         // --- Spawn ---
-        TypedExprKind::Spawn(block) => {
+        // §11.4: `yield` moves nothing and reads nothing.
+        TypedExprKind::Yield => {}
+        TypedExprKind::Spawn(block, _) => {
             // Spawned block gets its own moved set (it captures by move);
             // anything it moves is also moved in the parent scope.
             check_branches(env, vec![Box::new(|env: &mut MoveEnv| {

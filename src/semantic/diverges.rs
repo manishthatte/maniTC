@@ -43,6 +43,9 @@ fn stmt_diverges(stmt: &Stmt) -> bool {
 fn expr_diverges(expr: &Expr) -> bool {
     match expr {
         Expr::Return(..) => true,
+        // §11.4: `yield` suspends and RESUMES. It is not divergence — the
+        // statement after it runs, just later.
+        Expr::Yield(_) => false,
 
         // A conditional diverges only if every arm exists and diverges.
         Expr::If(if_expr) => {
@@ -156,6 +159,7 @@ fn expr_has_break(expr: &Expr) -> bool {
         Expr::Loop(..) | Expr::While(_) | Expr::For(_) => false,
         // A lambda body cannot break out of an enclosing loop.
         Expr::Lambda(..) | Expr::Spawn(..) => false,
+        Expr::Yield(_) => false,
         Expr::Block(b) => block_has_break(b),
         Expr::If(i) => {
             block_has_break(&i.then_block)

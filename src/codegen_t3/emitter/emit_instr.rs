@@ -1353,6 +1353,9 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "__task_fork" => {
                     emit_syscall_1arg_ret(em, args, dst, 80, "task_fork");
                 }
+                "__task_yield" => {
+                    em.emit("    SYSCALL #81  ; task_yield (\u{a7}11.4)".to_string());
+                }
                 "__task_exit" => {
                     em.emit("    SYSCALL #82  ; task_exit (spawned block)".to_string());
                 }

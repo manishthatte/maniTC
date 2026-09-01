@@ -343,6 +343,8 @@ pub enum Expr {
     While(WhileExpr),
     Loop(Box<Block>, Span),
     Spawn(Box<Block>, Span),
+    /// §11.4: `yield;` — the explicit yield point.
+    Yield(Span),
     Await(Box<Expr>, Span),
     Array(Vec<Expr>, Span),
     Tuple(Vec<Expr>, Span),
@@ -376,6 +378,7 @@ impl Expr {
             Expr::While(w) => w.span,
             Expr::Loop(_, s) => *s,
             Expr::Spawn(_, s) => *s,
+            Expr::Yield(s) => *s,
             Expr::Await(_, s) => *s,
             Expr::Array(_, s) => *s,
             Expr::Tuple(_, s) => *s,

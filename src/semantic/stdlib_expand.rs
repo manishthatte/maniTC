@@ -615,6 +615,8 @@ impl Rewrite {
 
     fn rewrite_expr(&self, expr: &mut Expr) {
         match expr {
+            // §11.4: `yield` names nothing, so nothing in it can be rewritten.
+            Expr::Yield(_) => {}
             Expr::Ident(name, span) => {
                 self.observed.borrow_mut().insert(name.clone());
                 if let Some(init) = self.const_inits.get(name.as_str()) {
@@ -1018,6 +1020,8 @@ fn rewrite_types_in_stmt(stmt: &mut Stmt, map: &HashMap<String, String>) {
 
 fn rewrite_types_in_expr(expr: &mut Expr, map: &HashMap<String, String>) {
     match expr {
+        // §11.4: `yield` mentions no type.
+        Expr::Yield(_) => {}
         Expr::Cast(e, ty, _) => {
             rewrite_types_in_expr(e, map);
             rewrite_host_type(ty, map);

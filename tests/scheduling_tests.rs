@@ -224,14 +224,23 @@ fn main() {
     );
 }
 
-/// `--sched cooperative` is refused on LLVM rather than ignored.
+/// `--sched cooperative` now COMPILES AND RUNS on LLVM, and produces the same
+/// observable behaviour as it does on T3.
 ///
-/// A flag silently dropped is how someone comes to believe a program is
-/// scheduled when it is not, and §11's whole point is that the two lowerings
-/// produce different output. The message names step 3 of the decision document
-/// so the reader learns what is missing rather than that something is.
+/// **Corrected 2 September 2026 (P99).** This row used to assert the opposite —
+/// that the flag was REFUSED — and the refusal was right for as long as the
+/// LLVM backend had no scheduler: a flag silently dropped is how someone comes
+/// to believe a program is scheduled when it is not. Step 3 of the decision
+/// document is now done and the refusal is gone, so the row asserts what
+/// replaced it rather than being deleted (permanent rule 7). What it pins is
+/// unchanged in spirit: the flag must MEAN something on this backend.
+///
+/// The two backends reach §11 by different lowerings — T3 forks (P89), LLVM
+/// outlines the body and passes §11.2's copy of the store explicitly (P99) —
+/// so agreement here is a real check rather than a shared lowering agreeing
+/// with itself.
 #[test]
-fn cooperative_is_refused_on_llvm_rather_than_ignored() {
+fn cooperative_now_runs_on_llvm_and_agrees_with_t3() {
     let slot = N.fetch_add(1, Ordering::Relaxed);
     let d = std::env::temp_dir()
         .join(format!("manitc_sched_{}", std::process::id()))
@@ -239,25 +248,35 @@ fn cooperative_is_refused_on_llvm_rather_than_ignored() {
     std::fs::create_dir_all(&d).expect("temp dir");
     let path = d.join("p.mt");
     std::fs::write(&path, SPAWN_THEN_PRINT).expect("write");
+    let bin = path.with_extension("");
 
     let c = Command::new(manitc_bin())
         .args([
             "compile", path.to_str().unwrap(), "--target", "llvm",
-            "--sched", "cooperative", "-o",
-            path.with_extension("").to_str().unwrap(),
+            "--sched", "cooperative", "-o", bin.to_str().unwrap(),
         ])
         .output()
         .expect("compile");
-    assert!(!c.status.success(), "LLVM must refuse --sched cooperative");
     let msg = format!(
         "{}{}",
         String::from_utf8_lossy(&c.stdout),
         String::from_utf8_lossy(&c.stderr)
     );
-    assert!(
-        msg.contains("step 3") && msg.contains("CONCURRENCY_DECISION"),
-        "the refusal must say what is missing, not merely that something is: {}",
-        msg
+    // No binary means no clang, which is an environment fact rather than a
+    // result. Told apart by the ARTEFACT and never by the shape of a message
+    // (P47).
+    if !bin.exists() {
+        return;
+    }
+    assert!(c.status.success(), "LLVM must accept --sched cooperative now: {msg}");
+
+    let r = Command::new(&bin).output().expect("run");
+    let llvm_out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert_eq!(
+        llvm_out, "main\ntask\ngot 7\n",
+        "§11.5 (SPAWN): the spawner continues; the task runs when main blocks \
+         in (RECV-BLOCK), and (SEND-WAKE) hands main the value — the SAME \
+         string the T3 row above asserts, reached by a different lowering"
     );
 }
 

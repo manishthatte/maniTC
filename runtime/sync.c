@@ -282,7 +282,27 @@ int channel_is_closed(ManitChan* c) {
     return r;
 }
 
-void async_yield_now(void) { sched_yield(); }
+/* P99 / §11.4: `yield_now` is a YIELD POINT and must hand the baton to the next
+ * task, not to the next OS thread.
+ *
+ * `sched_yield(3)` — POSIX, which is what this used to call unconditionally —
+ * yields the THREAD. Under the cooperative scheduler exactly one task runs at a
+ * time and the running one holds the baton, so yielding the thread hands it
+ * straight back and the caller spins forever holding the very thing the other
+ * tasks are waiting for. `examples/concurrency.mt`'s first demo does exactly
+ * that: its consumer loops on `try_recv` and calls `yield_now` when the channel
+ * is empty, so the producer could never run.
+ *
+ * The two backends' definitions LOOKED equivalent and were not. T3 compiles
+ * `async::yield_now` to `SYSCALL #81`, whose comment still reads "no-op"
+ * because it was one when it was written — P88 made it a real task yield, and
+ * T3 inherited the correct behaviour without the line changing. LLVM's
+ * `sched_yield()` kept the name it always had and stopped meaning the same
+ * thing. */
+void async_yield_now(void) {
+    if (manit_sched_active()) { __task_yield(); return; }
+    sched_yield();
+}
 
 /* ======================== ternary utils ======================== */
 

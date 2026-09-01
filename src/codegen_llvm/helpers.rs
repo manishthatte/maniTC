@@ -786,6 +786,13 @@ declare i64 @AtomicInt_fetch_add(ptr, i64)
 declare i64 @AtomicInt_fetch_sub(ptr, i64)
 declare i1 @AtomicInt_compare_exchange(ptr, i64, i64)
 declare ptr @channel_new()
+; P99 / docs/semantics.md §11: the cooperative scheduler. Emitted only under
+; `--sched cooperative`, but declared unconditionally — a declaration nothing
+; calls costs an unused line, while a missing one is a link failure.
+declare void @__task_bootstrap()
+declare i64 @__task_spawn(ptr, ptr)
+declare void @__task_yield()
+declare void @__task_main_done()
 declare ptr @channel_bounded(i64)
 declare void @channel_send(ptr, i64)
 declare i64 @channel_recv(ptr)

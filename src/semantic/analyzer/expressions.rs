@@ -1212,10 +1212,41 @@ impl SemanticAnalyzer {
                 })
             }
 
+            // §11.4: `yield` is a yield POINT and produces no value. It type-
+            // checks under every scheduling mode — the mode decides what it
+            // COMPILES to, and under `inline` it is a no-op, because §4's
+            // single task has nothing to yield to.
+            Expr::Yield(_) => Ok(TypedExpr {
+                kind: TypedExprKind::Yield,
+                ty: ManiType::Void,
+                span,
+            }),
+
             Expr::Spawn(block, _) => {
+                // §11.2's copy of the store, computed with the SAME walker that
+                // refuses lambda capture twenty lines below. Only genuine
+                // locals of an enclosing scope travel: a global or a function
+                // name is reachable from the outlined body by its own name, and
+                // `lookup_with_depth`'s `depth >= 1` is what tells them apart —
+                // the test the lambda path already uses.
+                let mut bound: Vec<std::collections::HashSet<String>> = Vec::new();
+                let mut free: std::collections::HashSet<String> = Default::default();
+                collect_free_in_block(block, &mut bound, &mut free);
+                let mut captures: Vec<(String, ManiType)> = free
+                    .iter()
+                    .filter_map(|v| match self.symbols.lookup_with_depth(v) {
+                        Some((depth, sym)) if depth >= 1 => Some((v.clone(), sym.ty.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                // Sorted, because a HashSet's order is not stable across runs
+                // and the env layout has to be the same one the outlined body
+                // reads back. §11.7's determinism is about the schedule; this
+                // is determinism of the CODE, and it is just as required.
+                captures.sort_by(|a, b| a.0.cmp(&b.0));
                 let tb = self.check_block(block)?;
                 Ok(TypedExpr {
-                    kind: TypedExprKind::Spawn(tb),
+                    kind: TypedExprKind::Spawn(tb, captures),
                     ty: ManiType::Void,
                     span,
                 })
@@ -1635,6 +1666,8 @@ fn collect_free_idents(
             collect_free_in_block(&we.body, bound, free);
         }
         Expr::Loop(b, _) | Expr::Spawn(b, _) => collect_free_in_block(b, bound, free),
+        // §11.4: `yield` reads nothing, so it captures nothing.
+        Expr::Yield(_) => {}
         Expr::Array(elems, _) | Expr::Tuple(elems, _) => {
             for e in elems {
                 collect_free_idents(e, bound, free);

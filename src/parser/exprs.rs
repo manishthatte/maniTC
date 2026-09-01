@@ -623,6 +623,14 @@ impl Parser {
                 Ok(Expr::Spawn(Box::new(block), span))
             }
 
+            // §11.4's explicit yield point. An expression of type `void`
+            // rather than a statement form of its own, so it composes with
+            // the block grammar exactly as `spawn { … }` does.
+            TokenKind::Yield => {
+                self.advance();
+                Ok(Expr::Yield(span))
+            }
+
             // Keyword-prefixed module paths: async::foo(), async::task::spawn(), etc.
             TokenKind::Async => {
                 self.advance();

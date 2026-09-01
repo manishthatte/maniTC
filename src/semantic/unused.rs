@@ -167,6 +167,8 @@ impl Usage {
             Expr::Ident(n, _) => {
                 self.read.insert(n.clone());
             }
+            // §11.4: `yield` reads no variable.
+            Expr::Yield(_) => {}
             Expr::Block(b) => self.scan_block(b),
             Expr::If(i) => {
                 self.scan_expr(&i.cond);

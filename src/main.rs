@@ -449,7 +449,7 @@ loads={} stores={} phis={} phi-edges-from-branch={}",
 /// whole point is that the two lowerings produce different output.
 fn parse_sched(s: &str, target: &str) -> CompileResult<manitc::ir::lower::SchedMode> {
     use manitc::ir::lower::SchedMode;
-    let mode = match s {
+    let mut mode = match s {
         "inline" => SchedMode::Inline,
         "cooperative" => SchedMode::Cooperative,
         other => {
@@ -459,17 +459,12 @@ fn parse_sched(s: &str, target: &str) -> CompileResult<manitc::ir::lower::SchedM
             ))));
         }
     };
+    // §11 is one specification and the two backends reach it by different
+    // routes: T3 forks (P89), LLVM outlines (P99). The TARGET picks the
+    // lowering here, at the one boundary that knows it, rather than the
+    // lowerer taking a second parameter it would have to keep in step.
     if mode == SchedMode::Cooperative && target != "t3" {
-        return Err(CompileError::Codegen(Diagnostic::unknown(
-            concat!(
-                "--sched cooperative is implemented for --target t3 only. ",
-                "The LLVM backend has no scheduler yet: that is step 3 of ",
-                "enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md ",
-                "\u{a7}5, and it must emulate the same semantics rather ",
-                "than call pthreads.",
-            )
-                .to_string(),
-        )));
+        mode = SchedMode::CooperativeOutlined;
     }
     Ok(mode)
 }

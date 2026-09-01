@@ -288,7 +288,21 @@ pub enum TypedExprKind {
     Continue,
     Cast(Box<TypedExpr>, ManiType),
     Question(Box<TypedExpr>),
-    Spawn(TypedBlock),
+    /// §11.2: a spawned task gets a COPY of the spawning task's store, so the
+    /// values the block reads from its enclosing scope travel with it.
+    ///
+    /// Computed in the analyzer, where `collect_free_in_block` already exists —
+    /// it is what refuses lambda capture (P55) — rather than by a second walker
+    /// over the TYPED tree, because a walker that misses a variant misses a
+    /// capture, and a missing capture is a silently wrong program.
+    ///
+    /// The T3 backend ignores this list: P89's `spawn` is a FORK, so the child
+    /// reaches its enclosing locals by sharing the frame layout. The LLVM
+    /// backend cannot copy a live C stack (P88, P99) and outlines the body
+    /// instead, which is where these are needed.
+    Spawn(TypedBlock, Vec<(String, ManiType)>),
+    /// §11.4's explicit yield point.
+    Yield,
     Await(Box<TypedExpr>),
     Tresult(TypedTresultExpr),
 }
