@@ -585,15 +585,45 @@ impl Parser {
         Ok(LintDecl { level, lints, span })
     }
 
-    /// A hyphenated lint name, re-joined from `Ident (- Ident)*`.
+    /// A hyphenated lint name, re-joined from `Ident (- Ident)*` — or from a
+    /// KEYWORD, which is report.txt P104.
+    ///
+    /// `lint allow(unknown-type);` was a parse error: `unknown` lexes as the
+    /// three-valued literal, and a `Token` carries only a kind and a span, so
+    /// there was nothing to rejoin. Three of the 26 lint names were unwritable
+    /// this way while their command-line form worked — and **a lint whose
+    /// `allow` cannot be spelled is not an exact restoration of anything**,
+    /// which is the guarantee `src/lint.rs` makes for every entry.
     fn parse_lint_name(&mut self) -> CompileResult<String> {
-        let (mut name, _) = self.expect_ident()?;
+        let mut name = self.lint_name_word()?;
         while self.eat(&TokenKind::Minus) {
-            let (part, _) = self.expect_ident()?;
+            let part = self.lint_name_word()?;
             name.push('-');
             name.push_str(&part);
         }
         Ok(name)
+    }
+
+    /// One word of a lint name: an identifier, or a keyword that
+    /// `lexer::lint_word_lexeme` can spell.
+    ///
+    /// Claimed only here. A keyword is a keyword everywhere else in the
+    /// grammar, so this widens nothing outside `lint <level>( … )`.
+    fn lint_name_word(&mut self) -> CompileResult<String> {
+        if let TokenKind::Ident(name) = self.peek().clone() {
+            self.advance();
+            return Ok(name);
+        }
+        if let Some(w) = crate::lexer::lint_word_lexeme(self.peek()) {
+            self.advance();
+            return Ok(w.to_string());
+        }
+        Err(self.err(format!(
+            "expected a lint name, found {:?}. A lint name is words joined by \
+             `-`; if this is a keyword, `lexer::lint_word_lexeme` has to carry \
+             its spelling (report.txt P104)",
+            self.peek()
+        )))
     }
 
     /// A1: an explicit native declaration.

@@ -176,6 +176,36 @@ impl Token {
 // Keyword map helper
 // ---------------------------------------------------------------------------
 
+/// P104. The spelling a keyword token carries when it appears INSIDE A LINT
+/// NAME, for the parser to rejoin.
+///
+/// `lint allow(unknown-type);` was a parse error, because `keyword_or_ident`
+/// turns `unknown` into `TokenKind::Unknown` and a `Token` records only its
+/// kind and span — no source text — so the parser had nothing to rejoin.
+/// **Measured: 3 of the 26 lint names were unwritable in a directive** —
+/// `unknown-type`, `unknown-lint`, and `literal-out-of-word`, `word` being the
+/// patent alias for `t27`. The command-line form (`-A unknown-type`) always
+/// worked, because that is a plain argument and never reaches the lexer, so
+/// exactly one of the two control surfaces was unreachable.
+///
+/// **This is deliberately not a general keyword→lexeme inverse, because there
+/// is no such function**: `"unknown"` and `"Unknown"` are one token, and so
+/// are `"word"` and `"t27"`. What a lint name needs is the spelling LINT NAMES
+/// use, which is a different question and has a single answer per token.
+///
+/// It is a registry that must agree with another registry, so it is checked
+/// rather than described (permanent rule 5):
+/// `parser_tests::every_lint_name_can_be_written_in_a_directive` iterates
+/// `lint::LINTS` itself, splits each name on `-`, and fails naming the word if
+/// one of them lexes to a keyword this table does not carry.
+pub fn lint_word_lexeme(k: &TokenKind) -> Option<&'static str> {
+    match k {
+        TokenKind::Unknown => Some("unknown"),
+        TokenKind::T27Kw => Some("word"),
+        _ => None,
+    }
+}
+
 fn keyword_or_ident(s: &str) -> TokenKind {
     match s {
         "let" => TokenKind::Let,

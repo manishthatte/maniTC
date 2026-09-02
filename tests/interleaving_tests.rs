@@ -2,15 +2,22 @@
 //!
 //! © Manish Jagdish Thatte
 //!
-//! **These rows are about a section that is AHEAD of both backends** (§1.2).
-//! The reference implements §11; the T3 and LLVM backends still run `spawn`
-//! inline, which is what `docs/memory-model.md` §4 says the language does
-//! today. So nothing here compares the three implementations — that is what
-//! `conformance_tests.rs` is for, and it would report the specification's lead
-//! as a regression. What these rows pin is that the reference matches the
-//! DOCUMENT, rule by rule, so that when step 2 of
-//! `enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md` §5 teaches T3
-//! the same rules, there is something to be conformant WITH.
+//! **Corrected 2 September 2026.** This header read *"These rows are about a
+//! section that is AHEAD of both backends"* and said the backends "still run
+//! `spawn` inline". That was true when written and stopped being true when
+//! steps 2 and 3 landed: under `--sched cooperative` both backends implement
+//! §11, and `structured_waiting_tests.rs` now runs the same programs on them.
+//! The claim survived six days and three commits because a file header is not
+//! something a test can fail on — which is this repository's own argument for
+//! pinning documented claims rather than reviewing prose (permanent rule 6).
+//!
+//! What these rows still are, and what makes them worth keeping separate: they
+//! pin the **A3 reference** against the DOCUMENT, rule by rule, with every
+//! expectation derived by hand from §11.5. That is a third account, independent
+//! of both backends — and the reason it stays independent is that it is the
+//! only one of the three that cannot be wrong in the same way as the other two.
+//! The rows remain correct as written; only the header's claim about the
+//! backends was stale.
 //!
 //! Every expected trace below was derived by hand from §11.5's rules before it
 //! was run, because a test whose expectation came from the implementation is a
@@ -503,9 +510,22 @@ fn t3_trace(src: &str) -> String {
 /// exactly what `docs/memory-model.md` §4 says the language does and what
 /// report.txt P5 records as the defect.
 ///
-/// **When step 2 of `CONCURRENCY_DECISION.md` §5 lands, this row goes red** —
-/// and that is the signal it exists to give. Deleting it then is correct;
-/// deleting it before then is deleting the only place the gap is written down.
+/// **Corrected 2 September 2026.** This paragraph used to read *"When step 2 of
+/// `CONCURRENCY_DECISION.md` §5 lands, this row goes red — and that is the
+/// signal it exists to give."* **Step 2 landed on 30 August and the row did not
+/// go red**, because it compiles WITHOUT `--sched cooperative` and so measures
+/// the DEFAULT mode, which still runs `spawn { B }` in place and still will.
+///
+/// The assertion was right the whole time; only the prediction about it was
+/// wrong. The row is not a temporary gap-marker after all — it is the pin on
+/// `--sched inline`'s semantics, which `docs/memory-model.md` §4 still governs
+/// and which every program compiled without the flag still gets. It goes red
+/// the day cooperative becomes the DEFAULT, and that is the signal it now
+/// gives.
+///
+/// *A test that predicts when it will fail is making a claim like any other,
+/// and this one was falsified without anybody noticing, because being wrong
+/// looked exactly like still being right.*
 #[test]
 fn t3_does_not_implement_11_yet_and_this_says_so() {
     let src = r#"
@@ -532,5 +552,226 @@ fn t3_does_not_implement_11_yet_and_this_says_so() {
     assert_ne!(
         reference, t3,
         "the gap §1.2 requires to be recorded has closed on one side only"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §11.10 — closing a channel, against the A3 reference
+// ---------------------------------------------------------------------------
+//
+// Every expectation below is derived by hand from §11.10's rules, as this
+// file requires. The reference is the account that had to CATCH UP here — both
+// backends implemented `close` before §11 was written — which is the reverse
+// of §11.9 and the reason these rows exist at all.
+
+/// (CLOSE) wakes EVERY waiter, in `B(c)`'s own order.
+///
+/// The one place in §11 where all are woken rather than one. Derived: two
+/// SPAWNs append A then B; (YIELD) sends main to the back; A blocks, then B
+/// blocks, leaving `B(ch) = [A, B]`; main's close appends both to `R` in that
+/// order, then main terminates by (DONE).
+///
+/// **Against a wake-one close this row does not merely print the wrong order —
+/// it deadlock-traps**, because the second waiter is stranded and no `send`
+/// can ever reach it. That is the opposite of (SEND-WAKE), where §11.7 records
+/// that a wake-all is nearly invisible; here a wake-one is loud.
+#[test]
+fn s11_10_close_wakes_every_waiter() {
+    let out = out_of(
+        "fn main() -> void {\n\
+         \x20  let ch = channel();\n\
+         \x20  spawn { io::println(\"A\"); let a = ch.recv(); io::println(\"A done\"); }\n\
+         \x20  spawn { io::println(\"B\"); let b = ch.recv(); io::println(\"B done\"); }\n\
+         \x20  yield;\n\
+         \x20  io::println(\"close\");\n\
+         \x20  ch.close();\n\
+         }",
+    );
+    assert_eq!(out, "A\nB\nclose\nA done\nB done\n", "§11.10 (CLOSE)");
+}
+
+/// (RECV) still drains a closed channel, then (RECV-CLOSED) yields zero
+/// without blocking.
+#[test]
+fn s11_10_a_closed_channel_drains_then_yields_zero() {
+    let out = out_of(
+        "fn main() -> void {\n\
+         \x20  let ch = channel();\n\
+         \x20  ch.send(1); ch.send(2);\n\
+         \x20  ch.close();\n\
+         \x20  io::println_int(ch.recv());\n\
+         \x20  io::println_int(ch.recv());\n\
+         \x20  io::println_int(ch.recv());\n\
+         }",
+    );
+    assert_eq!(out, "1\n2\n0\n", "§11.10 (RECV) then (RECV-CLOSED)");
+}
+
+/// (SEND-CLOSED) traps, and the trace produced up to that point is retained,
+/// exactly as §8 requires.
+#[test]
+fn s11_10_send_on_a_closed_channel_traps() {
+    let (out, trap) = obs(
+        "fn main() -> void {\n\
+         \x20  let ch = channel();\n\
+         \x20  ch.close();\n\
+         \x20  io::println(\"before\");\n\
+         \x20  ch.send(1);\n\
+         \x20  io::println(\"after\");\n\
+         }",
+    );
+    assert_eq!(out, "before\n", "the trace before the trap must be retained");
+    assert_eq!(
+        trap.as_deref(),
+        Some("send on a closed channel — the value cannot be received"),
+        "§11.10 (SEND-CLOSED)"
+    );
+}
+
+/// (CLOSE) is idempotent: a second close finds `B(c)` already empty and adds a
+/// member the set already has.
+///
+/// This row exists because the T3 emulator got it wrong in a way nothing else
+/// would have caught — `heap_objs.remove` took the entry out unconditionally
+/// and the following `if let` matched only an OPEN channel, so a second close
+/// destroyed the channel and its queued values. `send(7); close(); close();
+/// recv()` gave 0 on T3 and 7 on LLVM (report.txt P106).
+#[test]
+fn s11_10_close_is_idempotent() {
+    let out = out_of(
+        "fn main() -> void {\n\
+         \x20  let ch = channel();\n\
+         \x20  ch.send(7);\n\
+         \x20  ch.close();\n\
+         \x20  ch.close();\n\
+         \x20  io::println_int(ch.recv());\n\
+         }",
+    );
+    assert_eq!(out, "7\n", "§11.10: close is idempotent");
+}
+
+/// §11.6's deadlock trap must NOT fire for a task whose channel was closed.
+///
+/// Before (CLOSE) woke waiters, this program reported *"deadlock — every task
+/// is blocked on a channel that no runnable task can fill"*, which was true and
+/// useless: the close had already established that none ever would.
+#[test]
+fn s11_10_a_closed_channel_is_not_a_deadlock() {
+    let (out, trap) = obs(
+        "fn main() -> void {\n\
+         \x20  let ch = channel();\n\
+         \x20  spawn { let v = ch.recv(); io::println(\"woke\"); }\n\
+         \x20  yield;\n\
+         \x20  ch.close();\n\
+         }",
+    );
+    assert!(trap.is_none(), "a closed channel must not deadlock: {trap:?}");
+    assert_eq!(out, "woke\n");
+}
+
+// ---------------------------------------------------------------------------
+// §11.11 — bounded channels, and the fourth yield point
+// ---------------------------------------------------------------------------
+
+/// (SEND-BLOCK) and (RECV-WAKE): a producer stops at the bound and resumes
+/// when a receive frees a slot.
+///
+/// Derived by hand: capacity 2, so `send 1` and `send 2` fill it; `send 3`
+/// finds `|𝒞(c)| = cap(c)` and joins `S(c)`, which empties `R` of everything
+/// but main; each `recv` takes a value and wakes the one sender.
+#[test]
+fn s11_11_a_full_send_blocks_and_a_recv_wakes_it() {
+    let out = out_of(
+        "fn main() -> void {\n\
+         \x20  let ch = channel_bounded(2);\n\
+         \x20  spawn {\n\
+         \x20    let mut i = 1;\n\
+         \x20    while i <= 4 { ch.send(i); io::println(\"sent\"); i = i + 1; }\n\
+         \x20  }\n\
+         \x20  yield;\n\
+         \x20  let mut n = 0;\n\
+         \x20  while n < 4 { let v = ch.recv(); io::println(\"got\"); n = n + 1; }\n\
+         }",
+    );
+    assert_eq!(out, "sent\nsent\ngot\ngot\nsent\nsent\ngot\ngot\n", "§11.11");
+}
+
+/// An UNBOUNDED channel is never full, so §11.4's original three yield points
+/// are still exactly its yield points.
+///
+/// GUARD ROW: it passes before §11.11 too, and that is its job — it is the
+/// reason the fourth yield point moves no existing program.
+#[test]
+fn s11_11_an_unbounded_send_still_does_not_yield() {
+    let out = out_of(
+        "fn main() -> void {\n\
+         \x20  let ch = channel();\n\
+         \x20  let mut i = 0;\n\
+         \x20  while i < 300 { ch.send(i); i = i + 1; }\n\
+         \x20  io::println(\"sent 300\");\n\
+         \x20  let mut s = 0; let mut j = 0;\n\
+         \x20  while j < 300 { s = s + ch.recv(); j = j + 1; }\n\
+         \x20  io::println_int(s);\n\
+         }",
+    );
+    assert_eq!(out, "sent 300\n44850\n", "§11.1: unbounded means unbounded");
+}
+
+/// §11.6 counts `S` as well as `B`, and the message names which.
+///
+/// A task waiting for ROOM on a channel nothing will drain is as deadlocked as
+/// one waiting for a VALUE on a channel nothing will fill. The wrong word
+/// sends the reader looking for a missing sender when the problem is a missing
+/// receiver, so the row asserts the WORD and not merely that it trapped.
+#[test]
+fn s11_11_blocking_on_a_full_channel_is_a_deadlock_that_says_drain() {
+    let (out, trap) = obs(
+        "fn main() -> void {\n\
+         \x20  let ch = channel_bounded(1);\n\
+         \x20  ch.send(1);\n\
+         \x20  io::println(\"one\");\n\
+         \x20  ch.send(2);\n\
+         \x20  io::println(\"two\");\n\
+         }",
+    );
+    assert_eq!(out, "one\n", "the trace before the trap must be retained");
+    assert_eq!(
+        trap.as_deref(),
+        Some("deadlock — every task is blocked on a channel that no runnable task can drain"),
+        "§11.6 must say `drain`, not `fill`"
+    );
+}
+
+/// A capacity below 1 traps rather than clamping.
+///
+/// A zero-capacity channel can never hold a value, so every send on it blocks
+/// forever; rounding up to 1 turns a program that cannot work into one that
+/// quietly does something else.
+#[test]
+fn s11_11_a_capacity_below_one_traps() {
+    let (_, trap) = obs("fn main() -> void { let ch = channel_bounded(0); }");
+    assert_eq!(trap.as_deref(), Some("a channel capacity must be at least 1"));
+}
+
+/// (CLOSE) wakes blocked SENDERS too, and each then traps by (SEND-CLOSED).
+///
+/// The alternative is a task parked forever on a channel nothing will drain,
+/// so the trap is the right outcome rather than an accident of ordering.
+#[test]
+fn s11_11_close_wakes_a_blocked_sender_which_then_traps() {
+    let (out, trap) = obs(
+        "fn main() -> void {\n\
+         \x20  let ch = channel_bounded(1);\n\
+         \x20  spawn { ch.send(1); ch.send(2); io::println(\"sender done\"); }\n\
+         \x20  yield;\n\
+         \x20  io::println(\"closing\");\n\
+         \x20  ch.close();\n\
+         }",
+    );
+    assert_eq!(out, "closing\n", "the sender must not complete");
+    assert_eq!(
+        trap.as_deref(),
+        Some("send on a closed channel — the value cannot be received"),
+        "a woken sender re-executes its send and meets (SEND-CLOSED)"
     );
 }

@@ -188,7 +188,7 @@ CompileError::codegen(msg)                  // from backends (no location)
 
 ## 4. lexer.rs — tokenisation
 
-**File:** `maniTC/src/lexer.rs` (~1,000 lines)
+**File:** `maniTC/src/lexer.rs` (~1,130 lines)
 
 ### `Span`
 

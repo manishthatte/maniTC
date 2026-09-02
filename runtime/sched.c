@@ -252,6 +252,30 @@ void manit_sched_block_on(void** head, void** tail) {
  * it changes the ORDER of B. `tests/interleaving_tests.rs` carries the program
  * that can see it; the obvious test — counting how many waiters woke — cannot.
  */
+/* §11.10 (CLOSE): wake EVERY waiter, in B(c)'s own order.
+ *
+ * The one place in §11 where all are woken rather than one, and not an
+ * inconsistency with (SEND-WAKE): a `send` produces one value so only one
+ * waiter can proceed, while a `close` produces no value but makes a PERMANENT
+ * FACT true, and every waiter's `recv` can now complete with (RECV-CLOSED)'s
+ * zero. A waiter left on B(c) after a close is stranded forever, because no
+ * `send` will ever wake it — which is exactly what used to happen, on both
+ * backends, ending in §11.6's deadlock trap. */
+void manit_sched_wake_all(void** head, void** tail) {
+    pthread_mutex_lock(&manit_sched_lock);
+    ManitTask2* t = (ManitTask2*)*head;
+    while (t) {
+        ManitTask2* next = t->next;
+        t->next = NULL;
+        manit_blocked_count--;
+        manit_rq_push(t);
+        t = next;
+    }
+    *head = NULL;
+    *tail = NULL;
+    pthread_mutex_unlock(&manit_sched_lock);
+}
+
 void manit_sched_wake_one(void** head, void** tail) {
     pthread_mutex_lock(&manit_sched_lock);
     ManitTask2* t = (ManitTask2*)*head;

@@ -71,6 +71,20 @@ pub(crate) struct Sched {
     /// §11.3 `B`, one queue per channel handle so (SEND-WAKE) can take the
     /// longest-waiting waiter rather than an arbitrary one.
     pub blocked: HashMap<usize, VecDeque<TaskId>>,
+    /// §11.11 `S`, the SEND-blocked map — tasks waiting for room on a bounded
+    /// channel.
+    ///
+    /// **A second map and not an extension of `B`, which is the point.** A
+    /// `recv` must wake a SENDER and a `send` must wake a RECEIVER; one queue
+    /// holding both would let either wake the wrong kind, and the woken task
+    /// would re-check, find nothing changed for it, and block again — visible
+    /// only as an ordering difference, which is (SEND-WAKE)'s bug wearing a
+    /// new hat (§11.7).
+    pub blocked_send: HashMap<usize, VecDeque<TaskId>>,
+    /// §11.11: the capacity of each BOUNDED channel. A handle absent here is
+    /// unbounded, which is `channel<T>()` and every channel that existed
+    /// before 0.7.
+    pub chan_cap: HashMap<usize, usize>,
     /// Every task except the running one.
     pub saved: HashMap<TaskId, SavedTask>,
     pub next_id: TaskId,
@@ -89,6 +103,8 @@ impl Default for Sched {
         Sched {
             run: VecDeque::from([0usize]),
             blocked: HashMap::new(),
+            blocked_send: HashMap::new(),
+            chan_cap: HashMap::new(),
             saved: HashMap::new(),
             next_id: 1,
             main_exit: None,
@@ -105,7 +121,11 @@ impl Sched {
 
     /// Is any task waiting on a channel? §11.6's second end condition.
     pub fn anyone_blocked(&self) -> bool {
+        // §11.11: `S` counts as much as `B`. A task waiting for room on a
+        // channel nothing will drain is as deadlocked as one waiting for a
+        // value on a channel nothing will fill, and §11.6 must see both.
         self.blocked.values().any(|q| !q.is_empty())
+            || self.blocked_send.values().any(|q| !q.is_empty())
     }
 
 }
@@ -195,10 +215,24 @@ impl Emulator {
             return false;
         }
         if self.sched.anyone_blocked() {
-            self.trap(
-                "TRAP: deadlock — every task is blocked on a channel that no \
-                 runnable task can fill",
-            );
+            // §11.11: name which of the two it is. A task waiting for ROOM and
+            // one waiting for a VALUE are both deadlocked when R empties, and
+            // the message that says "fill" for a full channel sends the reader
+            // looking for a missing sender when the problem is a missing
+            // receiver.
+            let waiting_to_send =
+                self.sched.blocked_send.values().any(|q| !q.is_empty());
+            if waiting_to_send {
+                self.trap(
+                    "TRAP: deadlock — every task is blocked on a channel that \
+                     no runnable task can drain",
+                );
+            } else {
+                self.trap(
+                    "TRAP: deadlock — every task is blocked on a channel that \
+                     no runnable task can fill",
+                );
+            }
         } else {
             // §11.6: every task finished. The status is main's, captured when
             // task 0 ended (§11.6 lets main finish while others run on).
@@ -333,6 +367,80 @@ impl Emulator {
             return;
         }
         if let Some(q) = self.sched.blocked.get_mut(&chan) {
+            if let Some(w) = q.pop_front() {
+                self.sched.run.push_back(w);
+            }
+        }
+    }
+
+    /// §11.10 (CLOSE). Wake EVERY task waiting on this channel, in `B(c)`'s
+    /// own order — longest-waiting first, appended to the back of `R`.
+    ///
+    /// **This is the one place in §11 where all waiters are woken rather than
+    /// one, and it is not an inconsistency with (SEND-WAKE).** A `send`
+    /// produces exactly one value, so exactly one waiter can proceed and a
+    /// second would find nothing and block again — §11.7's invisible bug. A
+    /// `close` produces no value but makes a PERMANENT FACT true of the
+    /// channel, and every waiter's `recv` can now complete with the zero of
+    /// (RECV-CLOSED). Leaving any of them on `B(c)` strands it forever,
+    /// because after a close no `send` will ever wake it.
+    ///
+    /// That is exactly what happened before this existed: a task blocked in
+    /// `recv` when another closed the channel was never woken, and the program
+    /// hit §11.6's deadlock trap — reporting that no runnable task could fill
+    /// the channel, which was true and useless, since the close had already
+    /// established that none ever would. Identically on both backends, so the
+    /// parity matrix reported nothing.
+    pub(crate) fn sched_wake_all(&mut self, chan: usize) {
+        if !self.sched.active {
+            return;
+        }
+        if let Some(q) = self.sched.blocked.get_mut(&chan) {
+            while let Some(w) = q.pop_front() {
+                self.sched.run.push_back(w);
+            }
+        }
+        // §11.11: (CLOSE) wakes the SENDERS too. Each re-executes its send,
+        // finds the channel closed and traps by §11.10 (SEND-CLOSED) — which
+        // is the right outcome and not an accident: its value has nowhere to
+        // go, and the alternative is a task parked forever on a channel
+        // nothing will ever drain.
+        if let Some(q) = self.sched.blocked_send.get_mut(&chan) {
+            while let Some(w) = q.pop_front() {
+                self.sched.run.push_back(w);
+            }
+        }
+    }
+
+    /// §11.11 (SEND-BLOCK): the task leaves `R` for `S(c)` with its `send`
+    /// still in front of it. Mirrors `sched_block_on`, including the PC
+    /// rewind, so a woken sender RE-EXECUTES the send rather than being
+    /// credited with it — a third task may have taken the space meanwhile.
+    pub(crate) fn sched_block_on_send(&mut self, chan: usize) -> bool {
+        let Some(me) = self.sched.current() else {
+            return false;
+        };
+        self.sched.run.pop_front();
+        self.sched.blocked_send.entry(chan).or_default().push_back(me);
+        if self.end_of_program() {
+            return false;
+        }
+        self.pc -= 1;
+        let saved = self.save_current();
+        self.sched.saved.insert(me, saved);
+        if let Some(t) = self.sched.saved.remove(&self.sched.run[0]) {
+            self.restore(t);
+        }
+        true
+    }
+
+    /// §11.11 (RECV-WAKE): a receive frees exactly one slot, so exactly one
+    /// sender is woken — the longest-waiting.
+    pub(crate) fn sched_wake_one_sender(&mut self, chan: usize) {
+        if !self.sched.active {
+            return;
+        }
+        if let Some(q) = self.sched.blocked_send.get_mut(&chan) {
             if let Some(w) = q.pop_front() {
                 self.sched.run.push_back(w);
             }

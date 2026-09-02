@@ -8,6 +8,15 @@
 typedef struct {
     pthread_mutex_t lock;
     int64_t value;
+    /* §11.9. Under the scheduler `lock` is INTERNAL — it guards `held` and
+     * `value` for the few instructions that touch them and is never held
+     * across a yield. `held` is the mutex the program sees: §11.9 makes a
+     * `Mutex<T>` a one-slot channel carrying the value, so being held is the
+     * token's ABSENCE rather than a lock bit, and `waiters` is that channel's
+     * B(c) — ordered and moved only by sched.c, exactly as a channel's is. */
+    int held;
+    void* waiters;
+    void* waiters_tail;
 } ManitMutex;
 
 ManitMutex* Mutex_new(int64_t v) {
@@ -15,25 +24,67 @@ ManitMutex* Mutex_new(int64_t v) {
     if (!m) return NULL;
     /* Recursive: the guard pattern (`let g = m.lock(); g.get(); ...`)
      * calls Mutex_get/Mutex_set while the lock is already held by the
-     * same thread; a default mutex would self-deadlock there. */
+     * same thread; a default mutex would self-deadlock there.
+     *
+     * Still recursive, and under the scheduler it no longer needs to be: §11.9
+     * says `get`/`set` do NOT lock, they read the value the holder took out of
+     * the channel. Kept because the unscheduled path below is unchanged and
+     * that path is what every program compiled without `--sched cooperative`
+     * still runs. */
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&m->lock, &attr);
     pthread_mutexattr_destroy(&attr);
     m->value = v;
+    m->held = 0;
+    m->waiters = NULL;
+    m->waiters_tail = NULL;
     return m;
 }
 
 /* Returns the mutex itself: `let guard = m.lock()` binds the handle as the
  * guard, matching the T3 emulator (syscall 110 returns R1 unchanged). */
 ManitMutex* Mutex_lock(ManitMutex* m) {
-    if (m) pthread_mutex_lock(&m->lock);
+    if (!m) return m;
+    if (manit_sched_active()) {
+        /* §11.9: `m.lock()` is `m.recv()`. The LOOP is the specification and
+         * not defensive coding — a woken task re-executes its receive, which
+         * is what lets a third task take the mutex out from under it and is
+         * what makes a wake-all bug invisible to a test that counts wakes
+         * (§11.7).
+         *
+         * Blocking with the internal lock HELD would deadlock the whole
+         * program rather than the task: the baton would go to another task
+         * which would then wait on a mutex only a non-running task can
+         * release. That is the same hazard §11.9 records for the barrier's
+         * counter, one construct along. */
+        pthread_mutex_lock(&m->lock);
+        while (m->held) {
+            pthread_mutex_unlock(&m->lock);
+            manit_sched_block_on(&m->waiters, &m->waiters_tail);
+            pthread_mutex_lock(&m->lock);
+        }
+        m->held = 1;
+        pthread_mutex_unlock(&m->lock);
+        return m;
+    }
+    pthread_mutex_lock(&m->lock);
     return m;
 }
 
 void Mutex_unlock(ManitMutex* m) {
-    if (m) pthread_mutex_unlock(&m->lock);
+    if (!m) return;
+    if (manit_sched_active()) {
+        /* §11.5 (SEND-WAKE) through §11.9's desugaring: the value goes back
+         * into the slot and AT MOST ONE waiter is woken, the longest-waiting. */
+        pthread_mutex_lock(&m->lock);
+        m->held = 0;
+        pthread_mutex_unlock(&m->lock);
+        manit_sched_wake_one(&m->waiters, &m->waiters_tail);
+        return;
+    }
+    pthread_mutex_unlock(&m->lock);
 }
 
 int64_t Mutex_get(ManitMutex* m) {
@@ -144,18 +195,50 @@ typedef struct {
      * moved only by `sched.c`, which is the one place that knows what R is. */
     void* waiters;
     void* waiters_tail;
+    /* P107. Zero for the DEFAULT channel, which `docs/semantics.md` §11.1
+     * says is UNBOUNDED — `capacity` is then only the size of the ring today
+     * and grows on demand. Non-zero for a channel created with an explicit
+     * capacity, where the bound is the specification and a full `send`
+     * blocks (§11.11).
+     *
+     * `channel_new` used to call `channel_bounded(256)`, so every channel in
+     * the language was silently bounded at 256 and a 257th send blocked on a
+     * condition variable nothing could signal: `cap.mt` printed NOTHING AT
+     * ALL on LLVM and `sum=44850` on T3. §11.4 gives "channels are unbounded"
+     * as the reason `send` is not a yield point, so this was the
+     * specification being contradicted by the implementation of the one
+     * clause that justified it. */
+    int bounded;
+    /* §11.11 S(c): tasks waiting for ROOM. A SECOND queue and not an extension
+     * of `waiters`, which is the point — a `recv` must wake a SENDER and a
+     * `send` must wake a RECEIVER, and one queue holding both lets either wake
+     * the wrong kind. */
+    void* send_waiters;
+    void* send_waiters_tail;
 } ManitChan;
 
 ManitChan* channel_bounded(int64_t capacity);
 
+/* §11.1: the default channel is UNBOUNDED. `CHAN_DEFAULT_CAP` is the ring's
+ * starting size and nothing more — `channel_send` grows it rather than
+ * blocking. */
 ManitChan* channel_new(void) {
-    return channel_bounded(CHAN_DEFAULT_CAP);
+    ManitChan* c = channel_bounded(CHAN_DEFAULT_CAP);
+    if (c) c->bounded = 0;
+    return c;
 }
 
 ManitChan* channel_bounded(int64_t capacity) {
+    /* §11.11: a capacity below 1 TRAPS rather than clamping. A zero-capacity
+     * channel can never hold a value, so every send on it blocks forever and
+     * the first send is a guaranteed deadlock; rounding up to 1 turns a
+     * program that cannot work into one that quietly does something else. */
+    if (capacity < 1) {
+        manit_fault("a channel capacity must be at least 1");
+        return NULL;
+    }
     ManitChan* c = malloc(sizeof(ManitChan));
     if (!c) return NULL;
-    if (capacity < 1) capacity = 1;
     if (capacity > (int64_t)1 << 30) capacity = (int64_t)1 << 30;
     c->capacity = (int)capacity;
     c->buffer = malloc(sizeof(int64_t) * (size_t)c->capacity);
@@ -166,21 +249,74 @@ ManitChan* channel_bounded(int64_t capacity) {
     c->closed = 0;
     c->waiters = NULL;
     c->waiters_tail = NULL;
+    c->bounded = 1;   /* an explicit capacity is a BOUND; channel_new clears it */
+    c->send_waiters = NULL;
+    c->send_waiters_tail = NULL;
     pthread_mutex_init(&c->lock, NULL);
     pthread_cond_init(&c->not_empty, NULL);
     pthread_cond_init(&c->not_full, NULL);
     return c;
 }
 
+/* Grow an UNBOUNDED channel's ring. Called with the lock held.
+ *
+ * The ring may be wrapped, so the copy is two runs and not one `memcpy` —
+ * getting that wrong reorders the queue, which §11.5 (RECV) makes observable
+ * as values arriving out of order. Returns 0 only if the allocation fails,
+ * where the caller keeps the old ring and the send is dropped rather than
+ * corrupting it. */
+static int manit_chan_grow(ManitChan* c) {
+    int newcap = c->capacity * 2;
+    if (newcap <= c->capacity) return 0;           /* overflow */
+    int64_t* nb = malloc(sizeof(int64_t) * (size_t)newcap);
+    if (!nb) return 0;
+    for (int i = 0; i < c->count; i++) {
+        nb[i] = c->buffer[(c->head + i) % c->capacity];
+    }
+    free(c->buffer);
+    c->buffer = nb;
+    c->capacity = newcap;
+    c->head = 0;
+    c->tail = c->count;
+    return 1;
+}
+
 void channel_send(ManitChan* c, int64_t v) {
     if (!c) return;
     pthread_mutex_lock(&c->lock);
-    while (c->count == c->capacity && !c->closed) {
+    /* P107 / §11.1. An UNBOUNDED channel grows; only an explicitly bounded one
+     * can be full, and §11.4's list of three yield points depends on exactly
+     * that. */
+    if (!c->bounded) {
+        while (c->count == c->capacity && !c->closed) {
+            if (!manit_chan_grow(c)) break;
+        }
+    }
+    if (manit_sched_active()) {
+        /* §11.11 (SEND-BLOCK). The task leaves R for S(c). The LOOP is the
+         * specification: a woken sender RE-EXECUTES its send, because a third
+         * task may have taken the space it was woken for.
+         *
+         * Without this the bounded send waited on `not_full` while HOLDING THE
+         * BATON, so the receiver that would drain the channel could never run
+         * — P100's defect exactly, one construct along. */
+        while (c->bounded && c->count == c->capacity && !c->closed) {
+            pthread_mutex_unlock(&c->lock);
+            manit_sched_block_on(&c->send_waiters, &c->send_waiters_tail);
+            pthread_mutex_lock(&c->lock);
+        }
+    }
+    while (c->bounded && c->count == c->capacity && !c->closed) {
         pthread_cond_wait(&c->not_full, &c->lock);
     }
     if (c->closed) {
+        /* §11.10 (SEND-CLOSED). The value has nowhere to go — (RECV-CLOSED)
+         * drains what is already queued and then yields zeroes forever — so
+         * accepting it is data loss with no diagnostic. This used to warn on
+         * stderr and carry on, while T3 dropped the value in SILENCE: both
+         * lost it, and they disagreed about whether a program could tell. */
         pthread_mutex_unlock(&c->lock);
-        fprintf(stderr, "manit: send on closed channel\n");
+        manit_fault("send on a closed channel — the value cannot be received");
         return;
     }
     c->buffer[c->tail] = v;
@@ -250,6 +386,12 @@ int64_t channel_recv(ManitChan* c) {
     c->count--;
     pthread_cond_signal(&c->not_full);
     pthread_mutex_unlock(&c->lock);
+    /* §11.11 (RECV-WAKE): a receive frees exactly one slot, so exactly one
+     * sender is woken — the longest-waiting. A no-op on an unbounded channel,
+     * where nothing ever waits to send. */
+    if (manit_sched_active()) {
+        manit_sched_wake_one(&c->send_waiters, &c->send_waiters_tail);
+    }
     return v;
 }
 
@@ -272,6 +414,21 @@ void channel_close(ManitChan* c) {
     pthread_cond_broadcast(&c->not_empty);
     pthread_cond_broadcast(&c->not_full);
     pthread_mutex_unlock(&c->lock);
+    /* §11.10 (CLOSE): wake EVERY task on B(c), not one. The condition
+     * broadcasts above serve the UNSCHEDULED path, where waiters are OS
+     * threads; under the scheduler a waiter is a task on this channel's own
+     * queue and the broadcast reaches nobody. Without this line a task blocked
+     * in `recv` when another closed the channel was stranded, and the program
+     * ended in §11.6's deadlock trap — on BOTH backends, which is why the
+     * parity matrix reported nothing. */
+    if (manit_sched_active()) {
+        manit_sched_wake_all(&c->waiters, &c->waiters_tail);
+        /* §11.11: the SENDERS too. Each re-executes its send, finds the
+         * channel closed and traps by §11.10 (SEND-CLOSED) — the right
+         * outcome, since its value has nowhere to go and the alternative is a
+         * task parked forever on a channel nothing will drain. */
+        manit_sched_wake_all(&c->send_waiters, &c->send_waiters_tail);
+    }
 }
 
 int channel_is_closed(ManitChan* c) {
@@ -394,6 +551,10 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     int64_t permits;
+    /* §11.9: a Semaphore(n) is a channel pre-loaded with n tokens, so
+     * `permits` is |𝒞(s)| and these two are its B(c). */
+    void* waiters;
+    void* waiters_tail;
 } ManitSemaphore;
 
 ManitSemaphore* Semaphore_new(int64_t permits) {
@@ -402,11 +563,29 @@ ManitSemaphore* Semaphore_new(int64_t permits) {
     pthread_mutex_init(&s->lock, NULL);
     pthread_cond_init(&s->cond, NULL);
     s->permits = permits;
+    s->waiters = NULL;
+    s->waiters_tail = NULL;
     return s;
 }
 
 void Semaphore_acquire(ManitSemaphore* s) {
     if (!s) return;
+    if (manit_sched_active()) {
+        /* §11.9: `acquire` is `recv` — take a token, or block at §11.4's
+         * SECOND yield point, which already exists. Before this the
+         * (n+1)-th acquirer waited on a condition variable no task could
+         * ever signal, because signalling it needs the baton the waiter is
+         * still holding: the whole program stopped, printing nothing. */
+        pthread_mutex_lock(&s->lock);
+        while (s->permits <= 0) {
+            pthread_mutex_unlock(&s->lock);
+            manit_sched_block_on(&s->waiters, &s->waiters_tail);
+            pthread_mutex_lock(&s->lock);
+        }
+        s->permits--;
+        pthread_mutex_unlock(&s->lock);
+        return;
+    }
     pthread_mutex_lock(&s->lock);
     while (s->permits <= 0)
         pthread_cond_wait(&s->cond, &s->lock);
@@ -416,6 +595,14 @@ void Semaphore_acquire(ManitSemaphore* s) {
 
 void Semaphore_release(ManitSemaphore* s) {
     if (!s) return;
+    if (manit_sched_active()) {
+        /* §11.5 (SEND-WAKE): one permit back, at most one waiter woken. */
+        pthread_mutex_lock(&s->lock);
+        s->permits++;
+        pthread_mutex_unlock(&s->lock);
+        manit_sched_wake_one(&s->waiters, &s->waiters_tail);
+        return;
+    }
     pthread_mutex_lock(&s->lock);
     s->permits++;
     pthread_cond_signal(&s->cond);
@@ -442,8 +629,15 @@ int64_t Semaphore_available(ManitSemaphore* s) {
 /* ======================== Barrier ======================== */
 
 typedef struct {
-    pthread_barrier_t barrier;
     int count;
+    /* §11.9's desugaring: an arrival counter that outlives any one task, held
+     * exclusively while it is read and written, plus a gate channel whose
+     * tokens (`releases`) let the other n-1 through once the last arrives. */
+    pthread_mutex_t lock;
+    int64_t arrived;
+    int64_t releases;
+    void* waiters;
+    void* waiters_tail;
 } ManitBarrier;
 
 ManitBarrier* Barrier_new(int64_t n) {
@@ -451,17 +645,65 @@ ManitBarrier* Barrier_new(int64_t n) {
     ManitBarrier* b = malloc(sizeof(*b));
     if (!b) return NULL;
     b->count = (int)n;
-    if (pthread_barrier_init(&b->barrier, NULL, (unsigned)n) != 0) {
-        free(b);
-        return NULL;
-    }
+    b->arrived = 0;
+    b->releases = 0;
+    b->waiters = NULL;
+    b->waiters_tail = NULL;
+    pthread_mutex_init(&b->lock, NULL);
     return b;
 }
 
 int Barrier_wait(ManitBarrier* b) {
     if (!b) return 0;
-    int rc = pthread_barrier_wait(&b->barrier);
-    return rc == PTHREAD_BARRIER_SERIAL_THREAD ? 1 : 0;
+    if (manit_sched_active()) {
+        /* §11.9. Nobody passes until n have arrived; then all n pass and
+         * exactly one — the LAST to arrive — is the leader.
+         *
+         * Note the order: the counter's lock is released BEFORE blocking on
+         * the gate. §11.9 states that as the specification rather than a
+         * detail, because holding it while blocked means no later task can
+         * arrive to release it and the barrier deadlocks at n = 2 for every
+         * program. It is mechanical to write the two the wrong way round. */
+        pthread_mutex_lock(&b->lock);
+        b->arrived++;
+        if (b->arrived >= (int64_t)b->count) {
+            b->arrived = 0;                    /* reset: the barrier is reusable */
+            b->releases = (int64_t)b->count - 1;
+            pthread_mutex_unlock(&b->lock);
+            for (int i = 0; i < b->count - 1; i++)
+                manit_sched_wake_one(&b->waiters, &b->waiters_tail);
+            return 1;
+        }
+        while (b->releases == 0) {
+            pthread_mutex_unlock(&b->lock);
+            manit_sched_block_on(&b->waiters, &b->waiters_tail);
+            pthread_mutex_lock(&b->lock);
+        }
+        b->releases--;
+        pthread_mutex_unlock(&b->lock);
+        return 0;
+    }
+    /* Unscheduled: `docs/memory-model.md` §4, where `spawn { B }` runs B in
+     * place, so there is exactly one thread and a real `pthread_barrier_wait`
+     * would block it forever. Count the arrival and let the last one through
+     * as the leader — the same algorithm the T3 emulator's syscall 118 runs
+     * on its unscheduled path, and the same one the LLVM backend used to
+     * EMIT into every module rather than call.
+     *
+     * That emitted copy is why this function was unreachable on LLVM: it
+     * shadowed this one, so the scheduler-aware path above was dead and a
+     * `Barrier(2)` released one party alone. Three implementations, one
+     * reachable. There is now one, here.
+     *
+     * `pthread_barrier_t` went with it — it was initialised in `Barrier_new`
+     * and waited on only by the line this replaces, so nothing on either path
+     * used it. It is also the least portable thing in this file. */
+    pthread_mutex_lock(&b->lock);
+    b->arrived++;
+    int leader = b->arrived >= (int64_t)b->count;
+    if (leader) b->arrived = 0;   /* cycle complete: the barrier is reusable */
+    pthread_mutex_unlock(&b->lock);
+    return leader;
 }
 
 int64_t Barrier_count(ManitBarrier* b) {

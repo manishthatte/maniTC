@@ -655,11 +655,29 @@ impl Parser {
                         "expected `>` to close channel element type, found {:?}", self.peek())));
                 }
                 self.expect(&TokenKind::LParen)?;
+                // §11.11: an optional CAPACITY. `channel<T>()` is unbounded,
+                // as §11.1 has always said; `channel<T>(n)` holds at most n
+                // and a full `send` becomes §11.4's fourth yield point.
+                //
+                // One expression and not a list, because a channel has exactly
+                // one thing to configure and accepting a comma here would make
+                // a two-argument typo parse.
+                // §11.11: the two forms lower to two DIFFERENT builtins
+                // rather than to one with a sentinel capacity. A sentinel was
+                // written first and is wrong: whatever value stands for "no
+                // argument" is also a value the user can write, so
+                // `channel<T>(0)` — which §11.11 says must TRAP — becomes
+                // indistinguishable from `channel<T>()`. Two names have no
+                // such collision, and `channel_new` is already registered.
+                let (name, args) = if self.peek() == &TokenKind::RParen {
+                    ("channel_new", vec![])
+                } else {
+                    ("channel_bounded", vec![self.parse_expr()?])
+                };
                 self.expect(&TokenKind::RParen)?;
-                // Represent as call to builtin "channel"
                 Ok(Expr::Call(
-                    Box::new(Expr::Ident("channel".to_string(), span)),
-                    vec![],
+                    Box::new(Expr::Ident(name.to_string(), span)),
+                    args,
                     span,
                 ))
             }

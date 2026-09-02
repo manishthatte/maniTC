@@ -176,6 +176,16 @@ pub const LINTS: &[(WarningKind, &str, LintLevel)] = &[
     // resolves to `Unknown` and nothing is checked differently, it simply stops
     // being reported.
     (WarningKind::UndeclaredType, "undeclared-type", LintLevel::Deny),
+    // NAMED `undeclared-field`, not `unknown-field`, and the reason is
+    // measured rather than stylistic: the lexer reads `unknown` as the
+    // three-valued literal, so `lint allow(unknown-field);` is a PARSE ERROR.
+    // That is not a new problem — the existing `unknown-type` lint has been
+    // unwritable in an in-source directive for as long as it has existed
+    // (report.txt P104) — but a lint whose `allow` cannot be spelled is not an
+    // exact restoration of anything, which is the guarantee this file makes.
+    // `undeclared-field` also matches `undeclared-type` and
+    // `undeclared-native`, which is what it belongs beside.
+    (WarningKind::UnknownField, "undeclared-field", LintLevel::Deny),
 ];
 
 /// Resolve a lint name to its kind. `None` for an unknown name.

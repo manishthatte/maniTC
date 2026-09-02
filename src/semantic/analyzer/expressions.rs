@@ -759,6 +759,52 @@ impl SemanticAnalyzer {
                         }
                     }
                 }
+                // P103: a field the struct does not have. Refused HERE rather
+                // than left to `field_slot_index`, which has no slot for it and
+                // reads SLOT 0 — so the program runs and returns a different
+                // field's value, on both backends, with `check` exiting 0.
+                //
+                // Only when the struct is KNOWN. An unresolved receiver is
+                // `ManiType::Unknown` and is P95's finding, not this one; a
+                // tuple has its own arm in `resolve_field_type`; and a generic
+                // struct's field NAMES do not depend on its type arguments,
+                // which is why membership in `self.structs` is the right
+                // question even when the field's TYPE is still `Unknown`
+                // (P68).
+                //
+                // Returned as an `Err` for P70's measured reason: `main` prints
+                // warnings only after `analyze` RETURNS, so `analyze`'s `?` on
+                // the first type error discards them, and every observable case
+                // of this defect is one where something else goes wrong later.
+                if let ManiType::Struct(sname, _) = &tobj.ty {
+                    if self
+                        .warnings
+                        .effective_level(&WarningKind::UnknownField)
+                        .is_error()
+                    {
+                        if let Some(fields) = self.structs.get(sname.as_str()) {
+                            if !fields.iter().any(|(n, _)| n == field) {
+                                let hint = did_you_mean(
+                                    field,
+                                    fields.iter().map(|(n, _)| n.clone()),
+                                )
+                                .unwrap_or_default();
+                                let sname = sname.clone();
+                                return Err(self.err(
+                                    span,
+                                    format!(
+                                        "`{sname}` has no field `{field}`{hint}. It used to \
+                                         resolve to the unknown type, so the program \
+                                         type-checked and the read took SLOT 0 — a \
+                                         different field's value, on both backends. \
+                                         (`lint allow(undeclared-field);` restores the \
+                                         previous behaviour, in which this was silent.)"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
                 let field_ty = self.resolve_field_type(&tobj.ty, field);
                 Ok(TypedExpr {
                     kind: TypedExprKind::Field(Box::new(tobj), field.clone()),

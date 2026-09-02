@@ -178,6 +178,17 @@ struct Shared {
     blocked: Vec<VecDeque<TaskId>>,
     /// §11.3 𝒞.
     chans: Vec<VecDeque<Val>>,
+    /// §11.10 𝒦, the closed set. One flag per channel rather than a set,
+    /// because channels are named by index here and the two are the same
+    /// thing at this size.
+    closed: Vec<bool>,
+    /// §11.11: each channel's capacity, 0 meaning UNBOUNDED. Unbounded is the
+    /// default and what every channel was before 0.7.
+    caps: Vec<usize>,
+    /// §11.11 `S`, the send-blocked map. A SECOND map and not an extension of
+    /// `blocked`: a `recv` must wake a SENDER and a `send` must wake a
+    /// RECEIVER, and one queue holding both lets either wake the wrong kind.
+    blocked_send: Vec<VecDeque<TaskId>>,
     /// §8: the first trap ends the program, so later ones are not recorded.
     trap: Option<String>,
     /// The program is over — by a trap, or by §11.6's deadlock, or normally.
@@ -204,6 +215,9 @@ impl Sched {
                 run: VecDeque::from([0usize]),
                 blocked: Vec::new(),
                 chans: Vec::new(),
+                closed: Vec::new(),
+                caps: Vec::new(),
+                blocked_send: Vec::new(),
                 trap: None,
                 stopping: false,
             }),
@@ -252,10 +266,13 @@ impl Sched {
     }
 
     /// A fresh channel: an entry in 𝒞 and its own queue in B.
-    fn new_channel(&self) -> usize {
+    fn new_channel(&self, cap: usize) -> usize {
         let mut g = self.lock();
         g.chans.push(VecDeque::new());
         g.blocked.push(VecDeque::new());
+        g.blocked_send.push(VecDeque::new());
+        g.closed.push(false);
+        g.caps.push(cap);
         g.chans.len() - 1
     }
 
@@ -290,11 +307,63 @@ impl Sched {
     /// Never blocks: §11.1 leaves channels unbounded, which §11.4 gives as the
     /// reason `send` is not a fourth yield point. Exactly one waiter is woken,
     /// and it is the longest-waiting.
-    fn send(&self, c: usize, v: Val) {
+    fn send(&self, id: TaskId, c: usize, v: Val) -> R<()> {
+        // §11.11 (SEND-BLOCK). The LOOP is the specification, exactly as it is
+        // for `recv`: a woken sender RE-EXECUTES its send, because a third
+        // task may have taken the space it was woken for. An unbounded channel
+        // is never full, so a program that asks for no capacity never enters
+        // it and §11.4's original three yield points remain exactly its yield
+        // points.
+        loop {
+            {
+                let mut g = self.lock();
+                // §11.10 (SEND-CLOSED). Tested FIRST: a sender woken by
+                // (CLOSE) must trap rather than re-block.
+                if g.closed[c] {
+                    return trap("send on a closed channel — the value cannot be received");
+                }
+                let cap = g.caps[c];
+                if cap == 0 || g.chans[c].len() < cap {
+                    g.chans[c].push_back(v);
+                    if let Some(w) = g.blocked[c].pop_front() {
+                        g.run.push_back(w);
+                    }
+                    break;
+                }
+                debug_assert_eq!(g.run.front(), Some(&id), "§11.3: only the head runs");
+                g.run.pop_front();
+                g.blocked_send[c].push_back(id);
+                self.check_end(&mut g);
+            }
+            self.cv.notify_all();
+            self.await_turn(id)?;
+        }
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// §11.10 (CLOSE). Marks the channel closed and wakes **every** task
+    /// waiting on it, in `B(c)`'s own order.
+    ///
+    /// The one place in §11 where all waiters are woken rather than one, and
+    /// not an inconsistency with (SEND-WAKE): a `send` produces exactly one
+    /// value so only one waiter can proceed, while a `close` produces no value
+    /// but makes a PERMANENT fact true of the channel, and every waiter's
+    /// `recv` can now complete with (RECV-CLOSED)'s zero. A waiter left on
+    /// `B(c)` after a close is stranded forever, because no `send` will ever
+    /// wake it.
+    ///
+    /// Idempotent: a second close finds `B(c)` already empty.
+    fn close(&self, c: usize) {
         {
             let mut g = self.lock();
-            g.chans[c].push_back(v);
-            if let Some(w) = g.blocked[c].pop_front() {
+            g.closed[c] = true;
+            while let Some(w) = g.blocked[c].pop_front() {
+                g.run.push_back(w);
+            }
+            // §11.11: the SENDERS too. Each re-executes its send, finds the
+            // channel closed and traps by (SEND-CLOSED).
+            while let Some(w) = g.blocked_send[c].pop_front() {
                 g.run.push_back(w);
             }
         }
@@ -314,7 +383,22 @@ impl Sched {
             {
                 let mut g = self.lock();
                 if let Some(v) = g.chans[c].pop_front() {
+                    // §11.11 (RECV-WAKE): a receive frees exactly one slot, so
+                    // exactly one sender is woken — the longest-waiting.
+                    if let Some(w) = g.blocked_send[c].pop_front() {
+                        g.run.push_back(w);
+                    }
+                    drop(g);
+                    self.cv.notify_all();
                     return Ok(v);
+                }
+                // §11.10 (RECV-CLOSED) takes precedence over (RECV-BLOCK): a
+                // drained, CLOSED channel completes the receive with the zero
+                // value instead of blocking. The zero is a real value and
+                // cannot be told from a sent one — that is the cost of the
+                // rule, and why `try_recv` exists.
+                if g.closed[c] {
+                    return Ok(Val::Int(0));
                 }
                 debug_assert_eq!(g.run.front(), Some(&id), "§11.3: only the head runs");
                 g.run.pop_front();
@@ -349,7 +433,17 @@ impl Sched {
         if !g.run.is_empty() || g.stopping {
             return;
         }
-        if g.blocked.iter().any(|q| !q.is_empty()) {
+        // §11.11: `S` counts as much as `B`, and the message names which —
+        // "fill" for a channel nobody will send to, "drain" for one nobody
+        // will receive from. The wrong word sends the reader looking for a
+        // missing sender when the problem is a missing receiver.
+        if g.blocked_send.iter().any(|q| !q.is_empty()) {
+            g.trap = Some(
+                "deadlock — every task is blocked on a channel that no runnable \
+                 task can drain"
+                    .into(),
+            );
+        } else if g.blocked.iter().any(|q| !q.is_empty()) {
             g.trap = Some(
                 "deadlock — every task is blocked on a channel that no runnable \
                  task can fill"
@@ -967,7 +1061,7 @@ where
                 // §6.7: the channel carries `int`, so the value is cast on the
                 // way IN. Casting on the way out would make what a receiver
                 // sees depend on the binding it happens to be stored in.
-                self.sched.send(c, cast(v, Ty::Int));
+                self.sched.send(self.id, c, cast(v, Ty::Int))?;
                 Ok(Val::Int(0))
             }
             "recv" => {
@@ -975,6 +1069,16 @@ where
                     return trap("`recv` takes no arguments");
                 }
                 self.sched.recv(self.id, c)
+            }
+            // §11.10 (CLOSE). Added in 0.6 — the operation had been on BOTH
+            // BACKENDS since before §11 was written, and this account is the
+            // one that had to catch up, which is the reverse of §11.9.
+            "close" => {
+                if !args.is_empty() {
+                    return trap("`close` takes no arguments");
+                }
+                self.sched.close(c);
+                Ok(Val::Int(0))
             }
             other => trap(format!("`{}` is not a channel operation", other)),
         }
@@ -1015,7 +1119,24 @@ where
             if !args.is_empty() {
                 return trap("`channel()` takes no arguments");
             }
-            return Ok(Val::Chan(self.sched.new_channel()));
+            return Ok(Val::Chan(self.sched.new_channel(0)));
+        }
+
+        // §11.11. `channel<T>(n)` in the surface language, which the core
+        // spells as a second constructor — see the note in `parser/exprs.rs`
+        // for why two names rather than one with a sentinel capacity.
+        if name == "channel_bounded" {
+            let cap = match args {
+                [a] => self.expr(a, env)?.as_print_int(),
+                _ => return trap("`channel_bounded` takes exactly one argument"),
+            };
+            // A capacity below 1 traps rather than clamping: a zero-capacity
+            // channel can never hold a value, so every send on it blocks
+            // forever.
+            if cap < 1 {
+                return trap("a channel capacity must be at least 1");
+            }
+            return Ok(Val::Chan(self.sched.new_channel(cap as usize)));
         }
 
         // §1. The core's only library surface: the four printers.

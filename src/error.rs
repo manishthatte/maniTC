@@ -325,6 +325,21 @@ pub enum WarningKind {
     /// resolve to `ManiType::Unknown`, which is compatible with everything, so
     /// the program type-checks and both backends run it.
     UndeclaredType,
+    /// P103: a field name that the struct does not have.
+    ///
+    /// P95's mechanism one level in. That refuses a TYPE name nothing
+    /// declares; this refuses a FIELD name the (perfectly well declared)
+    /// struct does not have. Both end in `ManiType::Unknown`, and this one
+    /// then reaches `field_slot_index`, which has no slot for it and reads
+    /// **slot 0** — so the program runs and returns a different field's value.
+    ///
+    /// `field_slot_index` has carried a `debug_assert!` for exactly this since
+    /// P44. It is DEBUG-ONLY, and `thatteos/build.sh` resolves the compiler to
+    /// `target/release/manitc`, so the assertion never fired in the builds that
+    /// ship. P102(b) is what that cost: two thatteOS syscalls tested
+    /// `!desc.valid` on a struct whose field is `open`, read `desc.fd`
+    /// instead, and mis-answered EBADF.
+    UnknownField,
     /// A2: a function is unavailable on the selected backend because something
     /// in its reachable call graph is. Reported with the call chain.
     ///

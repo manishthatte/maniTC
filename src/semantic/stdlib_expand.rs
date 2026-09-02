@@ -242,6 +242,19 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
         })
         .collect();
 
+    // Natives the HOST program declares itself. A module's declaration of the
+    // same name is skipped rather than merged, on P62's precedent that the
+    // host's own definition wins — and here the alternative is not bloat but
+    // an ERROR, since a second declaration of one native is refused.
+    let host_extern_names: HashSet<String> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::ExternDecl(d) => Some(d.name.clone()),
+            _ => None,
+        })
+        .collect();
+
     // Build the combined rewrite context and transform each module.
     let mut merged_items: Vec<Item> = Vec::new();
     // Host-program rewrites: qualified const name -> inlined initializer,
@@ -410,6 +423,38 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
                         ctx.rewrite_expr(init);
                     }
                     merged_items.push(Item::GlobalVar(g));
+                }
+                // A1 declarations. These used to fall into the `_ => {}`
+                // below, which is report.txt P61's shape exactly, one item
+                // kind later: `Item::ImplBlock` vanished there and a module's
+                // methods silently did not expand. An `extern "c" fn` in a
+                // stdlib module vanished the same way, so the A1 declaration
+                // mechanism could not be used BY the standard library — the
+                // one place a native declaration is most worth having — and
+                // it failed silently, the declaration simply doing nothing.
+                //
+                // Found by writing `AtomicTrit`'s `deprecated(...)` clause for
+                // step 4 and measuring that no warning appeared. Nothing else
+                // would have reported it: no stdlib module had ever contained
+                // a declaration, so the population was zero. *A defect with a
+                // population of zero is not absent, it is unwritten.*
+                //
+                // The name is already qualified as it is CALLED
+                // (`AtomicTrit::new`), which is what `check_extern_call_site`
+                // looks up, so unlike a free function it must not be
+                // re-qualified with the module name.
+                Item::ExternDecl(d) => {
+                    if host_extern_names.contains(&d.name) {
+                        continue;
+                    }
+                    let mut d = d.clone();
+                    for p in &mut d.params {
+                        ctx.rewrite_type(&mut p.ty);
+                    }
+                    if let Some(rt) = &mut d.ret_ty {
+                        ctx.rewrite_type(rt);
+                    }
+                    merged_items.push(Item::ExternDecl(d));
                 }
                 // Inlined constants and use-decls produce no merged item.
                 _ => {}

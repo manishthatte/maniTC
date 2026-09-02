@@ -2,8 +2,17 @@
 
 © Manish Jagdish Thatte
 
-**Status: version 0.3, 24 August 2026. Normative for the constructs it
+**Status: version 0.7, 2 September 2026. Normative for the constructs it
 covers, and silent about everything else.**
+
+> **Correction, 2 September 2026.** This line read *"version 0.3, 24 August
+> 2026"* until today, while §12 below has carried a **0.4** entry since 29
+> August. Nothing in it was a false sentence when written; it simply was not
+> reopened when §11 landed. That is the fourth shape in this repository's
+> documentation-defect series — an absence, a word, a mechanism, and a count —
+> here in the normative document itself, and it is now pinned by
+> `tests/conformance_tests.rs` rather than described.
+
 
 This document says what a ManiT program *means*, independently of how either
 backend compiles it. Where this document and an implementation disagree, the
@@ -550,13 +559,31 @@ disagree about integer width. Recorded as report.txt P9.
 
 ## 11. Interleaving
 
-**Status: this section specifies a TARGET, and is ahead of all three
-implementations.** Everything above describes what ManiT does; this describes
-what it will do when
-`enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md` is implemented.
-Until then `docs/memory-model.md` §4 is the normative account of the language
-as it runs — execution is sequential and `spawn { B }` evaluates `B` in place
-— and report.txt P5.2/P5.3 are open against *that*, not against this.
+**Status, corrected 2 September 2026: §11.1–§11.8 are IMPLEMENTED by all
+three; §11.9 by both backends and §11.10 by both backends, with the A3
+reference behind on those two.** §1.2 makes this line an obligation rather
+than a courtesy, so it is restated whenever it stops being true.
+
+Steps 1–3 of `enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md` §5
+have landed: the A3 reference (step 1), the T3 emulator's scheduler and the
+`spawn` lowering (step 2), and the C runtime's scheduler and outlining
+(step 3). `--sched cooperative` compiles §11 on both backends and
+`examples/concurrency.mt` is byte-identical between them. **§11.9 is step 4 and
+is not implemented at the moment it is being read for the first time**, which
+is the state §1.2 exists to make legible.
+
+> The original text, kept because it is the record and because it was true for
+> six days: *"this section specifies a TARGET, and is ahead of all three
+> implementations. Everything above describes what ManiT does; this describes
+> what it will do when `CONCURRENCY_DECISION.md` is implemented. Until then
+> `docs/memory-model.md` §4 is the normative account of the language as it runs
+> — execution is sequential and `spawn { B }` evaluates `B` in place — and
+> report.txt P5.2/P5.3 are open against that, not against this."*
+
+`docs/memory-model.md` §4 remains the account of the **default** mode, which is
+still `--sched inline` and still evaluates `spawn { B }` in place; P5.2 and
+P5.3 are open against that. What changed is that the scheduled mode is no
+longer hypothetical.
 
 Saying so is the point of writing it here rather than later. The decision was
 taken on 24 August 2026 and its own §5 puts specification first, "because A3's
@@ -576,12 +603,26 @@ document should not take casually:
   it a handle means deciding what awaiting a task that has already finished
   does, what awaiting one twice does, and whether a handle can outlive its
   task. The next increment, and the reason `spawn` is a STATEMENT below.
-- **`Mutex`, `Barrier`, `Semaphore`** — the decision document §2 keeps them as
-  *structured waiting* rather than mutual exclusion. They are expressible in
-  terms of §11.4's yield points, and they need none of their own.
-- **Bounded channels**, so `send` never blocks (§11.4).
-- **Closing a channel**, which is how a receiver learns no more will come.
-  Without it the only way a `recv` ends is a value or the deadlock of §11.6.
+- ~~**`Mutex`, `Barrier`, `Semaphore`**~~ — **specified in §11.9 as of 0.5,
+  2 September 2026.** The decision document §2 keeps them as *structured
+  waiting* rather than mutual exclusion. They are expressible in terms of
+  §11.4's yield points, and they need none of their own — a claim this bullet
+  made before it had been checked, and which §11.9 discharges by giving the
+  expression. It is exactly true: no new rule, no new yield point, no new
+  configuration component.
+- ~~**Bounded channels**~~ — **specified in §11.11 as of 0.7, 2 September
+  2026.** This bullet read "so `send` never blocks (§11.4)", and on the LLVM
+  backend it was **false the whole time**: `channel_new` allocated a 256-slot
+  ring and a 257th send blocked on a condition variable nothing could signal,
+  so the program printed nothing at all while T3 grew its queue and answered
+  (report.txt P107). The clause that justified §11.4's list of three was the
+  one the implementation contradicted.
+- ~~**Closing a channel**~~ — **specified in §11.10 as of 0.6, 2 September
+  2026**, which is how a receiver learns no more will come. Without it the only
+  way a `recv` ends is a value or the deadlock of §11.6. This bullet was the
+  reverse of §11.9's: **both backends had implemented `close` since before §11
+  was written**, and `examples/concurrency.mt` depended on it, so the document
+  was the thing that lagged. Writing the rules down found two defects.
 - **Three-valued synchronisation** — `held / free / unknown`, the genuinely
   novel question. It depends on D2 (clock-domain types) and is research.
 
@@ -630,6 +671,21 @@ A running task keeps running until it reaches one of exactly three things:
 2. **`recv` on a channel whose queue is empty.**
 3. **its own termination.**
 
+> **Amended 2 September 2026 (0.7): there are now FOUR**, and this section
+> predicted the amendment — see the `send` note below, which named a full
+> `send` as the fourth and said "this list is what has to change". §11.11 makes
+> that change. Point 2 also gained "and which is not closed" in 0.6 (§11.10).
+> The current list is:
+>
+> 1. `yield` — explicit.
+> 2. `recv` on a channel whose queue is empty **and which is not closed**.
+> 3. **`send` on a channel that is full** — bounded channels only.
+> 4. its own termination.
+>
+> **An unbounded channel is never full, so a program that does not ask for a
+> capacity cannot reach point 3**, and for such programs the original three
+> are still exactly the yield points. That is why the addition moves nothing.
+
 **That is the whole list, and its completeness is the specification.** A
 conforming implementation may not switch tasks anywhere else — not at a call,
 not at a return, not on a loop back-edge, not at a print, and not on a timer.
@@ -641,7 +697,10 @@ Two consequences worth stating separately, because both are choices:
   makes `spawn` usable without reasoning about the scheduler.
 - **`send` does not yield**, because §11.1 leaves channels unbounded, so a send
   can always proceed. If bounded channels are ever added, a full `send` becomes
-  a fourth yield point, and this list is what has to change.
+  a fourth yield point, and this list is what has to change. **They were added
+  in 0.7 and it did** — §11.11. An UNBOUNDED `send` still does not yield, which
+  is what keeps this bullet true for every program that does not ask for a
+  capacity.
 
 ### 11.5 The rules
 
@@ -700,6 +759,11 @@ A task whose statement sequence is exhausted is removed:
     R = ε   and   B = ∅          the program ends, outcome = Normal
     R = ε   and   B ≠ ∅          TRAP (§8), outcome = Trap
 ```
+
+*As of 0.6, §11.10's (CLOSE) empties `B(c)` for the channel it closes, so a
+task waiting on a channel that someone closes is never among the `B ≠ ∅` that
+trap here. Before that rule existed it was — and the trap fired on programs
+whose receivers had in fact been told there was nothing more to wait for.*
 
 The second is the decision document's §3, and it is the strongest single
 argument for cooperative scheduling: **the scheduler knows the whole runnable
@@ -778,6 +842,336 @@ says so explicitly. See §9: a row that compares the reference against a backend
 on a concurrency program is asserting the gap, and must be labelled as
 asserting it.
 
+### 11.9 Structured waiting — `Mutex`, `Semaphore`, `Barrier`
+
+*Added in 0.5, 2 September 2026. §11.1 listed these three under "deliberately
+not specified yet" and said they were "expressible in terms of §11.4's yield
+points, and they need none of their own". This section discharges that
+sentence: it gives the expression, and the claim turns out to be exactly true.*
+
+**They are DERIVED forms, not primitives.** §11.5 gains no rule, §11.3 gains no
+component, and §11.4's list of three yield points is unchanged and still
+complete. Each of the three desugars into channel operations already specified,
+so every property proved of the core — determinism (§11.7), the longest-waiting
+wake order (SEND-WAKE), deadlock as a detected trap (§11.6) — holds of these by
+construction rather than by a second argument.
+
+#### The desugaring
+
+Written in the core of §2 plus §11's `channel()`, `send` and `recv`, which is
+the whole vocabulary it needs.
+
+A **`Semaphore`** is a channel pre-loaded with one token per permit. Acquiring
+takes a token; releasing puts one back. A task that finds the channel empty
+blocks at §11.4's *second* yield point, which is the one that already exists.
+
+```
+    sem_new(n)      ≡   let s = channel();
+                        mut i = 0; while i < n { s.send(1); i = i + 1; }  s
+    s.acquire()     ≡   s.recv();          // blocks while no permit is free
+    s.release()     ≡   s.send(1);         // wakes AT MOST ONE waiter
+    s.available()   ≡   |𝒞(s)|
+```
+
+A **`Mutex<T>`** is a one-slot channel **carrying the protected value**, and
+this is the part worth stating separately, because it answers a question §11.2
+otherwise leaves open. §11.2 gives a spawned task a *copy* of its spawner's
+store, so shared mutable state cannot live in a store at all; channels are the
+only contact between tasks. A mutex therefore cannot be a flag beside a value —
+**the value has to be the token**:
+
+```
+    mutex_new(v)    ≡   let m = channel();  m.send(v);  m
+    m.lock()        ≡   m.recv()           // blocks while another task holds it
+    g.get()         ≡   the value lock() returned
+    g.set(v)        ≡   changes what unlock() will send back
+    g.unlock()      ≡   m.send(v)          // hands it to the LONGEST-WAITING task
+```
+
+**Mutual exclusion is the token's absence from the channel**, not a lock bit,
+and the exclusion is therefore the same mechanism as `recv` blocking — not an
+analogue of it. `Mutex<T>` is `Semaphore(1)` whose permit carries `T`.
+
+A **`Barrier(n)`** needs an arrival count that outlives any one task, so the
+count is itself a channel, held exclusively while it is being read and written
+— a mutex by the line above — and a second channel gates the release:
+
+```
+    bar_new(n)      ≡   let count = channel(); count.send(0);
+                        let gate  = channel();  (count, gate)
+
+    b.wait()        ≡   mut c = count.recv();       // take the counter
+                        c = c + 1;
+                        if c == n {
+                            count.send(0);          // reset: the barrier is reusable
+                            mut i = 1;
+                            while i < n { gate.send(1); i = i + 1; }
+                            true                    // the LAST to arrive is the leader
+                        } else {
+                            count.send(c);          // release the counter FIRST
+                            gate.recv();            // then block until released
+                            false
+                        }
+```
+
+**The order of those last two lines is the specification, not an accident of
+how it was written.** Releasing the counter *after* blocking would leave the
+counter held by a task that is not running, so no later task could arrive to
+release it: the barrier would deadlock at n = 2 for every program. It is
+mechanical to write the two the wrong way round, and §11.6's trap is what
+catches it.
+
+#### The observable contract
+
+An implementation is conforming when a program cannot observe a difference from
+the desugaring. Stated directly, because these are the properties the tests
+assert and the ones the implementations got wrong:
+
+1. **At most one task holds a `Mutex`.** If task *A* holds it, a `lock()` in
+   task *B* does not return until *A* unlocks.
+2. **A `Semaphore(n)` admits at most n holders.** The (n+1)-th `acquire`
+   blocks until a `release`.
+3. **A `Barrier(n)` releases nobody until n have arrived**, then releases all
+   n, and returns `true` in exactly one of them — the last to arrive.
+4. **A release wakes at most one waiter**, the longest-waiting, appended to the
+   back of `R`. This is (SEND-WAKE) unchanged, including §11.7's warning that
+   waking all of them is nearly invisible to a test.
+5. **Blocking here is not a new yield point.** It is yield point 2, reached
+   through the desugaring. An implementation may not switch tasks on a `lock`
+   that succeeds, or on a `release`.
+
+#### What this section makes wrong, measured
+
+Recorded here rather than left for the reader to discover, because §11.8 set
+the precedent that a specification states its own cost, and because in this
+case the cost is already paid by programs that exist.
+
+Measured on `d841305` under `--sched cooperative`, two tasks contending:
+
+| | T3 | LLVM |
+|---|---|---|
+| `Mutex` | **both tasks hold it at once** | hangs, printing nothing at all |
+| `Semaphore(1)` | **admits two holders** | hangs, printing nothing at all |
+| `Barrier(2)` | **one party passes alone** | one party passes alone |
+
+The T3 emulator's five sites say so in their own comments — `mutex_lock` is
+*"no-op in sequential model"*, and so are `mutex_unlock`, `semaphore_acquire`
+and `semaphore_release`. **Those comments were true when they were written.**
+In the sequential model of `docs/memory-model.md` §4 there is never more than
+one task, so a lock that does nothing is not an approximation of mutual
+exclusion, it *is* mutual exclusion. Steps 2 and 3 of `CONCURRENCY_DECISION.md`
+§5 made tasks real and did not reach these five lines.
+
+The LLVM half is the sharper of the two only in appearance. A hang is loud; T3
+answers wrongly and exits 0, which by this project's own ranking is worse.
+Both are the same defect, and the Barrier row is worse still: **both backends
+agree**, so the parity matrix reports no divergence at all.
+
+### 11.10 Closing a channel
+
+*Added in 0.6, 2 September 2026. §11.1 listed this under "deliberately not
+specified yet" while **both backends had implemented it since before §11 was
+written** and `examples/concurrency.mt` depended on it. That is the reverse of
+§11.9's situation — there the document led and the implementations lagged; here
+the document lagged, and writing the rules down found two defects.*
+
+`c.close()` states that no further value will be sent. It is how a receiver
+learns that a drain is finished, and without it §11.6's deadlock trap is the
+only way a `recv` can end other than with a value.
+
+#### The rules
+
+§11.3's configuration gains **`𝒦`**, the set of closed channels. A program
+starts with `𝒦 = ∅`.
+
+```
+        ⟨ ⟨c.close(); s, σ⟩·R , B, 𝒞, 𝒦, ω ⟩
+                    → ⟨ ⟨s,σ⟩·R·B(c) , B[c ↦ ε], 𝒞, 𝒦 ∪ {c}, ω ⟩   (CLOSE)
+```
+
+**(CLOSE) wakes EVERY task waiting on `c`, and that is the one place in §11
+where all of them are woken rather than one.** It is not an inconsistency with
+(SEND-WAKE); it follows from what the two operations make true. A `send`
+produces exactly one value, so exactly one waiter can proceed and waking a
+second would have it find nothing and block again — §11.7's invisible bug. A
+`close` produces no value but makes a permanent fact true of the channel, and
+**every** waiter's `recv` can now complete. Leaving any of them on `B(c)` would
+strand it forever, because after a close no `send` will ever wake it.
+
+They are appended to `R` in `B(c)`'s own order, longest-waiting first, so
+(CLOSE) is as deterministic as the rest of §11.5.
+
+Closing is **idempotent**: `c ∈ 𝒦` already makes `B(c) = ε` by the rule above,
+so a second close moves nothing and adds nothing.
+
+A closed channel still **drains** — (RECV) is unchanged and takes values sent
+before the close:
+
+```
+                 𝒞(c) = ε   and   c ∈ 𝒦
+        ─────────────────────────────────────────────────────  (RECV-CLOSED)
+        ⟨ ⟨let x = c.recv(); s, σ⟩·R , B, 𝒞, 𝒦, ω ⟩
+                    → ⟨ ⟨s, σ[x ↦ 0]⟩·R , B, 𝒞, 𝒦, ω ⟩
+```
+
+(RECV-CLOSED) takes precedence over (RECV-BLOCK), which now requires
+`c ∉ 𝒦`. So a receive on a drained, closed channel **completes with the zero
+value rather than blocking**, and §11.7's determinism argument still holds:
+the three receive rules are separated by whether `𝒞(c)` is empty and whether
+`c ∈ 𝒦`, which are disjoint conditions.
+
+> **The zero is a real value and cannot be told from a sent one.** That is the
+> cost of this rule and the reason `try_recv` exists: it answers
+> `Err("closed")` where `recv` answers `0`, so a receiver that must
+> distinguish "the producer sent 0" from "the producer is finished" has to use
+> it. `examples/concurrency.mt` does exactly that, and its consumer loop is
+> the idiom.
+
+#### `send` on a closed channel is a trap
+
+```
+                        c ∈ 𝒦
+        ─────────────────────────────────────────────────────  (SEND-CLOSED)
+        ⟨ ⟨c.send(v); s, σ⟩·R , B, 𝒞, 𝒦, ω ⟩   →   TRAP
+
+    TRAP: send on a closed channel — the value cannot be received
+```
+
+The value has nowhere to go: no receiver will ever see it, because
+(RECV-CLOSED) drains what is already queued and then yields zeroes forever.
+Silently discarding it is data loss with no diagnostic, which is the shape
+P5.1 and P81 already rejected once for `recv`.
+
+This is the decision this section takes, and it is taken for the same reason as
+that one: **when a program cannot make progress in the way it asked to, the
+implementation should say so rather than continue plausibly.**
+
+#### What this section found
+
+Both defects were present on **both** backends, which is why the parity matrix
+reported nothing about either.
+
+1. **`close` did not wake blocked receivers.** A task blocked in `recv` when
+   another task closed the channel was never woken, and the program hit
+   §11.6's deadlock trap — reporting that no runnable task could fill the
+   channel, which was true and useless, because the close had already
+   established that none ever would. Measured identically on T3 and LLVM.
+
+2. **`send` on a closed channel diverged.** T3 dropped the value in silence;
+   LLVM dropped it and wrote `manit: send on closed channel` to stderr. Both
+   lost the value, and they disagreed about whether a program could tell.
+
+### 11.11 Bounded channels, and the fourth yield point
+
+*Added in 0.7, 2 September 2026. §11.1 listed this under "deliberately not
+specified yet" and §11.4 named the consequence in advance: "If bounded channels
+are ever added, a full `send` becomes a fourth yield point, and this list is
+what has to change." This is that change, made where it was predicted.*
+
+`channel<T>(n)` creates a channel that holds at most `n` values. `channel<T>()`
+is unbounded, as §11.1 has always said.
+
+#### `n` is a bound, not a hint
+
+A capacity below 1 is a **trap**, not a clamp:
+
+```
+TRAP: a channel capacity must be at least 1
+```
+
+A zero-capacity channel can never hold a value, so every `send` on it blocks
+forever and the program's first send is a guaranteed deadlock. Rounding it up
+to 1 would turn a program that cannot work into one that quietly does something
+else.
+
+#### The rules
+
+§11.3's configuration gains **`S`**, the *send*-blocked map — from channel to
+the finite sequence of tasks waiting to send on it, longest-waiting first. It
+is a second map and not an extension of `B`, and that is the point: a `recv`
+must wake a **sender**, a `send` must wake a **receiver**, and one queue holding
+both would let either wake the wrong kind, which is (SEND-WAKE)'s bug wearing a
+new hat.
+
+```
+              |𝒞(c)| = cap(c)
+        ─────────────────────────────────────────────────────  (SEND-BLOCK)
+        ⟨ ⟨t, σ⟩·R , B, S, 𝒞, 𝒦, ω ⟩ → ⟨ R , B, S[c ↦ S(c)·⟨t,σ⟩], 𝒞, 𝒦, ω ⟩
+                    where t is `c.send(v); s`
+```
+
+As with (RECV-BLOCK), the task is stored **with its `send` still in front of
+it**, so being woken means re-executing the send rather than being credited
+with it. A third task may take the space in between, and this is what makes
+that behave the way the rules say.
+
+```
+                 𝒞(c) = v·Q   and   S(c) = ⟨t⟩·W
+        ─────────────────────────────────────────────────────  (RECV-WAKE)
+        ⟨ ⟨let x = c.recv(); s, σ⟩·R , B, S, 𝒞, 𝒦, ω ⟩
+                    → ⟨ ⟨s, σ[x ↦ v]⟩·R·t , B, S[c ↦ W], 𝒞[c ↦ Q], 𝒦, ω ⟩
+```
+
+(RECV-WAKE) wakes **at most one** sender, the longest-waiting, appended to the
+back of `R` — the same shape as (SEND-WAKE) and for the same reason: a receive
+frees exactly one slot, so exactly one sender can proceed.
+
+(CLOSE) wakes the senders too:
+
+```
+        ⟨ ⟨c.close(); s, σ⟩·R , B, S, 𝒞, 𝒦, ω ⟩
+             → ⟨ ⟨s,σ⟩·R·B(c)·S(c) , B[c ↦ ε], S[c ↦ ε], 𝒞, 𝒦 ∪ {c}, ω ⟩
+```
+
+A woken sender re-executes its `send`, finds `c ∈ 𝒦` and traps by §11.10's
+(SEND-CLOSED). **That is the right outcome and not an accident**: its value has
+nowhere to go, and the alternative is a task parked forever on a channel
+nothing will ever drain.
+
+#### §11.4 now lists FOUR yield points
+
+**Corrected here rather than rewritten in place, because §11.4 says its own
+completeness is the specification.** The list is:
+
+1. `yield` — explicit.
+2. `recv` on a channel whose queue is empty **and which is not closed**
+   (§11.10).
+3. **`send` on a channel that is full** — bounded channels only, and new in
+   0.7.
+4. its own termination.
+
+An unbounded channel is never full, so **a program that does not ask for a
+capacity cannot reach point 3** and §11.4's original three remain exactly its
+yield points. That is why this addition moves no existing program.
+
+#### §11.6 counts both maps
+
+```
+    R = ε   and   B = ∅   and   S = ∅       the program ends, outcome = Normal
+    R = ε   and   (B ≠ ∅  or   S ≠ ∅)       TRAP (§8), outcome = Trap
+```
+
+A task blocked on a full channel that nothing will drain is as deadlocked as
+one blocked on an empty channel nothing will fill, and the scheduler can see
+both. The message names which:
+
+```
+TRAP: deadlock — every task is blocked on a channel that no runnable task can drain
+```
+
+#### Determinism survives
+
+§11.7's argument is unchanged in form. (SEND) and (SEND-BLOCK) are separated by
+whether `|𝒞(c)| = cap(c)`; (SEND-CLOSED) by `c ∈ 𝒦`, which is tested first;
+(RECV) and (RECV-WAKE) by whether `S(c)` is empty, and both by `𝒞(c)` against
+(RECV-CLOSED) and (RECV-BLOCK). Every rule still keys on the head of `R` and on
+one statement form, so `→` is still a partial function.
+
+**And the wake-all hazard §11.7 records applies to (RECV-WAKE) exactly as it
+does to (SEND-WAKE)**: a spuriously woken sender re-executes its send, finds
+the channel still full, and blocks again *while printing nothing*. It is
+observable only where the choice changes what is printed.
+
 ## 12. Changes
 
 - **0.1** (24 Aug 2026) — first version. Core as listed in §1. Written as A3,
@@ -808,3 +1202,64 @@ asserting it.
   the one P5.1 measured the absence of. Found report.txt **P83** while being
   written: the decision this section implements had been taken five days
   earlier and `report.txt` still told the reader to go and take it.
+- **0.5** (2 September 2026) — §11.9, structured waiting. `Mutex`, `Semaphore`
+  and `Barrier` move out of §11.1's "deliberately not specified yet" list and
+  into the core as **derived** forms, with the desugaring into channel
+  operations that §11.1 asserted existed. The assertion holds exactly: no new
+  rule, no new yield point, no new component of §11.3, and therefore no second
+  determinism argument. The one result worth naming is that **a `Mutex<T>` must
+  carry the protected value in the channel rather than beside it** — §11.2
+  gives a spawned task a copy of the store, so shared mutable state cannot live
+  in a store at all, and mutual exclusion is the token's absence rather than a
+  lock bit.
+
+  Written as step 4 of `CONCURRENCY_DECISION.md` §5, and it found what step 4
+  was for: measured on `d841305`, a contended `Mutex` lets **both** tasks hold
+  it on T3 and hangs printing nothing on LLVM, a `Semaphore(1)` admits two
+  holders, and a `Barrier(2)` lets one party through alone **on both backends**,
+  where the parity matrix cannot see it. The T3 emulator's own comments named
+  the cause — *"no-op in sequential model"*, true when written and untouched by
+  the two steps that made tasks real.
+
+  Also corrected the **status line at the top of this document**, which still
+  read 0.3 after 0.4 landed. A version in prose goes stale exactly as fast as a
+  count in prose does, and this one sat in the normative specification.
+- **0.6** (2 September 2026) — §11.10, closing a channel. The reverse of
+  §11.9's situation: `close` had been implemented on **both backends since
+  before §11 was written**, and `examples/concurrency.mt` depended on it, so
+  the specification was the thing that lagged. Writing the rules down found two
+  defects, both present on both backends and therefore invisible to the parity
+  matrix: **`close` did not wake blocked receivers**, so closing a channel a
+  task was waiting on deadlocked the program with a message that was true and
+  useless; and **`send` on a closed channel diverged**, T3 dropping the value
+  in silence while LLVM dropped it and wrote to stderr.
+
+  The rule worth naming is **(CLOSE) wakes EVERY waiter**, the one place in
+  §11 where all of them are woken rather than one. That is not an inconsistency
+  with (SEND-WAKE): a `send` produces one value so only one waiter can proceed,
+  while a `close` produces no value but makes a permanent fact true, and every
+  waiter's `recv` can now complete. Leaving any on `B(c)` would strand it
+  forever, because after a close no `send` will ever wake it.
+
+  `send` on a closed channel is now a **TRAP**, on P81's precedent: the value
+  has nowhere to go, and silently discarding it is data loss with no
+  diagnostic.
+- **0.7** (2 September 2026) — §11.11, bounded channels, and with them the
+  **fourth yield point** §11.4 predicted in its own text. `S`, the send-blocked
+  map, joins §11.3's configuration — a second map and not an extension of `B`,
+  because a `recv` must wake a SENDER and a `send` must wake a RECEIVER, and
+  one queue holding both lets either wake the wrong kind.
+
+  Writing it found report.txt **P107**, which is the clause that justified the
+  old list being false in the implementation: §11.1 said channels are unbounded
+  and §11.4 gave that as the reason `send` is not a yield point, while on LLVM
+  `channel_new` allocated a **256-slot ring** and a 257th send blocked on a
+  condition variable nothing could signal. The program printed **nothing at
+  all**; T3 grew its queue and answered. That is P5.1's signature for the third
+  distinct time in this document's history, after `recv` on an open empty
+  channel (P81) and the waiting primitives (P100).
+
+  A capacity below 1 is a **trap** rather than a clamp: a zero-capacity channel
+  can never hold a value, so every send on it blocks forever, and rounding it
+  up to 1 turns a program that cannot work into one that quietly does something
+  else.

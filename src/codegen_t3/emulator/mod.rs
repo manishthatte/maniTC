@@ -45,14 +45,33 @@ pub(super) enum HeapObj {
     ClosedChannel(std::collections::VecDeque<i64>),
     /// TernaryTrie: keys are Vec<i64> (sequence of trit values), values are i64
     Trie(std::collections::BTreeMap<Vec<i64>, i64>),
-    /// Mutex: holds a single value
-    Mutex(i64),
-    /// AtomicTrit: holds a trit value (-1, 0, or 1)
+    /// Mutex: the protected value, and the task holding it.
+    ///
+    /// §11.9 makes a `Mutex<T>` a ONE-SLOT CHANNEL CARRYING THE VALUE, so
+    /// "held" is the slot being empty rather than a lock bit beside it. The
+    /// holder is recorded because §11.6 has to be able to say that a task
+    /// blocked here can never be woken; `None` is free.
+    Mutex(i64, Option<usize>),
+    /// AtomicTrit: holds a trit value (-1, 0, or 1).
+    ///
+    /// DEPRECATED by `CONCURRENCY_DECISION.md` §2 — under a cooperative
+    /// schedule there is no pre-emption, so every sequence between two of
+    /// §11.4's yield points is already indivisible and this guarantees
+    /// nothing a plain `trit` does not.
     AtomicTrit(i64),
-    /// Barrier: (needed, arrived_count)
-    Barrier(i64, i64),
-    /// Semaphore: permit count
-    Semaphore(#[allow(dead_code)] i64),
+    /// Barrier: (needed, arrived, pending_releases).
+    ///
+    /// The third field is §11.9's gate channel. A task woken by the leader
+    /// RE-EXECUTES its syscall (see `sched_block_on`), so it needs to be able
+    /// to tell "I am resuming, already counted" from "I am arriving": a
+    /// pending release is the token that says the former.
+    Barrier(i64, i64, i64),
+    /// Semaphore: permit count. §11.9 makes it a channel pre-loaded with one
+    /// token per permit; this is |𝒞(s)|.
+    ///
+    /// It carried `#[allow(dead_code)]` until 2 September 2026, which was the
+    /// compiler saying out loud that nothing ever read the permits.
+    Semaphore(i64),
     /// Task result: stores a completed future's return value
     TaskResult(i64),
 }

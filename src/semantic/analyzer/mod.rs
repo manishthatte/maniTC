@@ -780,7 +780,11 @@ impl SemanticAnalyzer {
         // Concurrency primitives (opaque generic return types — not representable in static table)
         let chan_ty = Generic("Channel".to_string(), vec![Unknown]);
         self.functions.insert("channel".to_string(),     (vec![], chan_ty.clone()));
-        self.functions.insert("channel_new".to_string(), (vec![], chan_ty));
+        self.functions.insert("channel_new".to_string(), (vec![], chan_ty.clone()));
+        // §11.11: `channel<T>(n)`. A separate builtin rather than an optional
+        // parameter on `channel`, so no value has to stand for "absent" — see
+        // the note in the parser.
+        self.functions.insert("channel_bounded".to_string(), (vec![Int], chan_ty));
         self.functions.insert("Mutex::new".to_string(),
             (vec![Unknown], Generic("Mutex".to_string(), vec![Unknown])));
         self.functions.insert("AtomicTrit::new".to_string(), (vec![Trit],  Struct("AtomicTrit".to_string(), Vec::new())));
@@ -1286,6 +1290,23 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
     /// which is the shape of S45.
     fn collect_extern_decl(&mut self, decl: &ast::ExternDecl) -> CompileResult<()> {
         if let Some(prev) = self.externs.get(&decl.name) {
+            // A declaration scanned out of a STDLIB module is not a rival to
+            // one the program wrote; the program's is the authority and simply
+            // replaces it. Told apart by P80's `Span::module`, which
+            // `register_native_module_sigs` stamps with the module name and a
+            // user file leaves as `None` — the discriminator exists already
+            // and needs no flag on `ExternSig`.
+            //
+            // The ORDER is what makes this necessary rather than tidy: the
+            // stdlib scan runs BEFORE `collect_declarations`, so without it
+            // `stdlib/sync.mt` cannot type-check as a program — the scan
+            // registers the file's own declaration and the file then collides
+            // with itself, reporting "already declared at line 257" AT line
+            // 257. `tests/audit_regression_tests.rs::s49_*` type-checks every
+            // stdlib module and is what caught it.
+            if prev.span.module.is_some() && decl.span.module.is_none() {
+                self.externs.remove(&decl.name);
+            } else {
             return Err(CompileError::Type(crate::error::Diagnostic::new(
                 &self.dfile(decl.span),
                 decl.span.line,
@@ -1297,6 +1318,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     decl.name, prev.span.line
                 ),
             )));
+            }
         }
 
         let mut params = Vec::with_capacity(decl.params.len());
@@ -1990,6 +2012,29 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             };
             let register_ret = SIG_MODULES.contains(module);
             for item in &program.items {
+                // A1 declarations in a stdlib module. Without this arm they
+                // were skipped by the `else { continue }` below, so an
+                // `extern "c" fn` written in `stdlib/*.mt` did NOTHING — no
+                // signature, no `available`, no `deprecated`, and no
+                // diagnostic saying so.
+                //
+                // report.txt P61's shape for the third time in one pass, and
+                // the two halves fail for different reasons: a SOURCE module's
+                // declaration vanished in `stdlib_expand`'s merge loop, and a
+                // NATIVE-ONLY module's — `sync`, `io`, `time` — never reaches
+                // that loop at all, because only `SOURCE_MODULES` is merged.
+                // `sync` is where the deprecation step 4 calls for has to go,
+                // so both halves had to be fixed to make one clause work.
+                //
+                // A HOST declaration of the same name has already been
+                // collected and wins: a second declaration of one native is an
+                // error, and the program's own is the one the user wrote.
+                if let Item::ExternDecl(d) = item {
+                    if !self.externs.contains_key(&d.name) {
+                        let _ = self.collect_extern_decl(d);
+                    }
+                    continue;
+                }
                 let Item::FnDef(f) = item else { continue };
                 let qualified = format!("{}::{}", module, f.name);
 

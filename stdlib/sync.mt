@@ -235,6 +235,29 @@ impl Barrier {
 // AtomicTrit is the ternary analogue of AtomicBool / AtomicInt.
 // It is particularly useful for shared state flags that naturally have three
 // states (e.g. Unstarted / Running / Done mapped to - / 0 / +).
+//
+// DEPRECATED, 2 September 2026 — step 4 of
+// `enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md` §5, whose §2
+// gives the reason: an atomic exists to make an operation indivisible against
+// a PRE-EMPTIVE scheduler, and ManiT's is cooperative. Between any two of
+// `docs/semantics.md` §11.4's three yield points every sequence is already
+// indivisible, so `AtomicTrit` guarantees nothing a plain `trit` does not.
+//
+// Keeping it would be worse than removing it: a primitive named "atomic" that
+// provides no ordering invites code that assumes one. The type still works —
+// nothing below has changed and no program breaks — but constructing one now
+// warns, under the `deprecated-native` lint, which is `warn` by default and
+// silenced with `lint allow(deprecated-native);`.
+//
+// The warning is attached to the CONSTRUCTOR and that is sufficient rather
+// than partial: an `AtomicTrit` cannot be obtained any other way, so every
+// program that uses one calls this, exactly once per value. `Mutex`,
+// `Barrier` and `Semaphore` are NOT deprecated — §11.9 keeps them, with a
+// different job: not exclusion against pre-emption, but structured waiting.
+extern "c" fn AtomicTrit::new(val: trit) -> AtomicTrit
+    available(llvm, t3)
+    deprecated("ManiT's scheduler is cooperative, so a plain `trit` is already indivisible between yield points — see docs/semantics.md 11.4 and CONCURRENCY_DECISION.md 2");
+
 struct AtomicTrit {
     // native atomic storage
 }

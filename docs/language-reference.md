@@ -1542,12 +1542,33 @@ Suspends the current task and resumes when `t` completes.
 ### Channels
 
 ```
-let ch: Channel<int> = channel();
+let ch: Channel<int> = channel<int>();     // unbounded
+let bd: Channel<int> = channel<int>(8);    // holds at most 8
 ch.send(42);
 let v = ch.recv();
+ch.close();                                 // no more will be sent
 ```
 
 Channels are MPSC (multiple producer, single consumer).
+
+> **Added 2 September 2026 (§11.10, §11.11 of `docs/semantics.md`).** This
+> section listed only `send` and `recv`. Two operations it did not mention were
+> already implemented on both backends, and a third is new:
+>
+> - **`close()`** — states that no further value will be sent. A closed channel
+>   still **drains**; once drained, `recv` returns the zero value rather than
+>   blocking, and `try_recv` answers `Err("closed")`. **`try_recv` is the only
+>   way to tell a drained channel from a sent zero.** A `send` after a close is
+>   a **trap**: the value has nowhere to go.
+> - **A capacity** — `channel<T>(n)` holds at most `n` values, and a `send`
+>   that finds it full **blocks** until a receive frees a slot. That is a
+>   fourth yield point, and it is the only one a program can reach by accident:
+>   `channel<T>()` is unbounded and can never be full. A capacity below 1 is a
+>   **trap**, not a clamp — a zero-capacity channel can never hold a value.
+>
+> Blocking on a channel nothing can fill *or drain* is a **detected deadlock**
+> with a message naming which, not a hang; that is the property the cooperative
+> scheduler exists to provide.
 
 ### Mutex
 
@@ -1772,10 +1793,12 @@ lint deny(shadowing, unknown-type);
 | `backend-unavailable-chain` | deny | a call chain that cannot run on this backend |
 | `reserved-type-name`  | deny  | a `struct` or `enum` declared under a name the compiler owns |
 | `undeclared-type`     | deny  | a type name that is declared nowhere at all |
+| `undeclared-field`    | deny  | a field name the struct does not have |
 
 `--warn-as-error` still means "raise everything to deny".
 
-`reserved-type-name` and `undeclared-type` are reported only at `deny` or
+`reserved-type-name`, `undeclared-type` and `undeclared-field` are reported
+only at `deny` or
 above, and the reason is worth knowing because it is a property of the compiler
 rather than of the lint: a recorded warning is printed after analysis finishes,
 and a program these lints fire on typically fails analysis too, so a
@@ -1793,6 +1816,38 @@ and a program these lints fire on typically fails analysis too, so a
 > type's parameter, an `impl` target, a cast target, a global's annotation and a
 > generic struct's argument. `lint allow(undeclared-type);` restores the
 > previous behaviour exactly.
+
+> **Added 2 September 2026 (P103).** `undeclared-field` is `undeclared-type`
+> one level in: that refuses a TYPE name nothing declares, this refuses a FIELD
+> name a perfectly well declared struct does not have. Both used to resolve to
+> the unknown type, and this one then reaches the IR lowerer's
+> `field_slot_index`, which has no slot for it and reads **slot 0** — so the
+> program runs and returns a *different field's value*, on both backends, with
+> `manitc check` exiting 0.
+>
+> `field_slot_index` has carried a `debug_assert!` for exactly this since P44.
+> It is **debug-only**, and `thatteos/build.sh` resolves the compiler to
+> `target/release/manitc`, so it never fired in a shipped build. The cost is
+> report.txt P102(b): two thatteOS syscalls tested `!desc.valid` on a struct
+> whose field is `open`, read `desc.fd` instead, and mis-answered `EBADF` on
+> fd 0 while skipping the check entirely on every other fd.
+>
+> It fires only when the receiver's type is a KNOWN struct. An unresolved
+> receiver is `undeclared-type`'s business, a tuple has its own rule, and a
+> generic struct's field *names* do not depend on its type arguments — so the
+> question is asked of the declaration even when the field's type is still
+> unknown. Measured before it was written: **0 occurrences across every `.mt`
+> file in maniTC and thatteOS, and 0 across all 2,507 files of the model
+> corpus**, the single real instance being the thatteOS one this found.
+> `lint allow(undeclared-field);` restores the previous behaviour exactly.
+>
+> **The name is measured, not chosen.** It is not `unknown-field`, because the
+> lexer reads `unknown` as the three-valued literal and `lint
+> allow(unknown-field);` is a *parse error*. That is pre-existing rather than
+> new — the older `unknown-type` lint has never been writable in an in-source
+> directive either, though `-A unknown-type` on the command line works
+> (report.txt P104) — but a lint whose `allow` cannot be spelled is not an
+> exact restoration of anything.
 
 ### The manifest
 

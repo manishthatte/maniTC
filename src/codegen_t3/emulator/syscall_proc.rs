@@ -338,14 +338,78 @@ impl Emulator {
                 let h = self.heap_alloc_obj(HeapObj::Channel(std::collections::VecDeque::new()));
                 self.regs[1] = h as i64;
             }
+            137 => {
+                // §11.11: channel_bounded(capacity=R1) → R1 = handle.
+                //
+                // 137 and not 75: **75 is the file-system range.** The first
+                // draft used it, the router sent every `channel<T>(n)` to
+                // `do_syscall_fs`, and the symptom was a channel that accepted
+                // four values into a capacity of two and then returned zeroes
+                // — a handle that was never a channel. The ranges are written
+                // down at the top of `syscalls.rs`; 133-136 were the previous
+                // "first genuinely free number", so this is the next.
+                //
+                // A capacity below 1 TRAPS rather than clamping: a
+                // zero-capacity channel can never hold a value, so every send
+                // on it blocks forever and the first send is a guaranteed
+                // deadlock. Rounding up to 1 would turn a program that cannot
+                // work into one that quietly does something else.
+                let cap = self.regs[1];
+                if cap < 1 {
+                    self.trap("TRAP: a channel capacity must be at least 1");
+                    return;
+                }
+                let h = self.heap_alloc_obj(HeapObj::Channel(std::collections::VecDeque::new()));
+                self.sched.chan_cap.insert(h, cap as usize);
+                self.regs[1] = h as i64;
+            }
             71 => {
                 // channel_send(handle=R1, value=R2)
                 //
                 // §11.5 (SEND) and (SEND-WAKE). Never blocks — §11.1 leaves
                 // channels unbounded, which §11.4 gives as the reason `send`
                 // is not a fourth yield point.
+                //
+                // §11.10 (SEND-CLOSED): a send on a CLOSED channel traps. The
+                // value has nowhere to go — (RECV-CLOSED) drains what is
+                // already queued and then yields zeroes forever — so accepting
+                // it is data loss with no diagnostic. T3 used to drop it in
+                // silence while LLVM dropped it and wrote to stderr, which is
+                // a divergence about whether a program could tell.
                 let h = self.regs[1] as usize;
                 let v = self.regs[2];
+                if matches!(self.heap_objs.get(&h), Some(HeapObj::ClosedChannel(_))) {
+                    self.trap(
+                        "TRAP: send on a closed channel — the value cannot be \
+                         received",
+                    );
+                    return;
+                }
+                // §11.11 (SEND-BLOCK). Only a BOUNDED channel can be full, so
+                // a program that never asks for a capacity cannot reach this
+                // and §11.4's original three yield points are still exactly
+                // its yield points.
+                if let Some(&cap) = self.sched.chan_cap.get(&h) {
+                    let full = matches!(self.heap_objs.get(&h),
+                                        Some(HeapObj::Channel(q)) if q.len() >= cap);
+                    if full {
+                        if self.sched.active {
+                            self.sched_block_on_send(h);
+                            return;
+                        }
+                        // Unscheduled: there is no other task, so nothing can
+                        // ever drain it. Blocking would empty the run queue and
+                        // §11.6 would trap anyway; saying so here is the same
+                        // verdict reached in one step, which is P81's argument
+                        // for the `recv` case.
+                        self.trap(
+                            "TRAP: send on a full channel that nothing can \
+                             drain: `spawn` runs its block in place, so there \
+                             is no other task to receive",
+                        );
+                        return;
+                    }
+                }
                 if let Some(HeapObj::Channel(ch)) = self.heap_objs.get_mut(&h) {
                     ch.push_back(v);
                 }
@@ -390,6 +454,10 @@ impl Emulator {
                     Some(HeapObj::ClosedChannel(ch)) => ch.pop_front().unwrap_or(0),
                     _ => 0,
                 };
+                // §11.11 (RECV-WAKE): a receive frees exactly one slot, so
+                // exactly one sender is woken — the longest-waiting. A no-op
+                // on an unbounded channel, where nothing ever waits to send.
+                self.sched_wake_one_sender(h);
                 self.regs[1] = val;
             }
             73 => {
@@ -403,11 +471,33 @@ impl Emulator {
                 self.regs[1] = len;
             }
             74 => {
-                // channel_close(handle=R1) — mark closed
+                // channel_close(handle=R1) — §11.10 (CLOSE).
+                //
+                // Marks the channel closed AND wakes every task waiting on it.
+                // Waking is not an optimisation: after a close no `send` can
+                // ever wake them, so a waiter left on B(c) is stranded, and the
+                // program then hit §11.6's deadlock trap saying no runnable
+                // task could fill the channel — true, and useless, because the
+                // close had already settled that.
+                //
+                // Idempotent: a second close finds a `ClosedChannel`, converts
+                // nothing, and wakes an empty queue.
+                //
+                // P106: the conversion must not `remove` unconditionally.
+                // `heap_objs.remove(&h)` takes the entry out whatever it is,
+                // and the `if let` then matches only `Channel` — so a SECOND
+                // close, finding a `ClosedChannel`, dropped the object on the
+                // floor and the channel and its queued values ceased to exist.
+                // `ch.send(7); ch.close(); ch.close(); ch.recv()` gave 0 on T3
+                // and 7 on LLVM. Pre-existing, and found by writing §11.10's
+                // idempotence row.
                 let h = self.regs[1] as usize;
-                if let Some(HeapObj::Channel(q)) = self.heap_objs.remove(&h) {
-                    self.heap_objs.insert(h, HeapObj::ClosedChannel(q));
+                if matches!(self.heap_objs.get(&h), Some(HeapObj::Channel(_))) {
+                    if let Some(HeapObj::Channel(q)) = self.heap_objs.remove(&h) {
+                        self.heap_objs.insert(h, HeapObj::ClosedChannel(q));
+                    }
                 }
+                self.sched_wake_all(h);
             }
 
             // ----------------------------------------------------------------
@@ -740,16 +830,60 @@ impl Emulator {
             109 => {
                 // mutex_new(value=R1) → R1 = handle
                 let val = self.regs[1];
-                let h = self.heap_alloc_obj(HeapObj::Mutex(val));
+                let h = self.heap_alloc_obj(HeapObj::Mutex(val, None));
                 self.regs[1] = h as i64;
             }
             110 => {
-                // mutex_lock(handle=R1) → R1 = handle (no-op in sequential model)
+                // mutex_lock(handle=R1) → R1 = handle
+                //
+                // §11.9: `m.lock()` is `m.recv()` on the one-slot channel that
+                // carries the protected value, so it BLOCKS while another task
+                // holds it and mutual exclusion is the token's absence.
+                //
+                // The old body was empty and its comment read "no-op in
+                // sequential model". That was TRUE WHEN WRITTEN: under
+                // `docs/memory-model.md` §4 there is never more than one task,
+                // so a lock that does nothing is not an approximation of
+                // mutual exclusion, it IS mutual exclusion. Steps 2 and 3 of
+                // `CONCURRENCY_DECISION.md` §5 made tasks real and did not
+                // reach this line. Hence the gate on `sched.active`: with no
+                // second task the old answer is still the right one, and the
+                // default `--sched inline` mode is byte-identical to before.
+                //
+                // The state is RECORDED whether or not the scheduler is
+                // running, and only the BLOCK is gated. Gating the record too
+                // was the first version and it diverged from LLVM, which the
+                // §11.9 rows caught: T3's `active` flips on the first SPAWN,
+                // while the C runtime's is set by `__task_bootstrap` at the
+                // top of `main`, so a lock taken BEFORE the first spawn went
+                // unrecorded here and was correctly held there. Recording is
+                // invisible under `--sched inline` — nothing can block, since
+                // blocking needs `active` — so it costs the default mode
+                // nothing and closes the window.
+                let h = self.regs[1] as usize;
+                let active = self.sched.active;
+                let me = self.sched.current();
+                match self.heap_objs.get_mut(&h) {
+                    Some(HeapObj::Mutex(_, holder)) => {
+                        if holder.is_some() && active {
+                            self.sched_block_on(h);
+                            return;
+                        }
+                        *holder = me;
+                    }
+                    _ => {}
+                }
+                self.regs[1] = h as i64;
             }
             111 => {
                 // mutex_get(handle=R1) → R1 = value
+                //
+                // §11.9: `get` does NOT lock. It reads the value the holder
+                // took out of the channel, which is why the C runtime's
+                // recursive mutex — there so that get/set could be called with
+                // the lock already held — is no longer needed on either side.
                 let h = self.regs[1] as usize;
-                let val = if let Some(HeapObj::Mutex(v)) = self.heap_objs.get(&h) {
+                let val = if let Some(HeapObj::Mutex(v, _)) = self.heap_objs.get(&h) {
                     *v
                 } else { 0 };
                 self.regs[1] = val;
@@ -758,16 +892,26 @@ impl Emulator {
                 // mutex_update(handle=R1, fn_ptr=R2) → void
                 let h = self.regs[1] as usize;
                 let fn_ptr = self.regs[2] as usize;
-                let cur_val = if let Some(HeapObj::Mutex(v)) = self.heap_objs.get(&h) {
+                let cur_val = if let Some(HeapObj::Mutex(v, _)) = self.heap_objs.get(&h) {
                     *v
                 } else { 0 };
                 let new_val = self.call_fn_ptr(fn_ptr, cur_val);
-                if let Some(HeapObj::Mutex(v)) = self.heap_objs.get_mut(&h) {
+                if let Some(HeapObj::Mutex(v, _)) = self.heap_objs.get_mut(&h) {
                     *v = new_val;
                 }
             }
             113 => {
-                // mutex_unlock(handle=R1) → void — no-op
+                // mutex_unlock(handle=R1) → void
+                //
+                // §11.9: `g.unlock()` is `m.send(v)`, so it is (SEND-WAKE) —
+                // the value goes back into the slot and AT MOST ONE waiter is
+                // woken, the longest-waiting. Waking all of them would pass
+                // almost every test for the reason §11.7 gives.
+                let h = self.regs[1] as usize;
+                if let Some(HeapObj::Mutex(_, holder)) = self.heap_objs.get_mut(&h) {
+                    *holder = None;
+                }
+                self.sched_wake_one(h); // itself a no-op while inactive
             }
             114 => {
                 // atomic_trit_new(trit=R1) → R1 = handle
@@ -794,23 +938,70 @@ impl Emulator {
             117 => {
                 // barrier_new(n=R1) → R1 = handle
                 let n = self.regs[1];
-                let h = self.heap_alloc_obj(HeapObj::Barrier(n, 0));
+                let h = self.heap_alloc_obj(HeapObj::Barrier(n, 0, 0));
                 self.regs[1] = h as i64;
             }
             118 => {
                 // barrier_wait(handle=R1) → R1 = bool (is_leader = last to arrive)
+                //
+                // §11.9's desugaring: take the counter, increment it, and
+                // either release the other n-1 through the gate (the LAST to
+                // arrive is the leader) or put the counter back and block on
+                // the gate. Nobody passes until n have arrived.
+                //
+                // The old body counted arrivals and returned without ever
+                // blocking, so a `Barrier(2)` let one party through alone —
+                // and did so on BOTH backends, which is why the parity matrix
+                // reported nothing. Gated on `sched.active` for the reason at
+                // syscall 110: with one task the barrier is meaningless and
+                // §4's sequential model is what the default mode implements.
                 let h = self.regs[1] as usize;
-                let is_leader = if let Some(HeapObj::Barrier(needed, arrived)) = self.heap_objs.get_mut(&h) {
-                    *arrived += 1;
-                    if *arrived >= *needed {
-                        // Cycle complete: reset so the barrier is reusable.
-                        *arrived = 0;
-                        true
-                    } else {
-                        false
+                if !self.sched.active {
+                    let is_leader = if let Some(HeapObj::Barrier(needed, arrived, _)) =
+                        self.heap_objs.get_mut(&h)
+                    {
+                        *arrived += 1;
+                        if *arrived >= *needed { *arrived = 0; true } else { false }
+                    } else { false };
+                    self.regs[1] = if is_leader { 1 } else { 0 };
+                    return;
+                }
+
+                // A task the leader released re-executes this syscall, because
+                // `sched_block_on` rewinds the PC so a wait resumes AT the
+                // wait. A pending release is what tells "resuming, already
+                // counted" from "arriving".
+                let mut wake = 0i64;
+                let outcome = match self.heap_objs.get_mut(&h) {
+                    Some(HeapObj::Barrier(needed, arrived, releases)) => {
+                        if *releases > 0 {
+                            *releases -= 1;
+                            Some(false) // released: through the gate, not the leader
+                        } else {
+                            *arrived += 1;
+                            if *arrived >= *needed {
+                                *arrived = 0; // reset: the barrier is reusable
+                                wake = *needed - 1;
+                                *releases = wake;
+                                Some(true) // the last to arrive is the leader
+                            } else {
+                                None // block on the gate
+                            }
+                        }
                     }
-                } else { false };
-                self.regs[1] = if is_leader { 1 } else { 0 };
+                    _ => Some(false),
+                };
+                match outcome {
+                    Some(is_leader) => {
+                        for _ in 0..wake {
+                            self.sched_wake_one(h);
+                        }
+                        self.regs[1] = if is_leader { 1 } else { 0 };
+                    }
+                    None => {
+                        self.sched_block_on(h);
+                    }
+                }
             }
             119 => {
                 // semaphore_new(n=R1) → R1 = handle
@@ -819,10 +1010,40 @@ impl Emulator {
                 self.regs[1] = h as i64;
             }
             120 => {
-                // semaphore_acquire(handle=R1) → void (no-op in sequential model)
+                // semaphore_acquire(handle=R1) → void
+                //
+                // §11.9: a `Semaphore(n)` is a channel pre-loaded with n
+                // tokens, so `acquire` is `recv` — it takes a permit, or
+                // blocks at §11.4's SECOND yield point, which already exists.
+                // The (n+1)-th acquirer waits; before this it did not, so a
+                // one-permit semaphore admitted as many holders as asked.
+                //
+                // Permits are spent whether or not the scheduler is running,
+                // for the reason given at syscall 110: `active` flips later
+                // here than it does on LLVM. An exhausted semaphore under
+                // `--sched inline` still does not block — there is no second
+                // task to wait for — so that mode is unchanged.
+                let h = self.regs[1] as usize;
+                let active = self.sched.active;
+                match self.heap_objs.get_mut(&h) {
+                    Some(HeapObj::Semaphore(permits)) if *permits > 0 => *permits -= 1,
+                    Some(HeapObj::Semaphore(_)) if active => {
+                        self.sched_block_on(h);
+                        return;
+                    }
+                    _ => {}
+                }
             }
             121 => {
-                // semaphore_release(handle=R1) → void (no-op in sequential model)
+                // semaphore_release(handle=R1) → void
+                //
+                // §11.9: `release` is `send`, hence (SEND-WAKE) — one permit
+                // back, at most one waiter woken, longest-waiting first.
+                let h = self.regs[1] as usize;
+                if let Some(HeapObj::Semaphore(permits)) = self.heap_objs.get_mut(&h) {
+                    *permits += 1;
+                }
+                self.sched_wake_one(h); // itself a no-op while inactive
             }
             122 => {
                 // task_join(handle=R1) → R1 = return value
@@ -868,7 +1089,7 @@ impl Emulator {
                 // mutex_set_value(handle=R1, value=R2) → void
                 let h = self.regs[1] as usize;
                 let val = self.regs[2];
-                if let Some(HeapObj::Mutex(v)) = self.heap_objs.get_mut(&h) {
+                if let Some(HeapObj::Mutex(v, _)) = self.heap_objs.get_mut(&h) {
                     *v = val;
                 }
             }

@@ -1220,6 +1220,10 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     em.emit("    SYSCALL #70  ; channel_new".to_string());
                     if let Some(d) = dst { let rd = em.dst_reg(d); if rd != 1 { em.emit(format!("    MOV   {}, R1", AsmEmitter::rn(rd))); } }
                 }
+                // §11.11: `channel<T>(n)`. Capacity in R1, handle back in R1.
+                "channel_bounded" | "Channel::bounded" => {
+                    emit_syscall_1arg_ret(em, args, dst, 137, "channel_bounded");
+                }
                 "channel_send" | "Channel::send" => {
                     emit_syscall_2arg(em, args, dst, 71, "channel_send");
                 }

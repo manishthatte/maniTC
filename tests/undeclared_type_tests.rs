@@ -120,6 +120,19 @@ fn check(src: &str) -> (bool, String) {
              String::from_utf8_lossy(&c.stderr)))
 }
 
+/// `manitc check` with extra command-line arguments.
+fn check_with(src: &str, extra: &[&str]) -> (bool, String) {
+    let d = workdir();
+    let path = d.join("p.mt");
+    std::fs::write(&path, src).expect("write");
+    let mut args = vec!["check".to_string(), path.to_string_lossy().into_owned()];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let c = Command::new(manitc_bin()).args(&args).output().expect("check");
+    (c.status.success(),
+     format!("{}{}", String::from_utf8_lossy(&c.stdout),
+             String::from_utf8_lossy(&c.stderr)))
+}
+
 /// Assert both backends agree on `want`.
 fn both(src: &str, want: &str, what: &str) {
     let t3 = run_t3(src);
@@ -355,4 +368,189 @@ fn p98_a_genuinely_undeclared_name_is_still_refused_after_the_prepass() {
     );
     assert!(!ok, "P95/P98: a name declared nowhere was accepted\n{msg}");
     assert!(msg.contains("`NoSuchType` names no type"), "P95/P98: wrong reason:\n{msg}");
+}
+
+// ---------------------------------------------------------------------------
+// P103 — a field name the struct does not have
+// ---------------------------------------------------------------------------
+//
+// P95 one level in. That refuses a TYPE name nothing declares; this refuses a
+// FIELD name a perfectly well declared struct does not have. Both end in
+// `ManiType::Unknown`, and this one then reaches `field_slot_index`, which has
+// no slot for it and reads SLOT 0 — so the program RUNS and returns a
+// different field's value, on both backends, with `check` exiting 0.
+//
+// `field_slot_index` has carried a `debug_assert!` for this since P44, and it
+// is DEBUG-ONLY while `thatteos/build.sh` resolves the compiler to
+// `target/release/manitc`. Two thatteOS syscalls shipped reading the wrong
+// field because of that gap (report.txt P102(b)).
+
+#[test]
+fn p103_a_field_the_struct_does_not_have_is_refused() {
+    let (ok, msg) = check(
+        "struct Desc { pub fd: int, pub ino: int, pub open: bool }\n\
+         fn mk() -> Desc { return Desc { fd: 3, ino: 9, open: true }; }\n\
+         fn main() { let d = mk(); if !d.valid { io::print_int(0); } }",
+    );
+    assert!(!ok, "P103: a field the struct does not have was accepted\n{msg}");
+    assert!(msg.contains("has no field `valid`"), "P103: wrong reason:\n{msg}");
+}
+
+/// `lint allow(undeclared-field);` restores the previous compiler exactly —
+/// asserted as a PAIR, same program, so "accepted" cannot be satisfied by a
+/// compiler that accepts everything.
+///
+/// **The VALUE is deliberately not asserted here, and the reason is worth
+/// recording.** The old behaviour was `!d.valid` reading SLOT 0 — `fd` — which
+/// is the thatteOS shape exactly: with `fd: 0` the guard fires when it must
+/// not, and with any other `fd` it never fires at all. But that value is only
+/// observable through a RELEASE compiler: `field_slot_index` has carried a
+/// `debug_assert!` since P44, this harness runs the debug binary, and the
+/// assertion aborts before the program is built.
+///
+/// That abort is **pre-existing and unchanged** — a debug compiler refused
+/// this program before P103 too — so the `allow` really is an exact
+/// restoration in both build modes. It is also the whole of P102(b): the
+/// assertion is debug-only and `thatteos/build.sh` resolves the compiler to
+/// `target/release/manitc`, so nothing that ships ever ran it.
+#[test]
+fn p103_the_allow_restores_the_previous_compiler() {
+    const BODY: &str = "struct Desc { pub fd: int, pub ino: int, pub open: bool }\n\
+         fn mk() -> Desc { return Desc { fd: 0, ino: 9, open: true }; }\n\
+         fn main() { let d = mk(); if d.valid { io::print_int(1); } }";
+    let (refused, msg) = check(BODY);
+    assert!(!refused, "nothing to allow — P103 is not firing at all\n{msg}");
+    let (ok, msg2) = check(&format!("lint allow(undeclared-field);\n{BODY}"));
+    assert!(ok, "P103: the allow did not restore acceptance:\n{msg2}");
+    assert!(!msg2.contains("has no field"), "still reported under allow:\n{msg2}");
+}
+
+/// GUARD: a field that DOES exist is untouched, including on a generic struct
+/// whose field TYPE is still unknown.
+///
+/// A generic struct's field NAMES do not depend on its type arguments, which is
+/// why membership in the struct table is the right question even when P68's
+/// argument-aware lookup returns `Unknown`. Without this row the refusal could
+/// have been written to fire on any field whose type is unknown, which would
+/// reject every generic struct in the language.
+#[test]
+fn p103_a_real_field_is_untouched_including_on_a_generic_struct() {
+    let (ok, msg) = check(
+        "struct Pair<T> { pub first: T, pub second: int }\n\
+         fn main() {\n\
+         \x20   let p = Pair { first: 5, second: 7 };\n\
+         \x20   io::print_int(p.first); io::print_int(p.second);\n\
+         }",
+    );
+    assert!(ok, "P103: a real field on a generic struct was refused\n{msg}");
+}
+
+/// GUARD: an UNRESOLVED receiver is P95's finding, not this one.
+///
+/// The two must not overlap: if the refusal fired on `ManiType::Unknown` it
+/// would report a field problem for what is really a type problem, and the
+/// message would send the reader to the wrong line.
+#[test]
+fn p103_an_unresolved_receiver_is_still_reported_as_a_type() {
+    let (ok, msg) = check(
+        "struct Holder { pub a: NoSuchType, pub n: int }\n\
+         fn main() { io::print_int(1); }",
+    );
+    assert!(!ok, "{msg}");
+    assert!(
+        msg.contains("names no type"),
+        "P103 must not shadow P95's diagnostic:\n{msg}"
+    );
+    assert!(
+        !msg.contains("has no field"),
+        "an unresolved TYPE was reported as a missing FIELD:\n{msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P104 — a lint whose `allow` cannot be spelled
+// ---------------------------------------------------------------------------
+
+/// P104, FIXED — and this row is the previous one rewritten in place, because
+/// its own assertion message said to.
+///
+/// It used to read `assert!(!ok, "P104 has been fixed — update this row")` and
+/// pinned the LIMIT: `lint allow(unknown-type);` was a parse error, because the
+/// lexer reads `unknown` as the three-valued literal and a `Token` carries only
+/// a kind and a span. **2 of the 19 lint names were unwritable** —
+/// `unknown-type` and `literal-out-of-word` — while their command-line forms
+/// (`-A unknown-type`) worked, since those never reach the lexer. So exactly
+/// one of the two control surfaces was unreachable, and *a lint whose `allow`
+/// cannot be spelled is not an exact restoration of anything*.
+///
+/// Kept as a row rather than deleted because it is also why P103's lint is
+/// named `undeclared-field`: that name was chosen to dodge a trap that no
+/// longer exists. The name stays — it belongs beside `undeclared-type` and
+/// `undeclared-native` on its own merits — but the reason is now historical,
+/// and this is where that is written down.
+#[test]
+fn p104_a_keyword_named_lint_can_now_be_spelled() {
+    let (ok, msg) = check("lint allow(unknown-type);\nfn main() { io::print_int(1); }");
+    assert!(ok, "P104's fix regressed — `unknown` is a keyword again:\n{msg}");
+    // The command-line surface, which always worked, still does.
+    let (ok2, msg2) = check_with("fn main() { io::print_int(1); }", &["-A", "unknown-type"]);
+    assert!(ok2, "the CLI surface regressed:\n{msg2}");
+}
+
+
+// ---------------------------------------------------------------------------
+// P104's fix — every lint name can now be written in a directive
+// ---------------------------------------------------------------------------
+
+/// A registry that must agree with another registry gets a test, not a comment
+/// (permanent rule 5).
+///
+/// `lexer::lint_word_lexeme` must carry a spelling for every keyword that
+/// appears inside a lint name. This iterates `lint::LINTS` ITSELF rather than a
+/// list — so the day someone adds a lint whose name collides with a keyword,
+/// this row names the word instead of the lint quietly becoming unsilenceable.
+///
+/// Measured before the fix: **2 of the 19 lint names were unwritable** —
+/// `unknown-type` and `literal-out-of-word`, `word` being the patent alias for
+/// `t27`. Their command-line forms always worked, which is why nothing noticed.
+#[test]
+fn p104_every_lint_name_can_be_written_in_a_directive() {
+    let mut unwritable = Vec::new();
+    for (_, name, _) in manitc::lint::LINTS {
+        let (ok, msg) = check(&format!(
+            "lint allow({name});\nfn main() {{ io::print_int(1); }}"
+        ));
+        if !ok {
+            unwritable.push(format!("{name}: {}", msg.lines().next().unwrap_or("")));
+        }
+    }
+    assert!(
+        unwritable.is_empty(),
+        "these lint names cannot be spelled in a `lint` directive, so their \
+         `allow` is unreachable and they are not an exact restoration of \
+         anything (report.txt P104):\n  {}",
+        unwritable.join("\n  ")
+    );
+}
+
+/// ...and the two that used to fail are named explicitly, so the row above
+/// cannot go green by the registry shrinking.
+#[test]
+fn p104_the_two_keyword_lint_names_parse() {
+    for name in ["unknown-type", "literal-out-of-word"] {
+        let (ok, msg) = check(&format!(
+            "lint allow({name});\nfn main() {{ io::print_int(1); }}"
+        ));
+        assert!(ok, "`lint allow({name});` must parse (P104):\n{msg}");
+    }
+}
+
+/// GUARD: widening the lint-name parser must not widen the grammar elsewhere.
+/// `unknown` and `word` are still keywords in every other position.
+#[test]
+fn p104_the_keywords_are_still_keywords_outside_a_lint_directive() {
+    let (ok, msg) = check("fn main() { let unknown = 1; io::print_int(unknown); }");
+    assert!(!ok, "`unknown` stopped being a keyword outside a lint name:\n{msg}");
+    let (ok2, msg2) = check("fn main() { let word = 1; io::print_int(word); }");
+    assert!(!ok2, "`word` stopped being a keyword outside a lint name:\n{msg2}");
 }

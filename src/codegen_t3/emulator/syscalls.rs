@@ -2,7 +2,7 @@
 // Implementations are split into:
 //   syscall_io.rs   — I/O, strings, floats, time, env (0-16, 60-69, 127-132, 133-136, 200-203, 210-221, 540, 550, 552-553)
 //   syscall_fs.rs   — File system + TCP network (75-79, 500-525)
-//   syscall_proc.rs — Collections, channels, concurrency (17-59, 70-74, 80-107, 108-131)
+//   syscall_proc.rs — Collections, channels, concurrency (17-59, 70-74, 80-107, 108-131, 137)
 use super::*;
 
 impl Emulator {
@@ -28,8 +28,11 @@ impl Emulator {
             75..=79 | 500..=525 => {
                 self.do_syscall_fs(num);
             }
-            // Collections, channels, concurrency, scheduler
-            17..=59 | 70..=74 | 80..=131 => {
+            // Collections, channels, concurrency, scheduler.
+            // 137 is `channel_bounded` (§11.11), out of line with the 70-74
+            // channel block because 75-79 is the FILE SYSTEM — the first draft
+            // used 75 and every bounded channel silently became an fs call.
+            17..=59 | 70..=74 | 80..=131 | 137 => {
                 self.do_syscall_proc(num);
             }
             // `.unwrap()` guard — R1 = the Result's tag trit.

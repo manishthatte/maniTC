@@ -33,6 +33,32 @@ success label"; a guarantee wearing one is worse.
 
 ## 1. What each primitive actually is
 
+> **Correction, 2 September 2026.** The table below is the measurement of
+> **24 August 2026** and is kept as the record; it is no longer the state of
+> the compiler. Steps 1–4 of `CONCURRENCY_DECISION.md` §5 have landed, and
+> under **`--sched cooperative`** the rows now read:
+>
+> | primitive | LLVM backend | T3 backend |
+> |---|---|---|
+> | `spawn { … }` | body OUTLINED, a real task (P99b) | a FORK on syscall 80 (P89) |
+> | `yield`, `task_exit` | `__task_yield` / `__task_main_done` | syscalls 81/82, real |
+> | `Mutex<T>` | a one-slot channel carrying the value; `lock` blocks | the same, in the emulator |
+> | `Barrier`, `Semaphore` | scheduler wait queues; `wait`/`acquire` block | the same |
+> | `channel<T>` | `recv` blocks onto the run queue | the same |
+> | `AtomicTrit` | **DEPRECATED** — §2 below, and now it warns | as LLVM |
+>
+> The **default is still `--sched inline`**, where every row of the original
+> table below still holds and `spawn { B }` still evaluates `B` in place. §4 of
+> this document remains the account of that mode. `docs/semantics.md` §11 is
+> normative for the scheduled one, and its §11.9 specifies the three waiting
+> primitives as derived forms.
+>
+> One row of the original was measured wrong in a way worth keeping: *"`Barrier`,
+> `Semaphore` | pthread primitives"* was true of `runtime/sync.c` and false of
+> what LLVM actually ran, because the backend EMITTED its own counting barrier
+> into every module and that definition shadowed the runtime's. The C code the
+> row describes was unreachable.
+
 Measured, 24 August 2026, on both backends.
 
 | primitive | LLVM backend | T3 backend |
@@ -111,6 +137,15 @@ both backends and is byte-identical between them for exactly this reason: every
 receives never find an empty queue, which is why 3.1 was not already known.
 
 ## 4. What is normative here
+
+> **Scoped, 2 September 2026.** This section is normative for
+> **`--sched inline`**, which is still the default and still what every program
+> compiled without the flag runs. Under `--sched cooperative` the normative
+> document is `docs/semantics.md` §11, where point 2 below is exactly the rule
+> that changes: (SPAWN) appends a task and the spawner continues. Point 1 stays
+> true even there in the sense that matters — one task runs at a time — and
+> point 3 becomes stronger rather than weaker, because §11.2 gives a spawned
+> task a copy of the store, so there is nothing to order.
 
 1. Execution is single-threaded and sequential. Program order is the only
    order.

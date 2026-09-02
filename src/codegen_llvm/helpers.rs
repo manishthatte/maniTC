@@ -808,6 +808,15 @@ declare void @Semaphore_acquire(ptr)
 declare void @Semaphore_release(ptr)
 declare i1 @Semaphore_try_acquire(ptr)
 declare i64 @Semaphore_available(ptr)
+; §11.9 / step 4. These three were DECLARED in INTERNAL_HELPER_SIGS, which is
+; parsed for signatures and never emitted, because a `define internal` below
+; supplied them. That definition is gone (it shadowed the runtime's), so the
+; declaration has to move to the block that is actually written into the
+; module. `Barrier_wait` returns C `int` and is declared `i1` here, which is
+; the convention `Semaphore_try_acquire` two lines up has always used.
+declare ptr @Barrier_new(i64)
+declare i1 @Barrier_wait(ptr)
+declare i64 @Barrier_count(ptr)
 
 ; ---- ternary utils ----
 declare i64 @ternary_trit_to_int(i8 signext)
@@ -1071,9 +1080,6 @@ declare i64 @MutexGuard_get(i64)
 declare void @MutexGuard_unlock(i64)
 declare void @MutexGuard_update(i64, ptr)
 declare void @time_sleep(i64)
-declare ptr @Barrier_new(i64)
-declare i1 @Barrier_wait(ptr)
-declare i64 @Barrier_count(ptr)
 declare ptr @__lp_from_flat(ptr, i64)
 ";
 
@@ -1514,37 +1520,21 @@ entry:
   ret ptr %r
 }
 
-; Sequential counting barrier, mirroring T3 emulator syscalls 117/118.
-; Spawn blocks execute inline, so a real pthread barrier would block the
-; single thread forever; instead each wait counts an arrival and the last
-; arrival (the leader) resets the cycle. Layout: [0]=needed, [1]=arrived.
-define internal ptr @Barrier_new(i64 %n) {
-entry:
-  %b = call ptr @malloc(i64 16)
-  store i64 %n, ptr %b, align 8
-  %p1 = getelementptr i64, ptr %b, i64 1
-  store i64 0, ptr %p1, align 8
-  ret ptr %b
-}
-
-define internal i1 @Barrier_wait(ptr %b) {
-entry:
-  %pn = getelementptr i64, ptr %b, i64 0
-  %needed = load i64, ptr %pn, align 8
-  %pa = getelementptr i64, ptr %b, i64 1
-  %arrived = load i64, ptr %pa, align 8
-  %next = add i64 %arrived, 1
-  %done = icmp sge i64 %next, %needed
-  %reset = select i1 %done, i64 0, i64 %next
-  store i64 %reset, ptr %pa, align 8
-  ret i1 %done
-}
-
-define internal i64 @Barrier_count(ptr %b) {
-entry:
-  %n = load i64, ptr %b, align 8
-  ret i64 %n
-}
+; §11.9 / step 4. A sequential counting barrier used to be DEFINED here,
+; shadowing the C runtime's, and its comment said why: "Spawn blocks execute
+; inline, so a real pthread barrier would block the single thread forever".
+; That was true when it was written and stopped being true when step 3 gave
+; the runtime a scheduler — but this definition is what the module linked
+; against, so the runtime's scheduler-aware `Barrier_wait` was DEAD on LLVM
+; and a `Barrier(2)` let one party through alone.
+;
+; The barrier had THREE implementations (T3 emulator, C runtime, here) and
+; only this one was reachable. It now has one: the declaration above links to
+; `runtime/sync.c`, whose unscheduled path performs exactly the counting this
+; block did — same algorithm, so the default `--sched inline` mode is
+; unchanged — and whose scheduled path implements §11.9. The `declare` is
+; emitted automatically once nothing defines the name (see the dedup in
+; `mod.rs`, which drops a `declare` whose name is also defined).
 
 ; Method-name aliases: the language spells these .load()/.store(), the C
 ; runtime exports AtomicTrit_get/AtomicTrit_set.
