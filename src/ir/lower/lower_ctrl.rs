@@ -238,7 +238,130 @@ impl IRLowerer {
         }
     }
 
+    /// C6: is this `match` a three-way decision on ONE trit?
+    ///
+    /// Returns the trit position and the arm indices in `[neg, zero, pos]`
+    /// order. The shape is three unguarded arms, each a trit pattern that
+    /// fixes the SAME single position, to `-`, `0` and `+` between them, and
+    /// constrains nothing else — which is what `sole_fixed_position` asks.
+    ///
+    /// The leading `*` those patterns must carry is not a formality: without
+    /// it each arm ALSO requires every trit above the pattern to be zero, so
+    /// the three would not cover a word and a three-way branch would be
+    /// wrong. `check_exhaustiveness` accepts exactly this shape, and both
+    /// call the same predicate so the two cannot drift apart (P90).
+    fn trit_trichotomy(me: &TypedMatchExpr) -> Option<(usize, [usize; 3])> {
+        if me.arms.len() != 3 {
+            return None;
+        }
+        let mut at: Option<usize> = None;
+        let mut slot: [Option<usize>; 3] = [None, None, None];
+        for (i, arm) in me.arms.iter().enumerate() {
+            if arm.guard.is_some() {
+                return None;
+            }
+            let tp = match &arm.pattern {
+                crate::ast::Pattern::Trit(tp, _) => tp,
+                _ => return None,
+            };
+            let (p, v) = tp.sole_fixed_position()?;
+            match at {
+                None => at = Some(p),
+                Some(q) if q == p => {}
+                _ => return None,
+            }
+            let s = (v + 1) as usize;
+            if slot[s].is_some() {
+                return None;
+            }
+            slot[s] = Some(i);
+        }
+        Some((at?, [slot[0]?, slot[1]?, slot[2]?]))
+    }
+
+    /// C6: lower a one-trit three-way match to a `TritBranch`.
+    ///
+    /// This is the whole point of the feature. Compiled as an ordinary chain
+    /// the same program is three equality tests — on T3 each is eight
+    /// instructions (`TSHI TSUB TCMP TNEG TMAX TLIT TSUB TBRANCH`) because an
+    /// equality has to be reduced to a boolean before a two-way branch can use
+    /// it. The machine does not need any of that: the extracted trit is
+    /// already in {-1, 0, +1}, which is exactly what `TBRANCH` consumes, so
+    /// one instruction per level replaces binary's two.
+    fn lower_trit_trichotomy(
+        &mut self,
+        me: &TypedMatchExpr,
+        result_ty: &ManiType,
+        at: usize,
+        order: [usize; 3],
+    ) -> IRValue {
+        let x = self.lower_expr(&me.scrutinee);
+        // The trit itself. On LLVM `TritBranch` tests the SIGN, which for a
+        // value already in {-1, 0, +1} is the value.
+        //
+        // On a `trit` scrutinee at position 0 the extraction is the IDENTITY —
+        // the value already IS its own low trit — so it is skipped, and the
+        // trichotomy then costs exactly what `tif` costs: measured, 54,016
+        // dynamic instructions against `tif`'s 54,016 over the same 3,000
+        // iterations, where extracting cost 69,016.
+        //
+        // The assumption is that a `trit` holds a value in {-1, 0, +1}, and it
+        // is no stronger than the one `tif` already makes: `tif` branches on
+        // the SIGN of its operand, so a `trit` holding 2 would mis-branch there
+        // too. Any wider type keeps the extraction, because trit 0 of 2 is `-1`
+        // while its sign is `+1` — the two are not the same question.
+        let t = if at == 0 && matches!(me.scrutinee.ty, ManiType::Trit) {
+            x.clone()
+        } else {
+            self.emit_trit_slice(&x, at, 1)
+        };
+
+        let ir_result_ty = IRType::from_mani(result_ty);
+        let merge_label = self.fresh_label("tmatch_merge");
+        let labels: Vec<String> =
+            (0..3).map(|_| self.fresh_label("tmatch_arm")).collect();
+
+        self.set_term(IRTerminator::TritBranch {
+            cond: t,
+            pos_label: labels[2].clone(),
+            zero_label: labels[1].clone(),
+            neg_label: labels[0].clone(),
+        });
+
+        let mut incoming = Vec::new();
+        for (k, arm_idx) in order.iter().enumerate() {
+            let idx = self.new_block(labels[k].clone());
+            self.switch_to(idx);
+            let arm = &me.arms[*arm_idx];
+            let bind_val = x.clone();
+            self.bind_pattern_locals(&arm.pattern, &bind_val);
+            let val = self.lower_expr(&arm.body);
+            let end = self.current_block;
+            incoming.push((val, self.blocks[end].label.clone()));
+            self.set_term(IRTerminator::Jump(merge_label.clone()));
+        }
+
+        let merge_idx = self.new_block(merge_label);
+        self.switch_to(merge_idx);
+        if ir_result_ty == IRType::Void || incoming.is_empty() {
+            IRValue::Void
+        } else {
+            let phi_dst = self.fresh_temp();
+            let incoming = sanitize_phi_incoming(incoming, &ir_result_ty);
+            self.emit(IRInstr::Phi {
+                dst: phi_dst.clone(),
+                ty: ir_result_ty,
+                incoming,
+            });
+            IRValue::Temp(phi_dst)
+        }
+    }
+
     pub(super) fn lower_match(&mut self, me: &TypedMatchExpr, result_ty: &ManiType) -> IRValue {
+        // C6: a radix-3 decision compiles to a radix-3 branch.
+        if let Some((at, order)) = Self::trit_trichotomy(me) {
+            return self.lower_trit_trichotomy(me, result_ty, at, order);
+        }
         let raw_scrutinee = self.lower_expr(&me.scrutinee);
         // String scrutinees are compared with the str_eq runtime call, which
         // (on the T3 backend) clobbers the scrutinee's register. Keep the
@@ -359,6 +482,145 @@ impl IRLowerer {
         }
     }
 
+    /// C6: `shr(x, k)` — the value of the trits at position `k` and above,
+    /// with trit `k` becoming the units place.
+    ///
+    /// This is round-to-nearest division by 3^k and NOT truncating division.
+    /// The low `k` trits of a balanced-ternary word have magnitude at most
+    /// `(3^k - 1) / 2`, strictly inside half a step, so dropping them *is*
+    /// rounding to nearest and no tie can arise. `strength_reduce` then turns
+    /// it into a single `TSHR` on T3 (P22); on LLVM it stays the branchless
+    /// `DivNear` sequence, so the two backends agree by construction rather
+    /// than by a second lowering.
+    fn emit_trit_shr(&mut self, x: &IRValue, k: usize) -> IRValue {
+        if k == 0 {
+            return x.clone();
+        }
+        let divisor = 3i64.pow(k as u32);
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::BinOp {
+            dst: dst.clone(),
+            op: IRBinOp::DivNear,
+            lhs: x.clone(),
+            rhs: IRValue::Const(IRConst::Int(divisor)),
+            ty: IRType::I64,
+        });
+        IRValue::Temp(dst)
+    }
+
+    /// C6: the value of the trits `[lo, lo + len)`, read as a balanced-ternary
+    /// number in their own right — `shr(x, lo) - 3^len * shr(x, lo + len)`.
+    fn emit_trit_slice(&mut self, x: &IRValue, lo: usize, len: usize) -> IRValue {
+        let low = self.emit_trit_shr(x, lo);
+        let high = self.emit_trit_shr(x, lo + len);
+        let scaled = self.fresh_temp();
+        self.emit(IRInstr::BinOp {
+            dst: scaled.clone(),
+            op: IRBinOp::Mul,
+            lhs: high,
+            rhs: IRValue::Const(IRConst::Int(3i64.pow(len as u32))),
+            ty: IRType::I64,
+        });
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::BinOp {
+            dst: dst.clone(),
+            op: IRBinOp::Sub,
+            lhs: low,
+            rhs: IRValue::Temp(scaled),
+            ty: IRType::I64,
+        });
+        IRValue::Temp(dst)
+    }
+
+    /// C6: `<value> == <k>` as a `Bool`.
+    fn emit_trit_eq(&mut self, value: IRValue, k: i64) -> IRValue {
+        let dst = self.fresh_temp();
+        self.emit(IRInstr::BinOp {
+            dst: dst.clone(),
+            op: IRBinOp::IEq,
+            lhs: value,
+            rhs: IRValue::Const(IRConst::Int(k)),
+            ty: IRType::Bool,
+        });
+        IRValue::Temp(dst)
+    }
+
+    /// C6: the runtime test for a trit pattern.
+    ///
+    /// Every condition is a comparison against a constant, and there are at
+    /// most `runs + 1` of them. The `+ 1` is the requirement that the trits
+    /// ABOVE the pattern are zero, which is what makes a wildcard-free trit
+    /// pattern mean exactly the literal it spells.
+    ///
+    /// One collapse is worth the four lines it costs, because it is the
+    /// common case: when the pattern's topmost element is fixed and there is
+    /// no `*`, the top run's test and the zero test are the SAME test.
+    /// `shr(x, 3) == 4` already says "trits 3 and 4 are `+ +` and everything
+    /// above is zero", because a balanced-ternary representation is unique —
+    /// 4 is `++` and nothing else. So `0t++???` is one comparison, not three.
+    fn lower_trit_pattern(&mut self, tp: &crate::ast::TritPat, x: &IRValue) -> IRValue {
+        let w = tp.width();
+        let runs = tp.fixed_runs();
+        let mut conds: Vec<IRValue> = Vec::new();
+
+        // Does the topmost fixed run reach the top of the pattern?
+        let top_absorbed = !tp.open
+            && matches!(runs.last(), Some(&(_, hi, _)) if hi == w);
+
+        if !tp.open && !top_absorbed {
+            let high = self.emit_trit_shr(x, w);
+            conds.push(self.emit_trit_eq(high, 0));
+        }
+
+        for (i, &(lo, hi, value)) in runs.iter().enumerate() {
+            let last = i + 1 == runs.len();
+            let v = if top_absorbed && last {
+                // The collapse: compare the trits from `lo` upward against
+                // the run's value, which also forces everything above to zero.
+                self.emit_trit_shr(x, lo)
+            } else {
+                self.emit_trit_slice(x, lo, hi - lo)
+            };
+            conds.push(self.emit_trit_eq(v, value));
+        }
+
+        let mut acc = match conds.pop() {
+            None => return IRValue::Const(IRConst::Bool(true)),
+            Some(c) => c,
+        };
+        while let Some(c) = conds.pop() {
+            let dst = self.fresh_temp();
+            self.emit(IRInstr::BinOp {
+                dst: dst.clone(),
+                op: IRBinOp::And,
+                lhs: acc,
+                rhs: c,
+                ty: IRType::Bool,
+            });
+            acc = IRValue::Temp(dst);
+        }
+        acc
+    }
+
+    /// C6: the value each capture of a trit pattern binds, in the order
+    /// `TritPat::bound_names` reports them, so the two cannot disagree.
+    fn trit_capture_values(
+        &mut self,
+        tp: &crate::ast::TritPat,
+        x: &IRValue,
+    ) -> Vec<(String, IRValue)> {
+        let mut out = Vec::new();
+        if let Some(n) = &tp.open_capture {
+            let v = self.emit_trit_shr(x, tp.width());
+            out.push((n.clone(), v));
+        }
+        for (n, lo, len) in tp.captures.iter().rev() {
+            let v = self.emit_trit_slice(x, *lo, *len);
+            out.push((n.clone(), v));
+        }
+        out
+    }
+
     pub(super) fn lower_pattern_match(
         &mut self,
         pattern: &crate::ast::Pattern,
@@ -394,6 +656,11 @@ impl IRLowerer {
             crate::ast::Pattern::Ident(_name, _) => {
                 // Binding pattern — always matches, bind the variable
                 IRValue::Const(IRConst::Bool(true))
+            }
+            // C6
+            crate::ast::Pattern::Trit(tp, _) => {
+                let x = scrutinee.clone();
+                self.lower_trit_pattern(tp, &x)
             }
             crate::ast::Pattern::Enum(variant, enum_name, fields, _) => {
                 // Parser produces Pattern::Enum(variant_name, Some(enum_type_name), ...) for
@@ -688,6 +955,21 @@ impl IRLowerer {
                 });
                 self.locals.insert(name.clone(), (alloca, ty));
             }
+            // C6: each capture is a fresh `int` computed from the scrutinee.
+            Pattern::Trit(tp, _) => {
+                let x = scrutinee.clone();
+                for (name, val) in self.trit_capture_values(tp, &x) {
+                    let ty = IRType::I64;
+                    let alloca = self.fresh_temp();
+                    self.emit(IRInstr::Alloca { dst: alloca.clone(), ty: ty.clone() });
+                    self.emit(IRInstr::Store {
+                        ptr: IRValue::Temp(alloca.clone()),
+                        val,
+                        ty: ty.clone(),
+                    });
+                    self.locals.insert(name, (alloca, ty));
+                }
+            }
             Pattern::Enum(_, _, fields, _) => {
                 // scrutinee is a pointer to [tag, field0, field1, …].
                 //
@@ -872,6 +1154,10 @@ impl IRLowerer {
                     out.extend(Self::pattern_bound_names(a));
                 }
             }
+            // C6: `TritPat::bound_names` is the one definition of this, shared
+            // with the analyzer and the borrow checker, so an or-pattern's
+            // slots and the values written into them cannot disagree.
+            Pattern::Trit(tp, _) => out.extend(tp.bound_names()),
             _ => {}
         }
         out
@@ -896,6 +1182,21 @@ impl IRLowerer {
                         val: scrutinee.clone(),
                         ty: IRType::I64,
                     });
+                }
+            }
+            // C6: an alternative of an or-pattern writes its captures into the
+            // shared slots, so `0t+?@n | 0t-?@n` binds `n` from whichever arm
+            // matched.
+            Pattern::Trit(tp, _) => {
+                let x = scrutinee.clone();
+                for (name, val) in self.trit_capture_values(tp, &x) {
+                    if let Some(slot) = slots.get(&name) {
+                        self.emit(IRInstr::Store {
+                            ptr: IRValue::Temp(slot.clone()),
+                            val,
+                            ty: IRType::I64,
+                        });
+                    }
                 }
             }
             Pattern::Enum(_, _, fields, _) => {

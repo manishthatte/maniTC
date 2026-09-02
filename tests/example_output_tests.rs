@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod common;
+
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn get_manitc() -> PathBuf {
@@ -40,8 +42,7 @@ fn temp_output(name: &str) -> PathBuf {
     // Unique per call, nested under one directory per process — see the note
     // in `expected_output_tests::temp_output` (report.txt P28).
     let slot = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir()
-        .join(format!("manitc_example_{}", std::process::id()))
+    let dir = common::suite_root("example")
         .join(slot.to_string());
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir.join(name)

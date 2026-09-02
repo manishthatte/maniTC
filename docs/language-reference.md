@@ -1241,6 +1241,139 @@ match x {
 }
 ```
 
+### Trit patterns
+
+*Added 3 September 2026 (C6).*
+
+A **trit pattern** matches the individual trits of a balanced-ternary word. It
+is written like the `0t` literal — `0t` and then the trits, **high trit first**
+— with two wildcards and an optional capture name added:
+
+| | |
+|---|---|
+| `+` `0` `-` | a trit that must have this value |
+| `?` | one trit of any value |
+| `*` | any number of trits, **leftmost position only** |
+| `@name` | binds the wildcard run just written |
+
+```
+fn classify(x: int) -> str {
+    match x {
+        0t++?? => "high pair set",
+        0t--?? => "high pair clear",
+        0t?0?? => "third trit zero",
+        _      => "other",
+    }
+}
+```
+
+The scrutinee must be a balanced-ternary integer — `int`, `trit`, `tryte`,
+`t9`, `t27` or `t54`. `bool3` is not one: it is a truth value rather than a
+number, and `docs/semantics.md` §10.2 records that the two are not
+interchangeable.
+
+#### The trits above the pattern must be zero
+
+A trit pattern is **anchored at the low end**, and every trit above the ones it
+names is required to be zero unless the pattern opens with `*`. That is what
+makes a wildcard-free trit pattern mean exactly the literal it spells:
+
+```
+match x {
+    0t++0 => "…",    // matches 12, and nothing else
+}
+```
+
+This needs no width and no sign-extension rule, **because balanced ternary
+needs neither**. In two's complement the pattern for a small negative number
+would have to say how many leading `1` bits to expect, and the answer would
+depend on the word. In balanced ternary `-1` is `-` with *zeros* above it, so
+`0t-` matches `-1` whether the word is 27 trits or 64 bits. The representation
+is unique, and the rule falls out of it.
+
+#### `*` may only be leftmost, and that is a portability rule
+
+```
+0t*++??      // fine — the trits above are unconstrained
+0t+*??       // error
+```
+
+A `*` in the middle could only be placed by knowing how many trits the
+scrutinee has, and under `--lang v1` that number is not the same on the two
+backends: `docs/semantics.md` §10.1 records `int` as a 27-trit word on T3 and
+64 bits on LLVM. A pattern whose meaning depended on it would mean different
+things in the two places. Leftmost-only `*` needs no width at all, so **a trit
+pattern means the same thing on every backend and under both language
+versions.**
+
+#### Captures
+
+`@name` binds the wildcard run *immediately before* it, as an `int`:
+
+```
+match packed {
+    0t++??@lo   => io::println_int(lo),    // the low two trits, -4 ..= 4
+    0t*@hi+00+  => io::println_int(hi),    // everything above the low four
+    _           => {}
+}
+```
+
+Note the order. Rust writes `name @ pattern`; this writes `pattern@name`, and
+the reason is lexical rather than aesthetic: a letter can begin an operand, so
+the run `0t+lo@???` would end at `0t` and fail to lex. `@` cannot begin an
+operand, so the postfix form is unambiguous.
+
+A capture is an `int` whatever its width. A run may be 1 to 39 trits and only
+three widths have names (`tryte`, `t9`, `t27`), so typing a capture by its
+width wants the width-polymorphic `t<N>` of Phase 5's C3, which does not exist
+yet. Thirty-nine is the ceiling because the compilation needs 3^width as a
+machine word, and 3^40 is not one — so a trit pattern cannot span the whole of
+a `t54`.
+
+#### A three-way match is a three-way branch
+
+Three arms that fix the **same single trit position** to `+`, `0` and `-`, and
+constrain nothing else, cover every value of the word. The compiler knows it,
+so no `_` arm is needed — and it compiles the match to one three-way branch
+rather than to three equality tests:
+
+```
+fn name(t: trit) -> str {
+    match t {
+        0t*+ => "pos",
+        0t*0 => "zero",
+        0t*- => "neg",
+    }
+}
+```
+
+On T3 that is a `TSHR`, a `TSHI`, a `TSUB` and a single `TBRANCH`. Written as
+a chain of comparisons the same program is three equality tests of eight
+instructions each, because an equality has to be reduced to a boolean before a
+two-way branch can use it. The extracted trit is already in `{-1, 0, +1}`,
+which is exactly what `TBRANCH` consumes.
+
+The leading `*` is doing real work here. Without it each arm *also* demands
+that every trit above position 0 is zero, so `0t+ | 0t0 | 0t-` covers only
+`-1`, `0` and `+1` — exhaustive over a `trit`, and not over an `int`. The
+compiler accepts the three-way form only with the `*`.
+
+#### A match that matches nothing traps
+
+*Corrected 3 September 2026 (P113).* Because a wildcard-free trit pattern is
+narrow, it is easy to write a `match` on an `int` that no arm accepts. When
+that happens the program **traps**:
+
+```
+TRAP: unreachable code reached — commonly a `match` with no arm for this value
+```
+
+with exit status 70, identically on both backends. Before this date it did not:
+T3 emitted a bare halt, so the program stopped with status 0 and simply
+produced no further output, and LLVM emitted an `unreachable`, which is
+undefined behaviour and in practice read a garbage value and carried on. Both
+were reachable from ordinary literal patterns too, not only from trit patterns.
+
 ### Guards
 
 ```

@@ -9,12 +9,14 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn get_manitc() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_manitc"))
 }
 
 fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("manitc_audit_regr_{}", std::process::id()));
+    let dir = common::suite_root("audit_regr");
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir
 }
@@ -4918,4 +4920,89 @@ fn main() {
          document's OWN reproduction. If this change is deliberate, the dated \
          notice in KNOWN_ISSUES.md issue 5 needs reopening with it.",
     );
+}
+
+// ---------------------------------------------------------------------------
+// P115 — the test suites' scratch directories
+// ---------------------------------------------------------------------------
+
+/// No suite may build a scratch directory outside the shared root.
+///
+/// A registry that must agree with another registry gets a test rather than a
+/// comment (permanent rule 5), and this is that shape one level out: the
+/// sweep in `tests/common/mod.rs` can only clean up what it can find, so a
+/// suite that reaches for the process temp directory itself is invisible to
+/// it and leaks forever. That is not hypothetical — it is what every one of
+/// these twenty-five files did until 3 September 2026, between them leaving
+/// 6,792 directories and 844,623 inodes behind.
+///
+/// Read from DISK, never from a list, so a suite added tomorrow is covered.
+#[test]
+fn every_suite_uses_the_shared_scratch_root() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    // Assembled from pieces so this file does not match its own needle. The
+    // alternative is to exempt the suite that implements the check, which
+    // would exempt a real offender the day one appears here.
+    let needle = format!("std::{}::{}()", "env", "temp_dir");
+    let mut offenders = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("read tests/").flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read suite");
+        checked += 1;
+        if text.contains(&needle) {
+            offenders.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    assert!(checked >= 20, "expected to scan the suites, scanned {checked}");
+    assert!(
+        offenders.is_empty(),
+        "{} suite(s) build a scratch directory outside `common::suite_root`, so \
+         the liveness sweep cannot find them and they leak forever: {}. Use \
+         `common::suite_root(\"<short-name>\")`.",
+        offenders.len(),
+        offenders.join(", ")
+    );
+}
+
+/// The sweep removes a dead process's root, keeps a live one, and leaves
+/// alone anything it did not write.
+///
+/// Asserted rather than described. The three cases are three different rules
+/// and each fails in a different direction: not removing the dead one is the
+/// leak this exists to stop; removing the live one breaks a suite that is
+/// running right now; and removing an unrecognised name is deleting somebody
+/// else's directory out of a shared `/tmp`.
+#[test]
+fn the_scratch_sweep_removes_dead_roots_and_only_those() {
+    let parent = common::parent_dir();
+    std::fs::create_dir_all(&parent).expect("parent");
+
+    // `u32::MAX` is above every possible `pid_max` (2^22), so it is certainly
+    // not running — deterministic where reaping a child and reusing its pid
+    // would be a race.
+    let dead = parent.join(format!("p115probe_dead-{}", u32::MAX));
+    // Pid 1 is running wherever this can run at all.
+    let live = parent.join("p115probe_live-1");
+    // No `-<number>` tail: not a name this module writes.
+    let foreign = parent.join("p115probe_someone_elses_dir");
+    for d in [&dead, &live, &foreign] {
+        std::fs::create_dir_all(d).expect("probe dir");
+        std::fs::write(d.join("f"), b"x").expect("probe file");
+    }
+
+    common::sweep_dead_roots();
+
+    assert!(!dead.exists(), "a root whose process is gone must be swept: {dead:?}");
+    assert!(live.exists(), "a root whose process is RUNNING must survive: {live:?}");
+    assert!(
+        foreign.exists(),
+        "a directory this module did not name must be left alone: {foreign:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&live);
+    let _ = std::fs::remove_dir_all(&foreign);
 }

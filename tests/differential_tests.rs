@@ -33,6 +33,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 const LANES: usize = 27;
 /// (3^27 - 1) / 2 — the largest magnitude 27 balanced trits can hold.
 const T3_MAX: i64 = 3_812_798_742_493;
@@ -199,7 +201,7 @@ fn manitc() -> PathBuf {
 }
 
 fn temp_dir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("manitc_diff_{}", std::process::id()));
+    let d = common::suite_root("diff");
     std::fs::create_dir_all(&d).expect("temp dir");
     d
 }

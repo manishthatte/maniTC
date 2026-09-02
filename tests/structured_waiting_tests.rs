@@ -26,6 +26,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod common;
+
 static N: AtomicUsize = AtomicUsize::new(0);
 
 fn manitc_bin() -> PathBuf {
@@ -34,8 +36,7 @@ fn manitc_bin() -> PathBuf {
 
 fn workdir() -> PathBuf {
     let slot = N.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir()
-        .join(format!("manitc_sw_{}", std::process::id()))
+    let d = common::suite_root("sw")
         .join(slot.to_string());
     std::fs::create_dir_all(&d).expect("temp dir");
     d

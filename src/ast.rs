@@ -595,6 +595,136 @@ pub struct WhileExpr {
 // Patterns
 // ---------------------------------------------------------------------------
 
+/// C6: one element of a trit pattern, in high-to-low reading order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TritElem {
+    /// A trit that must have this value: -1, 0 or +1.
+    Fixed(i8),
+    /// `?` — one trit of any value.
+    Any,
+}
+
+/// C6: a pattern over the trits of a balanced-ternary word.
+///
+/// Written `0t` followed by the elements, high trit first, exactly as the
+/// `0t` *literal* reads — `0t++???` is "high two trits `+ +`, low three
+/// anything". Three decisions are carried in this structure rather than in
+/// the code that reads it, because two consumers must agree about them
+/// (P90: the lowerer and the exhaustiveness checker share one predicate or
+/// they drift apart):
+///
+/// **The trits ABOVE the pattern are required to be zero unless `open`.**
+/// That is what makes a wildcard-free trit pattern mean exactly the literal
+/// it spells: `0t++0` matches 12 and nothing else. It needs no
+/// sign-extension convention, because balanced ternary needs none — `-1` is
+/// `-` with zeros above it, not a run of `-`. A two's-complement bit pattern
+/// would have had to choose a width and a sign rule here; this does not.
+///
+/// **`open` (a leading `*`) is the only way to leave the high trits free,
+/// and it may appear only in the leftmost position.** A `*` in the middle
+/// could only be placed by knowing the scrutinee's trit width, and
+/// `docs/semantics.md` §10.1 records that `int` is a 27-trit word on T3 and
+/// 64 bits on LLVM under v1 — so a mid-pattern `*` would mean different
+/// things on the two backends. Anchoring everything at the low end makes a
+/// trit pattern's meaning width-independent.
+///
+/// **A capture binds `int`, whatever its width** — see `docs/language-reference.md`.
+#[derive(Debug, Clone)]
+pub struct TritPat {
+    /// Elements in HIGH-to-low order, as written.
+    pub elems: Vec<TritElem>,
+    /// A leading `*`: the trits above `elems` are unconstrained.
+    pub open: bool,
+    /// The name bound to those high trits, if the `*` carried one.
+    pub open_capture: Option<String>,
+    /// `(name, lo, len)` — each capture names the trits `[lo, lo+len)`
+    /// counting the LOW trit as position 0.
+    pub captures: Vec<(String, usize, usize)>,
+    /// The text as written, without the `0t`. Kept for diagnostics.
+    pub text: String,
+}
+
+impl TritPat {
+    /// Number of trit positions the pattern names, `*` excluded.
+    pub fn width(&self) -> usize {
+        self.elems.len()
+    }
+
+    /// The fixed trit at position `pos` (0 = the low trit), if any.
+    pub fn fixed_at(&self, pos: usize) -> Option<i8> {
+        if pos >= self.elems.len() {
+            return None;
+        }
+        // `elems` is high-to-low, so position `pos` counted from the low end
+        // is index `len - 1 - pos`.
+        match self.elems[self.elems.len() - 1 - pos] {
+            TritElem::Fixed(v) => Some(v),
+            TritElem::Any => None,
+        }
+    }
+
+    /// Maximal runs of fixed trits, as `(lo, hi, value)` half-open in
+    /// position space, `value` being the balanced-ternary value of the run
+    /// read as a number in its own right.
+    pub fn fixed_runs(&self) -> Vec<(usize, usize, i64)> {
+        let mut runs = Vec::new();
+        let w = self.width();
+        let mut pos = 0;
+        while pos < w {
+            if self.fixed_at(pos).is_none() {
+                pos += 1;
+                continue;
+            }
+            let lo = pos;
+            while pos < w && self.fixed_at(pos).is_some() {
+                pos += 1;
+            }
+            let mut value: i64 = 0;
+            for p in (lo..pos).rev() {
+                value = value * 3 + self.fixed_at(p).unwrap() as i64;
+            }
+            runs.push((lo, pos, value));
+        }
+        runs
+    }
+
+    /// Whether this pattern constrains nothing at all, so it matches every
+    /// value of its type. True only for an `open` pattern whose every
+    /// element is `?`: without the `*` the high trits are still required to
+    /// be zero, which is a real test.
+    pub fn matches_everything(&self) -> bool {
+        self.open && self.elems.iter().all(|e| *e == TritElem::Any)
+    }
+
+    /// The names this pattern binds, in the order they are written.
+    pub fn bound_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if let Some(n) = &self.open_capture {
+            out.push(n.clone());
+        }
+        // `captures` is built low-to-high; written order is the reverse, and
+        // the `*` capture is leftmost of all.
+        for (n, _, _) in self.captures.iter().rev() {
+            out.push(n.clone());
+        }
+        out
+    }
+
+    /// The single trit position this pattern discriminates on, if it fixes
+    /// exactly one and leaves everything else free. This is the shape that
+    /// is a three-way branch rather than a chain of comparisons.
+    pub fn sole_fixed_position(&self) -> Option<(usize, i8)> {
+        if !self.open {
+            return None;
+        }
+        let runs = self.fixed_runs();
+        if runs.len() != 1 || runs[0].1 - runs[0].0 != 1 {
+            return None;
+        }
+        Some((runs[0].0, self.fixed_at(runs[0].0).unwrap()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Pattern {
     Wildcard(Span),
@@ -604,6 +734,8 @@ pub enum Pattern {
     Enum(String, Option<String>, Vec<Pattern>, Span),
     Tuple(Vec<Pattern>, Span),
     Or(Vec<Pattern>, Span),
+    /// C6: a pattern over the trits of a balanced-ternary word.
+    Trit(TritPat, Span),
 }
 
 impl Pattern {
@@ -629,6 +761,11 @@ impl Pattern {
             // One irrefutable alternative makes the whole alternation match
             // everything, whatever the others test.
             Pattern::Or(alts, _) => alts.iter().any(Pattern::is_irrefutable),
+            // C6: a trit pattern is irrefutable only when it constrains
+            // nothing — a leading `*` and no fixed trit. Without the `*` the
+            // trits above the pattern must be zero, which is a real test, so
+            // `0t???` is refutable however many wildcards it has.
+            Pattern::Trit(tp, _) => tp.matches_everything(),
             Pattern::Lit(_, _) | Pattern::Struct(_, _, _) | Pattern::Enum(_, _, _, _) => false,
         }
     }

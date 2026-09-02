@@ -11,12 +11,14 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn manitc() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_manitc"))
 }
 
 fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("manitc_phase1_{}", std::process::id()));
+    let dir = common::suite_root("phase1");
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir
 }

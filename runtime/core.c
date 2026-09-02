@@ -99,6 +99,23 @@ void manit_check_t27_mul(int64_t a, int64_t b) {
 }
 
 /* Bounds guard: called before indexing a fixed-length array. */
+/* P113: the target of an `unreachable` terminator.
+ *
+ * The lowerer emits `IRTerminator::Unreachable` where it believes no path
+ * arrives — the fall-through of a value-producing `match` being much the
+ * commonest. When one does arrive, the two backends used to disagree about
+ * what happens: T3 emitted a bare `HALT`, which ends the program silently
+ * with status 0, and LLVM emitted `unreachable`, which is undefined
+ * behaviour and in practice read a garbage value and carried on. The
+ * lowerer's own comment said it "traps"; neither backend did.
+ *
+ * The message must stay byte-identical to the 562 handler in
+ * `src/codegen_t3/emulator/syscalls.rs`. */
+void manit_unreachable(void) {
+    manit_fault("unreachable code reached — commonly a `match` with no arm "
+                "for this value");
+}
+
 void manit_check_index(int64_t idx, int64_t len) {
     if (idx < 0 || idx >= len) {
         char buf[128];

@@ -1365,7 +1365,14 @@ impl LLVMEmitter {
                 lines
             }
 
-            IRTerminator::Unreachable => vec!["unreachable".to_string()],
+            // P113: `unreachable` alone is UNDEFINED BEHAVIOUR, not a trap.
+            // The call goes first so the fault is taken; the `unreachable`
+            // stays because it is still true after a noreturn call and it is
+            // what lets clang drop everything after it.
+            IRTerminator::Unreachable => vec![
+                "call void @manit_unreachable()".to_string(),
+                "unreachable".to_string(),
+            ],
         }
     }
 

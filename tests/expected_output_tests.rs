@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod common;
+
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn get_manitc() -> PathBuf {
@@ -37,8 +39,7 @@ fn temp_output(stem: &str, suffix: &str) -> PathBuf {
     // top-level entry per test is what makes a temp directory of 100,000
     // slow to open.
     let slot = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir()
-        .join(format!("manitc_expected_{}", std::process::id()))
+    let dir = common::suite_root("expected")
         .join(format!("{}_{}", suffix, slot));
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir.join(stem)

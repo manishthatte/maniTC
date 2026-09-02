@@ -587,6 +587,13 @@ fn declare_pattern_names(pat: &Pattern, env: &mut MoveEnv) {
     match pat {
         Pattern::Wildcard(_) | Pattern::Lit(_, _) => {}
         Pattern::Ident(n, _) => env.declare(n),
+        // C6: a trit capture is a fresh `int`, computed from the scrutinee
+        // rather than aliasing it, so it is declared and never a move.
+        Pattern::Trit(tp, _) => {
+            for n in tp.bound_names() {
+                env.declare(&n);
+            }
+        }
         Pattern::Tuple(ps, _) | Pattern::Or(ps, _) | Pattern::Enum(_, _, ps, _) => {
             for p in ps {
                 declare_pattern_names(p, env);

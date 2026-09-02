@@ -914,6 +914,9 @@ impl SemanticAnalyzer {
                     // Pattern bindings (e.g. `Ok(v) => ...`) live in a per-arm
                     // scope and are visible to both the guard and the body.
                     self.symbols.push_scope();
+                    // C6: a trit pattern reads the trits of a balanced-ternary
+                    // word, so its scrutinee must be one.
+                    self.check_trit_pattern_scrutinee(&arm.pattern, &tscrutinee.ty)?;
                     self.define_pattern_bindings(&arm.pattern, &tscrutinee.ty);
                     let guard = if let Some(g) = &arm.guard {
                         let tg = self.check_expr(g, Some(&ManiType::Bool))?;
@@ -1609,6 +1612,15 @@ fn bind_pattern_names(pat: &Pattern, bound: &mut [std::collections::HashSet<Stri
     match pat {
         Pattern::Wildcard(_) | Pattern::Lit(_, _) => {}
         Pattern::Ident(n, _) => bind_name(bound, n),
+        // C6: a trit pattern's captures are ordinary bindings. This walker is
+        // what `collect_free_in_block` uses to decide a spawned block's
+        // captures (P99b), so a missing arm here is a silently wrong program,
+        // not a diagnostic.
+        Pattern::Trit(tp, _) => {
+            for n in tp.bound_names() {
+                bind_name(bound, &n);
+            }
+        }
         Pattern::Tuple(ps, _) | Pattern::Or(ps, _) | Pattern::Enum(_, _, ps, _) => {
             for p in ps {
                 bind_pattern_names(p, bound);

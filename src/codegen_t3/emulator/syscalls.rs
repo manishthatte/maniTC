@@ -55,6 +55,15 @@ impl Emulator {
                         if tag == 0 { "Unknown" } else { "Err" }));
                 }
             }
+            // P113: the `unreachable` terminator. Takes no operands.
+            //
+            // The message text must stay byte-identical to
+            // `manit_unreachable` in runtime/core.c — the second hand-written
+            // pair in this file, and recorded as such for the same reason the
+            // first one is.
+            562 => {
+                self.trap("TRAP: unreachable code reached — commonly a `match` with no arm for this value".to_string());
+            }
             // A2: array bounds guard — R1 = index, R2 = length.
             560 => {
                 let idx = self.regs[1];

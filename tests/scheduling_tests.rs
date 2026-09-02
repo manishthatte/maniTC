@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod common;
+
 static N: AtomicUsize = AtomicUsize::new(0);
 
 fn manitc_bin() -> PathBuf {
@@ -26,8 +28,7 @@ fn manitc_bin() -> PathBuf {
 /// Compile with the given `--sched` and run on T3; returns (stdout, trapped).
 fn run(src: &str, sched: &str) -> (String, bool) {
     let slot = N.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir()
-        .join(format!("manitc_sched_{}", std::process::id()))
+    let d = common::suite_root("sched")
         .join(slot.to_string());
     std::fs::create_dir_all(&d).expect("temp dir");
     let path = d.join("p.mt");
@@ -242,8 +243,7 @@ fn main() {
 #[test]
 fn cooperative_now_runs_on_llvm_and_agrees_with_t3() {
     let slot = N.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir()
-        .join(format!("manitc_sched_{}", std::process::id()))
+    let d = common::suite_root("sched")
         .join(format!("llvm{}", slot));
     std::fs::create_dir_all(&d).expect("temp dir");
     let path = d.join("p.mt");
@@ -283,7 +283,7 @@ fn cooperative_now_runs_on_llvm_and_agrees_with_t3() {
 /// An unknown `--sched` is an error, not a silent fallback to the default.
 #[test]
 fn an_unknown_sched_mode_is_refused() {
-    let d = std::env::temp_dir().join(format!("manitc_sched_bad_{}", std::process::id()));
+    let d = common::suite_root("sched_bad");
     std::fs::create_dir_all(&d).expect("temp dir");
     let path = d.join("p.mt");
     std::fs::write(&path, "fn main() { }").expect("write");

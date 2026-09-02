@@ -12,6 +12,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -29,8 +31,11 @@ fn test_source(name: &str) -> PathBuf {
 /// Unique temp directory per test to allow parallel execution.
 fn temp_output(test_file: &str, suffix: &str) -> PathBuf {
     let stem = test_file.replace(".mt", "");
-    let dir = std::env::temp_dir().join(format!("manitc_test_{}_{}", suffix, std::process::id()));
-    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+    // The suffix is part of the SUITE name rather than of the path below it,
+    // because it is what makes two backends' outputs for one program distinct.
+    // `suite_root` splits the pid off from the right, so a suite name with a
+    // `-` in it is fine.
+    let dir = common::suite_root(&format!("integration-{}", suffix));
     dir.join(stem)
 }
 
@@ -387,7 +392,7 @@ fn minimal_runtime_gui_net_use_gets_clear_diagnostic() {
 }
 
 fn write_temp_mt(name: &str, source: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("manitc_runt3_{}", std::process::id()));
+    let dir = common::suite_root("runt3");
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     let path = dir.join(name);
     std::fs::write(&path, source).expect("failed to write temp source");

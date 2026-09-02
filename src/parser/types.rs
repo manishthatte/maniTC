@@ -187,9 +187,124 @@ impl Parser {
         Ok(first)
     }
 
+    /// C6: turn the text a `TritPat` token carries into an `ast::TritPat`.
+    ///
+    /// The grammar lives here and not in the lexer, which absorbs the run
+    /// without interpreting it. Elements are read left to right, HIGH trit
+    /// first, exactly as the `0t` literal reads.
+    fn build_trit_pattern(&self, text: &str, span: Span) -> CompileResult<TritPat> {
+        let mut elems: Vec<TritElem> = Vec::new();
+        let mut open = false;
+        let mut open_capture: Option<String> = None;
+        // `(name, elem_index, len)` while scanning; converted to trit
+        // positions once the width is known.
+        let mut caps: Vec<(String, usize, usize)> = Vec::new();
+        // The wildcard run a following `@` would name: `None` if the last
+        // element was not a wildcard, `Some(None)` for the leading `*`,
+        // `Some(Some((start, len)))` for a run of `?`.
+        let mut run: Option<Option<(usize, usize)>> = None;
+
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '*' => {
+                    if i != 0 {
+                        return Err(self.err_at(span, format!(
+                            "`*` may appear only as the first element of a trit pattern \
+                             (`0t{}`) — a `*` anywhere else would have to be placed by \
+                             knowing the word's trit width, which differs between the \
+                             backends", text)));
+                    }
+                    open = true;
+                    run = Some(None);
+                    i += 1;
+                }
+                '?' => {
+                    let start = elems.len();
+                    elems.push(TritElem::Any);
+                    run = match run {
+                        Some(Some((s, l))) => Some(Some((s, l + 1))),
+                        _ => Some(Some((start, 1))),
+                    };
+                    i += 1;
+                }
+                '+' | '0' | '-' => {
+                    let v: i8 = match chars[i] { '+' => 1, '-' => -1, _ => 0 };
+                    elems.push(TritElem::Fixed(v));
+                    run = None;
+                    i += 1;
+                }
+                '@' => {
+                    i += 1;
+                    let start = i;
+                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                        i += 1;
+                    }
+                    let name: String = chars[start..i].iter().collect();
+                    match run.take() {
+                        Some(None) => {
+                            if open_capture.is_some() {
+                                return Err(self.err_at(span,
+                                    "the `*` of a trit pattern is already named"));
+                            }
+                            open_capture = Some(name);
+                        }
+                        Some(Some((s, l))) => caps.push((name, s, l)),
+                        None => return Err(self.err_at(span,
+                            "`@` in a trit pattern must follow the wildcard run it names")),
+                    }
+                }
+                c => return Err(self.err_at(span, format!(
+                    "`{}` is not a trit pattern element — expected `+`, `0`, `-`, `?`, \
+                     a leading `*`, or `@name`", c))),
+            }
+        }
+
+        // The cap is arithmetic, not arbitrary: the lowering needs 3^width as
+        // a machine word and 3^40 does not fit one. `t54` is therefore wider
+        // than a trit pattern can span; `int`, `t27` and below are not.
+        const MAX_TRITS: usize = 39;
+        if elems.len() > MAX_TRITS {
+            return Err(self.err_at(span, format!(
+                "a trit pattern may name at most {} trits, this one names {} — beyond \
+                 that 3^width does not fit a 64-bit word", MAX_TRITS, elems.len())));
+        }
+
+        // elems are high-to-low, so element `idx` sits at position
+        // `width - 1 - idx` counting the LOW trit as 0.
+        let w = elems.len();
+        let mut captures: Vec<(String, usize, usize)> = Vec::new();
+        for (name, s, l) in caps {
+            captures.push((name, w - s - l, l));
+        }
+        // Low-to-high, so `fixed_runs` and the binder walk in one direction.
+        captures.sort_by_key(|(_, lo, _)| *lo);
+
+        let mut seen: Vec<&str> = Vec::new();
+        if let Some(n) = &open_capture {
+            seen.push(n.as_str());
+        }
+        for (n, _, _) in &captures {
+            if seen.contains(&n.as_str()) {
+                return Err(self.err_at(span, format!(
+                    "trit pattern binds `{}` twice", n)));
+            }
+            seen.push(n.as_str());
+        }
+
+        Ok(TritPat { elems, open, open_capture, captures, text: text.to_string() })
+    }
+
     pub(super) fn parse_single_pattern(&mut self) -> CompileResult<Pattern> {
         let span = self.span();
         match self.peek().clone() {
+            // C6: a trit pattern.
+            TokenKind::TritPat(text) => {
+                self.advance();
+                let tp = self.build_trit_pattern(&text, span)?;
+                Ok(Pattern::Trit(tp, span))
+            }
             // Wildcard _
             TokenKind::Ident(ref s) if s == "_" => {
                 self.advance();

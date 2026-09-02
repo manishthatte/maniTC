@@ -8,13 +8,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn get_manitc() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_manitc"))
 }
 
 /// Write `source` to a temp .mt file and return its path.
 fn write_source(name: &str, source: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("manitc_semantic_regr_{}", std::process::id()));
+    let dir = common::suite_root("semantic_regr");
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     let path = dir.join(name);
     std::fs::write(&path, source).expect("failed to write test source");

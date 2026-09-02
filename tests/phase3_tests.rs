@@ -21,10 +21,12 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn manitc() -> PathBuf { PathBuf::from(env!("CARGO_BIN_EXE_manitc")) }
 
 fn write(stem: &str, src: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("manitc_p3_{}", std::process::id()));
+    let d = common::suite_root("p3");
     std::fs::create_dir_all(&d).expect("temp dir");
     let p = d.join(format!("{}.mt", stem));
     std::fs::write(&p, src).expect("write");

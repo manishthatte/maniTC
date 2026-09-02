@@ -603,11 +603,98 @@ impl SemanticAnalyzer {
     /// deriving payload types from the scrutinee type where possible
     /// (Result/Option payloads, user enum variant fields, tuple elements,
     /// struct fields). Unknown payloads fall back to `ManiType::Unknown`.
+    /// C6: a trit pattern names trit positions of a balanced-ternary word, so
+    /// the scrutinee has to be one.
+    ///
+    /// `bool3` is excluded deliberately even though it is stored as a trit: it
+    /// is a truth value, not a number, and `docs/semantics.md` §10.2 already
+    /// records that the two are not interchangeable (`false as trit` is
+    /// unknown, not false). `float` and `t27f` are not ternary words at all.
+    /// `Unknown` passes, because refusing it would reject every generic body
+    /// whose type parameter is erased (P95).
+    pub(super) fn check_trit_pattern_scrutinee(
+        &self,
+        pat: &Pattern,
+        scrut_ty: &ManiType,
+    ) -> CompileResult<()> {
+        let tp_span = match pat {
+            Pattern::Trit(_, sp) => *sp,
+            // An alternative of an or-pattern sees the same scrutinee.
+            Pattern::Or(alts, _) => {
+                for a in alts {
+                    self.check_trit_pattern_scrutinee(a, scrut_ty)?;
+                }
+                return Ok(());
+            }
+            // A tuple element has its own type, and `(0t+?, _)` on a
+            // `(str, int)` is the same mistake one level in. Derived exactly
+            // as `define_pattern_bindings` derives it, so the two agree.
+            Pattern::Tuple(elems, _) => {
+                let elem_tys: Vec<ManiType> = match scrut_ty {
+                    ManiType::Tuple(ts) => ts.clone(),
+                    _ => vec![ManiType::Unknown; elems.len()],
+                };
+                for (i, e) in elems.iter().enumerate() {
+                    let ety = elem_tys.get(i).cloned().unwrap_or(ManiType::Unknown);
+                    self.check_trit_pattern_scrutinee(e, &ety)?;
+                }
+                return Ok(());
+            }
+            // A STATED LIMIT: a trit pattern inside a struct field or an enum
+            // payload is checked against `Unknown`, which passes. Deriving
+            // those types needs the declaration tables that
+            // `define_pattern_bindings` consults, and reaching for them here
+            // would make two walkers that must agree about payload types —
+            // P90's shape. The sub-patterns are still walked, so a tuple
+            // nested inside one is checked as soon as its own type is known.
+            Pattern::Struct(_, fields, _) => {
+                for (_, fp) in fields {
+                    self.check_trit_pattern_scrutinee(fp, &ManiType::Unknown)?;
+                }
+                return Ok(());
+            }
+            Pattern::Enum(_, _, fields, _) => {
+                for fp in fields {
+                    self.check_trit_pattern_scrutinee(fp, &ManiType::Unknown)?;
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let ok = matches!(
+            scrut_ty,
+            ManiType::Int
+                | ManiType::Trit
+                | ManiType::Tryte
+                | ManiType::T9
+                | ManiType::T27
+                | ManiType::T54
+                | ManiType::Unknown
+        );
+        if !ok {
+            return Err(self.err(tp_span, format!(
+                "a trit pattern matches the trits of a balanced-ternary word, but this \
+                 match is on `{}`",
+                scrut_ty.display()
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn define_pattern_bindings(&mut self, pat: &Pattern, scrut_ty: &ManiType) {
         match pat {
             Pattern::Wildcard(_) | Pattern::Lit(_, _) => {}
             Pattern::Ident(name, _) => {
                 self.symbols.define(name, scrut_ty.clone(), false);
+            }
+            // C6: a capture binds `int`, whatever its width and whatever the
+            // scrutinee's type. A capture may be 1..39 trits wide and only
+            // three widths have names (`tryte`, `t9`, `t27`), so typing it by
+            // width wants C3's `t<N>`, which is not built. One rule today.
+            Pattern::Trit(tp, _) => {
+                for name in tp.bound_names() {
+                    self.symbols.define(&name, ManiType::Int, false);
+                }
             }
             Pattern::Tuple(pats, _) => {
                 let elem_tys: Vec<ManiType> = match scrut_ty {
@@ -715,11 +802,61 @@ impl SemanticAnalyzer {
         let arms: Vec<&TypedMatchArm> = arms.iter().filter(|a| a.guard.is_none()).collect();
 
         // Wildcard or variable binding arm = always exhaustive
+        //
+        // C6 adds one more shape, and it consults the SHARED predicate rather
+        // than restating the rule: `0t*` (a leading run wildcard and no fixed
+        // trit) constrains nothing, so it is a catch-all. Only the new variant
+        // is routed through `is_irrefutable`; the two original arms are left
+        // spelled out, so no existing verdict moves.
         let has_catch_all = arms.iter().any(|arm| {
             matches!(&arm.pattern, Pattern::Wildcard(_) | Pattern::Ident(_, _))
+                || (matches!(&arm.pattern, Pattern::Trit(_, _)) && arm.pattern.is_irrefutable())
         });
         if has_catch_all {
             return Ok(());
+        }
+
+        // C6: three arms that fix the SAME single trit position to `+`, `0`
+        // and `-`, and constrain nothing else, cover every value — of any
+        // balanced-ternary word, not merely of a `trit`. This is the shape a
+        // radix-3 decision structure has, and saying it here is what lets one
+        // be written without a dead `_` arm.
+        //
+        // The leading `*` is load-bearing and `sole_fixed_position` requires
+        // it: WITHOUT it the arms also demand that every trit above the
+        // pattern is zero, and three such arms cover only the values that fit
+        // in the pattern's width. `0t+ | 0t0 | 0t-` is exhaustive over a
+        // `trit` and not over an `int`, which is a different claim needing the
+        // scrutinee's width; `0t*+ | 0t*0 | 0t*-` needs no width at all.
+        if !arms.is_empty() {
+            let mut sole: Vec<(usize, i8)> = Vec::new();
+            for arm in &arms {
+                match &arm.pattern {
+                    Pattern::Trit(tp, _) => match tp.sole_fixed_position() {
+                        Some(pv) => sole.push(pv),
+                        None => {
+                            sole.clear();
+                            break;
+                        }
+                    },
+                    _ => {
+                        sole.clear();
+                        break;
+                    }
+                }
+            }
+            if !sole.is_empty() {
+                let pos = sole[0].0;
+                if sole.iter().all(|(p, _)| *p == pos) {
+                    let mut seen = [false; 3];
+                    for (_, v) in &sole {
+                        seen[(*v + 1) as usize] = true;
+                    }
+                    if seen.iter().all(|b| *b) {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         match scrutinee_ty {

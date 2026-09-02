@@ -217,8 +217,26 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
             // `val_reg` writes into `lines` on the way past, so calling it and
             // ignoring the result would leave the TLIT behind.
             let r_imm = if binop_takes_imm3(op) { t3_imm3(rhs) } else { None };
+            // P114: the shift arm selects its OWN immediate, so materialising
+            // `rhs` into a register first pays a `TLIT` the emitted
+            // instruction never spends. `binop_takes_imm3` excludes the shifts
+            // deliberately and its comment says why — they need the register
+            // form when the amount overflows the three-trit field — but the
+            // exclusion was read as "always materialise", when only the
+            // FALLBACK needs it. Decided here rather than in the arm because
+            // `val_reg` writes its `TLIT` into `lines` on the way past, so the
+            // materialisation has to be skipped rather than discarded (P40's
+            // own note, at the one site P40 left out).
+            let shift_imm: Option<i64> = match (op, rhs) {
+                (
+                    IRBinOp::TShl | IRBinOp::TShlT27 | IRBinOp::TShr,
+                    IRValue::Const(IRConst::Int(n)),
+                ) if (0..=13).contains(n) => Some(*n),
+                _ => None,
+            };
             let r = match r_imm {
                 Some(k) => format!("#{}", k),
+                None if shift_imm.is_some() => String::new(),
                 None => AsmEmitter::rn(em.val_reg(rhs)),
             };
             let (d, l) = (AsmEmitter::rn(rd), AsmEmitter::rn(rl));
@@ -255,18 +273,18 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                     // traps on 27-trit overflow via `checked27` whether or not
                     // the IR asked for a check. The distinction is LLVM's.
                     let mn = if matches!(op, IRBinOp::TShr) { "TSHR" } else { "TSHI" };
-                    if let IRValue::Const(IRConst::Int(n)) = rhs {
-                        // The immediate field is THREE TRITS and holds -13..=13,
-                        // not the 0..=26 a 27-trit word can be shifted by. A
-                        // multiply by 3^18 exists in the stdlib's ternary
-                        // conversions and produced "Immediate out of range for
-                        // TSHI"; the register form is the same fallback the
-                        // binary shifts below already use.
-                        if (0..=13).contains(n) {
-                            em.emit(format!("    {}  {}, {}, #{}  ; ternary shift", mn, d, l, n));
-                        } else {
-                            em.emit(format!("    {}  {}, {}, {}  ; ternary shift (wide)", mn, d, l, r));
-                        }
+                    // The immediate field is THREE TRITS and holds -13..=13,
+                    // not the 0..=26 a 27-trit word can be shifted by. A
+                    // multiply by 3^18 exists in the stdlib's ternary
+                    // conversions and produced "Immediate out of range for
+                    // TSHI"; the register form is the same fallback the
+                    // binary shifts below already use. `shift_imm` is that
+                    // decision, taken above so the fallback is the only case
+                    // that materialises anything (P114).
+                    if let Some(n) = shift_imm {
+                        em.emit(format!("    {}  {}, {}, #{}  ; ternary shift", mn, d, l, n));
+                    } else if matches!(rhs, IRValue::Const(_)) {
+                        em.emit(format!("    {}  {}, {}, {}  ; ternary shift (wide)", mn, d, l, r));
                     } else {
                         em.emit(format!("    {}  {}, {}, {}  ; ternary shift (dyn)", mn, d, l, r));
                     }
@@ -2083,6 +2101,12 @@ pub(super) fn emit_term(em: &mut AsmEmitter, term: &IRTerminator) {
             ));
         }
         IRTerminator::Unreachable => {
+            // P113: a bare `HALT` ends the program with status 0, so a match
+            // that fell off its own end simply stopped producing output and
+            // said nothing. 562 is in the guard family beside 560 (bounds)
+            // and 561 (unwrap); the `HALT` stays after it because the syscall
+            // does not return.
+            em.emit("    SYSCALL #562  ; unreachable".to_string());
             em.emit("    HALT  ; unreachable".to_string());
         }
     }

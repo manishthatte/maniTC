@@ -14,6 +14,15 @@ pub enum TokenKind {
     Char(char),
     Bool(bool),
     TernaryInt(i64), // 0t+0- balanced ternary literal
+    /// C6: a trit PATTERN — `0t` followed by a run that contains at
+    /// least one wildcard (`?` or a leading `*`) or a capture. The
+    /// payload is the text after `0t`; the parser turns it into an
+    /// `ast::TritPat`, so the grammar lives in one place.
+    ///
+    /// A run with no wildcard and no capture is a `TernaryInt` as
+    /// before, which is what makes `0t++0` mean the same thing in a
+    /// pattern as it does in an expression.
+    TritPat(String),
 
     // --- Identifiers / keywords ---
     Ident(String),
@@ -462,10 +471,95 @@ impl Lexer {
                     self.advance(); // '0'
                     self.advance(); // 't'
                     let mut digits: Vec<char> = Vec::new();
+                    // C6: the same run also spells a trit PATTERN. `text` is
+                    // everything absorbed, `digits` only the trit digits, so
+                    // a run with no wildcard and no capture still produces
+                    // exactly the `TernaryInt` it always did.
+                    let mut text = String::new();
+                    let mut is_pattern = false;
                     while let Some(c) = self.peek() {
                         match c {
+                            // C6: `*` is the run wildcard, and it is accepted
+                            // ONLY as the first character. That is the
+                            // language rule (a `*` elsewhere would have to be
+                            // placed by knowing the word's trit width, which
+                            // differs between the backends under v1 — see
+                            // `ast::TritPat`), and it happens to also remove
+                            // the lexical hazard: `0t+*3` keeps its meaning,
+                            // `0t+` times 3, because that `*` is not first.
+                            // A `*` is the run wildcard when it is the first
+                            // element, when the run is already unambiguously a
+                            // pattern, or when the character after it could not
+                            // begin an operand — the same one-character
+                            // lookahead this function already applies to `+`
+                            // and `-`, and the reason `0t+*3` keeps meaning
+                            // `0t+` times 3.
+                            //
+                            // Only `?`, `*` and `@` are in that set. `+`, `0`
+                            // and `-` are left out on purpose: they ARE legal
+                            // operands, so `0t+*+` stays a multiplication. The
+                            // effect is that a misplaced `*` is absorbed
+                            // exactly when it cannot be anything else, which is
+                            // what makes the parser's explanation of the
+                            // leftmost-only rule reachable at all.
+                            '*' if text.is_empty()
+                                || is_pattern
+                                || matches!(self.peek2(), Some('?') | Some('*') | Some('@')) =>
+                            {
+                                is_pattern = true;
+                                text.push(c);
+                                self.advance();
+                            }
+                            // C6: `?` is the single-trit wildcard. Absorbing
+                            // it changes no existing program: a `?` after an
+                            // integer literal is the `Result` try operator,
+                            // which is ill-typed on an integer, and there is
+                            // no such site in either repository or in the
+                            // 2,507-file corpus (the one textual hit is a
+                            // comment, copied 126 times).
+                            '?' => {
+                                is_pattern = true;
+                                text.push(c);
+                                self.advance();
+                            }
+                            // C6: `name@` binds the wildcard run just read.
+                            // The name FOLLOWS the run, where Rust's `@`
+                            // precedes its pattern, and the lexer is why: a
+                            // letter is an operand start, so `0t+lo@???`
+                            // would end the literal at `0t`. `@` is not a
+                            // token in this language, so the postfix form is
+                            // unambiguous.
+                            '@' => {
+                                if !matches!(text.chars().last(), Some('?') | Some('*')) {
+                                    return Err(self.err_at(
+                                        span,
+                                        "`@` in a trit pattern must follow the wildcard run it names",
+                                    ));
+                                }
+                                is_pattern = true;
+                                text.push(c);
+                                self.advance();
+                                let mut name = String::new();
+                                while let Some(n) = self.peek() {
+                                    if n.is_alphanumeric() || n == '_' {
+                                        name.push(n);
+                                        self.advance();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if name.is_empty() || name.chars().next().unwrap().is_ascii_digit()
+                                {
+                                    return Err(self.err_at(
+                                        span,
+                                        "expected a capture name after `@` in a trit pattern",
+                                    ));
+                                }
+                                text.push_str(&name);
+                            }
                             '0' => {
                                 digits.push(c);
+                                text.push(c);
                                 self.advance();
                             }
                             '+' | '-' => {
@@ -485,10 +579,17 @@ impl Lexer {
                                     break;
                                 }
                                 digits.push(c);
+                                text.push(c);
                                 self.advance();
                             }
                             _ => break,
                         }
+                    }
+                    if is_pattern {
+                        // C6: `text` always ends a complete element here —
+                        // the `@` arm consumes its own name — so the parser
+                        // receives a run it can read left to right.
+                        return Ok(Token::new(TokenKind::TritPat(text), span));
                     }
                     if digits.is_empty() {
                         return Err(self.err_at(span, "empty balanced ternary literal after '0t'"));

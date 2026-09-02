@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod common;
+
 fn obs(src: &str) -> (String, Option<String>) {
     match reference::interpret(src) {
         Ok(o) => (o.out, o.trap),
@@ -465,8 +467,7 @@ static N: AtomicUsize = AtomicUsize::new(0);
 
 fn t3_trace(src: &str) -> String {
     let slot = N.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir()
-        .join(format!("manitc_il_{}", std::process::id()))
+    let d = common::suite_root("il")
         .join(slot.to_string());
     std::fs::create_dir_all(&d).expect("temp dir");
     let path = d.join("gap.mt");

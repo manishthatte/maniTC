@@ -42,6 +42,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 fn manitc() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_manitc"))
 }
@@ -60,7 +62,7 @@ fn expected(name: &str) -> String {
 }
 
 fn tmp(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("manitc_oracle_{}", std::process::id()));
+    let d = common::suite_root("oracle");
     std::fs::create_dir_all(&d).expect("temp dir");
     d.join(name)
 }

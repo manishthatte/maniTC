@@ -269,7 +269,7 @@ Accumulates `digit * 3^position`.
 
 ## 5. ast.rs — abstract syntax tree
 
-**File:** `maniTC/src/ast.rs` (~680 lines)
+**File:** `maniTC/src/ast.rs` (~840 lines)
 
 The AST represents the programmer's source code **after parsing** but **before**
 type checking. Every node carries a `Span` for error reporting.

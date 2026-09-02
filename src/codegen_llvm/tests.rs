@@ -602,7 +602,14 @@ fn runtime_declares_match_the_abi_clang_actually_emits() {
         return;
     }
 
-    let dir = std::env::temp_dir().join(format!("manitc_abi_{}", std::process::id()));
+    // P115: the same `manitc-tests/<suite>-<pid>` layout the integration
+    // suites use, so the liveness sweep in `tests/common/mod.rs` reaches this
+    // one too. It cannot call that module — a unit test inside the library
+    // cannot see `tests/` — so it shares the NAMING and lets the sweep, which
+    // has one home, do the removing.
+    let dir = std::env::temp_dir()
+        .join("manitc-tests")
+        .join(format!("abi-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let ll = dir.join("rt.ll");
     let out = Command::new(&clang)
