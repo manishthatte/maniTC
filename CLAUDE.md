@@ -237,11 +237,14 @@ above them (`cargo test`, the parity matrix, `--verify-ssa`, `--profile`,
   moves under you, and `target/debug/manitc` gets rebuilt mid-measurement. **Stage by
   path, never `git add -A`**; re-read `git status` between the last check and the
   commit; use a private `CARGO_TARGET_DIR` and a sha-pinned binary when it matters.
-  **Put that private target dir under `/var/scratch/builds/`, never in `TMPDIR`.**
-  `TMPDIR` is `/tmp` (32 GB, swept at 10 days) — right for this suite's own scratch,
-  far too small for several 2.7 GB target trees. It pointed at `/var/scratch` until
-  3 Sep 2026, which is how build scratch came to share the simulation volume and
-  exhaust its inodes; see `THATTE/hw/storage/STORAGE_POLICY.md`, "The two tenants".
+  **Builds no longer land in `./target`.** Since 3 Sep 2026 `CARGO_TARGET_DIR` is
+  `/var/scratch/builds/cargo` on the NVMe, set globally, so a private target dir for a
+  measurement is a subdirectory of that — never `TMPDIR`, which is `/tmp` at 32 GB with
+  ~20 GB free and cannot hold several 2.7 GB trees. `TMPDIR` pointed at `/var/scratch`
+  until the same day, which is how this repo's build and test scratch came to share the
+  simulation volume and exhaust its inodes. The repo-local `target/` on `/home` is also
+  gone as a side effect, and that is a gain: it was 2.7 GB of constantly-rebuilt output
+  on the SATA disk. See `THATTE/hw/storage/STORAGE_POLICY.md`, "The two tenants".
   A suite total measures the whole TREE — in a shared tree it is evidence about your
   change only once every moved row is accounted for.
 - **A skip condition that overlaps the failure condition is a silent pass.** Tell the
