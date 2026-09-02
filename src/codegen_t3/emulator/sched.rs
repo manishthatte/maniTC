@@ -64,6 +64,19 @@ pub(crate) struct SavedTask {
     pub call_depth: usize,
 }
 
+/// §11.12 `𝒯`. What a task handle names.
+///
+/// `Taken` is the only one of the three the one-shot-channel model does not
+/// already give, and §11.12 keeps it for one reason: without it the second
+/// `await` on a handle answers with (RECV-CLOSED)'s zero, silently. With it,
+/// the second `await` is a trap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskVal {
+    Running,
+    Done(i64),
+    Taken,
+}
+
 /// §11.3's configuration, less the parts the emulator already owns.
 pub(crate) struct Sched {
     /// §11.3 `R`. The head is the running task; there is never more than one.
@@ -85,6 +98,18 @@ pub(crate) struct Sched {
     /// unbounded, which is `channel<T>()` and every channel that existed
     /// before 0.7.
     pub chan_cap: HashMap<usize, usize>,
+    /// §11.12 `𝒯`, keyed by task handle. A handle is a task id, and inline
+    /// handles (below) draw from the same counter so the two can never
+    /// collide.
+    pub tstate: HashMap<TaskId, TaskVal>,
+    /// §11.12 (AWAIT-BLOCK): tasks waiting on a handle.
+    ///
+    /// **A third map, and separate from `blocked` for §11.11's reason.** A
+    /// channel's (SEND-WAKE) must not wake an awaiter and a task's (DONE-T)
+    /// must not wake a receiver; one queue holding both lets either wake the
+    /// wrong kind, and the woken task re-checks, finds nothing changed for it
+    /// and blocks again — visible only as an ordering difference.
+    pub blocked_await: HashMap<TaskId, VecDeque<TaskId>>,
     /// Every task except the running one.
     pub saved: HashMap<TaskId, SavedTask>,
     pub next_id: TaskId,
@@ -105,6 +130,8 @@ impl Default for Sched {
             blocked: HashMap::new(),
             blocked_send: HashMap::new(),
             chan_cap: HashMap::new(),
+            tstate: HashMap::new(),
+            blocked_await: HashMap::new(),
             saved: HashMap::new(),
             next_id: 1,
             main_exit: None,
@@ -120,6 +147,13 @@ impl Sched {
     }
 
     /// Is any task waiting on a channel? §11.6's second end condition.
+    /// Is anybody waiting on a task handle? §11.6 counts an awaiter exactly
+    /// as it counts a channel waiter: if `R` empties while one is queued, no
+    /// runnable task can ever finish the awaited task.
+    pub fn anyone_awaiting(&self) -> bool {
+        self.blocked_await.values().any(|q| !q.is_empty())
+    }
+
     pub fn anyone_blocked(&self) -> bool {
         // §11.11: `S` counts as much as `B`. A task waiting for room on a
         // channel nothing will drain is as deadlocked as one waiting for a
@@ -214,6 +248,16 @@ impl Emulator {
         if self.sched.current().is_some() {
             return false;
         }
+        if self.sched.anyone_awaiting() {
+            // §11.12's own §11.6 clause. Reachable only when the awaited task
+            // is itself blocked, and the message says so rather than naming a
+            // channel that has nothing to do with it.
+            self.trap(
+                "TRAP: deadlock — every task is blocked awaiting a task that \
+                 cannot finish",
+            );
+            return true;
+        }
         if self.sched.anyone_blocked() {
             // §11.11: name which of the two it is. A task waiting for ROOM and
             // one waiting for a VALUE are both deadlocked when R empties, and
@@ -285,6 +329,10 @@ impl Emulator {
         child.regs[1] = 0;
         self.sched.saved.insert(id, child);
         self.sched.run.push_back(id);
+        // §11.12 (SPAWN-T): 𝒯[h ↦ running]. Recorded for EVERY spawn, not
+        // only for one whose handle is used — the handle is a return value and
+        // nothing upstream knows whether it will be awaited.
+        self.sched.tstate.insert(id, TaskVal::Running);
         id
     }
 
@@ -319,6 +367,92 @@ impl Emulator {
             return;
         }
         self.switch_away_forever();
+    }
+
+    /// §11.12 (DONE-T). A spawned task terminates WITH A VALUE: `𝒯[h ↦
+    /// done(v)]`, and every waiter on `h` is woken.
+    ///
+    /// **All of them, not one, and it is (CLOSE)'s reason rather than
+    /// (SEND-WAKE)'s.** A `send` produces one value, so a second waiter would
+    /// find nothing and block again. Termination is a PERMANENT FACT: every
+    /// awaiting task can now proceed, and one left queued is stranded forever
+    /// because nothing will ever finish this task twice.
+    pub(crate) fn sched_task_exit_value(&mut self, v: i64) {
+        if let Some(me) = self.sched.current() {
+            self.sched.tstate.insert(me, TaskVal::Done(v));
+            if let Some(q) = self.sched.blocked_await.get_mut(&me) {
+                while let Some(w) = q.pop_front() {
+                    self.sched.run.push_back(w);
+                }
+            }
+        }
+        self.sched_task_exit();
+    }
+
+    /// A handle for a value that was computed WITHOUT a task.
+    ///
+    /// `--sched inline` is still the default and still evaluates `spawn { B }`
+    /// in place (`docs/memory-model.md` §4), so its handle is born `done`.
+    /// §11.12's decision 1 — "awaiting a finished task returns immediately" —
+    /// is what makes that a legal task rather than a special case: a handle
+    /// whose task finished long ago is the ordinary one.
+    pub(crate) fn sched_done_value(&mut self, v: i64) -> TaskId {
+        let h = self.sched.next_id;
+        self.sched.next_id += 1;
+        self.sched.tstate.insert(h, TaskVal::Done(v));
+        h
+    }
+
+    /// §11.12 (AWAIT). Returns `Some(v)` when the value is available, and
+    /// `None` when the task blocked or the program ended — in which case the
+    /// caller must not write a result register.
+    pub(crate) fn sched_await(&mut self, h: usize) -> Option<i64> {
+        match self.sched.tstate.get(&h).copied() {
+            // (AWAIT): 𝒯(h) = done(v). Does not touch `R` — a finished task
+            // is awaited without yielding.
+            Some(TaskVal::Done(v)) => {
+                self.sched.tstate.insert(h, TaskVal::Taken);
+                Some(v)
+            }
+            // Decision 2. The alternative — answering with the value again —
+            // is available and rejected: a program awaiting one handle twice
+            // has almost certainly confused two handles, and a detected error
+            // beats a plausible continuation.
+            Some(TaskVal::Taken) => {
+                self.trap(
+                    "TRAP: await on a task whose value has already been taken",
+                );
+                None
+            }
+            // (AWAIT-BLOCK). An unfinished task is an empty one-shot channel,
+            // so this is §11.4's point 2 and the list of yield points does not
+            // grow.
+            Some(TaskVal::Running) => {
+                let Some(me) = self.sched.current() else { return None };
+                self.sched.run.pop_front();
+                self.sched.blocked_await.entry(h).or_default().push_back(me);
+                if self.end_of_program() {
+                    return None;
+                }
+                // As (RECV-BLOCK): the task resumes with its `await` still in
+                // front of it, so rewind past the SYSCALL `step` already
+                // advanced over and re-execute.
+                self.pc -= 1;
+                let saved = self.save_current();
+                self.sched.saved.insert(me, saved);
+                if let Some(t) = self.sched.saved.remove(&self.sched.run[0]) {
+                    self.restore(t);
+                }
+                None
+            }
+            // A handle naming no task at all. Under `--sched inline` every
+            // handle is created `done`, and under a scheduler every fork
+            // records `running`, so this is a handle the program invented.
+            None => {
+                self.trap("TRAP: await on a value that is not a task handle");
+                None
+            }
+        }
     }
 
     /// §11.5 (RECV-BLOCK): the task leaves `R` for `B(c)` with its `recv`

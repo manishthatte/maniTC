@@ -170,6 +170,22 @@ pub struct Param {
     pub name: String,
     pub ty: Type,
     pub span: Span,
+    /// **B7's D-2**: `fn consume(x: move str)`. Passing an argument to a
+    /// `move` parameter CONSUMES it, so the caller may not use it afterwards.
+    ///
+    /// A per-parameter annotation and not a change to what all calls do, and
+    /// the sweep is why: making every call argument consume refuses **24.7 %
+    /// of 1,545 corpus programs, 36.4 % of distinct repository programs and
+    /// fifty standard-library functions**, because ManiT has no reference
+    /// types and a call is therefore the only way to read a value twice.
+    /// Annotating the few sites that consume has a blast radius of zero by
+    /// construction.
+    ///
+    /// `move` is a **contextual** keyword, recognised only here. It is not a
+    /// reserved word, because `stdlib/fs.mt` declares `fn move(src, dst)` and
+    /// making it one would delete a shipped function — P104's lesson, which
+    /// cost a lint an unspellable name.
+    pub is_move: bool,
 }
 
 // ---------------------------------------------------------------------------

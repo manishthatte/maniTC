@@ -1520,18 +1520,149 @@ fn p51_the_documented_move_table_holds_for_scopes() {
         "§22 lists `int` as Copy, so binding it twice must be fine");
 }
 
-/// **The array/tuple asymmetry, pinned as the open sub-finding it is.**
+/// **The array/tuple asymmetry — RESOLVED 2 September 2026 by B7's D-3, and
+/// this row is rewritten IN PLACE rather than replaced.**
 ///
-/// §22 records the array row with a warning not to rely on it. This test holds
-/// the CURRENT behaviour so that changing it is a deliberate act that also
-/// updates the section — not a silent drift in either direction.
+/// It used to pin the opposite behaviour and read: *"an array literal moving
+/// its elements would be a CHANGE — correct, probably, and it must update
+/// language-reference.md §22's table and its warning note at the same time"*.
+/// That instruction is what this rewrite is; the handoff worked, and it is
+/// kept here because a row that says what to do when it goes red is the
+/// cheapest handoff there is (P104).
+///
+/// **The resolution is not the one §22's old note anticipated.** It asked
+/// which of the tuple row and the array row was wrong. Measured, an array
+/// literal is TWO constructs wearing one syntax, and both rows are right for
+/// their own construct.
 #[test]
-fn p51_an_array_literal_does_not_move_its_elements_yet() {
+fn p51_an_array_literal_moves_its_elements_only_as_a_container() {
+    // CONTAINER — bound to a name, so it outlives the expression and holds a
+    // second name for `s`. Consumes, exactly as the tuple and struct rows do.
     assert!(
-        checks("array_elem", "    let s: str = \"ab\"; let a: [str; 2] = [s, s]; io::println(s); io::println(a[0]);"),
-        "an array literal moving its elements would be a CHANGE — correct, \
-         probably, and it must update language-reference.md §22's table and \
-         its warning note at the same time"
+        !checks("array_container", "    let s: str = \"ab\"; let a: [str; 2] = [s, s]; io::println(s); io::println(a[0]);"),
+        "§22 says an array literal BOUND TO A NAME moves its elements, like \
+         a tuple and a struct literal"
+    );
+    // VARARGS — the argument list of a call, which does not consume (the row
+    // above it in the same table). 1,120 of 1,120 array-literal sites in the
+    // standard library are this, so the other reading would refuse
+    // `fmt::format` itself.
+    assert!(
+        checks("array_vararg", "    let s: str = \"ab\"; io::println(fmt::format(\"{} {}\", [s, s])); io::println(s);"),
+        "§22 says an array literal in ARGUMENT position is a varargs list and \
+         does not consume — a call never consumes its argument"
+    );
+    // The rule fires only on a plain variable, which is what keeps its blast
+    // radius at zero over 2,873 measured files.
+    assert!(
+        checks("array_literals", "    let a: [str; 2] = [\"To:\", \"Sub:\"]; io::println(a[0]);"),
+        "an array of literals has no move site at all"
+    );
+}
+
+/// As `checks`, with a `move`-annotated function in scope.
+///
+/// **Separate from `checks` on purpose.** Putting `fn eat(x: move str)` in the
+/// shared preamble made every row that uses `checks` fail on the pre-D-2
+/// compiler — including two §22 rows that have nothing to do with D-2 — so the
+/// control was red for an environment reason rather than because the rows
+/// discriminate. A control that fails for the wrong reason is worth as little
+/// as one that passes for the wrong reason.
+fn checks_d2(name: &str, body: &str) -> bool {
+    let src = tmp(&format!("d2_{}.mt", name));
+    std::fs::write(
+        &src,
+        format!(
+            "use std::io;\n\
+             fn take(x: str) -> int {{ return str::len(x); }}\n\
+             fn eat(x: move str) -> int {{ return str::len(x); }}\n\
+             fn main() {{\n{}\n}}\n",
+            body
+        ),
+    )
+    .expect("write");
+    Command::new(manitc())
+        .args(["check", src.to_str().unwrap()])
+        .output()
+        .expect("check")
+        .status
+        .success()
+}
+
+/// **B7's D-2 — `fn consume(x: move str)`.**
+///
+/// The sweep is why this is a per-parameter annotation and not a change to what
+/// all calls do: making every call argument consume refuses **24.7 % of 1,545
+/// corpus programs, 36.4 % of distinct repository programs and fifty
+/// standard-library functions**, because ManiT has no reference types and a
+/// call is therefore the only way to read a value twice. `str::take` calls
+/// `len(s)` and then `slice(s, …)`; so does most correct code.
+///
+/// Annotating the few sites that genuinely consume has a blast radius of
+/// **zero by construction** — the map of consuming positions is empty for a
+/// program that writes no `move`.
+#[test]
+fn d2_a_move_parameter_consumes_its_argument() {
+    assert!(
+        !checks_d2("moved", "    let s: str = \"ab\"; io::print_int(eat(s)); io::println(s);"),
+        "a `move` parameter must consume: using `s` afterwards is a use of a \
+         moved value"
+    );
+    assert!(
+        checks_d2("once", "    let s: str = \"ab\"; io::print_int(eat(s));"),
+        "consuming and not using it again is the whole point — this must be \
+         accepted"
+    );
+    assert!(
+        !checks_d2("twice", "    let s: str = \"ab\"; io::print_int(eat(s)); io::print_int(eat(s));"),
+        "the second call is a use of a moved value"
+    );
+}
+
+#[test]
+fn d2_a_plain_parameter_still_does_not_consume() {
+    // Passes on the pre-D-2 compiler too — it pins the BOUNDARY the change is
+    // drawn along, which is §22's call row, unmoved — which is the half that makes D-2 safe to add.
+    assert!(
+        checks("d2_plain", "    let s: str = \"ab\"; take(s); take(s); io::println(s);"),
+        "an UNannotated parameter must borrow exactly as it always has"
+    );
+}
+
+/// **`move` is a CONTEXTUAL keyword, and `stdlib/fs.mt` is why.**
+///
+/// That module declares `fn move(src: str, dst: str) -> int;`, so reserving the
+/// word would delete a shipped standard-library function — P104's lesson,
+/// which cost a lint a name it could not spell. The annotation is told from a
+/// type by requiring something to follow it: in `x: move` the word is the
+/// TYPE, in `x: move str` it is the annotation.
+#[test]
+fn d2_move_is_contextual_and_still_a_usable_name() {
+    // Passes on the pre-D-2 compiler too, and that is the point: it records
+    // that adding the annotation took nothing away (permanent rule 9's honest
+    // half).
+    assert!(
+        checks("d2_fs_move", "    io::print_int(fs::move(\"/tmp/a\", \"/tmp/b\"));"),
+        "`fs::move` is a shipped stdlib function and must keep compiling"
+    );
+}
+
+/// A call through a function POINTER consumes nothing, because there is no
+/// name to look the signature up under. Stated rather than left implicit.
+///
+/// **This row is RED on the pre-D-2 compiler for a weaker reason than the
+/// others**, and saying so is the honest half of permanent rule 9: its
+/// preamble declares `fn eat(x: move str)`, which that compiler cannot parse,
+/// so the whole program fails to check. The redness shows the syntax is new,
+/// not that the row discriminates the RULE. What it really pins is a LIMIT.
+#[test]
+fn d2_an_indirect_call_consumes_nothing() {
+    assert!(
+        checks_d2("indirect",
+               "    let s: str = \"ab\"; let f: fn(str) -> int = eat; \
+                io::print_int(f(s)); io::println(s);"),
+        "an indirect call has no signature in hand, so it cannot consume — \
+         this is a LIMIT and the row records it"
     );
 }
 

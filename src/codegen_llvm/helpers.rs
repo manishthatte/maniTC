@@ -793,6 +793,11 @@ declare void @__task_bootstrap()
 declare i64 @__task_spawn(ptr, ptr)
 declare void @__task_yield()
 declare void @__task_main_done()
+; §11.12: `Task<T>` and `await`. Declared unconditionally for the reason above
+; — and these two are reached under `--sched inline` as well, because a handle
+; whose task ran in place is born `done(v)` (§11.12 decision 1).
+declare i64 @__task_await(i64)
+declare i64 @__task_done_value(i64)
 declare ptr @channel_bounded(i64)
 declare void @channel_send(ptr, i64)
 declare i64 @channel_recv(ptr)

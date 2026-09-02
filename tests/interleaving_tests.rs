@@ -780,61 +780,49 @@ fn s11_11_close_wakes_a_blocked_sender_which_then_traps() {
 // §11.12 — `Task<T>` and `await`: the gap, asserted in both directions
 // ---------------------------------------------------------------------------
 
-/// §1.2's obligation for a section that is ahead of the implementations.
+/// **§11.12 is now implemented BY BOTH BACKENDS and not by the A3 reference,
+/// so §1.2's obligation has moved rather than gone.**
 ///
-/// §11.12 specifies `spawn { B }` as an expression of type `Task<T>` and
-/// `await` as a receive on a one-shot channel. **No implementation has it
-/// yet** — not the two backends and not the A3 reference — so this row pins
-/// the CURRENT state, in both directions, and is built to go red the moment
-/// any of them moves.
+/// This row replaces `s11_12_task_and_await_are_specified_and_unimplemented`,
+/// whose message said to do exactly this when the section landed. What it
+/// pinned — that `spawn` binds `void` and `await` does not parse — is false
+/// now: `spawn { B }` has type `Task<T>`, `await h` parses in prefix position,
+/// and `structured_waiting_tests.rs` runs the behaviour on both backends.
 ///
-/// Both halves matter. `let t = spawn { … };` already PARSES and binds `void`,
-/// which is why `docs/examples.md` and `docs/language-reference.md` have shown
-/// it for weeks without anybody noticing it does nothing; `await` does not
-/// parse at all. A row asserting only the second would call the first fixed.
+/// **The gap that remains is the REFERENCE**, and it is a real one rather than
+/// an oversight. §11.12 says `spawn { B } : Task<T>` "where `T` is the value of
+/// block `B`", and §2's core grammar has no block value at all — a block is
+/// `"{" stmt* "}"` and nothing gives it one. So the reference cannot implement
+/// §11.12 as written without a grammar extension the section does not supply,
+/// and §11.12's own first line claiming *"The A3 reference implements it"* was
+/// false the day it was written.
 ///
-/// When a backend learns §11.12: move the program into `conformance_tests.rs`,
-/// where three-way agreement is the assertion, and delete this row. That is
-/// the same instruction `t3_does_not_implement_11_yet_and_this_says_so`
-/// carries — and note what happened to *its* prediction, recorded above.
+/// Asserted in BOTH directions, as §1.2 requires: that the reference still
+/// refuses `await`, AND that `spawn` is still a statement there. A row
+/// asserting only the first would call the second done.
 #[test]
-fn s11_12_task_and_await_are_specified_and_unimplemented() {
-    // Direction 1: `spawn` as an expression binds `void`, not `Task<T>`.
-    // Asserted through the SURFACE compiler, because the gap is in the
-    // language rather than in the core the reference parses.
-    let d = std::env::temp_dir().join(format!("manitc_s1112_{}", std::process::id()));
-    std::fs::create_dir_all(&d).expect("temp dir");
-    let p = d.join("a.mt");
-    std::fs::write(
-        &p,
-        "fn main() { let t: Task<int> = spawn { 5 }; io::print_int(1); }",
-    )
-    .expect("write");
-    let out = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_manitc")))
-        .args(["check", p.to_str().unwrap()])
-        .output()
-        .expect("check");
-    let msg = String::from_utf8_lossy(&out.stdout).to_string()
-        + &String::from_utf8_lossy(&out.stderr);
+fn s11_12_the_reference_does_not_have_task_and_await() {
+    // Direction 1: `await` is not a token the core lexer knows.
+    let refused = reference::interpret(
+        "fn main() -> int { let t = spawn { 1 }; let v = await t; return v; }",
+    );
     assert!(
-        !out.status.success() && msg.contains("has type `void`"),
-        "§11.12 has landed for `spawn` — move this to conformance_tests.rs \
-         and delete the row:\n{msg}"
+        refused.is_err(),
+        "§11.12 has landed in the A3 reference — delete this row, move the \
+         program into a rule-by-rule row above, and correct §11.12's first \
+         line, which claims the reference already implements it"
     );
 
-    // Direction 2: `await` does not parse.
-    let p2 = d.join("b.mt");
-    std::fs::write(&p2, "fn main() { let t = spawn { 5 }; let v = await t; }")
-        .expect("write");
-    let out2 = Command::new(PathBuf::from(env!("CARGO_BIN_EXE_manitc")))
-        .args(["check", p2.to_str().unwrap()])
-        .output()
-        .expect("check");
-    let msg2 = String::from_utf8_lossy(&out2.stdout).to_string()
-        + &String::from_utf8_lossy(&out2.stderr);
+    // Direction 2: `spawn` is a STATEMENT in the core, so it cannot be bound.
+    // `src/reference/ast.rs` says so in as many words, and until §2 gains a
+    // block value there is nothing for `Task<T>` to carry.
+    let as_expr = reference::interpret(
+        "fn main() -> int { let t = spawn { 1 }; return 0; }",
+    );
     assert!(
-        !out2.status.success() && msg2.contains("Await"),
-        "§11.12 has landed for `await` — move this to conformance_tests.rs \
-         and delete the row:\n{msg2}"
+        as_expr.is_err(),
+        "`spawn` has become an expression in the A3 reference — §2's core \
+         grammar must have gained a block value, and §11.12's status line \
+         needs correcting with it"
     );
 }

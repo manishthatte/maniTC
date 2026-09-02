@@ -731,13 +731,36 @@ after the `spawn` does not begin until the block has finished.
 > report.txt P5 records the defects. Do not write code against the old
 > description.
 
+> **Corrected again 2 September 2026 — the notice above is now itself stale,
+> and it is kept because the correction it records is the record.** ManiT
+> *does* have concurrency: `--sched cooperative` implements
+> `docs/semantics.md` §11 on both backends, and §11.12 makes `spawn { B }` an
+> expression of type `Task<T>` in **both** scheduling modes.
+>
+> So the 24 August sentence "Returns `Task<T>` where `T` is the block's type"
+> — deleted then as false — is **true now**, which is why the sentence that
+> deleted it could not simply be deleted in turn. What remains true of the
+> paragraph above it is the DEFAULT: under `--sched inline`, still the default,
+> the block runs in place to completion and the statement after it does not
+> begin until it has finished. §11.12's first decision is what makes the handle
+> work there too — a task that finished long ago is the ordinary case, so
+> `await` on it returns immediately.
+
 ### Await
 
 ```
 let value = await task;
 ```
 
-Yields control until the task completes, returns the task's result.
+Yields control until the task completes, and returns the task's result.
+`await` is a **prefix** operator and binds like the other unary forms, so
+`await t + 1` awaits `t` and then adds. The postfix `t.await` also parses and
+is what `examples/concurrency.mt` uses on an `async fn` result.
+
+**Awaiting the same handle twice is a trap**, not a second copy of the value
+(`docs/semantics.md` §11.12): a program that does it has almost certainly
+confused two handles. A handle may outlive its task, and a value nobody awaits
+is discarded.
 
 ---
 
@@ -1537,7 +1560,9 @@ Creates a task that runs the block asynchronously.
 let result = await t;
 ```
 
-Suspends the current task and resumes when `t` completes.
+Suspends the current task and resumes when `t` completes. Implemented on both
+backends as of 2 September 2026; `docs/semantics.md` §11.12 is normative, and
+`t` must be a `Task<T>` — `spawn { B }` is what produces one.
 
 ### Channels
 
@@ -2012,7 +2037,8 @@ languages with similar syntax.
 | `Point { x: s }` — struct literal field | **yes** |
 | `take(s)` — argument to a function | no |
 | `v.push(s)` — argument to a method | no |
-| `[s, "c"]` — array literal element | no |
+| `let v = [s, "c"];` — array literal **bound to a name** | **yes** |
+| `fmt::format("{}", [s])` — array literal **as an argument** | no |
 
 So all three of these are errors, and all three are the *same* error — the
 `let` moved `s`, and everything after it is a use of a moved value:
@@ -2035,9 +2061,105 @@ io::println(s);        // fine
 let t: str = s;        // fine — this is the first move
 ```
 
-> **Note.** The array and tuple rows differ from each other, and that is a
-> quirk of the implementation rather than a designed distinction. Do not rely
-> on the array row.
+> **Corrected 2 September 2026 — the array rows are now two rows, and the
+> distinction is designed.** This note used to read: *"The array and tuple rows
+> differ from each other, and that is a quirk of the implementation rather than
+> a designed distinction. Do not rely on the array row."* That was true, and
+> B7's D-3 asked which of the two was wrong.
+>
+> **Measured, the question was malformed.** An array literal is two constructs
+> wearing one syntax:
+>
+> * **Bound to a name, stored in a field, or returned — a CONTAINER.** It
+>   outlives the expression and holds a second name for each element, exactly
+>   as a tuple literal and a struct literal do. It consumes, and now does.
+> * **Passed as an argument — this language's VARARGS list.** `fmt::format`,
+>   `print` and their family take `[T]`. There it is an argument, the row above
+>   governs it, and a call does not consume its argument. Consuming here would
+>   make `f(s)` and `f([s])` disagree about the same `s` in the same call.
+>
+> The split is not a carve-out fitted to whatever failed: **1,120 of 1,120
+> array-literal sites in the standard library are varargs**, and 36–56 % of the
+> ones in ordinary programs. Treating the argument list as a container would
+> have refused `fmt::format` itself.
+>
+> The rule can only fire on a plain move-type **variable** — `["To:", "Sub:"]`
+> is untouched — which is why the change costs nothing measurable: **0 verdict
+> differences over 366 files in these repositories and 2,507 in the model
+> corpus.** One program was affected and it was a real alias, in
+> `thatteos/studioMani/email/email.mt`.
+
+### A parameter that consumes: `move`
+
+**Added 3 September 2026 — B7's D-2.** The table above says a call never
+consumes its argument, and that is still the default. A parameter marked
+`move` is the exception:
+
+```manit
+fn eat(x: move str) -> int { return str::len(x); }
+
+let s: str = "ab";
+io::print_int(eat(s));
+io::println(s);          // error: use of moved value: 's'
+```
+
+Without it a function that takes ownership cannot be written at all, which is
+what F-4 (regions) needs before it can start.
+
+**Why an annotation rather than a rule about every call.** Making every
+argument consume was measured before it was rejected: it refuses **24.7 % of
+1,545 corpus programs, 36.4 % of the distinct programs in these repositories,
+and fifty functions of this standard library.** Every failure is the same
+shape, and the shape is ordinary correct code — `str::take` calls `len(s)` and
+then `slice(s, …)`. ManiT has **no reference types**, so a call is the only way
+to read a value twice; that is why the default cannot be "consume", and why
+the annotation goes on the few parameters that genuinely take ownership. Its
+blast radius is zero by construction: nothing written before this existed
+carries the word.
+
+**`move` is contextual, not reserved.** `std::fs` declares `fn move(src, dst)`,
+so the word remains a usable name; it is an annotation only where a type
+follows it. In `x: move` the word is the type, in `x: move str` it is the
+annotation.
+
+**Limit, stated rather than left to be discovered:** a call through a function
+*pointer* consumes nothing, because the signature is not in hand at the call
+site. `let f: fn(str) -> int = eat; f(s);` leaves `s` live.
+
+### What a binding shares, and what it copies
+
+**Added 3 September 2026, and it is the answer to B7's D-1.** Until now this
+section said which constructs MOVE and said nothing about whether the new name
+shares storage with the old one — so a reader could not tell whether
+`let u = s.field; u.x = 9;` changes `s`. It does. Every row below was measured
+on both backends before it was written.
+
+| construct | the new name … |
+|---|---|
+| `fn f(p: Point)` — an aggregate **parameter** | is a **mutable reference** to the caller's object. `p.x = 9` is visible to the caller. |
+| `let b = a;` — from a **name** | **copies**. `a` is moved, so only the caller of the enclosing function can observe the difference — and that is exactly who it protects. |
+| `let u = s.f;` / `let u = v[i];` — from a **projection** | **aliases**. Writing through `u` writes through to `s` or `v`. |
+| `let u = f(…);` — an aggregate **returned** by a call | **copies**, for lifetime rather than for semantics: the callee's frame is gone. |
+
+**The rule to carry away: a call borrows, a name-binding copies, and a
+projection shares.** A reader arriving from Rust should note the third row in
+particular — there is no `&`, so a projection is the only way to name part of
+an aggregate, and it necessarily shares.
+
+**Why sharing rather than copying**, since the alternative was available and
+was rejected. Copying every projection is affordable in principle and not on
+this target: the T3 heap is 2,536 words with no free, an eleven-field process
+record is about twelve of them, and a scheduling pass that copy-constructed
+nine of them would exhaust the heap in roughly twenty-three passes. thatteOS's
+`src/kernel/process.mt` measured exactly that and designed its process table
+around sharing, with its operations named for the mutation they perform. When
+regions land (F-4) this becomes a real choice rather than a forced one.
+
+> **This is a designed rule now, and it was not before.** The two backends used
+> to disagree about it: T3 shared, and the LLVM emitter produced an aggregate
+> load/store pair — a copy — and then failed to link, so `v[i][j]` on a nested
+> array did not compile at all while `manitc check` accepted it. report.txt
+> P110 and P111. `escape_analysis_tests::d1_*` and `::p111_*` pin both halves.
 
 ### Rebinding clears a move
 

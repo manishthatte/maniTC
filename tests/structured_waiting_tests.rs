@@ -733,3 +733,152 @@ fn main() {
     );
     assert!(!out.contains("sender done"), "the sender must not complete: {out:?}");
 }
+
+
+// ---------------------------------------------------------------------------
+// §11.12 — `Task<T>` and `await`, on both backends and in BOTH scheduling modes
+//
+// The two backends reach these by different mechanisms, which is what makes
+// their agreement evidence rather than a shared lowering agreeing with itself:
+// **T3 forks** — the parent's `__task_fork` result is the handle and the child
+// exits through syscall 139 carrying the block's value — while **LLVM
+// outlines** the body into `__spawn_body_N(ptr env)` and its trampoline
+// completes the handle from the body's return value.
+//
+// And a third path with neither: under `--sched inline`, which is still the
+// default, `spawn { B }` runs `B` in place and the handle is born `done(v)`.
+// §11.12's decision 1 is what makes that a legal task rather than a special
+// case, and every row below runs in both modes for exactly that reason.
+// ---------------------------------------------------------------------------
+
+/// Both backends, both scheduling modes, one expected trace.
+fn all_four(src: &str, want: &str, what: &str) {
+    for sched in ["inline", "cooperative"] {
+        assert_eq!(run_t3(src, sched), want, "{what}: T3 under --sched {sched}");
+        if let Some(ll) = run_llvm(src, sched) {
+            assert_eq!(ll, want, "{what}: LLVM under --sched {sched}");
+        }
+    }
+}
+
+#[test]
+fn s11_12_await_returns_the_blocks_value() {
+    all_four(
+        "fn main() {\n    let t: Task<int> = spawn { 42 };\n\
+         \x20   io::print(\"v=\"); io::print_int(await t); io::println(\"\");\n}\n",
+        "v=42\n",
+        "§11.12: `spawn { B } : Task<T>` and `await` is its `recv`",
+    );
+}
+
+#[test]
+fn s11_12_a_float_survives_the_handle_unconverted() {
+    // The value travels as a BIT PATTERN through one machine word. This is the
+    // row that fails if anything on the path CONVERTS instead of
+    // reinterpreting — 1.5 would arrive as 1, which is P65's erasure and P92's
+    // float-in-a-word one construct later.
+    //
+    // It is also the row that caught the first design: the word was produced by
+    // storing at the value's type and loading at `i64` through one `alloca`,
+    // and `codegen_llvm` re-types a load to whatever was stored (precisely so a
+    // store/load pair cannot disagree), so the outlined body emitted
+    // `ret i64 %t1` for a `double` and clang refused the module.
+    all_four(
+        "fn main() {\n    let t: Task<float> = spawn { 1.5 };\n\
+         \x20   io::print(\"f=\"); io::print_float(await t); io::println(\"\");\n}\n",
+        "f=1.5\n",
+        "§11.12: a float payload is reinterpreted, not converted",
+    );
+}
+
+#[test]
+fn s11_12_awaiting_twice_traps() {
+    // §11.12 decision 2, and the message is the document's own words. Returning
+    // the value again is available and rejected: a program awaiting one handle
+    // twice has almost certainly confused two handles, and a detected error
+    // beats a plausible continuation.
+    //
+    // **The value is asserted BEFORE the trap**, not just the trap: a row that
+    // checked only for the message would pass on an implementation that trapped
+    // on the FIRST await too.
+    let src = "fn main() {\n    let t: Task<int> = spawn { 7 };\n\
+               \x20   io::print_int(await t);\n    io::print_int(await t);\n}\n";
+    for sched in ["inline", "cooperative"] {
+        let t3 = run_t3(src, sched);
+        assert!(t3.starts_with('7'), "the FIRST await must succeed: {t3:?}");
+        assert!(
+            t3.contains("await on a task whose value has already been taken"),
+            "§11.12 decision 2, T3 under --sched {sched}: {t3:?}"
+        );
+        if let Some(ll) = run_llvm(src, sched) {
+            assert!(ll.starts_with('7'), "the FIRST await must succeed: {ll:?}");
+            assert!(
+                ll.contains("await on a task whose value has already been taken"),
+                "§11.12 decision 2, LLVM under --sched {sched}: {ll:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn s11_12_await_blocks_on_a_task_that_has_not_finished() {
+    // (AWAIT-BLOCK): an unfinished task is an empty one-shot channel, so this
+    // is §11.4's point 2 and the list of yield points does not grow. Cooperative
+    // only — under `--sched inline` the block has already run, which is the
+    // whole of decision 1.
+    both_coop(
+        "fn main() {\n    let ch: Channel<int> = channel<int>();\n\
+         \x20   let t: Task<int> = spawn { let x: int = ch.recv(); x * 2 };\n\
+         \x20   ch.send(21);\n\
+         \x20   io::print(\"v=\"); io::print_int(await t); io::println(\"\");\n}\n",
+        "v=42\n",
+        "§11.12 (AWAIT-BLOCK) then (DONE-T)",
+    );
+}
+
+#[test]
+fn s11_12_spawn_as_a_statement_is_unmoved() {
+    // §11.12's "what this costs": **nothing, for programs that exist**. The
+    // handle is a return value rather than a change to the form, so a `spawn`
+    // used as a statement discards it exactly as any expression statement does.
+    //
+    // **This row PASSES on the compiler without §11.12**, and saying so is the
+    // honest half of permanent rule 9: it records the BOUNDARY the change is
+    // drawn along rather than the change itself. The other five §11.12 rows are
+    // red on the control; this one cannot be, because what it asserts is that
+    // nothing moved.
+    all_four(
+        "fn main() {\n    let ch: Channel<int> = channel<int>();\n\
+         \x20   spawn { ch.send(3); };\n\
+         \x20   io::print(\"got=\"); io::print_int(ch.recv()); io::println(\"\");\n}\n",
+        "got=3\n",
+        "§11.12: `spawn` as a statement is unchanged",
+    );
+}
+
+#[test]
+fn s11_12_deadlock_names_the_await_and_not_a_channel() {
+    // §11.12's §11.6 clause. A task blocked in `await` is in B, so §11.6
+    // already covers it — what it must not do is report a CHANNEL nobody is
+    // waiting on. The wrong word sends the reader looking for a missing sender
+    // when the problem is a task that cannot finish, which is §11.11's lesson
+    // about "fill" and "drain" one construct along.
+    //
+    // The backends compute this differently and that is the point: T3 asks its
+    // `blocked_await` map, LLVM walks its handle list. Both had the channel
+    // message first, and LLVM kept it until this row was written.
+    let src = "fn main() {\n    let ch: Channel<int> = channel<int>();\n\
+               \x20   let t: Task<int> = spawn { let x: int = ch.recv(); x };\n\
+               \x20   io::print_int(await t);\n}\n";
+    let t3 = run_t3(src, "cooperative");
+    assert!(
+        t3.contains("blocked awaiting a task that cannot finish"),
+        "§11.6 with tasks, T3: {t3:?}"
+    );
+    if let Some(ll) = run_llvm(src, "cooperative") {
+        assert!(
+            ll.contains("blocked awaiting a task that cannot finish"),
+            "§11.6 with tasks, LLVM: {ll:?}"
+        );
+    }
+}

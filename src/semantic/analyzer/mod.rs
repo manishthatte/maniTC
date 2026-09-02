@@ -3046,7 +3046,11 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         for p in &f.params {
             let ty = self.resolve_type(&p.ty)?;
             self.symbols.define(&p.name, ty.clone(), false);
-            typed_params.push(TypedParam { name: p.name.clone(), ty });
+            typed_params.push(TypedParam {
+                name: p.name.clone(),
+                ty,
+                is_move: p.is_move,
+            });
         }
 
         // A1: a non-void function must supply a value on every path. Falling

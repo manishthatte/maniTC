@@ -19,11 +19,187 @@
 //! lets the move-in-loop check ignore variables that are declared inside the
 //! loop body (they are fresh on every iteration).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{LetPat, Pattern};
 use crate::error::{CompileError, CompileResult};
 use crate::semantic::types::*;
+
+// ---------------------------------------------------------------------------
+// Move rules -- B7's D-2 and D-3, made switchable so they can be MEASURED
+// ---------------------------------------------------------------------------
+
+/// Which consuming rules are in force.
+///
+/// `CURRENT` is what the compiler does today. The other combinations exist so
+/// that the blast radius of changing a rule can be measured over the corpus
+/// **before** the rule is changed -- `enhance/phase5-type-system-second-half/
+/// B7_AFFINE_TYPES.md` §4 asks for exactly this, and P103's field-miss
+/// instrument is the precedent: build the sweep, take the number, then decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveRules {
+    /// **D-2** -- does passing a value to a function consume it? Today: no,
+    /// which is why `fn consume(x: T)` is inexpressible in this language.
+    pub call_args_move: bool,
+    /// **D-3, TAKEN 2 September 2026** -- an array literal in BINDING position
+    /// consumes its elements, like a tuple and a struct literal always have.
+    /// In ARGUMENT position it does not, because there it is this language's
+    /// varargs list rather than a container; see the `Array` arm.
+    ///
+    /// Retained as a switch so the pre-D-3 compiler stays measurable from one
+    /// binary: `false` is exactly what shipped before.
+    pub array_elems_move: bool,
+    /// Apply the candidate rules only at spans the USER wrote, told apart by
+    /// P80's `Span::module`.
+    ///
+    /// This is not a nicety. `stdlib_expand` APPENDS the merged stdlib to
+    /// every program before this pass runs, so a rule applied everywhere makes
+    /// every file's verdict the STANDARD LIBRARY's verdict -- measured, a
+    /// seven-line program reports 163 call-argument sites, 162 of them the
+    /// stdlib's. Both scopes are real questions and they are different ones:
+    /// "can the language adopt this rule" and "would this program survive it".
+    pub user_code_only: bool,
+}
+
+impl MoveRules {
+    /// Exactly what the compiler does today. Every shipped path uses this.
+    pub const CURRENT: MoveRules = MoveRules {
+        call_args_move: false,
+        array_elems_move: true,
+        user_code_only: false,
+    };
+
+    /// What shipped before D-3 was taken, kept so the change stays measurable
+    /// from one binary rather than needing a second.
+    pub const PRE_D3: MoveRules = MoveRules {
+        call_args_move: false,
+        array_elems_move: false,
+        user_code_only: false,
+    };
+}
+
+/// Population counts for the candidate rules: how many sites of each shape a
+/// program actually contains. A site is a plain move-type variable in the
+/// position named -- the only shape `consume_if_move` can bite on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MoveSites {
+    /// A call ARGUMENT. D-2's population. `.0` = user code, `.1` = stdlib.
+    pub call_arg: (usize, usize),
+    /// A method call's RECEIVER. Counted and never consumed: whether `self`
+    /// is taken by value is a decision D-2 does not take, and the count is
+    /// here so that decision starts from a number rather than a guess.
+    pub method_recv: (usize, usize),
+    /// An ARRAY literal element. D-3's population.
+    pub array_elem: (usize, usize),
+    /// Of those, the ones where the array literal is ITSELF a call argument
+    /// -- i.e. the array is a varargs list, not a container. `.0` = user.
+    ///
+    /// This is the number that decides D-3, and the design document did not
+    /// anticipate it: `fmt::format("{}", [s])` puts `s` in an array literal
+    /// only because that is how this language spells varargs, so consuming
+    /// there would contradict D-2's "a call argument does not move" for the
+    /// same `s` in the same call.
+    pub array_elem_in_call: (usize, usize),
+    /// A `let` binding an AGGREGATE (struct, tuple or array) from a
+    /// PROJECTION -- a field read or an index -- rather than from a bare
+    /// local name.
+    ///
+    /// Not a move site: `consume_if_move` only bites on a plain `Ident`, so
+    /// the move checker never fires here. It is counted because the IR
+    /// lowerer's value-semantics copy is guarded on the initialiser being a
+    /// bare local, so this is exactly the shape that ALIASES instead of
+    /// copying, and D-1 needs to know how much code is in it.
+    pub aggregate_from_projection: (usize, usize),
+}
+
+impl MoveSites {
+    fn add(&mut self, other: MoveSites) {
+        self.call_arg.0 += other.call_arg.0;
+        self.call_arg.1 += other.call_arg.1;
+        self.method_recv.0 += other.method_recv.0;
+        self.method_recv.1 += other.method_recv.1;
+        self.array_elem.0 += other.array_elem.0;
+        self.array_elem.1 += other.array_elem.1;
+        self.array_elem_in_call.0 += other.array_elem_in_call.0;
+        self.array_elem_in_call.1 += other.array_elem_in_call.1;
+        self.aggregate_from_projection.0 += other.aggregate_from_projection.0;
+        self.aggregate_from_projection.1 += other.aggregate_from_projection.1;
+    }
+}
+
+/// Bump the user half or the stdlib half according to where the span came
+/// from. `Span::module` is `None` exactly for the file the user is compiling.
+fn bump(counter: &mut (usize, usize), span: crate::ast::Span) {
+    if span.module.is_none() {
+        counter.0 += 1;
+    } else {
+        counter.1 += 1;
+    }
+}
+
+/// One program's answer to "what would changing a move rule cost?".
+///
+/// Verdicts are booleans because that is what the blast radius is: a file the
+/// compiler accepts today and would refuse tomorrow. The counts are the
+/// population -- sites where a rule *could* bite, whether or not it does.
+#[derive(Clone, Debug)]
+pub struct MoveSweep {
+    pub sites: MoveSites,
+    /// Does the checker accept the program today?
+    pub ok_current: bool,
+    /// **D-2's blast radius** -- would this program survive a call argument
+    /// consuming, with the rule applied to the USER's code only? D-2 is the
+    /// one candidate still open.
+    pub ok_call: bool,
+    /// **D-3, retrospectively** -- `false` marks a file whose verdict the
+    /// container/varargs split changed.
+    pub ok_array: bool,
+    pub ok_both: bool,
+    /// Verdicts with the rule applied EVERYWHERE, stdlib included. This asks
+    /// whether the language can adopt the rule at all, and it is the same
+    /// answer for every file, so one file suffices to establish it.
+    pub ok_call_all: bool,
+    pub ok_array_all: bool,
+    /// The first diagnostic each candidate rule produces on the user's own
+    /// code, so the write-up can quote a real message rather than a count.
+    pub first_call_err: Option<String>,
+    pub first_array_err: Option<String>,
+}
+
+impl MoveSweep {
+    /// One line per file, grep-able. `sites` is measured under CURRENT rules,
+    /// so a program that already FAILS the baseline check is counted only as
+    /// far as its first error -- such a file is already refused and is not in
+    /// any blast radius. Counts are `user/stdlib`.
+    pub fn line(&self, path: &str) -> String {
+        format!(
+            "MOVE-SWEEP base={} call={} array={} both={} \
+allcall={} allarray={} \
+call_arg={}/{} method_recv={}/{} array_elem={}/{} arrcall={}/{} proj={}/{} file={}",
+            ok(self.ok_current),
+            ok(self.ok_call),
+            ok(self.ok_array),
+            ok(self.ok_both),
+            ok(self.ok_call_all),
+            ok(self.ok_array_all),
+            self.sites.call_arg.0,
+            self.sites.call_arg.1,
+            self.sites.method_recv.0,
+            self.sites.method_recv.1,
+            self.sites.array_elem.0,
+            self.sites.array_elem.1,
+            self.sites.array_elem_in_call.0,
+            self.sites.array_elem_in_call.1,
+            self.sites.aggregate_from_projection.0,
+            self.sites.aggregate_from_projection.1,
+            path,
+        )
+    }
+}
+
+fn ok(b: bool) -> &'static str {
+    if b { "ok" } else { "ERR" }
+}
 
 // ---------------------------------------------------------------------------
 // Move environment: declaration scopes + moved bindings
@@ -34,17 +210,64 @@ use crate::semantic::types::*;
 /// the move-in-loop check does not apply to it.
 type LoopBoundary = Option<usize>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MoveEnv {
     /// Stack of declaration scopes (index = scope depth).
     scopes: Vec<HashSet<String>>,
     /// Moved bindings, keyed by (declaring scope depth, name).
     moved: HashSet<(usize, String)>,
+    /// Which consuming rules are in force for this run.
+    rules: MoveRules,
+    /// Population counts, accumulated as the walk proceeds.
+    sites: MoveSites,
+    /// Instrument only: the first diagnostic, WITH its originating module.
+    first_err: Option<String>,
+    /// **B7's D-2**: which parameter positions of which functions CONSUME
+    /// their argument, keyed by function name. Empty for a program that uses
+    /// no `move` annotation, which is every program written before 3 September
+    /// 2026 — so the rule's blast radius is zero by construction rather than
+    /// by measurement.
+    consuming: std::rc::Rc<HashMap<String, Vec<bool>>>,
+    /// Set while checking an argument that IS an array literal, so that
+    /// literal can tell whether it is a container or a varargs list. Cleared
+    /// on descent into the literal's elements, so only the OUTERMOST array of
+    /// `f([[s]])` counts as the argument list.
+    array_is_vararg: bool,
 }
 
 impl MoveEnv {
-    fn new() -> Self {
-        MoveEnv { scopes: vec![HashSet::new()], moved: HashSet::new() }
+    fn new(rules: MoveRules) -> Self {
+        MoveEnv {
+            scopes: vec![HashSet::new()],
+            moved: HashSet::new(),
+            rules,
+            sites: MoveSites::default(),
+            first_err: None,
+            array_is_vararg: false,
+            consuming: Default::default(),
+        }
+    }
+
+    fn with_consuming(
+        rules: MoveRules,
+        consuming: std::rc::Rc<HashMap<String, Vec<bool>>>,
+    ) -> Self {
+        let mut e = MoveEnv::new(rules);
+        e.consuming = consuming;
+        e
+    }
+
+    /// Does `func`'s parameter `i` consume its argument?
+    fn consumes(&self, func: &str, i: usize) -> bool {
+        self.consuming.get(func).map_or(false, |v| *v.get(i).unwrap_or(&false))
+    }
+
+    /// Record the first diagnostic and where it came from, for the sweep.
+    /// Never read by the shipped path; the returned `CompileError` is.
+    fn note_err(&mut self, span: crate::ast::Span, msg: &str) {
+        if self.first_err.is_none() {
+            self.first_err = Some(located(span, msg));
+        }
     }
 
     fn push_scope(&mut self) {
@@ -98,26 +321,167 @@ impl MoveEnv {
 // ---------------------------------------------------------------------------
 
 /// Run the borrow / move checker over every function in the program.
+///
+/// Setting `MANITC_MOVE_SWEEP` (to the file label to print) additionally emits
+/// one `MOVE-SWEEP` line on stderr describing what B7's candidate rules would
+/// cost on this program. It is an instrument, not a feature: the VERDICT this
+/// function returns is unchanged by it, and it is off unless the variable is
+/// set.
 pub fn check_borrows(program: &TypedProgram) -> CompileResult<()> {
-    for func in &program.functions {
-        check_fn_borrows(func)?;
+    if let Ok(label) = std::env::var("MANITC_MOVE_SWEEP") {
+        let sweep = sweep_move_sites(program);
+        eprintln!("{}", sweep.line(&label));
+        if std::env::var("MANITC_MOVE_SWEEP_SURVEY").is_ok() {
+            let all = |c, a| MoveRules {
+                call_args_move: c,
+                array_elems_move: a,
+                user_code_only: false,
+            };
+            for (kind, r) in [("call", all(true, false)), ("array", all(false, true))] {
+                for (module, n) in survey_move_failures(program, r) {
+                    eprintln!("MOVE-SURVEY {} {} {}", kind, module, n);
+                }
+            }
+        }
+        if std::env::var("MANITC_MOVE_SWEEP_WHERE").is_ok() {
+            if let Some(ref w) = sweep.first_call_err {
+                eprintln!("MOVE-SWEEP-WHERE call  {}  file={}", w, label);
+            }
+            if let Some(ref w) = sweep.first_array_err {
+                eprintln!("MOVE-SWEEP-WHERE array {}  file={}", w, label);
+            }
+        }
     }
-    Ok(())
+    check_borrows_with(program, MoveRules::CURRENT).0
+}
+
+/// The checker, under an explicit rule set. Returns the verdict and the
+/// population counts reached before it (counts are complete for a program that
+/// passes; a program that fails is counted only up to its first error).
+fn check_borrows_with(
+    program: &TypedProgram,
+    rules: MoveRules,
+) -> (CompileResult<()>, MoveSites) {
+    check_borrows_located(program, rules).0
+}
+
+/// As `check_borrows_with`, and also the first diagnostic with its module.
+fn check_borrows_located(
+    program: &TypedProgram,
+    rules: MoveRules,
+) -> ((CompileResult<()>, MoveSites), Option<String>) {
+    // D-2: one pass over the program's signatures, shared by every function
+    // check. Built here rather than looked up per call site, because the map
+    // is a property of the PROGRAM and rebuilding it per function would be
+    // quadratic in a language whose stdlib is merged into every module.
+    let consuming: std::rc::Rc<HashMap<String, Vec<bool>>> = std::rc::Rc::new(
+        program
+            .functions
+            .iter()
+            .filter(|f| f.params.iter().any(|p| p.is_move))
+            .map(|f| {
+                (f.name.clone(), f.params.iter().map(|p| p.is_move).collect())
+            })
+            .collect(),
+    );
+    let mut sites = MoveSites::default();
+    for func in &program.functions {
+        let (result, fn_sites, where_) =
+            check_fn_borrows(func, rules, consuming.clone());
+        sites.add(fn_sites);
+        if let Err(e) = result {
+            return ((Err(e), sites), where_);
+        }
+    }
+    ((Ok(()), sites), None)
+}
+
+/// Every function that fails under `rules`, grouped by the module its first
+/// diagnostic came from.
+///
+/// `check_borrows_with` stops at the FIRST failing function, which answers
+/// "is the program refused" and nothing else -- so a survey built on it can
+/// only ever name one module and would report a one-module problem whether
+/// there was one module or twelve. Each function gets a fresh `MoveEnv`, so
+/// continuing past a failure is sound rather than merely convenient.
+pub fn survey_move_failures(
+    program: &TypedProgram,
+    rules: MoveRules,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut by_module = std::collections::BTreeMap::new();
+    for func in &program.functions {
+        let (result, _, where_) =
+            check_fn_borrows(func, rules, Default::default());
+        if result.is_err() {
+            let module = where_
+                .as_deref()
+                .and_then(|w| w.split(':').next())
+                .unwrap_or("<unknown>")
+                .to_string();
+            *by_module.entry(module).or_insert(0) += 1;
+        }
+    }
+    by_module
+}
+
+/// Measure B7's D-2 and D-3 against one program: the population of sites each
+/// rule would bite on, and whether the program survives each rule.
+///
+/// The four verdicts are taken by RUNNING the checker four times rather than
+/// by reasoning about the counts, because a site only costs something when the
+/// value is used again afterwards -- the population is an upper bound on the
+/// blast radius and not the blast radius itself.
+pub fn sweep_move_sites(program: &TypedProgram) -> MoveSweep {
+    let rules = |call, array, user_only| MoveRules {
+        call_args_move: call,
+        array_elems_move: array,
+        user_code_only: user_only,
+    };
+    let run = |r| {
+        let ((verdict, sites), where_) = check_borrows_located(program, r);
+        (verdict.is_ok(), sites, where_)
+    };
+    let (ok_current, sites, _) = run(MoveRules::CURRENT);
+    // D-2 is the candidate still open, so it is measured ON TOP of what ships.
+    let (ok_call, _, call_where) = run(rules(true, true, true));
+    // D-3 is measured RETROSPECTIVELY: `false` here marks a file whose verdict
+    // the container/varargs split changed.
+    let (ok_array, _, array_where) = run(MoveRules::PRE_D3);
+    let (ok_both, _, _) = run(rules(true, false, true));
+    let (ok_call_all, _, call_all_where) = run(rules(true, true, false));
+    let (ok_array_all, _, array_all_where) = run(rules(false, true, false));
+    MoveSweep {
+        sites,
+        ok_current,
+        ok_call,
+        ok_array,
+        ok_both,
+        ok_call_all,
+        ok_array_all,
+        first_call_err: call_where.or(call_all_where),
+        first_array_err: array_where.or(array_all_where),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-function analysis
 // ---------------------------------------------------------------------------
 
-fn check_fn_borrows(func: &TypedFnDef) -> CompileResult<()> {
-    if let Some(ref body) = func.body {
-        let mut env = MoveEnv::new();
+fn check_fn_borrows(
+    func: &TypedFnDef,
+    rules: MoveRules,
+    consuming: std::rc::Rc<HashMap<String, Vec<bool>>>,
+) -> (CompileResult<()>, MoveSites, Option<String>) {
+    let mut env = MoveEnv::with_consuming(rules, consuming);
+    let result = if let Some(ref body) = func.body {
         for param in &func.params {
             env.declare(&param.name);
         }
-        check_block_borrows(body, &mut env, None)?;
-    }
-    Ok(())
+        check_block_borrows(body, &mut env, None)
+    } else {
+        Ok(())
+    };
+    (result, env.sites, env.first_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +490,17 @@ fn check_fn_borrows(func: &TypedFnDef) -> CompileResult<()> {
 
 fn err(span: crate::ast::Span, msg: String) -> CompileError {
     CompileError::type_err("<borrow>", span.line, span.col, msg)
+}
+
+/// The same diagnostic, with WHERE it came from, for the sweep only.
+///
+/// The shipped `err` above renders the file as `<borrow>` and drops
+/// `Span::module` -- P80's second site, one more time -- so a message from the
+/// merged stdlib is indistinguishable from the user's own. Rather than change
+/// a user-visible diagnostic from inside an instrument, the sweep formats its
+/// own copy and the shipped path is untouched.
+fn located(span: crate::ast::Span, msg: &str) -> String {
+    format!("{}:{}:{}: {}", span.module.unwrap_or("<user>"), span.line, span.col, msg)
 }
 
 /// If `expr` is a plain variable of move type, consume it: enforce the
@@ -141,28 +516,70 @@ fn consume_if_move(
             let depth = env.depth_of(var_name);
             // Variables declared inside the loop body (depth >= boundary) are
             // fresh each iteration -- moving them is fine.
+            // WITHDRAWN, 2 September 2026, and the measurement is the result.
+            // An exemption was built here for a binding the enclosing
+            // assignment restores -- `out = f(out)` is moved and replaced, not
+            // moved on each iteration -- because `stdlib/ternary.mt`'s
+            // accumulator appeared to need it under D-3. It did not: that site
+            // is a VARARGS list, which the array rule below exempts for a
+            // reason of its own, and the assignment exemption then measured
+            // **0 verdict differences over 366 repo files and 2,507 corpus
+            // files**. A loosening of a soundness rule, introduced for a cause
+            // that turned out to be something else and needed by nothing, is
+            // withdrawn rather than shipped (P66's shape). The tuple
+            // accumulator `out = (out, i).0` in a loop is still refused, and
+            // that is a decision for B7 to take on its own evidence.
             if let Some(boundary) = loop_from {
                 if depth < boundary {
-                    return Err(err(
-                        expr.span,
-                        format!(
-                            "cannot move '{}' in a loop \
-                             -- value would be moved on each iteration",
-                            var_name
-                        ),
-                    ));
+                    let msg = format!(
+                        "cannot move '{}' in a loop \
+                         -- value would be moved on each iteration",
+                        var_name
+                    );
+                    env.note_err(expr.span, &msg);
+                    return Err(err(expr.span, msg));
                 }
             }
             if env.is_moved(var_name) {
-                return Err(err(
-                    expr.span,
-                    format!("use of moved value: '{}'", var_name),
-                ));
+                let msg = format!("use of moved value: '{}'", var_name);
+                env.note_err(expr.span, &msg);
+                return Err(err(expr.span, msg));
             }
             env.mark_moved(var_name);
         }
     }
     Ok(())
+}
+
+/// A struct, tuple or array -- a type whose storage has more than one word
+/// and for which copy-versus-alias is therefore observable.
+fn is_aggregate(ty: &ManiType) -> bool {
+    matches!(
+        ty,
+        ManiType::Struct(_, _) | ManiType::Tuple(_) | ManiType::Array(_, _)
+    )
+}
+
+/// Does a candidate rule apply at this span? Under `user_code_only` the
+/// merged stdlib is exempt, so the verdict is about the program rather than
+/// about the library every program carries.
+fn in_scope(rules: MoveRules, span: crate::ast::Span) -> bool {
+    !rules.user_code_only || span.module.is_none()
+}
+
+/// Is `expr` the shape `consume_if_move` can bite on -- a plain variable of
+/// move type? Enum variant constructors (containing "::") are constants.
+///
+/// This is the POPULATION predicate, and it is deliberately the same condition
+/// `consume_if_move` tests, so a counted site and a consumed site cannot drift
+/// apart.
+fn is_move_site(expr: &TypedExpr) -> bool {
+    match expr.kind {
+        TypedExprKind::Ident(ref name) => {
+            is_move_type(&expr.ty) && !name.contains("::")
+        }
+        _ => false,
+    }
 }
 
 /// Collect every name bound by a match pattern.
@@ -238,6 +655,17 @@ fn check_stmt_borrows(
             // `let s = s;` reads the outer `s`.
             if let Some(ref init_expr) = let_stmt.init {
                 check_expr_borrows(init_expr, env, loop_from)?;
+                if is_aggregate(&init_expr.ty)
+                    && matches!(
+                        init_expr.kind,
+                        TypedExprKind::Field(_, _) | TypedExprKind::Index(_, _)
+                    )
+                {
+                    bump(
+                        &mut env.sites.aggregate_from_projection,
+                        init_expr.span,
+                    );
+                }
                 consume_if_move(init_expr, env, loop_from)?;
             }
 
@@ -268,10 +696,10 @@ fn check_stmt_borrows(
                         && !target_name.contains("::")
                         && env.is_moved(target_name)
                     {
-                        return Err(err(
-                            assign_stmt.target.span,
-                            format!("use of moved value: '{}'", target_name),
-                        ));
+                        let msg =
+                            format!("use of moved value: '{}'", target_name);
+                        env.note_err(assign_stmt.target.span, &msg);
+                        return Err(err(assign_stmt.target.span, msg));
                     }
                     env.clear_moved(target_name);
                 }
@@ -312,10 +740,9 @@ fn check_expr_borrows(
             // Enum variant constructors (e.g. "Season::Summer") are constant
             // expressions, not variables -- skip them.
             if !name.contains("::") && env.is_moved(name) {
-                return Err(err(
-                    expr.span,
-                    format!("use of moved value: '{}'", name),
-                ));
+                let msg = format!("use of moved value: '{}'", name);
+                env.note_err(expr.span, &msg);
+                return Err(err(expr.span, msg));
             }
         }
 
@@ -332,23 +759,65 @@ fn check_expr_borrows(
         }
 
         // --- Function call ---
-        // NOTE: In this simplified borrow checker we do NOT mark call
-        // arguments as moved.  ManiT has no explicit borrow/move syntax
-        // yet, so treating every call argument as a move would reject
-        // valid programs.  We still check that none of the arguments are
-        // already-moved variables (use-after-move).
+        // **D-2.** By default a call argument does NOT move: ManiT has no
+        // borrow/move syntax, so consuming every argument would reject valid
+        // programs. That default is also why `fn consume(x: T)` cannot be
+        // written, which is B7's D-2 and F-4's precondition. The site is
+        // always COUNTED so the cost of changing the default is measurable.
         TypedExprKind::Call(callee, args) => {
             check_expr_borrows(callee, env, loop_from)?;
-            for arg in args {
-                check_expr_borrows(arg, env, loop_from)?;
+            // **D-2**: the callee's name decides which arguments are consumed.
+            // A call through a function POINTER consumes nothing, because the
+            // signature is not in hand — stated rather than left implicit, and
+            // pinned by a row.
+            let callee_name = match &callee.kind {
+                TypedExprKind::Ident(n) => Some(n.clone()),
+                _ => None,
+            };
+            for (i, arg) in args.iter().enumerate() {
+                env.array_is_vararg =
+                    matches!(arg.kind, TypedExprKind::Array(_));
+                let r = check_expr_borrows(arg, env, loop_from);
+                env.array_is_vararg = false;
+                r?;
+                if is_move_site(arg) {
+                    bump(&mut env.sites.call_arg, arg.span);
+                }
+                // D-2 is checked BEFORE the sweep's candidate rule, so a
+                // `move` parameter consumes whether or not the experimental
+                // whole-language rule is switched on.
+                let consumed = callee_name
+                    .as_deref()
+                    .is_some_and(|n| env.consumes(n, i));
+                if consumed
+                    || (env.rules.call_args_move && in_scope(env.rules, arg.span))
+                {
+                    consume_if_move(arg, env, loop_from)?;
+                }
             }
         }
 
         // --- Method call ---
+        // The RECEIVER is counted and never consumed: whether `self` is taken
+        // by value is a separate decision from D-2, and the count is here so
+        // that decision can start from a number.
         TypedExprKind::MethodCall(receiver, _method, args, _) => {
             check_expr_borrows(receiver, env, loop_from)?;
+            if is_move_site(receiver) {
+                bump(&mut env.sites.method_recv, receiver.span);
+            }
             for arg in args {
-                check_expr_borrows(arg, env, loop_from)?;
+                env.array_is_vararg =
+                    matches!(arg.kind, TypedExprKind::Array(_));
+                let r = check_expr_borrows(arg, env, loop_from);
+                env.array_is_vararg = false;
+                r?;
+                if is_move_site(arg) {
+                    bump(&mut env.sites.call_arg, arg.span);
+                }
+                if env.rules.call_args_move && in_scope(env.rules, arg.span) {
+                    consume_if_move(arg, env, loop_from)?;
+                }
             }
         }
 
@@ -457,9 +926,43 @@ fn check_expr_borrows(
         }
 
         // --- Array literal ---
+        //
+        // **D-3, and the decision is not the one the design document framed.**
+        // It asked which of the tuple row and the array row is wrong, given
+        // that a tuple literal consumes its elements and an array literal did
+        // not. Measured, the question is malformed: an array literal is TWO
+        // constructs wearing one syntax.
+        //
+        //   * In BINDING position — `let v = [a, b];`, a struct field, a
+        //     return — it is a CONTAINER that outlives the expression and
+        //     holds a second name for each element. It consumes, exactly as a
+        //     tuple and a struct literal always have.
+        //   * In ARGUMENT position — `fmt::format("{}", [g, out])` — it is
+        //     this language's VARARGS list. It is an argument, so D-2 governs
+        //     it, and a call does not consume its argument. Consuming here
+        //     would make `f(s)` and `f([s])` disagree about the same `s` in
+        //     the same call.
+        //
+        // The split is not a carve-out fitted to the failures: **1,120 of
+        // 1,120 array-literal sites in the standard library are varargs**, and
+        // 36-56 % of the user ones. Treating the argument list as a container
+        // would have refused `fmt::format` itself.
         TypedExprKind::Array(elems) => {
+            let is_vararg = std::mem::replace(&mut env.array_is_vararg, false);
             for elem in elems {
                 check_expr_borrows(elem, env, loop_from)?;
+                if is_move_site(elem) {
+                    bump(&mut env.sites.array_elem, elem.span);
+                    if is_vararg {
+                        bump(&mut env.sites.array_elem_in_call, elem.span);
+                    }
+                }
+                if env.rules.array_elems_move
+                    && !is_vararg
+                    && in_scope(env.rules, elem.span)
+                {
+                    consume_if_move(elem, env, loop_from)?;
+                }
             }
         }
 
@@ -658,9 +1161,289 @@ mod tests {
     }
 
     fn check_stmts(stmts: Vec<TypedStmt>) -> CompileResult<()> {
+        check_stmts_under(stmts, MoveRules::CURRENT).0
+    }
+
+    /// As `check_stmts`, under an explicit rule set, returning the population
+    /// counts beside the verdict.
+    fn check_stmts_under(
+        stmts: Vec<TypedStmt>,
+        rules: MoveRules,
+    ) -> (CompileResult<()>, MoveSites) {
         let block = TypedBlock { stmts, ty: ManiType::Void };
-        let mut env = MoveEnv::new();
-        check_block_borrows(&block, &mut env, None)
+        let mut env = MoveEnv::new(rules);
+        let r = check_block_borrows(&block, &mut env, None);
+        (r, env.sites)
+    }
+
+    /// `f(s)` where `s` is a `str` variable -- a call ARGUMENT, D-2's shape.
+    fn call_with(src: &str) -> TypedStmt {
+        TypedStmt::Expr(TypedExpr {
+            kind: TypedExprKind::Call(
+                Box::new(ident_expr("f", ManiType::Void)),
+                vec![ident_expr(src, ManiType::Str)],
+            ),
+            ty: ManiType::Void,
+            span: Span::new(1, 1),
+        })
+    }
+
+    /// `f([<src>, <src>]);` -- an array literal in ARGUMENT position, which
+    /// is this language's varargs list rather than a container.
+    fn call_with_array(src: &str) -> TypedStmt {
+        let elem = || ident_expr(src, ManiType::Str);
+        TypedStmt::Expr(TypedExpr {
+            kind: TypedExprKind::Call(
+                Box::new(ident_expr("f", ManiType::Void)),
+                vec![TypedExpr {
+                    kind: TypedExprKind::Array(vec![elem(), elem()]),
+                    ty: ManiType::Array(Box::new(ManiType::Str), Some(2)),
+                    span: Span::new(1, 1),
+                }],
+            ),
+            ty: ManiType::Void,
+            span: Span::new(1, 1),
+        })
+    }
+
+    /// `let <name> = [<lit>, <lit>];` -- an array literal whose elements are
+    /// LITERALS, which no consuming rule can bite on.
+    fn let_array_of_literals(name: &str) -> TypedStmt {
+        let lit = || TypedExpr {
+            kind: TypedExprKind::Lit(Lit::Str("k".to_string())),
+            ty: ManiType::Str,
+            span: Span::new(1, 1),
+        };
+        TypedStmt::Let(TypedLetStmt {
+            name: name.to_string(),
+            pat: crate::ast::LetPat::Ident(name.to_string()),
+            ty: ManiType::Array(Box::new(ManiType::Str), Some(2)),
+            init: Some(TypedExpr {
+                kind: TypedExprKind::Array(vec![lit(), lit()]),
+                ty: ManiType::Array(Box::new(ManiType::Str), Some(2)),
+                span: Span::new(1, 1),
+            }),
+            mutable: false,
+        })
+    }
+
+    /// `let <name> = [<src>, <src>];` -- an ARRAY literal, D-3's shape.
+    fn let_array_of(name: &str, src: &str) -> TypedStmt {
+        TypedStmt::Let(TypedLetStmt {
+            name: name.to_string(),
+            pat: crate::ast::LetPat::Ident(name.to_string()),
+            ty: ManiType::Array(Box::new(ManiType::Str), Some(2)),
+            init: Some(TypedExpr {
+                kind: TypedExprKind::Array(vec![
+                    ident_expr(src, ManiType::Str),
+                    ident_expr(src, ManiType::Str),
+                ]),
+                ty: ManiType::Array(Box::new(ManiType::Str), Some(2)),
+                span: Span::new(1, 1),
+            }),
+            mutable: false,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // B7's D-3 -- an array literal is a CONTAINER or a VARARGS LIST, and the
+    // two are different constructs wearing one syntax.
+    //
+    // The design document asked which of the tuple row and the array row is
+    // wrong. Measured, that question is malformed: 1,120 of 1,120 array-literal
+    // sites in the standard library are varargs, so treating the argument list
+    // as a container would have refused `fmt::format` itself.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn d3_an_array_literal_in_binding_position_consumes_its_elements() {
+        // A container outlives the expression and holds a second name for each
+        // element, exactly as a tuple and a struct literal do -- and those two
+        // have consumed since the checker was written.
+        let e = check_stmts(vec![
+            let_str("s", "ab"),
+            let_array_of("v", "s"),
+        ]).unwrap_err();
+        assert!(
+            format!("{}", e).contains("use of moved value"),
+            "a container array literal must consume, got: {}", e,
+        );
+    }
+
+    #[test]
+    fn d3_an_array_literal_in_argument_position_does_not() {
+        // `fmt::format("{}", [g, out])` is a CALL, and a call does not consume
+        // its argument (D-2). Consuming inside the varargs list would make
+        // `f(s)` and `f([s])` disagree about the same `s` in the same call.
+        assert!(
+            check_stmts(vec![let_str("s", "ab"), call_with_array("s")]).is_ok(),
+            "a varargs array literal must not consume",
+        );
+        // Twice, because once cannot distinguish "does not consume" from
+        // "consumes but nothing read it afterwards".
+        assert!(
+            check_stmts(vec![
+                let_str("s", "ab"),
+                call_with_array("s"),
+                call_with_array("s"),
+            ]).is_ok(),
+            "a varargs array literal must not consume, on any call",
+        );
+    }
+
+    #[test]
+    fn d3_only_the_outermost_array_of_a_call_argument_is_the_varargs_list() {
+        // `f([[s]])`: the outer literal is the argument list, the inner one is
+        // an element of it and therefore a container. Pinned because the first
+        // implementation used a DEPTH counter, under which both were exempt.
+        let inner = TypedExpr {
+            kind: TypedExprKind::Array(vec![
+                ident_expr("s", ManiType::Str),
+                ident_expr("s", ManiType::Str),
+            ]),
+            ty: ManiType::Array(Box::new(ManiType::Str), Some(2)),
+            span: Span::new(1, 1),
+        };
+        let outer = TypedExpr {
+            ty: ManiType::Array(Box::new(inner.ty.clone()), Some(1)),
+            kind: TypedExprKind::Array(vec![inner]),
+            span: Span::new(1, 1),
+        };
+        let call = TypedStmt::Expr(TypedExpr {
+            kind: TypedExprKind::Call(
+                Box::new(ident_expr("f", ManiType::Void)),
+                vec![outer],
+            ),
+            ty: ManiType::Void,
+            span: Span::new(1, 1),
+        });
+        assert!(
+            check_stmts(vec![let_str("s", "ab"), call]).is_err(),
+            "the INNER array of `f([[s, s]])` is a container and must consume",
+        );
+    }
+
+    #[test]
+    fn d3_bites_only_on_a_plain_variable() {
+        // `["To:", "Subject:"]` is a container and must still be accepted: the
+        // rule can only fire on a plain move-type variable, which is what
+        // keeps its blast radius narrow (measured: 0 verdict changes over 366
+        // repo and 2,507 corpus files).
+        assert!(
+            check_stmts(vec![let_array_of_literals("labels")]).is_ok(),
+            "an array of literals has no move site at all",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B7's instrument -- the sweep must keep DISCRIMINATING
+    //
+    // These rows are a positive control made permanent. The whole value of the
+    // move-site sweep is that it separates "the rule bites here" from "the
+    // rule is invisible here"; an instrument that quietly stopped doing so
+    // would report a smaller blast radius and read as good news. Permanent
+    // rule 9's reasoning, applied to apparatus rather than to a fix.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn b7_the_shipped_rules_consume_at_neither_candidate_site() {
+        // The instrument must be INERT in the compiler as shipped: `f(s)`
+        // twice and `[s, s]` are both accepted today, and D-2/D-3 exist
+        // precisely because they are.
+        assert!(check_stmts(vec![
+            let_str("s", "ab"),
+            call_with("s"),
+            call_with("s"),
+        ]).is_ok(), "a call argument must not move under CURRENT rules");
+
+        // D-3 was TAKEN, so a CONTAINER array literal now consumes; the
+        // varargs form is what must stay inert.
+        assert!(check_stmts(vec![
+            let_str("s", "ab"),
+            call_with_array("s"),
+            call_with_array("s"),
+        ]).is_ok(), "a varargs array element must not move under CURRENT rules");
+    }
+
+    #[test]
+    fn b7_each_candidate_rule_bites_on_its_own_site_and_no_other() {
+        let call_rule = MoveRules {
+            call_args_move: true,
+            array_elems_move: false,
+            user_code_only: false,
+        };
+        let array_rule = MoveRules {
+            call_args_move: false,
+            array_elems_move: true,
+            user_code_only: false,
+        };
+
+        // D-2 refuses the twice-passed value...
+        assert!(check_stmts_under(
+            vec![let_str("s", "ab"), call_with("s"), call_with("s")],
+            call_rule,
+        ).0.is_err(), "D-2 must refuse a value passed twice");
+        // ...and D-3 leaves it alone. Each rule is tested against the OTHER's
+        // site as well, or "the rule fires" would not distinguish it from
+        // "everything fires".
+        assert!(check_stmts_under(
+            vec![let_str("s", "ab"), call_with("s"), call_with("s")],
+            array_rule,
+        ).0.is_ok(), "D-3 must not touch a call argument");
+
+        // D-3 refuses the doubled CONTAINER element...
+        assert!(check_stmts_under(
+            vec![let_str("s", "ab"), let_array_of("v", "s")],
+            array_rule,
+        ).0.is_err(), "D-3 must refuse an element used twice");
+        // ...and D-2 leaves it alone. (`call_rule` has D-3 off, so this also
+        // pins that PRE_D3 really is the previous compiler.)
+        assert!(check_stmts_under(
+            vec![let_str("s", "ab"), let_array_of("v", "s")],
+            call_rule,
+        ).0.is_ok(), "D-2 must not touch an array element");
+    }
+
+    #[test]
+    fn b7_the_population_count_is_taken_whether_or_not_the_rule_is_on() {
+        // The COUNT and the CONSUME are deliberately separate: the population
+        // is what makes a rule's cost measurable BEFORE it is adopted, so it
+        // has to be collected under the shipped rules. `is_move_site` is the
+        // same predicate `consume_if_move` tests, so the two cannot drift.
+        let (verdict, sites) = check_stmts_under(
+            vec![let_str("s", "ab"), call_with("s"), call_with("s")],
+            MoveRules::CURRENT,
+        );
+        assert!(verdict.is_ok());
+        assert_eq!(sites.call_arg, (2, 0), "two user call-argument sites");
+
+        // Counted on a program that PASSES, deliberately. Under the shipped
+        // rules a CONTAINER array literal consumes, so `[s, s]` errors on its
+        // second element and the walk stops -- the counts would then be a
+        // report of where the checker gave up rather than of the program.
+        // The varargs form has the same two sites and no error.
+        let (verdict, sites) = check_stmts_under(
+            vec![let_str("s", "ab"), call_with_array("s")],
+            MoveRules::CURRENT,
+        );
+        assert!(verdict.is_ok());
+        assert_eq!(sites.array_elem, (2, 0), "two user array-element sites");
+        assert_eq!(
+            sites.array_elem_in_call, (2, 0),
+            "both of them in ARGUMENT position -- the split's own counter",
+        );
+
+        // And the container form, counted under PRE_D3 so the walk completes.
+        let (verdict, sites) = check_stmts_under(
+            vec![let_str("s", "ab"), let_array_of("v", "s")],
+            MoveRules::PRE_D3,
+        );
+        assert!(verdict.is_ok(), "PRE_D3 is what shipped before D-3");
+        assert_eq!(sites.array_elem, (2, 0), "two user array-element sites");
+        assert_eq!(
+            sites.array_elem_in_call, (0, 0),
+            "neither of them in argument position",
+        );
     }
 
     #[test]

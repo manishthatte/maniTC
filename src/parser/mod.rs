@@ -315,6 +315,26 @@ impl Parser {
 
     // --- fn ---
 
+    /// **B7's D-2.** Consume a `move` annotation before a parameter's type.
+    ///
+    /// `move` is CONTEXTUAL, not reserved: `stdlib/fs.mt` declares
+    /// `fn move(src: str, dst: str)`, and reserving the word would delete a
+    /// shipped function (P104's lesson). It lexes as an ordinary identifier,
+    /// so this arm has to tell the annotation from a TYPE that happens to be
+    /// called `move` — and it does so by requiring something to follow: in
+    /// `x: move` the word is the type, in `x: move str` it is the annotation.
+    fn eat_move_annotation(&mut self) -> bool {
+        if !matches!(self.peek(), TokenKind::Ident(w) if w == "move") {
+            return false;
+        }
+        // A type must follow for this to be an annotation rather than a type.
+        if matches!(self.peek_at(1), TokenKind::Comma | TokenKind::RParen) {
+            return false;
+        }
+        self.advance();
+        true
+    }
+
     pub(super) fn parse_fn_def(&mut self, is_pub: bool) -> CompileResult<FnDef> {
         let span = self.span();
         let is_async = self.eat(&TokenKind::Async);
@@ -336,12 +356,17 @@ impl Parser {
                     name: "self".to_string(),
                     ty: Type::Named("Self".to_string(), pspan),
                     span: pspan,
+                    // A `move self` is B7's business, not D-2's: consuming the
+                    // receiver is a separate decision (see `method_recv` in the
+                    // move-site sweep, which counts it and never consumes it).
+                    is_move: false,
                 });
             } else {
                 let (pname, _) = self.expect_ident()?;
                 self.expect(&TokenKind::Colon)?;
+                let is_move = self.eat_move_annotation();
                 let ty = self.parse_type()?;
-                params.push(Param { name: pname, ty, span: pspan });
+                params.push(Param { name: pname, ty, span: pspan, is_move });
             }
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -673,8 +698,9 @@ impl Parser {
             let pspan = self.span();
             let (pname, _) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
+            let is_move = self.eat_move_annotation();
             let ty = self.parse_type()?;
-            params.push(Param { name: pname, ty, span: pspan });
+            params.push(Param { name: pname, ty, span: pspan, is_move });
             if !self.eat(&TokenKind::Comma) {
                 break;
             }

@@ -212,6 +212,10 @@ pub struct TypedFnDef {
 pub struct TypedParam {
     pub name: String,
     pub ty: ManiType,
+    /// **B7's D-2**: passing an argument here CONSUMES it. See
+    /// `ast::Param::is_move` for why this is per-parameter and not a change to
+    /// what all calls do.
+    pub is_move: bool,
 }
 
 #[derive(Debug, Clone)]

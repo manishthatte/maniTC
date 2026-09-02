@@ -252,6 +252,20 @@ impl Parser {
                 let expr = self.parse_unary_expr()?;
                 Ok(Expr::UnOp(UnOpKind::Neg, Box::new(expr), span))
             }
+            // §11.12: `await e` in PREFIX position, which is the form
+            // `docs/examples.md` and `docs/language-reference.md` have shown
+            // since before §11 existed — `let value = await task;`. The
+            // postfix `e.await` was already accepted by the `Dot` arm below
+            // and stays accepted; it was the only form that parsed, and it is
+            // not the one anything was written in.
+            //
+            // It binds like a unary operator, so `await t + 1` awaits `t` and
+            // then adds, matching every other prefix form here.
+            TokenKind::Await => {
+                self.advance();
+                let expr = self.parse_unary_expr()?;
+                Ok(Expr::Await(Box::new(expr), span))
+            }
             TokenKind::Bang => {
                 self.advance();
                 let expr = self.parse_unary_expr()?;

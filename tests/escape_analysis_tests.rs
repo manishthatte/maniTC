@@ -312,6 +312,54 @@ fn main() {{
 }
 
 #[test]
+fn p109_a_tuple_returned_through_a_fn_pointer_links() {
+    // P97 repaired this for the ARRAY spelling of an aggregate return with a
+    // hand-written `IRType::Array(..) => "ptr"` arm in the `CallIndirect`
+    // emitter, and every STRUCT-typed return went on falling through to
+    // `llvm_type`. A TUPLE is one: `IRType::from_mani` spells `(int, int)` as
+    // `Struct("<tuple:2>")`, which renders `%struct.<tuple:2>` — not a legal
+    // unquoted LLVM identifier at all — so clang rejected the module on the
+    // TYPE NAME rather than on a type mismatch, while `manitc check` exited 0
+    // and T3 ran the program. That is P87's shape (a name the compiler built
+    // that LLVM cannot spell) reached by P97's mechanism.
+    //
+    // The fix asks `llvm_abi_type`, which is the function `emit_function` uses
+    // for the matching `define`, so the two cannot disagree by construction.
+    //
+    // WHAT THIS ROW ASSERTS IS THE SUM, deliberately. Whether a returned
+    // aggregate copies or aliases is an open decision (B7's D-1: measured on
+    // both backends, an aggregate parameter is a MUTABLE REFERENCE and a
+    // projection aliases), and a row that read one field after mutating the
+    // other would pin that decision by accident.
+    both("
+fn mk(a: int, b: int) -> (int, int) { return (a, b); }
+fn main() {
+    let f: fn(int, int) -> (int, int) = mk;
+    let t: (int, int) = f(4, 38);
+    io::print(\"pair-sum: \"); io::print_int(t.0 + t.1); io::println(\"\");
+}
+", "pair-sum: 42", "tuple returned through a fn pointer");
+}
+
+#[test]
+fn p109_a_tuple_returned_from_a_direct_call_was_already_fine() {
+    // The boundary, said plainly rather than left for a reader to infer: this
+    // row PASSES on the compiler without the fix (permanent rule 9 — a row
+    // that cannot tell the two binaries apart is not evidence for the change,
+    // and saying which rows those are is the honest half). The direct `Call`
+    // arm takes its return type from the declared signature and has always
+    // rendered an aggregate as `ptr`; only `CallIndirect`, which has no
+    // signature to consult, went to `llvm_type`.
+    both("
+fn mk(a: int, b: int) -> (int, int) { return (a, b); }
+fn main() {
+    let t: (int, int) = mk(4, 38);
+    io::print(\"direct-sum: \"); io::print_int(t.0 + t.1); io::println(\"\");
+}
+", "direct-sum: 42", "tuple returned from a direct call");
+}
+
+#[test]
 fn p94_a_sized_array_field_was_already_safe_and_still_is() {
     // Stated rather than left implicit: this row passes on the compiler
     // WITHOUT the fix, and it is here to pin the boundary the fix is drawn
@@ -360,4 +408,63 @@ fn main() {
     io::print(\"acc=\"); io::println_int(acc);
 }
 ", "acc=162400", "non-escaping array stays in the frame");
+}
+
+
+// ---------------------------------------------------------------------------
+// P111 / B7's D-1 — an aggregate is a REFERENCE, and a nested array read has
+// to compile
+// ---------------------------------------------------------------------------
+
+#[test]
+fn p111_a_nested_array_read_compiles_on_both_backends() {
+    // `v[i][j]` where `v: [[int; 3]; 2]` did not compile on LLVM AT ALL, while
+    // `manitc check` exited 0 and T3 ran it and printed the right answer.
+    //
+    // `array_value_ty` has said "an array's value is its address" since arrays
+    // got a representation, and the Index read path did not ask it: for a flat
+    // `[int; N]` the element is `I64` and the answer is unchanged, but for a
+    // nested array the element is itself an array and the slot holds a POINTER.
+    // Not asking meant `load [3 x i64]` and then using the result as a pointer,
+    // which clang rejects.
+    //
+    // **Index 1 as well as index 0, deliberately.** The stride takes the same
+    // answer as the load, and at index 0 a wrong stride is invisible — which is
+    // why the shape was first reported as a projection defect rather than as
+    // every nested read.
+    both("
+fn main() {
+    let v: [[int; 3]; 2] = [[1,2,3],[4,5,6]];
+    io::print(\"nested: \");
+    io::print_int(v[0][0]); io::print(\" \");
+    io::print_int(v[0][2]); io::print(\" \");
+    io::print_int(v[1][0]); io::print(\" \");
+    io::print_int(v[1][2]); io::println(\"\");
+}
+", "nested: 1 3 4 6", "a nested array read, at index 0 AND index 1");
+}
+
+#[test]
+fn d1_an_aggregate_bound_from_a_projection_aliases_on_both_backends() {
+    // **B7's D-1, taken 3 September 2026: an aggregate is a REFERENCE.**
+    //
+    // `let u = v[0]; u[0] = 9;` writes through to `v`. That is what T3 has
+    // always done and what `thatteos/src/kernel/process.mt` measured and
+    // designed around, citing P63's 2,536-word heap as why copying is not
+    // affordable. LLVM used to emit an aggregate load/store pair — a COPY —
+    // and then fail to link, so the two backends disagreed about the INTENT
+    // and not merely about the answer.
+    //
+    // This row pins the DECISION, so it is the one to change if D-1 is ever
+    // retaken: value semantics would make this print 1, and it would have to
+    // print 1 on both backends and be paid for out of the heap.
+    both("
+fn main() {
+    let v: [[int; 3]; 2] = [[1,2,3],[4,5,6]];
+    let mut u: [int; 3] = v[0];
+    u[0] = 9;
+    io::print(\"aliased: \");
+    io::print_int(v[0][0]); io::println(\"\");
+}
+", "aliased: 9", "D-1: a projection aliases");
 }

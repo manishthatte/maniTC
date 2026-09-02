@@ -1248,9 +1248,24 @@ impl SemanticAnalyzer {
                 span,
             }),
 
+            // §11.12 (AWAIT). `await h` on a `Task<T>` has type `T`: a task
+            // handle is a one-shot channel of capacity one that the task sends
+            // to when it terminates, and `await` is its `recv`.
+            //
+            // **Anything else keeps the identity typing it has always had**,
+            // and that is a decision rather than an oversight. The only live
+            // `await` in either repository is `fetch_data(id).await` in
+            // `examples/concurrency.mt`, applied to an `async fn` result —
+            // a surface §11 does not specify. Typing `Task<T>` and leaving the
+            // rest alone moves exactly the construct §11.12 defines.
             Expr::Await(inner, _) => {
-                let tinner = self.check_expr(inner, hint)?;
-                let ty = tinner.ty.clone();
+                let tinner = self.check_expr(inner, None)?;
+                let ty = match &tinner.ty {
+                    ManiType::Generic(n, args) if n == "Task" => {
+                        args.first().cloned().unwrap_or(ManiType::Unknown)
+                    }
+                    other => other.clone(),
+                };
                 Ok(TypedExpr {
                     kind: TypedExprKind::Await(Box::new(tinner)),
                     ty,
@@ -1291,9 +1306,15 @@ impl SemanticAnalyzer {
                 // is determinism of the CODE, and it is just as required.
                 captures.sort_by(|a, b| a.0.cmp(&b.0));
                 let tb = self.check_block(block)?;
+                // §11.12: `spawn { B } : Task<T>` where `T` is the value of
+                // `B`. Used as a STATEMENT its value is discarded like any
+                // expression statement's, which is why every existing program
+                // is unmoved — the handle is a return value rather than a
+                // change to the form.
+                let ty = ManiType::Generic("Task".to_string(), vec![tb.ty.clone()]);
                 Ok(TypedExpr {
                     kind: TypedExprKind::Spawn(tb, captures),
-                    ty: ManiType::Void,
+                    ty,
                     span,
                 })
             }
@@ -1310,7 +1331,14 @@ impl SemanticAnalyzer {
                 for (pname, pty) in params {
                     let mty = self.resolve_type(pty)?;
                     param_mani_tys.push(mty.clone());
-                    typed_params.push(TypedParam { name: pname.clone(), ty: mty });
+                    typed_params.push(TypedParam {
+                        name: pname.clone(),
+                        ty: mty,
+                        // A lambda parameter: `move` is not spellable there
+                        // yet, and lambdas cannot capture at all (P55), so
+                        // there is nothing for it to protect.
+                        is_move: false,
+                    });
                     param_names.insert(pname.clone());
                 }
                 let ret_mani = if let Some(rt) = ret_ty_opt {

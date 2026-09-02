@@ -1183,18 +1183,37 @@ impl IRLowerer {
                 if let Some(len) = arr_len {
                     self.emit(IRInstr::BoundsCheck { idx: idx_val.clone(), len });
                 }
+                // **An array's VALUE is its address** — `array_value_ty` has
+                // said so since arrays got a representation, and this site did
+                // not ask it. For a flat `[int; N]` the element type is `I64`
+                // and the answer is unchanged; for a NESTED `[[int; 3]; 2]` the
+                // element is itself an array, and the slot holds a POINTER to
+                // it rather than 24 bytes of aggregate.
+                //
+                // Not asking meant emitting `load [3 x i64]` and then using the
+                // result as a pointer — `getelementptr i64, ptr %t16` against
+                // an aggregate value — so **`v[i][j]` did not compile on LLVM
+                // AT ALL**, while `manitc check` exited 0 and T3 ran it and
+                // printed the right answer. report.txt P111, and the population
+                // is every nested-array read rather than the one projection
+                // shape it was reported as.
+                //
+                // The stride takes the same answer as the load, or the two
+                // disagree about how wide a slot is: at index 0 that is
+                // invisible, which is why the reported repro used `v[0]`.
+                let slot_ty = array_value_ty(&ty);
                 let ptr_t = self.fresh_temp();
                 self.emit(IRInstr::GetPtr {
                     dst: ptr_t.clone(),
                     ptr: arr_val,
                     idx: idx_val,
-                    ty: ty.clone(),
+                    ty: slot_ty.clone(),
                 });
                 let dst = self.fresh_temp();
                 self.emit(IRInstr::Load {
                     dst: dst.clone(),
                     ptr: IRValue::Temp(ptr_t),
-                    ty,
+                    ty: slot_ty,
                 });
                 IRValue::Temp(dst)
             }
@@ -1525,7 +1544,30 @@ impl IRLowerer {
                 IRValue::Void
             }
 
-            TypedExprKind::Await(inner) => self.lower_expr(inner),
+            // §11.12 (AWAIT). A `Task<T>` is a one-shot channel of capacity
+            // one, and this is its `recv`; §11.4's list of yield points does
+            // not grow, because an unfinished task is an empty queue.
+            //
+            // `await` on anything that is NOT a `Task<T>` keeps the identity
+            // lowering it has always had — the analyzer types it that way for
+            // the same reason, and `examples/concurrency.mt`'s
+            // `fetch_data(id).await` is the one live case.
+            TypedExprKind::Await(inner) => {
+                let v = self.lower_expr(inner);
+                match &inner.ty {
+                    crate::semantic::ManiType::Generic(n, _) if n == "Task" => {
+                        let w = self.fresh_temp();
+                        self.emit(IRInstr::Call {
+                            dst: Some(w.clone()),
+                            func: "__task_await".to_string(),
+                            args: vec![v],
+                            ret_ty: IRType::I64,
+                        });
+                        self.task_word_to_value(IRValue::Temp(w), &expr.ty)
+                    }
+                    _ => v,
+                }
+            }
 
             // §11.4's first yield point. Under `inline` there is one task and
             // nothing to yield to, so it lowers to nothing at all — the same
@@ -1547,20 +1589,30 @@ impl IRLowerer {
                 IRValue::Void
             }
 
-            TypedExprKind::Spawn(block, captures) => {
-                match self.sched {
-                    // `docs/memory-model.md` §4, and what every ManiT program
-                    // has always done: evaluate the block in place.
-                    SchedMode::Inline => {
-                        self.lower_block(block);
-                    }
-                    SchedMode::Cooperative => self.lower_spawn_as_fork(block),
-                    SchedMode::CooperativeOutlined => {
-                        self.lower_spawn_outlined(block, captures)
-                    }
+            TypedExprKind::Spawn(block, captures) => match self.sched {
+                // `docs/memory-model.md` §4, and what every ManiT program has
+                // always done: evaluate the block in place. §11.12's decision
+                // 1 is what makes that a legal task rather than a special
+                // case — a handle whose task finished long ago is the ordinary
+                // one — so the block's value becomes a handle already in
+                // `done(v)` and `await` on it returns immediately.
+                SchedMode::Inline => {
+                    let v = self.lower_block(block);
+                    let w = self.task_value_to_word(v, &block.ty);
+                    let h = self.fresh_temp();
+                    self.emit(IRInstr::Call {
+                        dst: Some(h.clone()),
+                        func: "__task_done_value".to_string(),
+                        args: vec![w],
+                        ret_ty: IRType::I64,
+                    });
+                    IRValue::Temp(h)
                 }
-                IRValue::Void
-            }
+                SchedMode::Cooperative => self.lower_spawn_as_fork(block),
+                SchedMode::CooperativeOutlined => {
+                    self.lower_spawn_outlined(block, captures)
+                }
+            },
 
             TypedExprKind::Tresult(tr) => self.lower_tresult(tr, &expr.ty),
         }
@@ -1891,7 +1943,7 @@ impl IRLowerer {
         &mut self,
         block: &crate::semantic::TypedBlock,
         captures: &[(String, crate::semantic::ManiType)],
-    ) {
+    ) -> IRValue {
         let name = format!("__spawn_body_{}", self.spawn_counter);
         self.spawn_counter += 1;
 
@@ -1917,11 +1969,15 @@ impl IRLowerer {
                 ty: IRType::from_mani(cty),
             });
         }
+        // §11.12 (SPAWN-T): `__task_spawn` has always returned the new task's
+        // id; it was discarded. Taking it is the whole of the handle on this
+        // backend.
+        let handle = self.fresh_temp();
         self.emit(IRInstr::Call {
-            dst: None,
+            dst: Some(handle.clone()),
             func: "__task_spawn".to_string(),
             args: vec![IRValue::Global(name.clone()), IRValue::Temp(env)],
-            ret_ty: IRType::Void,
+            ret_ty: IRType::I64,
         });
 
         // ---- the outlined body, built in its own function context
@@ -1968,9 +2024,14 @@ impl IRLowerer {
             self.locals.insert(cname.clone(), (home, ity));
         }
 
-        self.lower_block(block);
+        // §11.12: the outlined body RETURNS the block's value, packed into the
+        // one word a handle carries. `__task_spawn`'s trampoline records it as
+        // `done(v)`; the body's return type was already `i64` and already
+        // returned 0.
+        let bv = self.lower_block(block);
+        let bw = self.task_value_to_word(bv, &block.ty);
         if matches!(self.blocks[self.current_block].term, IRTerminator::Unreachable) {
-            self.set_term(IRTerminator::Return(Some(IRValue::Const(IRConst::Int(0)))));
+            self.set_term(IRTerminator::Return(Some(bw)));
         }
         let body_fn = IRFunction {
             name,
@@ -1987,10 +2048,48 @@ impl IRLowerer {
         self.current_fn_ret = saved_ret;
         self.temp_counter = saved_temp;
         self.label_counter = saved_label;
+        IRValue::Temp(handle)
     }
 
-    pub(super) fn lower_spawn_as_fork(&mut self, block: &crate::semantic::TypedBlock) {
+    /// §11.12: pack a task's value into the one machine word a handle
+    /// carries, and read it back out.
+    ///
+    /// **The value travels as a BIT PATTERN and nothing converts it.** A
+    /// `spawn { 1.5 }` must arrive at its `await` as 1.5 and not as 1.
+    ///
+    /// The first version round-tripped through an `alloca` — store at the
+    /// value's own type, load at `i64` — which is P99b's `env` design and does
+    /// not work here: `codegen_llvm` keeps `alloca_stored_types` and
+    /// deliberately re-types a load to whatever was stored, precisely so a
+    /// store/load pair cannot disagree. That heuristic makes an alloca unable
+    /// to express a REINTERPRET, and the outlined body emitted
+    /// `ret i64 %t1` for a `double`.
+    ///
+    /// So the word is the value itself and the coercion happens where the
+    /// backend already does it: the `i64`/`double` bitcast at a CALL BOUNDARY
+    /// that `Ok(1.5)` has needed since 20 August. Both halves are kept as
+    /// named functions rather than inlined, because the pair is the place to
+    /// put the argument and the point where a future representation change
+    /// would have to be made twice if it were not.
+    fn task_value_to_word(&mut self, v: IRValue, ty: &crate::semantic::ManiType) -> IRValue {
+        let _ = ty;
+        if matches!(v, IRValue::Void) {
+            // A `spawn { }` whose block yields nothing still needs a handle;
+            // §11.12 decision 3 discards un-awaited values, and a `void` task
+            // is the case where there was never one.
+            return IRValue::Const(IRConst::Int(0));
+        }
+        v
+    }
+
+    fn task_word_to_value(&mut self, w: IRValue, ty: &crate::semantic::ManiType) -> IRValue {
+        let _ = ty;
+        w
+    }
+
+    pub(super) fn lower_spawn_as_fork(&mut self, block: &crate::semantic::TypedBlock) -> IRValue {
         let id = self.fresh_temp();
+        let id_for_handle = id.clone();
         self.emit(IRInstr::Call {
             dst: Some(id.clone()),
             func: "__task_fork".to_string(),
@@ -2017,19 +2116,24 @@ impl IRLowerer {
 
         let body_idx = self.new_block(body_label);
         self.switch_to(body_idx);
-        self.lower_block(block);
-        // §11.5 (DONE). Not a `Return`: the child's copied stack still holds
-        // its parent's frames, so returning would run the SPAWNER's
-        // continuation inside the task.
+        let v = self.lower_block(block);
+        let w = self.task_value_to_word(v, &block.ty);
+        // §11.5 (DONE) / §11.12 (DONE-T). Not a `Return`: the child's copied
+        // stack still holds its parent's frames, so returning would run the
+        // SPAWNER's continuation inside the task. It carries the block's value
+        // now, which is what makes `𝒯[h ↦ done(v)]` possible at all.
         self.emit(IRInstr::Call {
             dst: None,
-            func: "__task_exit".to_string(),
-            args: vec![],
+            func: "__task_exit_value".to_string(),
+            args: vec![w],
             ret_ty: IRType::Void,
         });
         self.set_term(IRTerminator::Unreachable);
 
         let cont_idx = self.new_block(cont_label);
         self.switch_to(cont_idx);
+        // §11.12 (SPAWN-T): the parent's `__task_fork` result is the handle.
+        // It already existed and was discarded; nothing new is emitted for it.
+        IRValue::Temp(id_for_handle)
     }
 }

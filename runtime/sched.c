@@ -43,6 +43,11 @@ typedef struct ManitTask2 {
     int64_t         id;
     int64_t       (*body)(int64_t*);
     int64_t*        env;
+    /* §11.12: the `ManitHandle` this task completes when it terminates.
+     * `void*` because the handle type is declared below — the task does not
+     * need to see inside it, and keeping it opaque is the same discipline the
+     * `void**` waiter protocol uses. */
+    void*           handle;
     struct ManitTask2* next;      /* run queue, or a channel's waiter list */
 } ManitTask2;
 
@@ -84,12 +89,34 @@ static ManitTask2* manit_rq_pop(void) {
  * detect. A pthread runtime can only suffer that; a scheduler that owns the
  * whole runnable set can name it.
  */
+static int manit_anyone_awaiting(void);
+
 static void manit_hand_off(ManitTask2* self, int self_requeued) {
     if (!manit_run_head) {
         if (manit_blocked_count > 0) {
+            /* §11.12's own §11.6 clause, checked FIRST and in the same order
+             * the T3 emulator checks it. A task blocked in `await` is in B, so
+             * §11.6 already covers it; what it must not do is report a CHANNEL
+             * nobody is waiting on. The message names which kind of wait it
+             * is, for §11.11's reason — the wrong word sends the reader
+             * looking for a missing sender when the problem is a task that
+             * cannot finish.
+             *
+             * Derived by WALKING the handle list rather than kept as a second
+             * counter: `manit_sched_block_on` and `manit_sched_wake_all` are
+             * shared with channels and do not know which kind of queue they
+             * were handed, so a counter would have to be maintained at call
+             * sites that cannot see the distinction — and a counter that can
+             * drift from the thing it counts is what P41 was. */
+            int awaiting = manit_anyone_awaiting();
             pthread_mutex_unlock(&manit_sched_lock);
-            manit_fault("deadlock — every task is blocked on a channel that no "
-                        "runnable task can fill");
+            if (awaiting) {
+                manit_fault("deadlock — every task is blocked awaiting a task "
+                            "that cannot finish");
+            } else {
+                manit_fault("deadlock — every task is blocked on a channel that no "
+                            "runnable task can fill");
+            }
             return; /* not reached */
         }
         /* R is empty and nothing is blocked: the program is over (§11.6). */
@@ -106,6 +133,132 @@ static void manit_hand_off(ManitTask2* self, int self_requeued) {
     }
 }
 
+/* ---- §11.12: `Task<T>` and `await` ------------------------------------
+ *
+ * A task handle is a ONE-SHOT CHANNEL OF CAPACITY ONE that the task sends to
+ * when it terminates, and `await` is its `recv` — which is why §11.4's list of
+ * yield points does not grow: an unfinished task is an empty queue, so
+ * awaiting one is point 2.
+ *
+ * `taken` is the only state the channel model does not already give. Without
+ * it a second `await` answers with (RECV-CLOSED)'s zero, silently; with it,
+ * the second `await` is a trap. §11.12 decision 2 states the rule on the
+ * VALUE rather than as a restriction on the handle, deliberately, so that when
+ * affine types land `await` consuming its handle makes the second one a
+ * COMPILE error and this trap becomes unreachable.
+ */
+/* Forward-declared: both live below, next to the channel protocol they were
+ * written for, and §11.12 reuses that protocol rather than growing a second. */
+void manit_sched_block_on(void** head, void** tail);
+void manit_sched_wake_all(void** head, void** tail);
+
+typedef enum { MT_RUNNING, MT_DONE, MT_TAKEN } ManitTaskState;
+
+typedef struct ManitHandle {
+    int64_t id;
+    ManitTaskState state;
+    int64_t value;
+    /* B(h). The same `void**` protocol a channel uses, so the
+     * "longest-waiting" ordering stays enforced in one place. */
+    void* awaiters_head;
+    void* awaiters_tail;
+    struct ManitHandle* next;
+} ManitHandle;
+
+static ManitHandle* manit_handles = NULL;
+static int64_t manit_next_handle = 1;
+
+/* Allocated under the scheduler lock: `__task_spawn` runs with tasks live. */
+static ManitHandle* manit_handle_new_locked(ManitTaskState st, int64_t v) {
+    ManitHandle* h = (ManitHandle*)calloc(1, sizeof(ManitHandle));
+    h->id = manit_next_handle++;
+    h->state = st;
+    h->value = v;
+    h->next = manit_handles;
+    manit_handles = h;
+    return h;
+}
+
+static ManitHandle* manit_handle_find(int64_t id) {
+    for (ManitHandle* h = manit_handles; h; h = h->next) {
+        if (h->id == id) return h;
+    }
+    return NULL;
+}
+
+/* §11.12 decision 1 and 3, and `--sched inline`'s whole implementation: a
+ * value that never had a task gets a handle already in `done(v)`. A handle
+ * whose task finished long ago is the ordinary case, not a special one. */
+int64_t __task_done_value(int64_t v) {
+    pthread_mutex_lock(&manit_sched_lock);
+    ManitHandle* h = manit_handle_new_locked(MT_DONE, v);
+    int64_t id = h->id;
+    pthread_mutex_unlock(&manit_sched_lock);
+    return id;
+}
+
+/* §11.12 (DONE-T): 𝒯[h ↦ done(v)], and EVERY waiter is woken.
+ *
+ * All of them, and it is (CLOSE)'s reason rather than (SEND-WAKE)'s: a `send`
+ * produces one value so a second waiter would find nothing and block again,
+ * while termination is a PERMANENT FACT — every awaiting task can proceed, and
+ * one left queued is stranded forever because nothing finishes a task twice. */
+static void manit_handle_complete(ManitHandle* h, int64_t v) {
+    if (!h) return;
+    pthread_mutex_lock(&manit_sched_lock);
+    h->state = MT_DONE;
+    h->value = v;
+    pthread_mutex_unlock(&manit_sched_lock);
+    manit_sched_wake_all(&h->awaiters_head, &h->awaiters_tail);
+}
+
+/* Is any task queued on a task handle? §11.6 counts an awaiter exactly as it
+ * counts a channel waiter. */
+static int manit_anyone_awaiting(void) {
+    for (ManitHandle* h = manit_handles; h; h = h->next) {
+        if (h->awaiters_head) return 1;
+    }
+    return 0;
+}
+
+/* §11.12 (AWAIT) and (AWAIT-BLOCK). */
+int64_t __task_await(int64_t id) {
+    for (;;) {
+        pthread_mutex_lock(&manit_sched_lock);
+        ManitHandle* h = manit_handle_find(id);
+        if (!h) {
+            pthread_mutex_unlock(&manit_sched_lock);
+            manit_fault("await on a value that is not a task handle");
+            return 0;
+        }
+        if (h->state == MT_TAKEN) {
+            pthread_mutex_unlock(&manit_sched_lock);
+            manit_fault("await on a task whose value has already been taken");
+            return 0;
+        }
+        if (h->state == MT_DONE) {
+            /* (AWAIT) does not touch R: a finished task is awaited without
+             * yielding. */
+            h->state = MT_TAKEN;
+            int64_t v = h->value;
+            pthread_mutex_unlock(&manit_sched_lock);
+            return v;
+        }
+        pthread_mutex_unlock(&manit_sched_lock);
+        if (!manit_sched_on) {
+            /* Unscheduled and still running is unreachable — every handle is
+             * born `done` under `--sched inline` — so saying so beats hanging
+             * in a wait nothing can end (P5.1's signature). */
+            manit_fault("await on a task that cannot finish");
+            return 0;
+        }
+        /* (AWAIT-BLOCK). The loop is the specification: being woken means
+         * re-executing the await, exactly as (RECV-BLOCK) does, so an
+         * intervening `await` by a third task behaves as the rules say. */
+        manit_sched_block_on(&h->awaiters_head, &h->awaiters_tail);
+    }
+}
+
 /* ---- the entry point every task thread runs --------------------------- */
 
 static void* manit_task_trampoline(void* arg) {
@@ -116,7 +269,7 @@ static void* manit_task_trampoline(void* arg) {
     }
     pthread_mutex_unlock(&manit_sched_lock);
 
-    if (self->body) self->body(self->env);
+    int64_t result = self->body ? self->body(self->env) : 0;
     /* THE RUNTIME OWNS `env`, ALWAYS. Both paths free it and no body may:
      * the two disagreed at first — the unscheduled path freed and the
      * trampoline leaked — so a body written to free its own captures
@@ -125,6 +278,12 @@ static void* manit_task_trampoline(void* arg) {
      * have to emit a free. */
     free(self->env);
     self->env = NULL;
+
+    /* §11.12 (DONE-T) BEFORE §11.5 (DONE), and the order matters: completing
+     * the handle moves every awaiter back onto R, so it has to happen while
+     * this task is still the head and can hand off to them. Doing it after the
+     * hand-off would leave them queued behind a task that has gone. */
+    manit_handle_complete((ManitHandle*)self->handle, result);
 
     /* §11.5 (DONE): the task is removed. It is already the head of R. */
     pthread_mutex_lock(&manit_sched_lock);
@@ -158,10 +317,15 @@ void __task_bootstrap(void) {
  * CONTINUES. `env` is the captured store §11.2 gives the child, packed by the
  * compiler; the task owns it and frees it when the body returns. */
 int64_t __task_spawn(int64_t (*body)(int64_t*), int64_t* env) {
-    if (!manit_sched_on) { /* not scheduled: run it in place, as §4 always did */
+    if (!manit_sched_on) {
+        /* Not scheduled: run it in place, as §4 always did — and §11.12
+         * decision 1 makes the result an ordinary finished task rather than a
+         * special case, so it gets a handle already in `done(v)`. The return
+         * value used to be the BODY's result, which is not a handle and could
+         * not be awaited. */
         int64_t r = body ? body(env) : 0;
         free(env);
-        return r;
+        return __task_done_value(r);
     }
     pthread_mutex_lock(&manit_sched_lock);
     ManitTask2* t = (ManitTask2*)calloc(1, sizeof(ManitTask2));
@@ -169,8 +333,13 @@ int64_t __task_spawn(int64_t (*body)(int64_t*), int64_t* env) {
     t->id = manit_next_id++;
     t->body = body;
     t->env = env;
+    /* §11.12 (SPAWN-T): 𝒯[h ↦ running], recorded for EVERY spawn. Nothing
+     * upstream knows whether the handle will be awaited, and a handle created
+     * only on demand could not exist by the time the task finished. */
+    ManitHandle* h = manit_handle_new_locked(MT_RUNNING, 0);
+    t->handle = h;
     manit_rq_push(t);
-    int64_t id = t->id;
+    int64_t id = h->id;
     pthread_mutex_unlock(&manit_sched_lock);
 
     if (pthread_create(&t->thread, NULL, manit_task_trampoline, t) != 0) {

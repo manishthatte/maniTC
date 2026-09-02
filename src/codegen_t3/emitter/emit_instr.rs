@@ -1363,6 +1363,18 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "__task_exit" => {
                     em.emit("    SYSCALL #82  ; task_exit (spawned block)".to_string());
                 }
+                // §11.12 (DONE-T), (AWAIT), and the inline handle. Each takes
+                // its one argument in R1 and — where it has a result — leaves
+                // it in R1, which is what the shared helpers below already do.
+                "__task_exit_value" => {
+                    emit_syscall_1arg(em, args, dst, 139, "task_exit_value");
+                }
+                "__task_await" => {
+                    emit_syscall_1arg_ret(em, args, dst, 138, "task_await");
+                }
+                "__task_done_value" => {
+                    emit_syscall_1arg_ret(em, args, dst, 140, "task_done_value");
+                }
                 // Vec sort / reverse
                 "Vec::remove" => {
                     // `_ret`, because this call HAS a result (report.txt P59).

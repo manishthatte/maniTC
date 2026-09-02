@@ -2,7 +2,7 @@
 
 © Manish Jagdish Thatte
 
-**Status: version 0.8, 2 September 2026. Normative for the constructs it
+**Status: version 0.9, 2 September 2026. Normative for the constructs it
 covers, and silent about everything else.**
 
 > **Correction, 2 September 2026.** This line read *"version 0.3, 24 August
@@ -559,10 +559,18 @@ disagree about integer width. Recorded as report.txt P9.
 
 ## 11. Interleaving
 
-**Status, corrected 2 September 2026: §11.1–§11.8 are IMPLEMENTED by all
-three; §11.9 by both backends and §11.10 by both backends, with the A3
-reference behind on those two.** §1.2 makes this line an obligation rather
-than a courtesy, so it is restated whenever it stops being true.
+**Status, corrected again 2 September 2026 (0.9): §11.1–§11.8 are IMPLEMENTED
+by all three; §11.9, §11.11 and §11.12 by BOTH BACKENDS only; §11.10 by all
+three.** §1.2 makes this line an obligation rather than a courtesy, so it is
+restated whenever it stops being true — and it has now been wrong twice, in
+opposite directions, which is the argument for a row rather than a sentence.
+
+> The previous version read *"§11.9 by both backends and §11.10 by both
+> backends, with the A3 reference behind on those two"*. **§11.10 was wrong**:
+> `src/reference/eval.rs` carries `closed: Vec<bool>` as "§11.10 𝒦, the closed
+> set" and `recv` implements (RECV-CLOSED) — P105 put it in all three accounts
+> when it wrote the section. §11.11 was not mentioned at all, and the reference
+> has `caps` and `blocked_send`, so it has that too.
 
 Steps 1–3 of `enhance/phase3-the-semantics-debt/CONCURRENCY_DECISION.md` §5
 have landed: the A3 reference (step 1), the T3 emulator's scheduler and the
@@ -598,10 +606,13 @@ and the smallness is deliberate: §1's rule is to specify the core and grow it.
 **Deliberately not specified yet**, each because it needs a decision this
 document should not take casually:
 
-- ~~**`Task<T>` and `await`**~~ — **specified in §11.12 as of 0.8, 2 September
-  2026**, which takes the three decisions this bullet named: awaiting a
-  finished task returns immediately, awaiting twice is a TRAP, and a handle may
-  outlive its task. §11.12 is AHEAD of both backends and says so.
+- ~~**`Task<T>` and `await`**~~ — **specified in §11.12 as of 0.8 and
+  IMPLEMENTED BY BOTH BACKENDS as of 0.9, both 2 September 2026.** It takes the
+  three decisions this bullet named: awaiting a finished task returns
+  immediately, awaiting twice is a TRAP, and a handle may outlive its task. The
+  **A3 reference does not** implement it and cannot as written — §2's core
+  grammar gives a block no value — which §11.12 now says in its own first line
+  instead of the reverse, which is what it said when written.
 - ~~**`Mutex`, `Barrier`, `Semaphore`**~~ — **specified in §11.9 as of 0.5,
   2 September 2026.** The decision document §2 keeps them as *structured
   waiting* rather than mutual exclusion. They are expressible in terms of
@@ -1173,12 +1184,36 @@ observable only where the choice changes what is printed.
 
 ### 11.12 `Task<T>` and `await`
 
-**Status: this section is AHEAD of both backends.** §1.2 makes saying so an
-obligation. The A3 reference implements it; T3 and LLVM do not, and a
-conformance row asserts that gap in both directions until they do. This is
-deliberately the same shape as §11 itself took in 0.4 — specify, give the
-reference the rules, then teach the backends — because that order is what
-`CONCURRENCY_DECISION.md` §5 requires and what found P83, P105 and P107.
+**Status, corrected 2 September 2026 (0.9): BOTH BACKENDS IMPLEMENT THIS
+SECTION; the A3 reference does not.** §1.2 makes saying so an obligation, and
+this line is the second thing in this section that had to be corrected rather
+than merely updated.
+
+> **The original status line was FALSE ON THE DAY IT WAS WRITTEN.** It read:
+> *"this section is AHEAD of both backends. §1.2 makes saying so an obligation.
+> The A3 reference implements it; T3 and LLVM do not"*. It had the two halves
+> exactly the wrong way round about the reference — `src/reference/ast.rs`
+> carries `Stmt::Spawn(Vec<Stmt>)`, a STATEMENT, with a comment saying that
+> making it an expression *"would be the first half of the `Task<T>` decision
+> §11.1 declines to take"*, and the core lexer has no `await` at all. Nothing
+> checked the claim, because §1.2's own discipline had been applied only to the
+> backends: the conformance row asserted the gap through the SURFACE compiler
+> and said so in its comment.
+>
+> **And the reference cannot implement this section as written.** `spawn { B }
+> : Task<T>` is specified "where `T` is the value of block `B`", and §2's core
+> grammar gives a block no value — it is `"{" stmt* "}"` and nothing more. So
+> §11.12 needs a grammar extension it does not supply before a third account of
+> it can exist. That is recorded here rather than papered over, and
+> `interleaving_tests::s11_12_the_reference_does_not_have_task_and_await`
+> asserts the gap in both directions with the instruction to delete itself.
+
+`structured_waiting_tests::s11_12_*` runs the behaviour on both backends, in
+**both scheduling modes**, and the two reach it by different mechanisms — T3
+FORKS, so the parent's `__task_fork` result is the handle and the child exits
+carrying the block's value; LLVM OUTLINES, and the trampoline completes the
+handle from the body's return. That difference is what makes their agreement
+evidence rather than a shared lowering agreeing with itself.
 
 *Added in 0.8, 2 September 2026, closing report.txt P5.2 and P5.3. Both
 `docs/examples.md` and `docs/language-reference.md` have shown `let t = spawn
@@ -1275,6 +1310,32 @@ TRAP: deadlock — every task is blocked awaiting a task that cannot finish
 `await` was unparseable, and `Task<T>` named a type nothing produced. The
 section can therefore be implemented backend by backend without a flag, unlike
 §11's own arrival, which had to be gated because it moved output.
+
+*Measured when it landed, 2 September 2026: `manitc check` reaches the same
+verdict on all 366 `.mt` files in the two repositories and all 2,507 in the
+model corpus, the 17 examples are byte-identical on both backends, and the
+parity matrix is unmoved. The one live `await` in either repository is
+`fetch_data(id).await` in `examples/concurrency.mt`, applied to an `async fn`
+result — a surface this section does not specify, and which keeps the identity
+typing it has always had for that reason.*
+
+#### Two implementation notes that are consequences of the rules
+
+**The value travels as a bit pattern.** A handle carries one machine word, so
+`spawn { 1.5 }` must arrive at its `await` as 1.5 and not as 1. The first
+implementation produced the word by storing the value at its own type into an
+`alloca` and loading it back at `i64`; that is the design `§11.2`'s captured
+store uses, and it does not work here, because `codegen_llvm` re-types a load
+to whatever was stored — deliberately, so a store/load pair cannot disagree —
+and the outlined body emitted `ret i64` for a `double`. The word is the value
+itself, reinterpreted at the call boundary where an `i64`/`double` bitcast has
+existed since `Ok(1.5)` needed one.
+
+**§11.6's message names the await.** A task blocked in `await` is in `B`, so
+§11.6 already covers it — but reporting a CHANNEL nobody is waiting on sends
+the reader looking for a missing sender. This is §11.11's "fill" and "drain"
+one construct along, and both backends had the channel message until a row
+asked for the other one.
 
 ## 12. Changes
 
@@ -1398,3 +1459,34 @@ section can therefore be implemented backend by backend without a flag, unlike
   **This section is AHEAD of both backends and says so in its own first line**,
   which §1.2 requires. The A3 reference implements it and a conformance row
   asserts the gap in both directions — the same shape §11 itself took in 0.4.
+
+  > **Corrected in 0.9: the last sentence was false when written.** The A3
+  > reference does not implement §11.12 and cannot as written — see 0.9.
+- **0.9** (2 September 2026) — §11.12 **implemented on both backends**, and two
+  status lines corrected. `spawn { B }` now has type `Task<T>`, `await h`
+  parses in prefix position, and the six `structured_waiting_tests::s11_12_*`
+  rows run the behaviour on T3 and LLVM in **both scheduling modes**.
+
+  **Two claims in 0.8 were wrong, in opposite directions, and both were about
+  which implementations had a section.** 0.8 said the A3 reference implemented
+  §11.12: it does not, and `src/reference/ast.rs` says so in a comment —
+  `spawn` is a STATEMENT there and `await` is not a token. §11's own status
+  line said the reference was behind on §11.10: it is not, and has carried
+  `closed: Vec<𝔹>` as "§11.10 𝒦" since P105 wrote that section into all three.
+  **§1.2's discipline had been applied to the backends and not to the
+  reference**, so the one account nothing checked is the one both claims got
+  wrong. The rows now assert the reference's gap directly.
+
+  **§11.12 cannot be given a third account as written**, and that is recorded
+  rather than smoothed over: it specifies `spawn { B } : Task<T>` "where `T` is
+  the value of block `B`", and §2's core grammar gives a block no value. A
+  future version that wants the reference to have this section has to extend §2
+  first.
+
+  Landing it found no defect in either backend and moved no verdict: `manitc
+  check` agrees on all 366 repository files and all 2,507 corpus files, the 17
+  examples are byte-identical on both backends, and the parity matrix is
+  unmoved. What it did find is that **the two backends disagreed about §11.6's
+  message** — T3 named the await and LLVM named a channel nobody was waiting
+  on — which is §11.11's "fill"/"drain" lesson one construct along and is what
+  the deadlock row was written to catch.

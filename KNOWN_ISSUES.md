@@ -15,6 +15,11 @@ in a golden file — and both are now fixed with regression tests (issues 1 and
 **18 of the 20 programs are byte-identical across the two backends.** The two
 that are not are characterised exactly, below.
 
+> **Note, 2 September 2026.** Issue 5 below is **fixed** and its "one remaining
+> cross-backend divergence" billing is stale; see the dated notice there. The
+> divergence still open is **P111** in `../report.txt`, which is a different
+> program shape and was found on 2 September.
+
 ## Example programs
 
 All 17 example programs compile and run to completion with exit status 0 on
@@ -124,9 +129,32 @@ quoted.
    second. The four minutes were spent generating the 7.7 GB of NULs in
    issue 3, not on allocation.
 
-5. **Arrays on T3 are stack-allocated, and `[str]` elements do not survive a
-   loop iteration whose body allocates.** *This is the one remaining
+5. ~~**Arrays on T3 are stack-allocated, and `[str]` elements do not survive a
+   loop iteration whose body allocates.**~~ *This is the one remaining
    cross-backend divergence, and it is what `data_structures` diverges on.*
+
+   > **CORRECTED 2 September 2026 — FIXED, and the sentence above was TWICE
+   > wrong by the time anyone read it.** The reproduction printed below now
+   > gives `w=[aa] w=[bb] w=[aa]` and `len=2` on **both** backends, identical
+   > and correct. `report.txt` P77 recorded this as stale on 29 August —
+   > "F-4's own cited 'one remaining cross-backend divergence' (issue 5,
+   > `[str]` in a loop) is STALE — fixed even on the oldest archived binary" —
+   > and this document was never reopened. P94 then heap-allocated escaping
+   > arrays outright, which is the repair this entry asked for.
+   >
+   > **And "the one remaining" is false independently of that**: P111 (2
+   > September) is a cross-backend divergence — `let u: [int;3] = v[0];` on an
+   > array of arrays gives a wrong answer on T3 and a module clang refuses on
+   > LLVM.
+   >
+   > Kept in place rather than deleted, because the *reasoning* below is the
+   > record of why arrays were left on the stack when structs moved to the
+   > heap, and a fix can destroy the observation that justified it (permanent
+   > rule 7). **Pinned by
+   > `tests/audit_regression_tests.rs::known_issues_issue_5_no_longer_reproduces`,
+   > which runs the reproduction verbatim on both backends** — a count in
+   > prose goes stale exactly as fast as the thing it counts (P93, P96), and
+   > prose review does not catch that class (rule 6).
 
    Structs were fixed on 11 Aug 2026 by moving their allocations to the heap
    via syscall #218, matching the LLVM backend's malloc, because a struct

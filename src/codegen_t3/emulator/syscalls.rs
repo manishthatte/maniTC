@@ -32,7 +32,11 @@ impl Emulator {
             // 137 is `channel_bounded` (§11.11), out of line with the 70-74
             // channel block because 75-79 is the FILE SYSTEM — the first draft
             // used 75 and every bounded channel silently became an fs call.
-            17..=59 | 70..=74 | 80..=131 | 137 => {
+            // 138-140 are §11.12's task handles (await, exit-with-value,
+            // done-value), taken next to 137 for the same reason: the number
+            // must be inside a range this router actually forwards, and an
+            // unrouted number is a TRAP rather than a compile error.
+            17..=59 | 70..=74 | 80..=131 | 137..=140 => {
                 self.do_syscall_proc(num);
             }
             // `.unwrap()` guard — R1 = the Result's tag trit.

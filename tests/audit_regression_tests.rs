@@ -4867,3 +4867,55 @@ fn documented_module_level_lets_have_constant_initialisers() {
         bad.join("\n  ")
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// KNOWN_ISSUES.md issue 5 — pinning a document against the compiler
+// ---------------------------------------------------------------------------
+
+#[test]
+fn known_issues_issue_5_no_longer_reproduces() {
+    // `KNOWN_ISSUES.md` issue 5 said arrays on T3 are stack-allocated and
+    // `[str]` elements do not survive a loop iteration whose body allocates,
+    // and billed itself as "the one remaining cross-backend divergence". It
+    // was FIXED — report.txt P77 said so on 29 August and P94 heap-allocated
+    // escaping arrays outright — and the document was never reopened. The
+    // billing is false a second way now that P111 exists.
+    //
+    // THIS IS THE REPRODUCTION PRINTED IN THE DOCUMENT, VERBATIM. The document
+    // records the broken output as `w=[aa]  w=[]  w=[]` on T3 against
+    // `w=[aa] w=[bb] w=[aa]` on LLVM; both backends now give the second.
+    //
+    // Permanent rule 6: prose review does not catch a claim that was true when
+    // written, so the claim is pinned against the compiler rather than
+    // reviewed. What is pinned is that the two backends AGREE and that every
+    // element survives — not the map's length, which is a property of the
+    // program and not of the defect.
+    let ((_, t3), (_, ll)) = run_both_backends("ki5_str_array_in_loop.mt", r#"
+fn main() {
+    let words: [str] = ["aa", "bb", "aa"];
+    let m: Map<str, int> = Map::new();
+    for w in words {
+        io::print("w=["); io::print(w); io::println("]");
+        m.insert(w, 1);
+    }
+    io::print("len="); io::print_int(m.len()); io::println("");
+}
+"#);
+    assert!(
+        t3.contains("w=[aa]") && t3.contains("w=[bb]"),
+        "KNOWN_ISSUES issue 5 has REOPENED on T3: an element of a `[str]` did \
+         not survive the iteration. Got:\n{}", t3,
+    );
+    assert!(
+        !t3.contains("w=[]"),
+        "KNOWN_ISSUES issue 5 has REOPENED on T3: an element read empty. \
+         Got:\n{}", t3,
+    );
+    assert_eq!(
+        t3, ll,
+        "KNOWN_ISSUES issue 5 has REOPENED: the backends disagree on the \
+         document's OWN reproduction. If this change is deliberate, the dated \
+         notice in KNOWN_ISSUES.md issue 5 needs reopening with it.",
+    );
+}

@@ -526,6 +526,34 @@ impl Emulator {
             }
 
             // ----------------------------------------------------------------
+            // §11.12 — `Task<T>` and `await` (138-140)
+            // ----------------------------------------------------------------
+            138 => {
+                // task_await(handle=R1) → R1 = the task's value.
+                //
+                // Writes R1 only when a value is available: (AWAIT-BLOCK) and
+                // both traps return None, and writing then would hand the
+                // resumed task a value it must instead re-read.
+                let h = self.regs[1] as usize;
+                if let Some(v) = self.sched_await(h) {
+                    self.regs[1] = v;
+                }
+            }
+            139 => {
+                // task_exit_value(value=R1) — §11.12 (DONE-T).
+                let v = self.regs[1];
+                self.sched_task_exit_value(v);
+            }
+            140 => {
+                // task_done_value(value=R1) → R1 = a handle already in
+                // `done(v)`. This is `--sched inline`, where the block ran in
+                // place and there was never a task to wait for.
+                let v = self.regs[1];
+                let h = self.sched_done_value(v);
+                self.regs[1] = h as i64;
+            }
+
+            // ----------------------------------------------------------------
             // Vec higher-order functions (83-86)
             // ----------------------------------------------------------------
             83 => {
