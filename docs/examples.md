@@ -651,13 +651,31 @@ the others.
 ### Semaphore rate limiting
 
 ```maniT
-let sem: Semaphore = Semaphore::new(2);   // at most 2 concurrent workers
-
-fn worker(id: int) {
-    sem.acquire();
-    do_limited_work(id);
-    sem.release();
+fn run_workers() {
+    let sem: Semaphore = Semaphore::new(2);   // at most 2 concurrent workers
+    mut id = 0;
+    while id < 5 {
+        let wid = id;
+        spawn {
+            sem.acquire();
+            do_limited_work(wid);
+            sem.release();
+        }
+        id = id + 1;
+    }
 }
 ```
 
 `Semaphore::new(n)` allows at most `n` tasks past `acquire()` simultaneously.
+
+> **Corrected 2 September 2026 (report.txt P108).** This example used to put
+> the `let` at MODULE level, above `fn worker`, and **a reader who copied it
+> got an error**: a module-level `let` is stored as a single word written
+> before `main` runs, so its initialiser must be a compile-time constant, and
+> `Semaphore::new(2)` is a call. The semaphore is created inside a function
+> here and reached by the spawned blocks, which is §11.2's copy of the store
+> and how `examples/concurrency.mt` does it.
+>
+> Found by compiling every fenced block in `docs/` rather than reading them.
+> **The population is exactly one** — it is the only module-level `let` with a
+> non-constant initialiser in any documented block.

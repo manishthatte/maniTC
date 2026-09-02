@@ -2,7 +2,7 @@
 
 © Manish Jagdish Thatte
 
-**Status: version 0.7, 2 September 2026. Normative for the constructs it
+**Status: version 0.8, 2 September 2026. Normative for the constructs it
 covers, and silent about everything else.**
 
 > **Correction, 2 September 2026.** This line read *"version 0.3, 24 August
@@ -598,11 +598,10 @@ and the smallness is deliberate: §1's rule is to specify the core and grow it.
 **Deliberately not specified yet**, each because it needs a decision this
 document should not take casually:
 
-- **`Task<T>` and `await`** — report.txt P5.2 and P5.3. `spawn` here produces
-  no value, which is what `docs/memory-model.md` §4 already says it does. Giving
-  it a handle means deciding what awaiting a task that has already finished
-  does, what awaiting one twice does, and whether a handle can outlive its
-  task. The next increment, and the reason `spawn` is a STATEMENT below.
+- ~~**`Task<T>` and `await`**~~ — **specified in §11.12 as of 0.8, 2 September
+  2026**, which takes the three decisions this bullet named: awaiting a
+  finished task returns immediately, awaiting twice is a TRAP, and a handle may
+  outlive its task. §11.12 is AHEAD of both backends and says so.
 - ~~**`Mutex`, `Barrier`, `Semaphore`**~~ — **specified in §11.9 as of 0.5,
   2 September 2026.** The decision document §2 keeps them as *structured
   waiting* rather than mutual exclusion. They are expressible in terms of
@@ -1172,6 +1171,111 @@ does to (SEND-WAKE)**: a spuriously woken sender re-executes its send, finds
 the channel still full, and blocks again *while printing nothing*. It is
 observable only where the choice changes what is printed.
 
+### 11.12 `Task<T>` and `await`
+
+**Status: this section is AHEAD of both backends.** §1.2 makes saying so an
+obligation. The A3 reference implements it; T3 and LLVM do not, and a
+conformance row asserts that gap in both directions until they do. This is
+deliberately the same shape as §11 itself took in 0.4 — specify, give the
+reference the rules, then teach the backends — because that order is what
+`CONCURRENCY_DECISION.md` §5 requires and what found P83, P105 and P107.
+
+*Added in 0.8, 2 September 2026, closing report.txt P5.2 and P5.3. Both
+`docs/examples.md` and `docs/language-reference.md` have shown `let t = spawn
+{ … }` followed by `await t` since before §11 existed. **The first half parses
+today and binds `void`; the second does not parse at all.** So this is the
+third section running where the documentation was ahead of the language rather
+than behind it — and the first where it was ahead of BOTH.*
+
+#### `spawn` becomes an expression
+
+```
+    spawn { B }  :  Task<T>       where T is the value of block B
+```
+
+Used as a statement its value is discarded, exactly as any expression
+statement's is. **Every existing program is therefore unmoved**, which is the
+whole reason the handle is a return value rather than a change to the form.
+
+#### `await` is not a new yield point
+
+A `Task<T>` is a **one-shot channel of capacity one** that the task sends to
+when it terminates, and `await` is `recv`. So §11.4's list does not grow: a
+task that has not finished is an empty queue, which is point 2.
+
+§11.3's configuration gains **`𝒯`**, mapping a task handle to one of three
+states — `running`, `done(v)`, and `taken`. The third is the only thing the
+channel model does not already give, and §11.6 needs it.
+
+```
+        ⟨ ⟨let x = spawn{B}; s, σ⟩·R , … ⟩
+              → ⟨ ⟨s, σ[x ↦ h]⟩·R·⟨B,σ,h⟩ , … , 𝒯[h ↦ running] ⟩   (SPAWN-T)
+
+              𝒯(h) = done(v)
+        ─────────────────────────────────────────────────────      (AWAIT)
+        ⟨ ⟨let x = await h; s, σ⟩·R , … , 𝒯 ⟩
+                    → ⟨ ⟨s, σ[x ↦ v]⟩·R , … , 𝒯[h ↦ taken] ⟩
+
+              𝒯(h) = running
+        ─────────────────────────────────────────────────────      (AWAIT-BLOCK)
+        ⟨ ⟨t, σ⟩·R , B, … ⟩ → ⟨ R , B[h ↦ B(h)·⟨t,σ⟩], … ⟩
+                    where t is `let x = await h; s`
+
+        ⟨ ⟨ε,σ,h⟩·R , B, … , 𝒯 ⟩
+              → ⟨ R·B(h) , B[h ↦ ε], … , 𝒯[h ↦ done(v)] ⟩          (DONE-T)
+```
+
+(DONE-T) replaces §11.5's (DONE) for a task with a handle, and it **wakes every
+waiter**, for §11.10 (CLOSE)'s reason exactly: termination is a permanent fact,
+so every awaiting task can now proceed, and one left queued would be stranded
+forever.
+
+#### The three decisions
+
+**1. Awaiting a finished task returns immediately.** `𝒯(h) = done(v)` is
+(AWAIT), which does not touch `R`. A handle whose task finished long ago is not
+a special case; it is the ordinary one.
+
+**2. Awaiting the same task twice is a TRAP.**
+
+```
+TRAP: await on a task whose value has already been taken
+```
+
+The alternative — returning the value again — is available and is rejected,
+because a program that awaits one handle twice has almost certainly confused
+two handles, and this document's standing preference is a **detected error over
+a plausible continuation** (§11.6, §11.10's (SEND-CLOSED), §11.11's capacity
+rule). It is also why `𝒯` has a `taken` state at all: the one-shot channel
+alone would answer the second `await` with (RECV-CLOSED)'s zero, silently.
+
+*This is the clause a later affine type system should subsume.* When B7 lands,
+`await` consuming its handle makes the second one a COMPILE error and this trap
+becomes unreachable — which is strictly better and is the reason the rule is
+stated as a trap on the VALUE rather than a restriction on the handle.
+
+**3. A handle may outlive its task, and an un-awaited value is discarded.** The
+program may end with handles in `done(v)`; those values are dropped, exactly as
+a spawned block's value is dropped today. Nothing waits for a task nobody
+awaits, and §11.6 is unchanged: `𝒯` never keeps `R` alive.
+
+#### §11.6 with tasks
+
+A task blocked in `await` is in `B`, so §11.6 already covers it: if `R` empties
+while somebody is awaiting, that is a deadlock, and it is reachable only when
+the awaited task is itself blocked. The message says so:
+
+```
+TRAP: deadlock — every task is blocked awaiting a task that cannot finish
+```
+
+#### What this costs
+
+**Nothing, for programs that exist.** `spawn` used as a statement is unchanged,
+`await` was unparseable, and `Task<T>` named a type nothing produced. The
+section can therefore be implemented backend by backend without a flag, unlike
+§11's own arrival, which had to be gated because it moved output.
+
 ## 12. Changes
 
 - **0.1** (24 Aug 2026) — first version. Core as listed in §1. Written as A3,
@@ -1263,3 +1367,34 @@ observable only where the choice changes what is printed.
   can never hold a value, so every send on it blocks forever, and rounding it
   up to 1 turns a program that cannot work into one that quietly does something
   else.
+- **0.8** (2 September 2026) — §11.12, `Task<T>` and `await`, closing
+  report.txt P5.2 and P5.3. **The third section running where the documentation
+  was ahead of the language rather than behind it, and the first where it was
+  ahead of BOTH backends**: `docs/examples.md` and `docs/language-reference.md`
+  have shown `let t = spawn { … }` with `await t` since before §11 existed —
+  the first half parses today and binds `void`, and the second does not parse
+  at all.
+
+  Three decisions, and the second is the one with a future: **awaiting a
+  finished task returns immediately**; **awaiting the same task twice is a
+  TRAP** rather than returning the value again, because a program that does it
+  has almost certainly confused two handles and this document prefers a
+  detected error to a plausible continuation; and **a handle may outlive its
+  task**, with an un-awaited value discarded exactly as a spawned block's value
+  is discarded today.
+
+  The trap is stated on the VALUE rather than as a restriction on the handle,
+  deliberately: **when B7's affine types land, `await` consuming its handle
+  makes the second one a COMPILE error and this trap becomes unreachable.**
+  That is strictly better, and stating it this way is what lets the two coexist
+  rather than conflict.
+
+  `await` is **not** a fifth yield point. A `Task<T>` is a one-shot channel of
+  capacity one that the task sends to on termination, so awaiting an unfinished
+  task is §11.4's point 2 — an empty queue. The only thing the channel model
+  does not supply is the `taken` state, which exists so that the second `await`
+  traps instead of answering with (RECV-CLOSED)'s silent zero.
+
+  **This section is AHEAD of both backends and says so in its own first line**,
+  which §1.2 requires. The A3 reference implements it and a conformance row
+  asserts the gap in both directions — the same shape §11 itself took in 0.4.

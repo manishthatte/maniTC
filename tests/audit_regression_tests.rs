@@ -4795,3 +4795,75 @@ fn the_documentation_index_lists_every_document() {
         );
     }
 }
+
+/// P108: a module-level `let` in a documented example must have a
+/// compile-time-constant initialiser, because that is the only kind the
+/// compiler accepts.
+///
+/// `docs/examples.md` showed `let sem: Semaphore = Semaphore::new(2);` above a
+/// `fn`, and **a reader who copied it got an error** — a module-level `let` is
+/// stored as a single word written before `main` runs, so `Semaphore::new(2)`
+/// is refused. The population was exactly one, and the diagnostic is good,
+/// which is what makes it a documentation defect rather than a compiler one.
+///
+/// Reads the documents FROM DISK and applies the rule to every fenced block,
+/// so a future example acquires the pin without anybody adding it to a list.
+/// The scope is deliberately narrow — an unindented `let` in a block that also
+/// defines a function is unambiguously module-level, while an indented one is
+/// inside something and none of this test's business.
+#[test]
+fn documented_module_level_lets_have_constant_initialisers() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+    let mut bad = Vec::new();
+    for entry in std::fs::read_dir(&docs).expect("docs/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // Not ManiT: one documents the compiler's own Rust, the other an ISA.
+        if name == "compiler-internals.md" || name == "t3isa-reference.md" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read");
+        let mut in_block = false;
+        let mut block: Vec<(usize, String)> = Vec::new();
+        for (i, line) in text.lines().enumerate() {
+            if line.starts_with("```") {
+                if in_block {
+                    let defines_fn = block.iter().any(|(_, l)| l.starts_with("fn "));
+                    if defines_fn {
+                        for (ln, l) in &block {
+                            if let Some(rest) = l.strip_prefix("let ") {
+                                if let Some(init) = rest.split_once('=').map(|(_, r)| r.trim()) {
+                                    let head = init.trim_start_matches(['-', '!']).trim();
+                                    let constant = head.starts_with('"')
+                                        || head.starts_with(|c: char| c.is_ascii_digit())
+                                        || head.starts_with("true")
+                                        || head.starts_with("false")
+                                        || head.starts_with("unknown");
+                                    if !constant {
+                                        bad.push(format!("{name}:{}  {}", ln + 1, l));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    block.clear();
+                }
+                in_block = !in_block;
+                continue;
+            }
+            if in_block {
+                block.push((i, line.to_string()));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "a documented module-level `let` has an initialiser the compiler will \
+         refuse — a module-level `let` is one word written before `main` runs, \
+         so it must be a compile-time constant (report.txt P108):\n  {}",
+        bad.join("\n  ")
+    );
+}
