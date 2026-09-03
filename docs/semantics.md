@@ -654,6 +654,44 @@ The core has no heap (§1), so this costs nothing here. A version of this
 section that admits references will have to say what a spawn captures, and
 that is where the yield-point rule starts doing real work.
 
+> **Notice, 3 September 2026 (report.txt P118) — the surface language does not
+> honour this clause for an AGGREGATE, and the two backends fail in opposite
+> directions.** Measured with the task's write ordered before the spawner's
+> read, so the answer is about sharing and not about scheduling:
+>
+> ```
+> struct P { pub x: int, pub y: int }
+> let mut p = P { x: 1, y: 2 };   spawn { p.x = 99; }   yield;   print(p.x)
+>
+>   T3    99   the task and the spawner hold the same heap cell
+>   LLVM   1   but for the wrong reason: the outlined body binds the captured
+>              ADDRESS as though it were the value, so a task that merely READS
+>              the capture sees `x=94299331632576 y=0`
+> ```
+>
+> The paragraph above predicted exactly this — "a version of this section that
+> admits references will have to say what a spawn captures" — and the surface
+> language admits references while the core does not.
+>
+> **Until the copy exists, capturing an aggregate in a `spawn` is REFUSED** by
+> the move checker, naming this clause. The population was measured before the
+> refusal was written: 0 of the 34 `spawn` sites across both repositories and
+> the 2,507-file corpus capture one; every one captures a channel, a
+> `Mutex`/atomic handle, or a scalar, all of which are one word and copy
+> correctly. A field-less struct — `AtomicTrit`, `Barrier`, `Semaphore` — is a
+> handle by that same test and is not refused.
+>
+> **The other direction of this clause is now implemented rather than merely
+> stated**: because the task's store is a copy, a move INSIDE a spawned block
+> consumes the task's binding and not the spawner's. The move checker used to
+> treat `spawn { B }` as a plain block, and its own comment said so.
+>
+> Making the copy real is B7's D-4 with F-4's regions behind it: a deep copy at
+> the spawn site is what this clause asks for, and P63's 2,536-word heap with
+> no free is why it cannot be written today. **The A3 reference is unaffected
+> and always was** — it gives each task its own store by construction, which is
+> what §1.2 asks a normative section to be able to say.
+
 ### 11.3 Configurations
 
 §4's `⟨ s , σ , ω ⟩` becomes `⟨ R , B , 𝒞 , ω ⟩`:

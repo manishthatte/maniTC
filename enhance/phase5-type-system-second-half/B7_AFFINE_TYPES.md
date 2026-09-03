@@ -71,6 +71,42 @@ captured affine values are refused, or §11.2 gains an exception. **This is the
 decision most likely to be missed**, because §11.2 and `borrow/mod.rs` were
 written eighteen days apart and have never been read together.
 
+> **TAKEN, 3 September 2026 — and reading the two together first found a
+> defect that made the question's premise false (report.txt P118).** The
+> premise was that a spawned task gets a copy. Measured, it does not: for an
+> AGGREGATE, T3 shares the heap cell (a write inside the task escapes to the
+> spawner) and LLVM binds the captured ADDRESS as though it were the value (a
+> task that merely reads the capture sees garbage). Neither is a copy, and the
+> two are not even the same wrong answer.
+>
+> So D-4 is decided in three parts, and only the first is a rule about
+> affinity:
+>
+> 1. **§11.2 stands. A capture is a copy, and where the implementations cannot
+>    make one, the capture is REFUSED** rather than given a third meaning. The
+>    refusal is in `borrow/mod.rs` and names §11.2. Population measured first:
+>    0 of 34 `spawn` sites in both repositories and the corpus.
+> 2. **A move inside the task is the task's own**, because the store is a copy.
+>    This is a LOOSENING and it is sound only because of (1) — what remains
+>    capturable is scalars, strings and handles, all of which the backends
+>    really do copy.
+> 3. **An affine value may not be captured**, for the reason the question
+>    gives: a capture is a copy and an affine value copied exists twice. Under
+>    D-1 affinity is opt-in, so this rule is unreachable until the first affine
+>    type exists — stated now, in the shape §1.2 requires of a rule that is
+>    ahead of its implementation, and it falls out of (1) rather than being a
+>    new mechanism: the same site asks the same question of the capture's type.
+>
+> **`spawn` does NOT consume what it captures.** That was the other candidate
+> and it is wrong for the same reason D-2's blanket version was: it would
+> refuse ordinary code — `spawn { print(s) }` followed by `print(s)` — for a
+> value that is genuinely copied. Consumption is for affine types, which are
+> the ones for which copying is the thing being forbidden.
+>
+> What is still owed is the copy itself: a deep copy at the spawn site, which
+> is F-4's regions (P63's heap is 2,536 words with no free). Until then the
+> refusal is what stands between a user and two different wrong answers.
+
 **D-5. Where does the check live?** `borrow/mod.rs` runs after the analyzer and
 before lowering. An affine check needs types, so it stays there — but note that
 P65 DISCARDS a failed generic instantiation, so a move error inside one would

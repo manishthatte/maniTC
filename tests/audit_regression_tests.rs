@@ -5006,3 +5006,126 @@ fn the_scratch_sweep_removes_dead_roots_and_only_those() {
     let _ = std::fs::remove_dir_all(&live);
     let _ = std::fs::remove_dir_all(&foreign);
 }
+
+// ---------------------------------------------------------------------------
+// P116 — `abs()` on a machine word is a hazard with more than one spelling
+// ---------------------------------------------------------------------------
+
+/// Every `.abs()` under `src/` is on a value that cannot be `i64::MIN`, and
+/// the five sites P116 repaired still say `unsigned_abs`.
+///
+/// **Why this is a registry test and not a comment** (permanent rule 5).
+/// `i64::MIN.abs()` has no i64 answer: in release it wraps back to `i64::MIN`,
+/// so a range test written `x.abs() <= LIMIT` answers *true* for the widest
+/// value in the language — and in debug the same line panics with "attempt to
+/// negate with overflow". A21 fixed one instance of that hazard in the
+/// analyzer and recorded it as "the only unchecked site of three", which was
+/// true of the three a grep for *negation* finds; `.abs()` is the same hazard
+/// spelled differently, and P116 then found five more of it in the T3 backend
+/// and the constant-hoisting pass. Nothing but a check stops a seventh
+/// spelling arriving, so this is the check.
+///
+/// The safe sites are safe for ONE reason and it is worth naming: they widen
+/// to `i128` before taking the magnitude, which is the general remedy —
+/// `(x as i128).abs()` cannot overflow for any `i64`. Sites that must stay in
+/// 64 bits use `unsigned_abs`, which is total.
+///
+/// **The allowlist is keyed on file AND count**, so a new `.abs()` inside one
+/// of the two known-safe files fails here too. If you are adding one: widen to
+/// `i128` first, or use `unsigned_abs`, and only then update the table — with
+/// the reason, not just the number.
+#[test]
+fn integer_abs_is_only_used_where_it_cannot_overflow() {
+    // (file, occurrences, why it is safe)
+    const ALLOWED: &[(&str, usize, &str)] = &[
+        ("lang.rs", 6, "division-rounding search, entirely in i128"),
+        ("reference/eval.rs", 2, "div_nearest_ref widens both operands to i128"),
+    ];
+
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).expect("read src/").flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    assert!(files.len() > 50, "expected to scan src/, found {} files", files.len());
+
+    // Assembled so this suite does not match its own needle, and so a comment
+    // ABOUT the hazard is not counted as an instance of it (P115's rule: do
+    // not exempt the checker, make it unable to match itself).
+    let needle = format!(".{}()", "abs");
+    let mut found: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for f in &files {
+        let rel = f.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(f).expect("read source");
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue; // a comment about the hazard is not the hazard
+            }
+            let n = t.matches(&needle).count();
+            if n > 0 {
+                for _ in 0..n {
+                    found.entry(rel.clone()).or_default().push(i + 1);
+                }
+            }
+        }
+    }
+
+    // Direction 1: nothing unexpected, and nothing that grew.
+    let mut problems = Vec::new();
+    for (file, lines) in &found {
+        match ALLOWED.iter().find(|(f, _, _)| f == file) {
+            None => problems.push(format!(
+                "{file}:{:?} takes `.abs()` of a value that may be i64::MIN — \
+                 widen to i128 first, or use `unsigned_abs`", lines)),
+            Some((_, want, why)) if lines.len() != *want => problems.push(format!(
+                "{file} has {} `.abs()` sites, expected {want} ({why}); the new \
+                 one at {:?} needs the same argument or a different primitive",
+                lines.len(), lines)),
+            Some(_) => {}
+        }
+    }
+    // Direction 2: the known-safe sites must still BE there, or this row has
+    // gone hollow — a scan that matches nothing reports no offenders.
+    for (file, want, _) in ALLOWED {
+        let got = found.get(*file).map(|v| v.len()).unwrap_or(0);
+        assert_eq!(
+            got, *want,
+            "the scan found {got} `.abs()` in {file} and the table says {want}: \
+             either the file moved or this check stopped working"
+        );
+    }
+    assert!(problems.is_empty(), "P116's hazard, again:\n  {}", problems.join("\n  "));
+
+    // Direction 3: the five sites P116 repaired must still be repaired. A
+    // silent revert would restore a compiler crash on `i64::MIN`, and none of
+    // the sweeps can see it — no program in either repository contains that
+    // value.
+    for (file, want) in [
+        ("codegen_t3/emitter/mod.rs", 3usize),
+        ("codegen_t3/assembler.rs", 1),
+        ("ir/hoist_const.rs", 1),
+    ] {
+        let text = std::fs::read_to_string(src.join(file)).expect("read repaired file");
+        let n = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| l.matches("unsigned_abs").count())
+            .sum::<usize>();
+        assert_eq!(
+            n, want,
+            "{file} should take {want} magnitude(s) with `unsigned_abs` and takes {n} \
+             — P116 was a compiler crash on i64::MIN and the sweeps are blind to it"
+        );
+    }
+}

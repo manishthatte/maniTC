@@ -296,3 +296,151 @@ fn an_unknown_sched_mode_is_refused() {
         .expect("compile");
     assert!(!c.status.success(), "an unknown mode must be refused");
 }
+
+// ---------------------------------------------------------------------------
+// P118 — §11.2 says a spawned task gets a COPY of the store, and for an
+// aggregate neither backend makes one
+// ---------------------------------------------------------------------------
+//
+// Measured with the task's write ordered before the spawner's read, so the
+// answer is about sharing and not about scheduling:
+//
+//   struct P { pub x: int, pub y: int }
+//   let mut p = P { x: 1, y: 2 };  spawn { p.x = 99; }  yield;  print(p.x)
+//     T3   -> 99   the task and the spawner hold the same heap cell
+//     LLVM -> 1    but for the wrong reason: the outlined body binds the
+//                  captured ADDRESS as though it were the value, so a task
+//                  that merely READS the capture sees `x=94299331632576 y=0`
+//
+// Refused rather than repaired, because the repair is a deep copy at the spawn
+// site and a deep copy needs regions to be affordable (F-4, and B7's D-4).
+// **The population was measured first**: 0 of the 34 `spawn` sites across both
+// repositories and the 2,507-file corpus capture an aggregate — every one
+// captures a channel, a `Mutex`/atomic handle, or a scalar.
+
+/// `manitc check` only, since these rows are about a refusal.
+fn check_only(src: &str) -> (bool, String) {
+    let slot = N.fetch_add(1, Ordering::Relaxed);
+    let d = common::suite_root("sched").join(format!("chk{}", slot));
+    std::fs::create_dir_all(&d).expect("temp dir");
+    let path = d.join("p.mt");
+    std::fs::write(&path, src).expect("write");
+    let c = Command::new(manitc_bin())
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .expect("check");
+    (
+        c.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        ),
+    )
+}
+
+#[test]
+fn p118_a_spawn_may_not_capture_an_aggregate() {
+    // Three shapes, because "aggregate" is three variants of one type and a
+    // row that tested only the struct would leave the other two to be found by
+    // somebody else.
+    let cases = [
+        ("struct", r#"
+use std::io;
+struct P { pub x: int, pub y: int }
+fn main() {
+    let p: P = P { x: 11, y: 22 };
+    spawn { io::println_int(p.x); }
+}
+"#),
+        ("array", r#"
+use std::io;
+fn main() {
+    let a: [int; 3] = [1, 2, 3];
+    spawn { io::println_int(a[0]); }
+}
+"#),
+        ("tuple", r#"
+use std::io;
+fn main() {
+    let t: (int, int) = (4, 5);
+    spawn { io::println_int(t.0); }
+}
+"#),
+    ];
+    for (what, src) in cases {
+        let (ok, msg) = check_only(src);
+        assert!(!ok, "P118: a spawn capturing a {what} must be refused, and was accepted");
+        assert!(
+            msg.contains("11.2") && msg.contains("aggregate"),
+            "P118: the {what} refusal must name the clause it enforces, and said:\n{msg}"
+        );
+    }
+}
+
+/// A GUARD, and it says so: this passes on the pre-P118 compiler too, because
+/// nothing was refused there at all. It is here because the refusal's
+/// discriminator is "does this struct have FIELDS", and getting that wrong in
+/// the other direction would refuse every concurrent program in the language —
+/// `Channel<T>` and `Mutex<T>` are `Generic`, while `AtomicTrit`, `Barrier` and
+/// `Semaphore` are `Struct(name, [])` with no fields, which is exactly the
+/// distinction §11.2 needs: a handle is one word and copies correctly, and
+/// channels are the one thing tasks are REQUIRED to share.
+#[test]
+fn p118_a_handle_is_not_an_aggregate() {
+    let cases = [
+        ("channel", r#"
+use std::io;
+fn main() {
+    let ch = channel<int>();
+    spawn { ch.send(7); }
+    io::println_int(ch.recv());
+}
+"#),
+        ("barrier", r#"
+use std::sync;
+use std::io;
+fn main() {
+    let b: Barrier = Barrier::new(2);
+    spawn { b.wait(); }
+    b.wait();
+    io::println("through");
+}
+"#),
+    ];
+    for (what, src) in cases {
+        let (ok, msg) = check_only(src);
+        assert!(ok, "P118 must not refuse a {what} capture — §11.2 requires tasks to share these:\n{msg}");
+    }
+}
+
+#[test]
+fn p118_a_move_inside_a_task_does_not_consume_the_spawners_binding() {
+    // The same clause in the other direction. The move checker used to treat
+    // `spawn { B }` as a plain block, so a move inside B consumed the
+    // SPAWNER's binding — its own comment said "anything it moves is also
+    // moved in the parent scope". Under §11.2 the task moved its own copy.
+    //
+    // Asserted on the VALUE and under both lowerings (rule 8), because "it
+    // compiles now" would also be true of a checker that had simply stopped
+    // looking inside the block.
+    let src = r#"
+use std::io;
+fn main() {
+    let s: str = "hello";
+    spawn { let t: str = s; io::println(t); }
+    io::println(s);
+}
+"#;
+    let (ok, msg) = check_only(src);
+    assert!(ok, "P118: §11.2 gives the task a copy, so its move is its own:\n{msg}");
+    for sched in ["inline", "cooperative"] {
+        let (out, trapped) = run(src, sched);
+        assert!(!trapped, "P118: --sched {sched} trapped");
+        assert_eq!(
+            out, "hello\nhello\n",
+            "P118: under --sched {sched} both the task's copy and the spawner's \
+             own binding must print"
+        );
+    }
+}

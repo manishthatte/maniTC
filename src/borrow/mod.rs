@@ -233,6 +233,15 @@ struct MoveEnv {
     /// on descent into the literal's elements, so only the OUTERMOST array of
     /// `f([[s]])` counts as the argument list.
     array_is_vararg: bool,
+    /// **P118**: struct names that have at least one FIELD. A struct with none
+    /// is an opaque built-in handle — `AtomicTrit`, `Barrier` and `Semaphore`
+    /// are `Struct(name, [])` with no entry in `struct_fields` — and a handle
+    /// is one machine word that copies correctly. A struct with fields is a
+    /// heap aggregate whose fields a spawned task would reach through a
+    /// pointer, which is the case neither backend gets right. Keyed on having
+    /// fields rather than on a name list, because a name list is a registry
+    /// that would have to agree with another registry (permanent rule 5).
+    aggregates: std::rc::Rc<HashSet<String>>,
 }
 
 impl MoveEnv {
@@ -245,16 +254,40 @@ impl MoveEnv {
             first_err: None,
             array_is_vararg: false,
             consuming: Default::default(),
+            aggregates: Default::default(),
         }
     }
 
     fn with_consuming(
         rules: MoveRules,
         consuming: std::rc::Rc<HashMap<String, Vec<bool>>>,
+        aggregates: std::rc::Rc<HashSet<String>>,
     ) -> Self {
         let mut e = MoveEnv::new(rules);
         e.consuming = consuming;
+        e.aggregates = aggregates;
         e
+    }
+
+    /// **P118**: an aggregate whose parts a spawned task would have to reach
+    /// through a pointer.
+    ///
+    /// Built ON `is_aggregate` rather than beside it, so that a type variant
+    /// added there arrives here too — two predicates answering almost the same
+    /// question are how one of them quietly stops being true. The extra clause
+    /// is the only difference and it is the handle exemption: `AtomicTrit`,
+    /// `Barrier` and `Semaphore` are `Struct(name, [])` with no fields, and a
+    /// field-less struct is one word that copies correctly. `Channel<T>`,
+    /// `Mutex<T>` and `Vec<T>` are `Generic` and never reach here at all,
+    /// which matters because channels are the one thing §11.2 REQUIRES tasks
+    /// to share.
+    fn reaches_through_a_pointer(&self, ty: &ManiType) -> bool {
+        is_aggregate(ty)
+            && match ty {
+                ManiType::Struct(name, _) => self.aggregates.contains(name),
+                // A tuple or an array always has elements to reach.
+                _ => true,
+            }
     }
 
     /// Does `func`'s parameter `i` consume its argument?
@@ -384,10 +417,20 @@ fn check_borrows_located(
             })
             .collect(),
     );
+    // P118: one pass over the struct table, for the same reason as `consuming`
+    // above — it is a property of the PROGRAM.
+    let aggregates: std::rc::Rc<HashSet<String>> = std::rc::Rc::new(
+        program
+            .struct_fields
+            .iter()
+            .filter(|(_, fields)| !fields.is_empty())
+            .map(|(name, _)| name.clone())
+            .collect(),
+    );
     let mut sites = MoveSites::default();
     for func in &program.functions {
         let (result, fn_sites, where_) =
-            check_fn_borrows(func, rules, consuming.clone());
+            check_fn_borrows(func, rules, consuming.clone(), aggregates.clone());
         sites.add(fn_sites);
         if let Err(e) = result {
             return ((Err(e), sites), where_);
@@ -411,7 +454,7 @@ pub fn survey_move_failures(
     let mut by_module = std::collections::BTreeMap::new();
     for func in &program.functions {
         let (result, _, where_) =
-            check_fn_borrows(func, rules, Default::default());
+            check_fn_borrows(func, rules, Default::default(), Default::default());
         if result.is_err() {
             let module = where_
                 .as_deref()
@@ -471,8 +514,9 @@ fn check_fn_borrows(
     func: &TypedFnDef,
     rules: MoveRules,
     consuming: std::rc::Rc<HashMap<String, Vec<bool>>>,
+    aggregates: std::rc::Rc<HashSet<String>>,
 ) -> (CompileResult<()>, MoveSites, Option<String>) {
-    let mut env = MoveEnv::with_consuming(rules, consuming);
+    let mut env = MoveEnv::with_consuming(rules, consuming, aggregates);
     let result = if let Some(ref body) = func.body {
         for param in &func.params {
             env.declare(&param.name);
@@ -1014,12 +1058,50 @@ fn check_expr_borrows(
         // --- Spawn ---
         // §11.4: `yield` moves nothing and reads nothing.
         TypedExprKind::Yield => {}
-        TypedExprKind::Spawn(block, _) => {
-            // Spawned block gets its own moved set (it captures by move);
-            // anything it moves is also moved in the parent scope.
-            check_branches(env, vec![Box::new(|env: &mut MoveEnv| {
-                check_block_borrows(block, env, loop_from)
-            }) as Box<dyn FnOnce(&mut MoveEnv) -> CompileResult<()>>])?;
+        TypedExprKind::Spawn(block, captures) => {
+            // **P118.** §11.2: "a spawned task gets a COPY of the spawning
+            // task's store at the moment of the spawn, and its writes are its
+            // own." Neither backend makes that copy for an AGGREGATE, and they
+            // fail in opposite directions — measured on both, with the task's
+            // write ordered before the spawner's read:
+            //
+            //   T3   shares the heap cell: `p.x = 99` inside the task is
+            //        visible to the spawner. §11.2 violated.
+            //   LLVM binds the captured ADDRESS as though it were the value,
+            //        into a fresh cell — so the task reads `x=94299331632576
+            //        y=0`, and its write lands on a cell nobody else holds.
+            //
+            // Refused here rather than fixed in the backends, because the fix
+            // is a deep copy at the spawn site and a deep copy needs regions
+            // to be affordable (P63's heap is 2,536 words with no free) — that
+            // is F-4's work and B7's D-4 decision. **The population was
+            // measured before the refusal was written** (P103's method): 0 of
+            // the 34 `spawn` sites in both repositories and the corpus capture
+            // an aggregate. Every one captures a channel, a `Mutex`/atomic
+            // handle, or a scalar.
+            for (name, ty) in captures {
+                if env.reaches_through_a_pointer(ty) {
+                    return Err(err(expr.span, format!(
+                        "`spawn` would capture `{name}`, which is an aggregate. \
+                        docs/semantics.md §11.2 gives a spawned task a COPY of the store, \
+                        and neither backend makes one for an aggregate: T3 shares it, so a \
+                        write inside the task escapes, and LLVM binds its address as the \
+                        value, so the task reads garbage. Send it over a channel instead, \
+                        or read what you need before the spawn"
+                    )));
+                }
+            }
+            // §11.2 again, in the other direction: because the task's store is
+            // a COPY, a move INSIDE the task consumes the task's binding and
+            // not the spawner's. This used to say "anything it moves is also
+            // moved in the parent scope", which is a plain block's rule — and
+            // a `spawn` is not a block. The loosening is sound only because of
+            // the refusal above: what remains capturable is scalars, strings
+            // and handles, all of which really are copied by both backends.
+            let before = env.moved.clone();
+            let result = check_block_borrows(block, env, loop_from);
+            env.moved = before;
+            result?;
         }
 
         // --- Await ---
