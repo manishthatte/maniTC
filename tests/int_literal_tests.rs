@@ -268,3 +268,158 @@ fn a21_negating_the_minimum_does_not_crash_the_compiler() {
         "negating the minimum wraps, as every other t54 overflow does",
     );
 }
+
+// ---------------------------------------------------------------------------
+// P116 — the same value one layer down: the T3 backend could not materialise it
+// ---------------------------------------------------------------------------
+//
+// A21 gave `i64::MIN` a spelling. It did not ask what the T3 backend does with
+// one, and the answer was: crash. `emit_lit` decides between a single `TLIT`
+// and a hi*1000+lo decomposition with `imm.abs() <= MAX_LIT`, and
+// `i64::MIN.abs()` has no i64 answer — in release it wraps back to `i64::MIN`,
+// which IS ≤ MAX_LIT, so the one value that most needed the decomposition was
+// the one value that skipped it. The emitter then wrote
+// `TLIT R5, #-9223372036854775808` into the assembly and `encode_wide`'s
+// internal-error assert took the process down.
+//
+// **The defect is older than A21 and that is measured, not assumed**: the fold
+// form `-9223372036854775807 - 1` lexed before A21 and panics identically on
+// the pre-A21 compiler (`b08dbfb`, `215c1ab38b8319f8`). A21 widened the door
+// rather than opening it.
+//
+// **The guard that should have caught it could not fire, for the same reason.**
+// `assembler.rs`'s TLIT arm tests `imm_val.abs() > WIDE_IMM_MAX` to turn an
+// unencodable immediate into a diagnostic; with `i64::MIN` that test is false,
+// so the diagnostic was unreachable exactly when it was needed. Both are
+// `unsigned_abs` now, and so are the two other copies of the same range test
+// (`emit_lit_cur_at`, `lit_into`) and `hoist_const`'s key.
+//
+// **A21's own record said `i64::MAX` "traps there too, on the pre-fix compiler
+// as well — checked, not assumed", and that check was run on MAX only.** MAX
+// takes the decomposition and traps at run time on the 27-trit multiply; MIN
+// never got that far. The rows below assert the two now behave the same way,
+// because the pair is the claim.
+
+/// Compile to T3 WITHOUT asserting success. P116 is about what the compiler
+/// does when it cannot encode a value, so `run_t3`'s assertion would discard
+/// the thing being measured.
+fn compile_t3_raw(src: &str) -> (bool, String, PathBuf) {
+    let d = workdir();
+    let path = d.join("p.mt");
+    std::fs::write(&path, src).expect("write");
+    let base = path.with_extension("");
+    let c = Command::new(manitc_bin())
+        .args(["compile", path.to_str().unwrap(), "--target", "t3",
+               "-o", base.to_str().unwrap()])
+        .output()
+        .expect("compile");
+    (c.status.success(),
+     format!("{}{}", String::from_utf8_lossy(&c.stdout),
+             String::from_utf8_lossy(&c.stderr)),
+     base.with_extension("t3b"))
+}
+
+/// Run a `.t3b` and return everything it printed, trap included.
+fn run_t3b(bin: &PathBuf) -> String {
+    let r = Command::new(manitc_bin())
+        .args(["run-t3", bin.to_str().unwrap()])
+        .output()
+        .expect("run");
+    format!("{}{}", String::from_utf8_lossy(&r.stdout),
+            String::from_utf8_lossy(&r.stderr))
+        .lines()
+        .filter(|l| !l.starts_with("[T3ISA] running"))
+        .map(|l| format!("{}\n", l))
+        .collect()
+}
+
+#[test]
+fn p116_the_most_negative_word_does_not_crash_the_t3_backend() {
+    // Both spellings, because they reach the emitter by different routes: the
+    // literal is A21's fold, the subtraction is constant-folded later. Only the
+    // second was reachable before A21, and both panicked.
+    for src in [
+        "use std::io;\nfn main() { io::print_int(-9223372036854775808); io::newline(); }",
+        "use std::io;\nfn main() { io::print_int(-9223372036854775807 - 1); io::newline(); }",
+    ] {
+        let (ok, msg, _) = compile_t3_raw(src);
+        assert!(
+            !msg.contains("panicked") && !msg.contains("internal error"),
+            "P116: the compiler crashed materialising i64::MIN:\n{msg}"
+        );
+        assert!(ok, "P116: T3 refused to compile i64::MIN:\n{msg}");
+    }
+}
+
+#[test]
+fn p116_the_minimum_traps_at_run_time_exactly_as_the_maximum_does() {
+    // Rule 8: assert the VALUE, and both orderings of the pair. `i64::MAX` has
+    // always taken the decomposition and trapped on the 27-trit multiply; the
+    // claim is that `i64::MIN` now does the same thing, not merely that it
+    // stopped crashing. A row asserting only "no panic" would pass over an
+    // emitter that silently produced the wrong number.
+    let mut traps = Vec::new();
+    for lit in ["9223372036854775807", "-9223372036854775808"] {
+        let src = format!(
+            "use std::io;\nfn main() {{ io::print_int({lit}); io::newline(); }}");
+        let (ok, msg, bin) = compile_t3_raw(&src);
+        assert!(ok, "P116: T3 would not compile {lit}:\n{msg}");
+        let out = run_t3b(&bin);
+        assert!(
+            out.contains("TRAP") && out.contains("27-trit range"),
+            "P116: {lit} on T3 gave {out:?}, wanted a 27-trit range trap"
+        );
+        traps.push(out);
+    }
+    // The two traps must be the same KIND. They cannot be the same string --
+    // they carry different values -- so the assertion is on the sentence.
+    let kind = |s: &str| -> String {
+        s.lines()
+            .find(|l| l.contains("TRAP"))
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    assert_eq!(kind(&traps[0]), kind(&traps[1]),
+        "P116: the two ends of the word trap differently:\n{}\n{}",
+        traps[0], traps[1]);
+}
+
+#[test]
+fn p116_the_minimum_still_prints_on_llvm_and_that_divergence_is_the_documented_one() {
+    // A GUARD, and it says so: this passes on the pre-fix compiler too, because
+    // the defect was never LLVM's. It is here so that a later "fix" which made
+    // the two backends agree by narrowing LLVM would be caught -- `int` is 27
+    // trits on T3 and 64 bits on LLVM under v1, which `docs/semantics.md`
+    // §10.1 specifies and P79 pinned. T3 trapping and LLVM printing is the
+    // specified behaviour, not a defect to be closed.
+    llvm_only(
+        "use std::io;\nfn main() { io::print_int(-9223372036854775808); io::newline(); }",
+        "-9223372036854775808",
+        "i64::MIN on LLVM",
+    );
+}
+
+#[test]
+fn p116_the_assembler_reports_an_unencodable_tlit_instead_of_asserting() {
+    // The second line of defence, pinned directly rather than through a
+    // program: `assemble` must return an Err naming the immediate, where it
+    // used to fall through its own bound check into `encode_wide`'s assert.
+    //
+    // The positive control is the first case: an ordinary TLIT must still
+    // assemble, or this row would pass on an assembler that refused everything.
+    let ok = manitc::codegen_t3::assembler::assemble(
+        "main:\n  main_entry:\n    TLIT  R5, #1234\n    HALT\n");
+    assert!(ok.is_ok(), "P116: an ordinary TLIT stopped assembling: {ok:?}");
+
+    let bad = manitc::codegen_t3::assembler::assemble(
+        "main:\n  main_entry:\n    TLIT  R5, #-9223372036854775808\n    HALT\n");
+    match bad {
+        Err(msg) => assert!(
+            msg.contains("TLIT") && msg.contains("out of range"),
+            "P116: the assembler refused, but not legibly: {msg}"),
+        Ok(_) => panic!("P116: the assembler encoded an immediate it cannot hold"),
+    }
+}

@@ -172,9 +172,15 @@ impl AsmEmitter {
     /// Emit instructions to `self.lines` that load `imm` into register `r`.
     /// Single TLIT when |imm| ≤ 797161 (the balanced 13-trit wide-imm bound).
     /// Larger values are decomposed recursively as hi*1000 + lo.
+    ///
+    /// The magnitude is taken with `unsigned_abs` and not `abs`, because
+    /// `i64::MIN.abs()` has no i64 answer: in release it wraps back to
+    /// `i64::MIN`, which is ≤ MAX_LIT, so the one value that most needs the
+    /// decomposition was the one value that skipped it (P116). The two are
+    /// identical everywhere else.
     fn emit_lit(&mut self, r: usize, imm: i64) {
         const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX; // 797_161
-        if imm.abs() <= MAX_LIT {
+        if imm.unsigned_abs() <= MAX_LIT as u64 {
             self.lines.push(format!("    TLIT  {}, #{}", Self::rn(r), imm));
         } else {
             let hi = imm / 1000;
@@ -199,7 +205,8 @@ impl AsmEmitter {
     fn emit_lit_cur_at(&mut self, r: usize, imm: i64, depth: usize) {
         const MAX_LIT: i64 = crate::codegen_t3::isa::WIDE_IMM_MAX;
         const SCRATCH: [usize; 3] = [23, 21, 22];
-        if imm.abs() <= MAX_LIT {
+        // `unsigned_abs` for `emit_lit`'s reason (P116).
+        if imm.unsigned_abs() <= MAX_LIT as u64 {
             self.emit(format!("    TLIT  R{}, #{}", r, imm));
             return;
         }
@@ -597,7 +604,9 @@ pub fn emit_t3_asm(module: &IRModule) -> CompileResult<String> {
     /// mirroring AsmEmitter::emit_lit's TLIT range handling.
     fn lit_into(out: &mut String, reg: &str, tmp: &str, imm: i64) {
         let max = crate::codegen_t3::isa::WIDE_IMM_MAX;
-        if imm.abs() <= max {
+        // `unsigned_abs` for `emit_lit`'s reason (P116) — this is the third
+        // copy of that range test and it mirrors the first by contract.
+        if imm.unsigned_abs() <= max as u64 {
             out.push_str(&format!("    TLIT  {}, #{}\n", reg, imm));
         } else {
             let hi = imm / 1000;

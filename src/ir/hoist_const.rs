@@ -84,7 +84,11 @@ enum Key {
 impl Key {
     fn of(v: &IRValue) -> Option<Key> {
         match v {
-            IRValue::Const(IRConst::Int(n)) if n.abs() > IMM3_MAX => Some(Key::Int(*n)),
+            // `unsigned_abs` for P116's reason: `i64::MIN.abs()` wraps in
+            // release, so the widest constant in the language read as one that
+            // fits a 3-trit immediate and was never hoisted — and in a debug
+            // build the `abs` itself panicked.
+            IRValue::Const(IRConst::Int(n)) if n.unsigned_abs() > IMM3_MAX as u64 => Some(Key::Int(*n)),
             // A float costs more than a wide integer on this machine: it is a
             // `TLIT` of the sidecar address followed by `SYSCALL #219`, so a
             // loop re-materialising one pays two instructions and a syscall.

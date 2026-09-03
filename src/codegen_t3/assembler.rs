@@ -477,7 +477,12 @@ fn encode_raw(raw: &RawInstr, pc: usize, label_map: &HashMap<String, usize>) -> 
         "TLIT" => {
             let r = reg!(0);
             let imm_val = imm!(1);
-            if imm_val.abs() > WIDE_IMM_MAX {
+            // `unsigned_abs`, not `abs`: with `i64::MIN` the latter wraps back
+            // to `i64::MIN`, so this guard — which exists to turn an
+            // unencodable TLIT into a diagnostic — could not fire for the one
+            // immediate that needed it, and `encode_wide`'s internal-error
+            // assert took the process down instead (P116).
+            if imm_val.unsigned_abs() > WIDE_IMM_MAX as u64 {
                 return Err(format!(
                     "TLIT immediate out of range at pc={}: {} (13-trit wide field holds ±{})",
                     pc, imm_val, WIDE_IMM_MAX));
