@@ -5129,3 +5129,117 @@ fn integer_abs_is_only_used_where_it_cannot_overflow() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// P122 — the documented width table, checked against the compiler
+// ---------------------------------------------------------------------------
+
+/// Every row of `docs/language-reference.md`'s ternary type table states a
+/// bound the compiler must enforce: the value is accepted and the next one is
+/// refused.
+///
+/// **Why this reads the document and asks the COMPILER** (P64): the table had
+/// two false rows and neither was caught by review, because both are
+/// internally consistent — `tryte | 3 | −13 … +13` is exactly right *for three
+/// trits*, and the compiler has always enforced six. A check that compared the
+/// table against another table in the compiler would have been same-origin;
+/// this one crosses to the behaviour, which is what a programmer actually
+/// meets.
+///
+/// **The `Trits` column is checked too, from the range**: (3^w − 1)/2 must be
+/// the stated maximum. That is the arithmetic the two disagreeing tables were
+/// each internally consistent with, so checking only the range would have let
+/// a wrong width survive beside a right bound.
+#[test]
+fn documented_ternary_ranges_match_the_compiler() {
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs/language-reference.md");
+    let text = std::fs::read_to_string(&doc).expect("read the language reference");
+
+    // The table rows, as the document writes them: `| `t9` | 9 | −9841 … +9841 |`
+    let mut rows: Vec<(String, u32, i64)> = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if !l.starts_with("| `") {
+            continue;
+        }
+        let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len() < 3 {
+            continue;
+        }
+        let name = cells[0].trim_matches('`').to_string();
+        if !matches!(name.as_str(), "trit" | "tryte" | "t9" | "t27" | "t54") {
+            continue;
+        }
+        let Ok(width) = cells[1].parse::<u32>() else { continue };
+        // The maximum is the last run of digits in the range cell, with the
+        // document's thousands separators removed.
+        let digits: String = cells[2]
+            .rsplit(|c: char| !(c.is_ascii_digit() || c == ','))
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let Ok(max) = digits.parse::<i64>() else { continue };
+        rows.push((name, width, max));
+    }
+    assert_eq!(
+        rows.len(),
+        5,
+        "expected the five named ternary types in the table, parsed {rows:?}"
+    );
+
+    for (name, width, max) in &rows {
+        // The width and the range must be the same claim. `t54` is the one
+        // exception and it is stated as such: its true 54-trit range exceeds
+        // the machine word, so what binds is i64 — the row therefore documents
+        // the bound that exists rather than the one the arithmetic gives.
+        if name != "t54" {
+            let from_width = (0..*width).fold(1i64, |a, _| a * 3);
+            assert_eq!(
+                (from_width - 1) / 2,
+                *max,
+                "{name}: the table says {width} trits and a maximum of {max}, and \
+                 (3^{width} - 1)/2 is {}", (from_width - 1) / 2
+            );
+        } else {
+            assert_eq!(*max, i64::MAX, "t54's documented bound should be i64::MAX");
+        }
+
+        // And the compiler must agree, at the bound and one past it.
+        let at = format!("fn main() {{ let x: {name} = {max}; }}");
+        let (ok, msg) = check_only_src(&at);
+        assert!(ok, "{name}: the compiler refused its own documented maximum {max}:\n{msg}");
+
+        if let Some(over) = max.checked_add(1) {
+            let past = format!("fn main() {{ let x: {name} = {over}; }}");
+            let (ok_past, _) = check_only_src(&past);
+            assert!(
+                !ok_past,
+                "{name}: the compiler accepted {over}, one past the documented \
+                 maximum {max} — the table promises a bound that is not enforced"
+            );
+        }
+    }
+}
+
+/// `manitc check` on a source string: (succeeded, diagnostics).
+fn check_only_src(src: &str) -> (bool, String) {
+    let dir = temp_dir().join("p122");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join(format!("p{}.mt", src.len()));
+    std::fs::write(&path, src).expect("write");
+    let out = Command::new(get_manitc())
+        .args(["check", path.to_str().unwrap()])
+        .output()
+        .expect("check");
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}

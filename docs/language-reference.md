@@ -116,11 +116,36 @@ significant trit comes first.
 | Type | Trits | Range |
 |------|-------|-------|
 | `trit` | 1 | −1, 0, +1 |
-| `tryte` | 3 | −13 … +13 |
+| `tryte` | 6 | −364 … +364 |
 | `t9` | 9 | −9841 … +9841 |
 | `t27` | 27 | −3,812,798,742,493 … +3,812,798,742,493 |
-| `t54` | 54 | ≈ ±1.46×10²⁵ |
+| `t54` | 54 | −9,223,372,036,854,775,807 … +9,223,372,036,854,775,807 |
 | `bool3` | — | `true` (+1), `unknown` (0), `false` (−1) |
+
+> **Correction, 3 September 2026 (report.txt P122).** Two of these rows were
+> false, and the compiler has always enforced the corrected numbers.
+>
+> **`tryte` read "3 | −13 … +13".** The checker accepts up to ±364 and refuses
+> ±365, which is (3⁶−1)/2 — six trits, not three. **The standard library
+> settles which is right**: `bridge::byte_to_tryte(b: t9) -> tryte` maps a byte
+> into a `tryte`, and a three-trit tryte holds ±13, which cannot hold a byte at
+> all. The compiler said one thing, this table said another, and a *third*
+> place — the diagnostic for a three-valued operator on a wide number — sided
+> with the table and told the reader "a 3-trit number". All three now derive
+> the width from one function.
+>
+> **`t54` read "≈ ±1.46×10²⁵".** A 54-trit range is (3⁵⁴−1)/2 ≈ 2.9×10²⁵, so
+> the figure was wrong even for the width it claimed — and neither number is
+> what binds: a `t54` is **i64-bounded**, which is what the type's own
+> definition says and what the checker enforces (`i64::MAX` accepted,
+> `i64::MAX + 1` refused). The table now states the bound that exists rather
+> than the one the arithmetic would give.
+>
+> Both rows are pinned by
+> `audit_regression_tests::documented_ternary_ranges_match_the_compiler`, which
+> reads this table from disk and asks the compiler about each bound and the
+> value one past it — because a table that must agree with the compiler gets a
+> test rather than a proofread.
 
 ### Compound types
 

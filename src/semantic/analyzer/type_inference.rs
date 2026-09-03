@@ -180,10 +180,11 @@ impl SemanticAnalyzer {
                          the lane-wise form `{}w`; for a numeric comparison, use \
                          `math::min`/`math::max`; to test one trit, narrow it first.",
                         Self::binop_symbol(op), wide.display(),
-                        match wide {
-                            ManiType::Tryte => "3", ManiType::T9 => "9",
-                            ManiType::T27 => "27", ManiType::T54 => "54",
-                            _ => "multi",
+                        // P122: was a second width table, and it said a
+                        // `tryte` is 3 trits where the range table said 6.
+                        match ternary_type_width(wide) {
+                            Some(n) => n.to_string(),
+                            None => "multi".to_string(),
                         },
                         Self::binop_symbol(op),
                     )));
@@ -1065,14 +1066,36 @@ impl Default for SemanticAnalyzer {
 // Ternary type range helpers (module-level)
 // ---------------------------------------------------------------------------
 
-/// Returns (min, max) range for balanced ternary types, or None for non-ternary types.
-pub(super) fn ternary_type_range(ty: &ManiType) -> Option<(i64, i64)> {
+/// How many trits wide each named ternary type is.
+///
+/// **This is the one place that answers the question** (P122). It used to be
+/// answered twice — here as a table of RANGES, and again in the three-valued
+/// operator diagnostic as a table of WIDTHS — and the two disagreed about
+/// `tryte`: the range said 6 trits (±364) and the message told the user "a
+/// 3-trit number". `docs/language-reference.md` sided with the message and was
+/// wrong; the standard library settles it, because `byte_to_tryte` maps a byte
+/// into a `tryte` and ±13 cannot hold one.
+pub(super) fn ternary_type_width(ty: &ManiType) -> Option<u32> {
     match ty {
-        ManiType::Trit => Some((-1, 1)),
-        ManiType::Tryte => Some((-364, 364)),             // 6 trits: -(3^6-1)/2 .. (3^6-1)/2
-        ManiType::T9 => Some((-9841, 9841)),             // 9 trits: -(3^9-1)/2 .. (3^9-1)/2
-        ManiType::T27 => Some((-3_812_798_742_493, 3_812_798_742_493)), // 27 trits
-        ManiType::T54 => None, // 54 trits fits in i64 but range is nearly full — skip
+        ManiType::Trit => Some(1),
+        ManiType::Tryte => Some(6),
+        ManiType::T9 => Some(9),
+        ManiType::T27 => Some(27),
+        ManiType::T54 => Some(54),
         _ => None,
     }
+}
+
+/// Returns (min, max) range for balanced ternary types, or None for non-ternary types.
+///
+/// **Derived from the width rather than listed beside it**, so the two cannot
+/// drift apart again (permanent rule 5). The arithmetic reproduces the previous
+/// table exactly, `t54` included: 3^54 does not fit in an i64, so the fold
+/// fails and the answer is `None` — which is the honest one, since a `t54`'s
+/// true range exceeds the machine word and what actually binds it is i64.
+pub(super) fn ternary_type_range(ty: &ManiType) -> Option<(i64, i64)> {
+    let w = ternary_type_width(ty)?;
+    let pow = (0..w).try_fold(1i64, |acc, _| acc.checked_mul(3))?;
+    let max = (pow - 1) / 2;
+    Some((-max, max))
 }
