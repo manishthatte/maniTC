@@ -2422,6 +2422,24 @@ different direction:
    the receiver's own type. A handle built *inside* the region may be filled
    freely, and a scalar may be pushed onto an outer one.
 
+   **A container counts as storage when its ELEMENTS do.** `Vec<int>` may leave
+   a region; `Vec<str>` may not, because letting it out is the same escape as
+   letting one of its cells out:
+
+   ```manit
+   let mut keep: Vec<str> = Vec::new();
+   region {
+       let inner: Vec<str> = Vec::new();
+       inner.push(str::concat("hel", "lo"));   // fine: inner is inner
+       keep = inner;                            // refused: it holds cells
+   }
+   ```
+
+   A value whose type the compiler has not resolved — which is what
+   `let v = Vec::new();` binds, with no annotation — counts as storage too,
+   because an unknown type could be a cell or a container of cells. **Annotate
+   it** if it needs to leave a region.
+
 ```manit
 let mut n: int = 0;
 region {

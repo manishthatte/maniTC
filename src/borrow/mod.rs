@@ -292,13 +292,55 @@ impl MoveEnv {
     /// refuses some safe programs and no unsafe ones, which is the direction
     /// to be wrong in.
     fn is_region_storage(&self, ty: &ManiType) -> bool {
-        matches!(
-            ty,
+        match ty {
             ManiType::Str
-                | ManiType::Struct(_, _)
-                | ManiType::Tuple(_)
-                | ManiType::Array(_, _)
-        )
+            | ManiType::Struct(_, _)
+            | ManiType::Tuple(_)
+            | ManiType::Array(_, _) => true,
+            // `Unknown` counts, and MEASURING is what said so rather than
+            // reasoning: `let inner = Vec::new();` with no annotation binds a
+            // value of type `Unknown`, not `Vec<...>` — `let x: int = inner;`
+            // is accepted on the same compiler, which is P95's family. So a
+            // rule that enumerated the container types would have walked past
+            // the commonest way to write one. An unknown type could be a cell
+            // or a container of cells; refusing is the direction to be wrong
+            // in, and the remedy is an annotation.
+            ManiType::Unknown => true,
+            // **P120.** A handle may leave a region — but not while it is
+            // holding something that may not. `Vec<int>` is a word and its
+            // elements are words; `Vec<str>` is a word holding CELLS, and
+            // letting it out is the same escape as letting one of those cells
+            // out, reached by a route the element-blind rule could not see:
+            //
+            //     let mut keep: Vec<str> = Vec::new();
+            //     region {
+            //         let inner: Vec<str> = Vec::new();
+            //         inner.push(str::concat("hel", "lo"));  // legal: inner is inner
+            //         keep = inner;                          // legal: a handle may leave
+            //     }
+            //     keep.get(0)   // T3 printed nothing; LLVM printed "hello"
+            //
+            // Every step permitted, the composition unsound — which is what
+            // makes this a rule about the TYPE's contents rather than about
+            // its head.
+            //
+            // An `Unknown` argument counts as storage: an unresolved element
+            // type could be a `str`, and refusing is the direction to be wrong
+            // in. `Vec::new()` with no annotation is exactly that case.
+            // An EMPTY argument list counts too, and finding that out cost a
+            // probe: `let inner = Vec::new();` with no annotation types as
+            // `Vec` with NO arguments, so `any()` over the list was vacuously
+            // false and the container walked out of the region holding cells.
+            // *A predicate over a list of type arguments has to say what it
+            // means by the empty list.*
+            ManiType::Generic(_, args) => {
+                args.is_empty()
+                    || args
+                        .iter()
+                        .any(|a| matches!(a, ManiType::Unknown) || self.is_region_storage(a))
+            }
+            _ => false,
+        }
     }
 
     /// **P118**: an aggregate whose parts a spawned task would have to reach
@@ -644,10 +686,10 @@ fn region_escape_check(
         return Ok(());
     }
     Err(err(span, format!(
-        "`{}` outlives this `region`, so it may not be given a value of type \
-         `{}` inside it — the region releases every cell allocated in it, and \
-         this binding would still be holding one. Scalars may leave a region \
-         freely; `str`, structs, tuples and arrays may not",
+        "`{}` outlives this `region`, so it may not be given {} inside it — \
+         the region releases every cell allocated in it, and this binding \
+         would still be holding one. Scalars may leave a region freely; a \
+         `str`, a struct, a tuple, an array, and a container of those may not",
         holder, type_name(&value.ty)
     )))
 }
@@ -671,11 +713,21 @@ fn root_binding(expr: &TypedExpr) -> Option<&str> {
 /// F-4's message is more useful naming the kind than enumerating the variant.
 fn type_name(ty: &ManiType) -> &'static str {
     match ty {
-        ManiType::Str => "str",
+        ManiType::Str => "a `str`",
         ManiType::Struct(_, _) => "a struct",
         ManiType::Tuple(_) => "a tuple",
         ManiType::Array(_, _) => "an array",
-        _ => "a storage type",
+        // Named for what the reader must DO about it: the remedy for an
+        // unresolved type is an annotation, and a message that said "a storage
+        // type" would leave them looking for a `str` that is not there.
+        ManiType::Unknown => "a value whose type the compiler has not resolved (annotate it)",
+        ManiType::Generic(n, _) => match n.as_str() {
+            "Vec" => "a `Vec` of cells",
+            "Map" => "a `Map` of cells",
+            "Set" => "a `Set` of cells",
+            _ => "a container of cells",
+        },
+        _ => "a value of storage type",
     }
 }
 

@@ -393,3 +393,89 @@ fn main() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// P120 — a handle may leave a region, but not while it is holding a cell
+// ---------------------------------------------------------------------------
+//
+// F-4's split was storage-versus-handle, and P119 fixed the ROUTES a cell could
+// take out. This is the third hole and it is neither: every step is permitted
+// and the composition is unsound.
+//
+//     let mut keep: Vec<str> = Vec::new();
+//     region {
+//         let inner: Vec<str> = Vec::new();
+//         inner.push(str::concat("hel", "lo"));  // legal: inner is inside
+//         keep = inner;                          // legal: a handle may leave
+//     }
+//     keep.get(0)     // T3 printed NOTHING; LLVM printed "hello"
+//
+// So the test is on what the type CONTAINS and not on its head: `Vec<int>` may
+// leave a region, `Vec<str>` may not.
+//
+// **Two of the three answers here came from probing rather than reasoning.**
+// A `Generic` with an EMPTY argument list has to count — `any()` over nothing
+// is vacuously false — and, measured, an unannotated `Vec::new()` does not
+// type as `Vec` at all: it binds `Unknown`, which `let x: int = inner;`
+// accepts on the same compiler (P95's family). A rule that enumerated the
+// container types would have walked past the commonest way to write one.
+
+#[test]
+fn p120_a_container_of_cells_may_not_leave_a_region() {
+    let cases = [
+        ("an annotated Vec<str>", r#"
+use std::io;
+fn main() {
+    let mut keep: Vec<str> = Vec::new();
+    region {
+        let inner: Vec<str> = Vec::new();
+        inner.push(str::concat("hel", "lo"));
+        keep = inner;
+    }
+    io::println(keep.get(0));
+}
+"#),
+        ("an unannotated one, which types as Unknown", r#"
+use std::io;
+fn main() {
+    let mut keep: Vec<str> = Vec::new();
+    region { let inner = Vec::new(); inner.push(str::concat("a", "b")); keep = inner; }
+    io::println(keep.get(0));
+}
+"#),
+    ];
+    for (what, src) in cases {
+        let (ok, msg) = check(src);
+        assert!(!ok, "P120: {what} must not leave a region");
+        assert!(
+            msg.contains("outlives this `region`"),
+            "P120: the {what} refusal must name the rule, and said:\n{msg}"
+        );
+    }
+}
+
+#[test]
+fn p120_a_container_of_words_still_may() {
+    // The discriminator's other side, and the one that would hurt: refusing
+    // every container would make a region useless for anything that computes
+    // a collection. Asserted on the VALUE and on both backends.
+    let src = r#"
+use std::io;
+fn main() {
+    let mut keep: Vec<int> = Vec::new();
+    region {
+        let inner: Vec<int> = Vec::new();
+        inner.push(7);
+        keep = inner;
+    }
+    io::print("keep0="); io::println_int(keep.get(0));
+}
+"#;
+    let (ok, msg) = check(src);
+    assert!(ok, "P120 must not refuse a Vec<int> leaving a region:\n{msg}");
+    let (t3, _) = run_t3(src);
+    assert_eq!(t3, "keep0=7\n");
+    if let Some(ll) = run_llvm(src) {
+        assert_eq!(ll, "keep0=7\n");
+    }
+}
