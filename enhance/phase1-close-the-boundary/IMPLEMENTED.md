@@ -174,7 +174,34 @@ Both lists now name all 17.
   Phase 1. The diagnostic is produced and the `backend-unavailable` lint exists
   at `allow`, so the step-3 backlog can be generated the same way the step-1
   one is, before it becomes blocking.
-- **The stdlib migration** — see A1 above.
+
+  > **MEASURED, 3 September 2026, and the backlog is not what "generate it the
+  > same way" would report.** Running `check -W backend-unavailable --backend
+  > t3` over a hello-world reports **zero**, and that zero is the finding
+  > rather than a clean bill: the lint fires when an `available(...)` clause
+  > EXCLUDES the target, and almost nothing declares one. Counted directly in
+  > `stdlib/`: **2 `extern` declarations, both carrying `available(...)`,
+  > against 414 native declarations in the older `fn f(…) -> T ;  // native`
+  > form.** So step 3's precondition is 2 of 416, and its real content is the
+  > stdlib migration below rather than a level change in `lint.rs`.
+  >
+  > **The truth it would be migrating to already exists in the compiler**, and
+  > that is the cheaper design worth weighing before anyone hand-writes 414
+  > clauses: P85 measured **ninety** registered builtins that link on LLVM and
+  > have no T3ISA syscall — `fs_*` (13), `io_*` (7), `terminal_*` (4), `env_*`
+  > (3), `path_*` (3), one each of `net_*`, `process_*`, `shell_*`, and the
+  > `gui_*` surface §3.4 names — and it measured them by reading the backends'
+  > own registries, in
+  > `analyzer::tests::every_registered_flat_builtin_is_linkable`. A check that
+  > consults those registries needs no migration at all; 414 hand-written
+  > clauses are a second registry that must agree with the first, which is
+  > exactly the shape permanent rule 5 exists to refuse.
+  >
+  > Note also what step 3 costs the instruments: it edits `stdlib/*.mt`, and
+  > each built binary embeds its own copy (`include_str!`), so **R5 is invalid
+  > across the change unless its denominator is rebuilt per binary** — P70's
+  > rule, and no change since has needed it.
+- **The stdlib migration** — see A1 above, where its size is now measured.
 - **A2, A3** — Phase 2 and Phase 3 respectively.
 
 ## R5 — what this does to the L1 metric
