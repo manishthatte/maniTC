@@ -2401,10 +2401,26 @@ different direction:
 2. **No `break` or `continue` that leaves a region.** Same reason, minus the
    value. A loop written *inside* a region is ordinary, and its `break` lands
    inside too — the rule is about crossing the boundary, not about loops.
-3. **A binding that outlives the region may not be assigned a value of storage
-   type inside it.** `str`, structs, tuples and arrays are storage; scalars —
+3. **Nothing that outlives the region may be GIVEN a value of storage type
+   inside it.** `str`, structs, tuples and arrays are storage; scalars —
    `int`, `trit`, `float`, `bool`, `char` — are not, and may leave a region
-   freely, which is how a region returns an answer:
+   freely, which is how a region returns an answer.
+
+   The rule is asked of the **root** of whatever would be left holding the
+   cell, so all four of these are refused, and the last two are the reason the
+   rule is not about assignment alone:
+
+   ```manit
+   outer = s;            // a binding declared outside the region
+   outer.field = s;      // the root is `outer`
+   outer[0] = s;         // likewise
+   outer_vec.push(s);    // a method call, with `outer_vec` as the receiver
+   ```
+
+   A `Vec` handle may leave a region; what may not is the **cell** it would be
+   left holding, so the test on a method call is on its ARGUMENTS and not on
+   the receiver's own type. A handle built *inside* the region may be filled
+   freely, and a scalar may be pushed onto an outer one.
 
 ```manit
 let mut n: int = 0;

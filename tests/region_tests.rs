@@ -291,3 +291,105 @@ fn main() {
         assert_eq!(ll, "n=4\n");
     }
 }
+
+// ---------------------------------------------------------------------------
+// P119 — rule 3 asked about the wrong thing, and three spellings walked past it
+// ---------------------------------------------------------------------------
+//
+// F-4 as first committed asked rule 3 of a plain-identifier assignment target.
+// Three routes to the same escape were not targets of that shape:
+//
+//     v.push(s)      an outer Vec, given a cell allocated inside
+//     b.f = s        a Field target, not an Ident
+//     a[0] = s       an Index target, not an Ident
+//
+// Measured on the compiler that shipped without the fix, the first one:
+// **T3 printed `v[0]=` — nothing — while LLVM printed `hello`.** A silent
+// wrong answer on one backend and a divergence between them, in code F-4
+// accepted. The cell was released with the region and the Vec kept its
+// address; on LLVM the string is the collections library's own allocation,
+// which the region does not hold, so it survived by not being reclaimed.
+//
+// The rule now asks about the ROOT of the target, and about the ARGUMENTS of a
+// method call whose receiver is rooted outside the region. The receiver's own
+// type is deliberately not the question: a `Vec` handle may leave a region;
+// what may not is the cell it would be left holding.
+
+#[test]
+fn p119_storage_may_not_reach_an_outer_holder_by_any_route() {
+    let cases = [
+        ("method call on an outer handle", r#"
+use std::io;
+fn main() {
+    let v: Vec<str> = Vec::new();
+    region { let s: str = str::concat("hel", "lo"); v.push(s); }
+    io::println(v.get(0));
+}
+"#),
+        ("field of an outer struct", r#"
+use std::io;
+struct Box2 { pub s: str }
+fn main() {
+    let mut b: Box2 = Box2 { s: "outer" };
+    region { b.s = str::concat("in", "ner"); }
+    io::println(b.s);
+}
+"#),
+        ("element of an outer array", r#"
+use std::io;
+fn main() {
+    let a: [str; 2] = ["x", "y"];
+    region { a[0] = str::concat("in", "ner"); }
+    io::println(a[0]);
+}
+"#),
+    ];
+    for (what, src) in cases {
+        let (ok, msg) = check(src);
+        assert!(!ok, "P119: storage escaping by {what} must be refused");
+        assert!(
+            msg.contains("outlives this `region`"),
+            "P119: the {what} refusal must name the rule, and said:\n{msg}"
+        );
+    }
+}
+
+#[test]
+fn p119_the_rule_is_about_the_cell_and_not_about_the_receiver() {
+    // Both directions of the discriminator, because getting it wrong the other
+    // way refuses ordinary code: a handle built INSIDE the region may be
+    // filled freely, and a scalar may be pushed onto an outer handle. A row
+    // that only checked the refusals would be satisfied by a compiler that
+    // refused every method call inside a region.
+    let cases = [
+        ("a handle built inside the region", r#"
+use std::io;
+fn main() {
+    let mut n: int = 0;
+    region {
+        let v: Vec<str> = Vec::new();
+        v.push(str::concat("a", "b"));
+        n = v.len();
+    }
+    io::print("n="); io::println_int(n);
+}
+"#, "n=1\n"),
+        ("a scalar into an outer handle", r#"
+use std::io;
+fn main() {
+    let v: Vec<int> = Vec::new();
+    region { v.push(7); }
+    io::print("v0="); io::println_int(v.get(0));
+}
+"#, "v0=7\n"),
+    ];
+    for (what, src, want) in cases {
+        let (ok, msg) = check(src);
+        assert!(ok, "P119 must not refuse {what}:\n{msg}");
+        let (t3, _) = run_t3(src);
+        assert_eq!(t3, want, "P119: {what} on T3");
+        if let Some(ll) = run_llvm(src) {
+            assert_eq!(ll, want, "P119: {what} on LLVM");
+        }
+    }
+}

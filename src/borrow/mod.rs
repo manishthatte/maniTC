@@ -627,6 +627,46 @@ fn consume_if_move(
     Ok(())
 }
 
+/// **F-4 rule 3**, in one place because it has two callers that look nothing
+/// alike: an assignment whose target outlives the region, and a method call
+/// that hands a cell to a receiver that does.
+///
+/// `holder` is the binding that would still be holding the cell after the
+/// release, and `value` is what it would be holding.
+fn region_escape_check(
+    env: &MoveEnv,
+    holder: &str,
+    value: &TypedExpr,
+    span: crate::ast::Span,
+) -> CompileResult<()> {
+    let Some(rf) = env.region_from else { return Ok(()) };
+    if env.depth_of(holder) >= rf || !env.is_region_storage(&value.ty) {
+        return Ok(());
+    }
+    Err(err(span, format!(
+        "`{}` outlives this `region`, so it may not be given a value of type \
+         `{}` inside it — the region releases every cell allocated in it, and \
+         this binding would still be holding one. Scalars may leave a region \
+         freely; `str`, structs, tuples and arrays may not",
+        holder, type_name(&value.ty)
+    )))
+}
+
+/// The binding a projection chain is rooted at: `v[i].f` is rooted at `v`.
+///
+/// **P119**: F-4's rule 3 first asked only about a plain-identifier assignment
+/// target, so `outer[0] = s` and `outer.f = s` walked past it — the target was
+/// an `Index`/`Field`, not an `Ident`, and the check never ran. The root is
+/// what the rule was always about: whichever binding still holds the cell
+/// after the region releases.
+fn root_binding(expr: &TypedExpr) -> Option<&str> {
+    match &expr.kind {
+        TypedExprKind::Ident(n) => Some(n),
+        TypedExprKind::Index(base, _) | TypedExprKind::Field(base, _) => root_binding(base),
+        _ => None,
+    }
+}
+
 /// A short name for a type, for diagnostics. `ManiType` has no `Display`, and
 /// F-4's message is more useful naming the kind than enumerating the variant.
 fn type_name(ty: &ManiType) -> &'static str {
@@ -782,35 +822,28 @@ fn check_stmt_borrows(
             check_expr_borrows(&assign_stmt.value, env, loop_from)?;
             consume_if_move(&assign_stmt.value, env, loop_from)?;
 
+            // F-4 rule 3: inside a region, anything that OUTLIVES the region
+            // may not be given a value of storage type. The region is about to
+            // invalidate every cell allocated inside it, and an outer binding
+            // is exactly what would still be holding one.
+            //
+            // Asked of the ROOT of the target and not of the target itself
+            // (P119): `outer[0] = s` and `outer.f = s` are an `Index` and a
+            // `Field`, so a check written for `Ident` alone walked straight
+            // past them and the same cell escaped by a different spelling.
+            //
+            // Names this environment never declared — globals, and anything
+            // unresolved — report depth 0, so they count as outer, which is
+            // the conservative direction.
+            if let Some(root) = root_binding(&assign_stmt.target) {
+                region_escape_check(env, root, &assign_stmt.value, assign_stmt.target.span)?;
+            }
+
             match &assign_stmt.target.kind {
                 // A plain-identifier target is a REBIND, not a read: it must
                 // not trip use-after-move, and it clears the moved flag.
                 // (Compound assignments like `s += x` do read the target.)
                 TypedExprKind::Ident(ref target_name) => {
-                    // F-4 rule 3: inside a region, a binding that OUTLIVES the
-                    // region may not be assigned a value of storage type. The
-                    // region is about to invalidate every cell allocated
-                    // inside it, and an outer binding is exactly the thing
-                    // that would still be holding one.
-                    //
-                    // Names this environment never declared — globals, and
-                    // anything unresolved — report depth 0, so they count as
-                    // outer, which is the conservative direction.
-                    if let Some(rf) = env.region_from {
-                        if env.depth_of(target_name) < rf
-                            && env.is_region_storage(&assign_stmt.value.ty)
-                        {
-                            return Err(err(assign_stmt.target.span, format!(
-                                "`{}` outlives this `region`, so it may not be \
-                                 assigned a value of type `{}` inside it — the \
-                                 region releases every cell allocated in it, \
-                                 and this binding would still hold one. Scalars \
-                                 may leave a region freely; `str`, structs, \
-                                 tuples and arrays may not",
-                                target_name, type_name(&assign_stmt.value.ty)
-                            )));
-                        }
-                    }
                     if assign_stmt.op.is_some()
                         && !target_name.contains("::")
                         && env.is_moved(target_name)
@@ -975,6 +1008,27 @@ fn check_expr_borrows(
             check_expr_borrows(receiver, env, loop_from)?;
             if is_move_site(receiver) {
                 bump(&mut env.sites.method_recv, receiver.span);
+            }
+            // **F-4 rule 3, second half (P119).** `v.push(s)` where `v`
+            // outlives the region and `s` was allocated inside it puts a cell
+            // somewhere that survives the release — the same escape as an
+            // assignment, by a route an assignment rule cannot see.
+            //
+            // Measured before the rule was written, on the compiler that
+            // shipped without it: `let v: Vec<str>` outside, `v.push(s)`
+            // inside, and afterwards **T3 printed nothing for `v[0]` while
+            // LLVM printed `hello`** — a silent wrong answer on one backend
+            // and a divergence between them, in code F-4 accepted.
+            //
+            // The receiver's own type is not the question: a `Vec` handle may
+            // leave a region, and what may not is the CELL it would be left
+            // holding. So the test is on the ARGUMENTS.
+            if env.region_from.is_some() {
+                if let Some(root) = root_binding(receiver) {
+                    for arg in args {
+                        region_escape_check(env, root, arg, arg.span)?;
+                    }
+                }
             }
             for arg in args {
                 env.array_is_vararg =
