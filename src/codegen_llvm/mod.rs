@@ -209,6 +209,7 @@ impl LLVMEmitter {
         out.push_str("declare i32 @printf(ptr, ...)\n");
         out.push_str("declare i32 @putchar(i32)\n");
         out.push_str("declare ptr @malloc(i64)\n");
+        out.push_str("declare ptr @manit_alloc(i64)\n");
         out.push_str("declare void @free(ptr)\n");
         out.push_str("declare i32 @strcmp(ptr, ptr)\n");
         out.push_str("declare i32 @usleep(i32)\n");
@@ -259,6 +260,7 @@ impl LLVMEmitter {
         let libc_decls = "declare i32 @printf(ptr, ...)\n\
                           declare i32 @putchar(i32)\n\
                           declare ptr @malloc(i64)\n\
+                          declare ptr @manit_alloc(i64)\n\
                           declare void @free(ptr)\n\
                           declare i32 @strcmp(ptr, ptr)\n";
         for (k, v) in parse_declare_sigs(libc_decls) {

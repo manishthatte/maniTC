@@ -146,6 +146,19 @@ impl Sched {
         self.run.front().copied()
     }
 
+    /// **F-4**: how many tasks exist at all — running, runnable or blocked.
+    ///
+    /// A region may reclaim only when this is 1, because the bump pointer is
+    /// shared: with a second task alive, an allocation of ITS may sit above
+    /// the mark, and resetting would hand out memory that task still holds.
+    /// Blocked tasks count — a task waiting on a channel still owns whatever
+    /// it allocated before it blocked.
+    pub fn live_task_count(&self) -> usize {
+        // `saved` holds every task except the running one, blocked ones
+        // included, so this is the whole population and not just the queue.
+        self.saved.len() + self.run.len().min(1)
+    }
+
     /// Is any task waiting on a channel? §11.6's second end condition.
     /// Is anybody waiting on a task handle? §11.6 counts an awaiter exactly
     /// as it counts a channel waiter: if `R` empties while one is queued, no

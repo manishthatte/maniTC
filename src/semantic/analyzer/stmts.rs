@@ -74,6 +74,14 @@ impl SemanticAnalyzer {
 
     pub(super) fn check_stmt(&mut self, stmt: &Stmt) -> CompileResult<TypedStmt> {
         match stmt {
+            // **F-4**: `region { ... }`. Checked as an ordinary block — the
+            // region bounds ALLOCATION, not the scope of a name — and its
+            // safety rule lives in `borrow::check_borrows`, beside the move
+            // rules it is a special case of.
+            Stmt::Region(block, span) => {
+                let tb = self.check_block(block)?;
+                Ok(TypedStmt::Region(tb, *span))
+            }
             Stmt::Let(ls) => {
                 // Shadowing detection: warn if this variable name already exists in scope
                 if !ls.name.starts_with('_') {

@@ -2344,3 +2344,98 @@ about conditional moves converging at a join point beyond forking the moved-set
 across match arms, and does not free anything — see
 `KNOWN_ISSUES` on the absence of a free/destroy API. A move is a compile-time
 restriction on reading a binding, not a runtime transfer of ownership.
+
+## 23. Allocation regions
+
+*(F-4, 3 September 2026. Both backends.)*
+
+A **region** is a lexical scope whose allocations are released when it ends:
+
+```manit
+region {
+    let p: Point = Point { x: 1, y: 2 };
+    let q: Point = Point { x: p.y, y: p.x };
+    io::println_int(q.x);
+}
+// every cell allocated above is gone here
+```
+
+It is a **statement**, never an expression, and that is the first half of the
+safety argument: a region that could produce a value could hand out a pointer
+into the memory it is about to release.
+
+### Why this rather than a free/destroy API
+
+`KNOWN_ISSUES` issue 6 has recorded "no free/destroy API — leak by design"
+since the initial release. The recommendation attached to it was regions rather
+than a garbage collector, for a reason specific to this machine: the T3 heap
+**is** a bump pointer, so releasing a region costs one assignment, while a
+tracing collector on a 65,536-word address space would spend more than it
+recovered. A manual `free` would be the other option and it is worse here — the
+language has no ownership yet, so use-after-free would be a runtime surprise
+rather than a compile error.
+
+### What it costs and what it saves
+
+The same program, a 200-iteration loop allocating two 2-word structs per pass,
+measured on T3 with `run-t3 --profile`:
+
+| form | peak heap |
+|---|---|
+| with `region` around the body | **4 words** |
+| without | **800 words** |
+
+On LLVM, where the heap is the host's, the difference is visible as address
+space: a 3,000,000-iteration version of the same loop runs to completion under
+an 80 MB cap with the region and **segfaults without it**.
+
+### The three rules
+
+A region releases every cell allocated inside it, so nothing that outlives the
+region may still be holding one. Three rules enforce that, and each fails in a
+different direction:
+
+1. **No `return` inside a region.** It would leave without releasing, and a
+   returned value could point into the released memory. Compute the value, end
+   the region, then return.
+2. **No `break` or `continue` that leaves a region.** Same reason, minus the
+   value. A loop written *inside* a region is ordinary, and its `break` lands
+   inside too — the rule is about crossing the boundary, not about loops.
+3. **A binding that outlives the region may not be assigned a value of storage
+   type inside it.** `str`, structs, tuples and arrays are storage; scalars —
+   `int`, `trit`, `float`, `bool`, `char` — are not, and may leave a region
+   freely, which is how a region returns an answer:
+
+```manit
+let mut n: int = 0;
+region {
+    let s: str = str::concat("a", "b");
+    n = str::len(s);          // fine: an int is not storage
+}
+io::println_int(n);           // 2
+```
+
+`Vec<T>`, `Map`, `Set`, `Channel<T>` and `Mutex<T>` are **not** storage either,
+and that is a fact about both backends rather than a convenience: on T3 they
+live in the emulator's object table, which the bump pointer does not address,
+and on LLVM they are the collections library's own allocations, which the
+region does not hold. A handle may leave a region; a cell may not.
+
+The rule is stated on the **type** and not on where the value was allocated. A
+provenance analysis would accept more programs, and making one cheap is exactly
+what affine types (B7) are for; until then this refuses some safe programs and
+no unsafe ones, which is the direction to be wrong in.
+
+### What is not reclaimed yet
+
+- **The collections and string routines allocate outside the region on LLVM.**
+  A `Vec` built inside a region is still there afterwards on that backend. On
+  T3 a string cell *is* region memory and is released. The residual is 114
+  `malloc` call sites across seven runtime files; routing them through the
+  region allocator is the next step and it is stated here rather than implied.
+- **A region does not reclaim while another task exists.** The allocator is
+  shared, so with a second task alive an allocation of *its* may sit above the
+  region's mark, and resetting would hand out memory that task still holds.
+  With other tasks running the region is a no-op — a leak, which is what
+  happened before regions existed, rather than corruption. Per-task regions
+  want a per-task heap and are future work.

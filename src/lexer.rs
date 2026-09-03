@@ -60,6 +60,8 @@ pub enum TokenKind {
     Async,
     Await,
     Spawn,
+    /// F-4: `region { ... }`, a lexical allocation region.
+    Region,
     Channel,
     As,
     SelfKw,
@@ -248,6 +250,7 @@ fn keyword_or_ident(s: &str) -> TokenKind {
         "async" => TokenKind::Async,
         "await" => TokenKind::Await,
         "spawn" => TokenKind::Spawn,
+        "region" => TokenKind::Region,
         "channel" => TokenKind::Channel,
         "as" => TokenKind::As,
         "self" => TokenKind::SelfKw,

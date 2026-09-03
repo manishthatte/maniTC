@@ -1375,6 +1375,16 @@ pub(super) fn emit_instr(em: &mut AsmEmitter, instr: &IRInstr) {
                 "__task_fork" => {
                     emit_syscall_1arg_ret(em, args, dst, 80, "task_fork");
                 }
+                // **F-4**: the region's two ends. No operands, no result —
+                // the allocator's mark is the emulator's own bump pointer, so
+                // nothing has to be carried in a register or a frame slot, and
+                // a nested region is a nested push/pop with no extra state.
+                "__region_push" => {
+                    em.emit("    SYSCALL #141  ; region_push (F-4)".to_string());
+                }
+                "__region_pop" => {
+                    em.emit("    SYSCALL #142  ; region_pop (F-4)".to_string());
+                }
                 "__task_yield" => {
                     em.emit("    SYSCALL #81  ; task_yield (\u{a7}11.4)".to_string());
                 }

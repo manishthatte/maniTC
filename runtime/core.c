@@ -3,6 +3,82 @@
  * Author: Manish Jagdish Thatte
  */
 
+/* ======================== F-4: allocation regions ======================== */
+/* `region { ... }` in maniT compiles to a push/pop pair around a block, and
+ * everything the block allocates is released when it ends.
+ *
+ * On T3 this is one assignment, because that heap IS a bump pointer. A hosted
+ * process has no bump pointer to reset, so the region keeps the LIST of
+ * pointers handed out while it was open and frees them at the end. That is
+ * the same guarantee by a different mechanism, which is what makes the two
+ * backends agree about the only thing a program can observe: what is still
+ * valid after the region, and what the answers are.
+ *
+ * What is tracked is what the COMPILER allocates — struct, tuple, array and
+ * enum cells, and the spawn env. The collections and the string routines call
+ * `malloc` directly and are not reclaimed here; that residual is stated in
+ * `docs/language-reference.md` rather than implied, and it is 114 call sites
+ * across seven files, which is why it is not this step. */
+static void**  manit_region_ptrs = NULL;   /* every pointer handed out inside a region */
+static size_t  manit_region_len  = 0;
+static size_t  manit_region_cap  = 0;
+static size_t* manit_region_marks = NULL;  /* one saved length per open region */
+static size_t  manit_region_depth = 0;
+static size_t  manit_region_marks_cap = 0;
+
+/* Declared in sched.c, which is included after this file. */
+int manit_live_task_count(void);
+
+void __region_push(void) {
+    if (manit_region_depth == manit_region_marks_cap) {
+        size_t n = manit_region_marks_cap ? manit_region_marks_cap * 2 : 8;
+        size_t* m = (size_t*)realloc(manit_region_marks, n * sizeof(size_t));
+        if (!m) return;                    /* out of memory: do not track */
+        manit_region_marks = m;
+        manit_region_marks_cap = n;
+    }
+    manit_region_marks[manit_region_depth++] = manit_region_len;
+}
+
+void __region_pop(void) {
+    if (manit_region_depth == 0) {
+        return;                            /* unbalanced: the emitter's bug */
+    }
+    size_t mark = manit_region_marks[--manit_region_depth];
+    /* The allocator is shared, so with a second task alive an allocation of
+     * ITS may sit above the mark. Decline rather than corrupt — and forget the
+     * pointers, because the region they belonged to is over and nothing will
+     * ever free them here. */
+    if (manit_live_task_count() > 1) {
+        manit_region_len = mark;
+        return;
+    }
+    while (manit_region_len > mark) {
+        free(manit_region_ptrs[--manit_region_len]);
+    }
+}
+
+/* The allocation entry point the emitted code uses. Outside a region it is
+ * `malloc` and nothing else, so a program that never writes `region` is
+ * byte-for-byte the program it was before this existed. */
+void* manit_alloc(size_t n) {
+    void* p = malloc(n);
+    if (!p || manit_region_depth == 0) {
+        return p;
+    }
+    if (manit_region_len == manit_region_cap) {
+        size_t c = manit_region_cap ? manit_region_cap * 2 : 64;
+        void** q = (void**)realloc(manit_region_ptrs, c * sizeof(void*));
+        if (!q) {
+            return p;                      /* untracked rather than lost */
+        }
+        manit_region_ptrs = q;
+        manit_region_cap = c;
+    }
+    manit_region_ptrs[manit_region_len++] = p;
+    return p;
+}
+
 /* ======================== runtime faults ======================== */
 /* A7/A2/E1: a single reporting path for runtime faults, so the LLVM backend
  * fails the way the T3 emulator already does (a named TRAP and a defined exit

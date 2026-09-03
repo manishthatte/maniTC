@@ -193,6 +193,25 @@ quoted.
    are never freed. Fine for the short-lived demo programs; a real
    allocator interface is future work.
 
+   > **Notice, 3 September 2026 — F-4 landed and this is now HALF true.**
+   > `region { ... }` releases everything the block allocated, on both
+   > backends: T3 resets its bump pointer, LLVM frees the list of cells handed
+   > out while the region was open. Measured on the same program with and
+   > without: **peak heap 800 words → 4** on T3, and on LLVM a 3,000,000-pass
+   > version runs under an 80 MB cap where the region-free version segfaults.
+   > `docs/language-reference.md` §23 has the three rules that make it safe.
+   >
+   > **What is still true is the list above.** A region reclaims what the
+   > COMPILER allocates — struct, tuple, array and enum cells, and on T3 the
+   > string cells too. The collections and the string routines call `malloc`
+   > directly on LLVM and are not reclaimed: 114 call sites across seven
+   > runtime files. Routing them through the region allocator is the next
+   > step, and the count is here rather than a vague "most" so that the next
+   > person knows what it costs. There is still no `free` a program can call,
+   > and that remains deliberate: use-after-free in a language without
+   > ownership is a runtime surprise, where a region's rules are compile-time
+   > refusals.
+
 ## Fixed since the initial release (summary)
 
 The August 2026 campaign closed all 116 findings of the full review plus

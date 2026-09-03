@@ -87,6 +87,7 @@ fn collect_lets(block: &Block, out: &mut Vec<(String, Span, bool)>) {
             Stmt::Return(Some(e), _) => collect_lets_in_expr(e, out),
             Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_)
             | Stmt::LocalStructDef(_) => {}
+            Stmt::Region(b, _) => collect_lets(b, out),
         }
     }
 }
@@ -159,6 +160,13 @@ impl Usage {
             Stmt::Return(Some(e), _) => self.scan_expr(e),
             Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_)
             | Stmt::LocalStructDef(_) => {}
+            // A use inside a region is a use: the region bounds the ALLOCATION
+            // and not the scope of a name.
+            Stmt::Region(b, _) => {
+                for st in &b.stmts {
+                    self.scan_stmt(st);
+                }
+            }
         }
     }
 

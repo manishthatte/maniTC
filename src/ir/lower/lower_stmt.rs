@@ -26,6 +26,38 @@ impl IRLowerer {
 
     pub(super) fn lower_stmt(&mut self, stmt: &TypedStmt) -> IRValue {
         match stmt {
+            // **F-4**: `region { B }` lowers to two ordinary calls around an
+            // ordinary block.
+            //
+            // No new IR instruction, no new terminator and not one pass
+            // touched — P89's shape, and for P89's reason: a new `IRInstr`
+            // variant leaves every `matches!(i, A | B)` in the optimiser valid
+            // and no longer true, and the compiler cannot say which. Two calls
+            // to names no source program can produce are a mechanism the
+            // passes already understand, and both backends already intercept
+            // names at exactly this layer.
+            //
+            // The names are `__region_push` / `__region_pop`. They are not
+            // registered with the analyzer and never appear in source: they
+            // are born here, after checking, which is why no `use` is needed
+            // and why a user cannot call them.
+            TypedStmt::Region(block, _) => {
+                self.emit(IRInstr::Call {
+                    dst: None,
+                    func: "__region_push".to_string(),
+                    args: vec![],
+                    ret_ty: IRType::Void,
+                });
+                let v = self.lower_block(block);
+                self.emit(IRInstr::Call {
+                    dst: None,
+                    func: "__region_pop".to_string(),
+                    args: vec![],
+                    ret_ty: IRType::Void,
+                });
+                let _ = v;
+                IRValue::Void
+            }
             TypedStmt::Let(ls) => {
                 // Special case: LetPat::Tuple — destructure a tuple into separate locals.
                 if let LetPat::Tuple(names) = &ls.pat {

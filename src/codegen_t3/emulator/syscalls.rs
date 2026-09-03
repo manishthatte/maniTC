@@ -2,7 +2,7 @@
 // Implementations are split into:
 //   syscall_io.rs   — I/O, strings, floats, time, env (0-16, 60-69, 127-132, 133-136, 200-203, 210-221, 540, 550, 552-553)
 //   syscall_fs.rs   — File system + TCP network (75-79, 500-525)
-//   syscall_proc.rs — Collections, channels, concurrency (17-59, 70-74, 80-107, 108-131, 137)
+//   syscall_proc.rs — Collections, channels, concurrency, regions (17-59, 70-74, 80-107, 108-131, 137-142)
 use super::*;
 
 impl Emulator {
@@ -36,7 +36,7 @@ impl Emulator {
             // done-value), taken next to 137 for the same reason: the number
             // must be inside a range this router actually forwards, and an
             // unrouted number is a TRAP rather than a compile error.
-            17..=59 | 70..=74 | 80..=131 | 137..=140 => {
+            17..=59 | 70..=74 | 80..=131 | 137..=142 => {
                 self.do_syscall_proc(num);
             }
             // `.unwrap()` guard — R1 = the Result's tag trit.

@@ -655,6 +655,13 @@ impl Rewrite {
             Stmt::Return(Some(e), _) => self.rewrite_expr(e),
             Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::LocalStructDef(_) => {}
+            // F-4: a region is a block, and every statement in it needs the
+            // same module-qualification rewrite as one outside it.
+            Stmt::Region(b, _) => {
+                for st in &mut b.stmts {
+                    self.rewrite_stmt(st);
+                }
+            }
         }
     }
 

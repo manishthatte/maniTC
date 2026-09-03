@@ -1335,3 +1335,42 @@ instantiate through `ensure_mono` with the impl's generics and `Self` bound;
 and redirect the call, which is the piece with no precedent, because the
 lowerer derives a method's callee name from the RECEIVER's type rather than
 from the typed expression.
+
+
+## F-4 — heap management and regions (3 September 2026)
+
+**DONE, on both backends**, and it is the last of Phase 4's four items.
+`report.txt` records the finding; `docs/language-reference.md` §23 is the
+surface; `tests/region_tests.rs` pins it with seven rows.
+
+`region { B }` releases everything B allocated. The mechanism differs by
+backend and their agreement is what makes it evidence rather than a shared
+lowering agreeing with itself: **T3 resets its bump pointer** — one assignment,
+which is exactly why F-4's own text recommended regions over a collector for
+this machine — while **LLVM frees the list of cells handed out while the region
+was open**, because a hosted process has no bump pointer to reset.
+
+| measurement | result |
+|---|---|
+| T3, 200-pass loop allocating two 2-word structs | peak heap **800 → 4 words** |
+| LLVM, 3,000,000-pass version under an 80 MB cap | **runs** with the region, **segfaults** without |
+| the answer, both backends, with and against | identical |
+
+**No new IR instruction, no new terminator and not one pass touched.** The
+statement lowers to two ordinary calls, `__region_push` / `__region_pop`, which
+both emitters already intercept at that layer — P89's shape, and for P89's
+reason: a new `IRInstr` variant leaves every `matches!(i, A | B)` in the
+optimiser valid and no longer true, and the compiler cannot say which.
+
+**Three rules make it safe, and each fails in a different direction**: no
+`return` inside a region, no `break`/`continue` out of one, and no assignment
+of a value of storage type to a binding that outlives the region. Scalars leave
+freely, which is how a region returns an answer. The rule is stated on the TYPE
+rather than on provenance — a provenance analysis would accept more programs
+and is exactly what B7's affine types exist to make cheap.
+
+**Two limits, stated rather than implied.** A region does not reclaim while
+another task exists (the allocator is shared, so another task's allocation may
+sit above the mark — declining is a leak, resetting would be corruption), and
+on LLVM the collections and string routines allocate outside it: 114 `malloc`
+sites across seven runtime files.

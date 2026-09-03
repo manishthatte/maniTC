@@ -58,6 +58,13 @@ static ManitTask2* manit_current  = NULL;   /* the head of R is the running task
 static int64_t     manit_next_id  = 0;
 static int         manit_sched_on = 0;
 static int         manit_blocked_count = 0; /* |B|, for §11.6 */
+/* F-4: how many tasks exist, main included. A region may reclaim only when
+ * this is 1 — the allocator is shared, so with a second task alive an
+ * allocation of ITS may sit above the mark. Declining to reclaim is a leak,
+ * which is what happened before regions existed; reclaiming would be
+ * corruption, and those are not the same size of mistake. */
+static int         manit_live_tasks = 1;
+int manit_live_task_count(void) { return manit_live_tasks; }
 /* Broadcast when R empties. `__task_main_done` waits on it: the other tasks are
  * real threads, so returning from `main` would take the process down under
  * them. A separate variable from the per-task `wake` because a finished task is
@@ -288,6 +295,7 @@ static void* manit_task_trampoline(void* arg) {
     /* §11.5 (DONE): the task is removed. It is already the head of R. */
     pthread_mutex_lock(&manit_sched_lock);
     self->finished = 1;
+    manit_live_tasks--;                       /* F-4 */
     ManitTask2* me = manit_rq_pop();
     (void)me;
     manit_hand_off(self, 0);
@@ -328,6 +336,7 @@ int64_t __task_spawn(int64_t (*body)(int64_t*), int64_t* env) {
         return __task_done_value(r);
     }
     pthread_mutex_lock(&manit_sched_lock);
+    manit_live_tasks++;                       /* F-4 */
     ManitTask2* t = (ManitTask2*)calloc(1, sizeof(ManitTask2));
     pthread_cond_init(&t->wake, NULL);
     t->id = manit_next_id++;

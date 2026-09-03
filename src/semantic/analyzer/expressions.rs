@@ -1664,6 +1664,10 @@ fn collect_free_in_block(
             Stmt::Return(Some(e), _) => collect_free_idents(e, bound, free),
             Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::LocalStructDef(_) => {}
+            // F-4: a region is a block, so it binds its own names and its free
+            // ones are free here too. A capture missed here is a silently
+            // wrong program (P99b), which is why this walks rather than skips.
+            Stmt::Region(b, _) => collect_free_in_block(b, bound, free),
         }
     }
     bound.pop();

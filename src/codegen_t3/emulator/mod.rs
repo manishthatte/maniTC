@@ -145,6 +145,10 @@ pub struct Emulator {
     heap_ptr: usize,
     /// Heap objects (Vecs, Maps, Sets, Deques, Channels) keyed by handle.
     heap_objs: HashMap<usize, HeapObj>,
+    /// **F-4**: the stack of open allocation regions, each a saved `heap_ptr`.
+    /// A bump allocator makes a region cheap in exactly this way — entering
+    /// one costs a push and leaving one costs an assignment.
+    region_marks: Vec<usize>,
     /// Canonical address per string CONTENT, for Map/Set keys: two string
     /// values with equal text must hash/compare as the same key even though
     /// they live at different addresses.
@@ -219,6 +223,7 @@ impl Emulator {
             call_stack: Vec::new(),
             heap_ptr: HEAP_BASE,
             heap_objs: HashMap::new(),
+            region_marks: Vec::new(),
             string_intern: HashMap::new(),
             files: HashMap::new(),
             next_fd: 3,

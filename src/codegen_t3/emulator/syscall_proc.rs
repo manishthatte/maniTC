@@ -554,6 +554,56 @@ impl Emulator {
             }
 
             // ----------------------------------------------------------------
+            // F-4: allocation regions (141-142)
+            //
+            // 141/142 and not a new range: the number must sit inside a range
+            // this router actually forwards, and an unrouted number is a TRAP
+            // at run time rather than a compile error — the lesson 137 was
+            // learned by (`syscalls.rs` names the ranges at the top).
+            // ----------------------------------------------------------------
+            141 => {
+                // region_push: save the bump pointer.
+                self.region_marks.push(self.heap_ptr);
+            }
+            142 => {
+                // region_pop: release everything allocated since the mark.
+                let mark = match self.region_marks.pop() {
+                    Some(m) => m,
+                    None => {
+                        // Only a compiler that emitted an unbalanced pair can
+                        // reach this, so it names that rather than the user's
+                        // program.
+                        self.trap(
+                            "TRAP: region_pop with no open region — the \
+                             compiler emitted an unbalanced region pair"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                };
+                // **A region releases only when it is the program's only
+                // task.** The bump pointer is shared by every task, so with
+                // another task alive an allocation of ITS may sit above this
+                // mark, and resetting would hand that task memory the
+                // allocator will hand out again. Declining to reclaim is a
+                // leak, which is what happens today anyway; reclaiming would
+                // be corruption. Per-task regions are the fix and they want a
+                // per-task heap, which is F-4's next step rather than this
+                // one.
+                if self.sched.active && self.sched.live_task_count() > 1 {
+                    return;
+                }
+                // Strings are keyed by their heap ADDRESS, so an address that
+                // is about to be handed out again must not still name the old
+                // bytes — that is P106's shape (a stale entry surviving the
+                // thing it described) and it would show up as a string
+                // changing its contents.
+                self.string_data.retain(|addr, _| *addr < mark);
+                self.string_intern.retain(|_, addr| (*addr as usize) < mark);
+                self.heap_ptr = mark;
+            }
+
+            // ----------------------------------------------------------------
             // Vec higher-order functions (83-86)
             // ----------------------------------------------------------------
             83 => {

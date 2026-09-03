@@ -232,6 +232,10 @@ pub enum TypedStmt {
     Return(Option<TypedExpr>),
     Break,
     Continue,
+    /// **F-4**: `region { ... }`. The block, and the span of the `region`
+    /// keyword — the span is carried because every diagnostic this construct
+    /// produces is about the region and not about a statement inside it.
+    Region(TypedBlock, ast::Span),
 }
 
 #[derive(Debug, Clone)]

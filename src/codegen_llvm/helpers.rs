@@ -790,6 +790,11 @@ declare ptr @channel_new()
 ; P99 / docs/semantics.md §11: the cooperative scheduler. Emitted only under
 ; `--sched cooperative`, but declared unconditionally — a declaration nothing
 ; calls costs an unused line, while a missing one is a link failure.
+; F-4: the region's two ends and the allocation entry point they bracket.
+; Declared unconditionally for the scheduler block's reason below — an unused
+; declaration costs a line, a missing one is a link failure.
+declare void @__region_push()
+declare void @__region_pop()
 declare void @__task_bootstrap()
 declare i64 @__task_spawn(ptr, ptr)
 declare void @__task_yield()
@@ -1258,7 +1263,7 @@ entry:
   %isempty = icmp sle i64 %len, 0
   %n = select i1 %isempty, i64 1, i64 %len
   %n1 = add i64 %n, 1
-  %s = call ptr @malloc(i64 %n1)
+  %s = call ptr @manit_alloc(i64 %n1)
   br i1 %isempty, label %empty, label %cond
 empty:
   store i8 48, ptr %s, align 1
@@ -1289,7 +1294,7 @@ exit:
 
 define internal ptr @math_to_balanced_ternary(i64 %n) {
 entry:
-  %buf = call ptr @malloc(i64 336)
+  %buf = call ptr @manit_alloc(i64 336)
   %iszero = icmp eq i64 %n, 0
   br i1 %iszero, label %zero, label %cond
 zero:
@@ -1336,7 +1341,7 @@ entry:
   %width = select i1 %wneg, i64 0, i64 %w
   %slots = add i64 %width, 1
   %bytes = mul i64 %slots, 8
-  %buf = call ptr @malloc(i64 %bytes)
+  %buf = call ptr @manit_alloc(i64 %bytes)
   store i64 %width, ptr %buf, align 8
   br label %cond
 cond:
@@ -1457,7 +1462,7 @@ define internal ptr @__lp_from_flat(ptr %p, i64 %n) {
 entry:
   %n1 = add i64 %n, 1
   %bytes = mul i64 %n1, 8
-  %buf = call ptr @malloc(i64 %bytes)
+  %buf = call ptr @manit_alloc(i64 %bytes)
   store i64 %n, ptr %buf, align 8
   br label %cond
 cond:
@@ -1487,7 +1492,7 @@ exit:
 
 define internal ptr @Ok_new(i64 %v) {
 entry:
-  %r = call ptr @malloc(i64 16)
+  %r = call ptr @manit_alloc(i64 16)
   store i64 1, ptr %r, align 8
   %p1 = getelementptr i64, ptr %r, i64 1
   store i64 %v, ptr %p1, align 8
@@ -1496,7 +1501,7 @@ entry:
 
 define internal ptr @Err_new(ptr %m) {
 entry:
-  %r = call ptr @malloc(i64 16)
+  %r = call ptr @manit_alloc(i64 16)
   store i64 -1, ptr %r, align 8
   %mi = ptrtoint ptr %m to i64
   %p1 = getelementptr i64, ptr %r, i64 1
@@ -1506,7 +1511,7 @@ entry:
 
 define internal ptr @Unknown_new(ptr %m) {
 entry:
-  %r = call ptr @malloc(i64 16)
+  %r = call ptr @manit_alloc(i64 16)
   store i64 0, ptr %r, align 8
   %mi = ptrtoint ptr %m to i64
   %p1 = getelementptr i64, ptr %r, i64 1
@@ -1602,7 +1607,7 @@ entry:
 
 define internal ptr @async_spawn_task(i64 %result) {
 entry:
-  %box = call ptr @malloc(i64 8)
+  %box = call ptr @manit_alloc(i64 8)
   store i64 %result, ptr %box, align 8
   ret ptr %box
 }
@@ -1617,7 +1622,7 @@ entry:
 define internal i64 @async_select(ptr %futs) {
 entry:
   %val = call i64 @Vec_get(ptr %futs, i64 0)
-  %sel = call ptr @malloc(i64 16)
+  %sel = call ptr @manit_alloc(i64 16)
   store i64 0, ptr %sel, align 8
   %p1 = getelementptr i64, ptr %sel, i64 1
   store i64 %val, ptr %p1, align 8

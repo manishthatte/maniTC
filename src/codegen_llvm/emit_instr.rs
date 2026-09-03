@@ -459,7 +459,7 @@ impl LLVMEmitter {
                         });
                     let bytes = (n * 8).max(8);
                     return format!(
-                        "%{} = call ptr @malloc(i64 {})",
+                        "%{} = call ptr @manit_alloc(i64 {})",
                         dst.0,
                         bytes
                     );
@@ -475,7 +475,7 @@ impl LLVMEmitter {
                         _ => 8,
                     };
                     let bytes = (n * elem_bytes).max(1);
-                    return format!("%{} = call ptr @malloc(i64 {})", dst.0, bytes);
+                    return format!("%{} = call ptr @manit_alloc(i64 {})", dst.0, bytes);
                 }
                 let (alloca_ty, align) = (alloca_ty, llvm_align(ty));
                 format!(

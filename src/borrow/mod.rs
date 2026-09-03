@@ -233,6 +233,11 @@ struct MoveEnv {
     /// on descent into the literal's elements, so only the OUTERMOST array of
     /// `f([[s]])` counts as the argument list.
     array_is_vararg: bool,
+    /// **F-4**: scope depth at which the innermost enclosing `region` begins,
+    /// or `None` outside one. Mirrors `loop_from`, which is the same idea for
+    /// loops — a binding declared at `depth >= region_from` dies when the
+    /// region releases, and one below it does not.
+    region_from: Option<usize>,
     /// **P118**: struct names that have at least one FIELD. A struct with none
     /// is an opaque built-in handle — `AtomicTrit`, `Barrier` and `Semaphore`
     /// are `Struct(name, [])` with no entry in `struct_fields` — and a handle
@@ -255,6 +260,7 @@ impl MoveEnv {
             array_is_vararg: false,
             consuming: Default::default(),
             aggregates: Default::default(),
+            region_from: None,
         }
     }
 
@@ -267,6 +273,32 @@ impl MoveEnv {
         e.consuming = consuming;
         e.aggregates = aggregates;
         e
+    }
+
+    /// **F-4**: a type whose value LIVES in the region's allocator, so that a
+    /// reference to it dangles once the region releases.
+    ///
+    /// `str`, a struct, a tuple, an array and an enum payload are storage:
+    /// they are cells the compiler allocates. `Vec<T>`, `Map`, `Channel<T>`
+    /// and the other `Generic` handles are NOT, and that is a fact about both
+    /// backends rather than a convenience — on T3 they live in the emulator's
+    /// object table, which the bump pointer does not address, and on LLVM they
+    /// are the C runtime's own mallocs, which the region arena does not hold.
+    /// A handle may therefore leave a region; a cell may not.
+    ///
+    /// The rule is deliberately about the TYPE and not about where the value
+    /// was allocated: a provenance analysis would be more permissive and is
+    /// the thing B7's affine types exist to make cheap. Until then this
+    /// refuses some safe programs and no unsafe ones, which is the direction
+    /// to be wrong in.
+    fn is_region_storage(&self, ty: &ManiType) -> bool {
+        matches!(
+            ty,
+            ManiType::Str
+                | ManiType::Struct(_, _)
+                | ManiType::Tuple(_)
+                | ManiType::Array(_, _)
+        )
     }
 
     /// **P118**: an aggregate whose parts a spawned task would have to reach
@@ -595,6 +627,18 @@ fn consume_if_move(
     Ok(())
 }
 
+/// A short name for a type, for diagnostics. `ManiType` has no `Display`, and
+/// F-4's message is more useful naming the kind than enumerating the variant.
+fn type_name(ty: &ManiType) -> &'static str {
+    match ty {
+        ManiType::Str => "str",
+        ManiType::Struct(_, _) => "a struct",
+        ManiType::Tuple(_) => "a tuple",
+        ManiType::Array(_, _) => "an array",
+        _ => "a storage type",
+    }
+}
+
 /// A struct, tuple or array -- a type whose storage has more than one word
 /// and for which copy-versus-alias is therefore observable.
 fn is_aggregate(ty: &ManiType) -> bool {
@@ -743,6 +787,30 @@ fn check_stmt_borrows(
                 // not trip use-after-move, and it clears the moved flag.
                 // (Compound assignments like `s += x` do read the target.)
                 TypedExprKind::Ident(ref target_name) => {
+                    // F-4 rule 3: inside a region, a binding that OUTLIVES the
+                    // region may not be assigned a value of storage type. The
+                    // region is about to invalidate every cell allocated
+                    // inside it, and an outer binding is exactly the thing
+                    // that would still be holding one.
+                    //
+                    // Names this environment never declared — globals, and
+                    // anything unresolved — report depth 0, so they count as
+                    // outer, which is the conservative direction.
+                    if let Some(rf) = env.region_from {
+                        if env.depth_of(target_name) < rf
+                            && env.is_region_storage(&assign_stmt.value.ty)
+                        {
+                            return Err(err(assign_stmt.target.span, format!(
+                                "`{}` outlives this `region`, so it may not be \
+                                 assigned a value of type `{}` inside it — the \
+                                 region releases every cell allocated in it, \
+                                 and this binding would still hold one. Scalars \
+                                 may leave a region freely; `str`, structs, \
+                                 tuples and arrays may not",
+                                target_name, type_name(&assign_stmt.value.ty)
+                            )));
+                        }
+                    }
                     if assign_stmt.op.is_some()
                         && !target_name.contains("::")
                         && env.is_moved(target_name)
@@ -763,14 +831,65 @@ fn check_stmt_borrows(
             check_expr_borrows(expr, env, loop_from)?;
         }
 
+        // **F-4**: `region { B }` — everything B allocates is released when it
+        // ends. The three rules below are the whole safety argument, and each
+        // fails in a different direction.
+        TypedStmt::Region(block, span) => {
+            let outer = env.region_from;
+            // `check_block_borrows` pushes a scope, so the block's own
+            // bindings live at this depth and anything BELOW it outlives the
+            // region.
+            env.region_from = Some(env.scopes.len());
+            let result = check_block_borrows(block, env, loop_from);
+            env.region_from = outer;
+            result?;
+            let _ = span;
+        }
+
         TypedStmt::Return(opt_expr) => {
+            // F-4 rule 1: a `return` inside a region would leave without
+            // releasing, and — worse — could carry out a value the release is
+            // about to invalidate. Refusing it is both halves at once.
+            if let Some(depth) = env.region_from {
+                let _ = depth;
+                let span = opt_expr
+                    .as_ref()
+                    .map(|e| e.span)
+                    .unwrap_or_else(crate::ast::Span::default);
+                return Err(err(span, "`return` inside a `region` is not \
+                    allowed: it would leave without releasing the region, and \
+                    a returned value could point into the memory the release \
+                    invalidates. Compute the value, end the region, then \
+                    return".to_string()));
+            }
             if let Some(ref expr) = opt_expr {
                 check_expr_borrows(expr, env, loop_from)?;
             }
         }
 
         TypedStmt::Break | TypedStmt::Continue => {
-            // Nothing to check.
+            // F-4 rule 2: a `break` or `continue` that leaves a region skips
+            // its release. Refused only when the LOOP is outside the region —
+            // a loop written inside one is ordinary, and its `break` lands
+            // inside too. The depths are what tell the two apart, which is why
+            // `loop_from` and `region_from` are both scope depths and not
+            // flags.
+            if let Some(rf) = env.region_from {
+                let escapes = match loop_from {
+                    None => true,
+                    Some(lf) => lf < rf,
+                };
+                if escapes {
+                    return Err(err(
+                        crate::ast::Span::default(),
+                        "`break`/`continue` out of a `region` is not allowed: \
+                         it would leave the region without releasing it. Put \
+                         the loop inside the region, or the region inside the \
+                         loop body"
+                            .to_string(),
+                    ));
+                }
+            }
         }
     }
     Ok(())

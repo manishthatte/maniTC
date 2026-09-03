@@ -281,6 +281,12 @@ pub enum Stmt {
     Break(Span),
     Continue(Span),
     LocalStructDef(StructDef), // struct defined inside a function body
+    /// **F-4**: `region { ... }` — a lexical allocation region. Everything the
+    /// block allocates is released when it ends, which on a bump allocator is
+    /// one pointer assignment. It is a STATEMENT and not an expression, and
+    /// that is the first half of its safety argument: a region that cannot
+    /// produce a value cannot hand one out.
+    Region(Block, Span),
 }
 
 impl Stmt {
@@ -293,6 +299,7 @@ impl Stmt {
             Stmt::Break(span) => *span,
             Stmt::Continue(span) => *span,
             Stmt::LocalStructDef(s) => s.span,
+            Stmt::Region(_, span) => *span,
         }
     }
 }

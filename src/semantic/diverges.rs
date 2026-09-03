@@ -37,6 +37,9 @@ fn stmt_diverges(stmt: &Stmt) -> bool {
         // non-diverging here; `loop_diverges` accounts for them separately.
         Stmt::Break(_) | Stmt::Continue(_) => false,
         Stmt::LocalStructDef(_) => false,
+        // A region diverges when its body does: it is a block with a bump
+        // pointer saved around it, and saving a pointer cannot return.
+        Stmt::Region(b, _) => block_diverges(b),
     }
 }
 
@@ -149,6 +152,10 @@ fn stmt_has_break(stmt: &Stmt) -> bool {
         Stmt::Let(ls) => ls.init.as_ref().is_some_and(expr_has_break),
         Stmt::Assign(a) => expr_has_break(&a.value),
         Stmt::Return(..) | Stmt::Continue(_) | Stmt::LocalStructDef(_) => false,
+        // A `break` inside a region is refused by the borrow pass (it would
+        // skip the release), but this function runs first and must still
+        // answer honestly about the syntax in front of it.
+        Stmt::Region(b, _) => b.stmts.iter().any(stmt_has_break),
     }
 }
 

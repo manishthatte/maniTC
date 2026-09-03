@@ -71,6 +71,14 @@ impl Parser {
                     span,
                 }))
             }
+            // **F-4**: `region { ... }`. Parsed as a statement, never as an
+            // expression, because a region that could produce a value could
+            // hand out a pointer into the memory it is about to release.
+            TokenKind::Region => {
+                self.advance();
+                let block = self.parse_block()?;
+                Ok(Stmt::Region(block, span))
+            }
             // Local struct definition inside a function body
             TokenKind::Struct => {
                 let sdef = self.parse_struct_def(false)?;
