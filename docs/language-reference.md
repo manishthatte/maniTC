@@ -2462,11 +2462,14 @@ no unsafe ones, which is the direction to be wrong in.
 
 ### What is not reclaimed yet
 
-- **The collections and string routines allocate outside the region on LLVM.**
-  A `Vec` built inside a region is still there afterwards on that backend. On
-  T3 a string cell *is* region memory and is released. The residual is 114
-  `malloc` call sites across seven runtime files; routing them through the
-  region allocator is the next step and it is stated here rather than implied.
+- **The COLLECTIONS allocate outside the region.** A `Vec` built inside a
+  region is still there afterwards. That is not an oversight: the rules let a
+  handle leave a region, so anything reachable from one must not be
+  region-owned, and the collections' internals are exactly that. What the rules
+  *do* forbid from leaving is storage — which is why the **string** routines
+  are region-owned on both backends now (fourteen sites in `runtime/core.c`),
+  and why the collections are not. The residual is the collections, the
+  scheduler and synchronisation handles, and the GUI and network resources.
 - **A region does not reclaim while another task exists.** The allocator is
   shared, so with a second task alive an allocation of *its* may sit above the
   region's mark, and resetting would hand out memory that task still holds.

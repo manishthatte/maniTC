@@ -79,6 +79,17 @@ void* manit_alloc(size_t n) {
     return p;
 }
 
+/* `strdup` through the region allocator. The libc one calls `malloc`
+ * directly, so a string duplicated inside a region would outlive it. */
+static char* manit_strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* p = (char*)manit_alloc(n);
+    if (p) {
+        memcpy(p, s, n);
+    }
+    return p;
+}
+
 /* ======================== runtime faults ======================== */
 /* A7/A2/E1: a single reporting path for runtime faults, so the LLVM backend
  * fails the way the T3 emulator already does (a named TRAP and a defined exit
@@ -396,7 +407,7 @@ void io_println_float(double f) {
 }
 
 char* io_read_line(void) {
-    char* buf = malloc(1024);
+    char* buf = manit_alloc(1024);
     if (!buf) return NULL;
     if (!fgets(buf, 1024, stdin)) { buf[0] = '\0'; return buf; }
     size_t len = strlen(buf);
@@ -417,7 +428,7 @@ int64_t io_read_int(void) {
 /* ======================== fmt ======================== */
 
 char* fmt_int_to_str(int64_t n) {
-    char* buf = malloc(32);
+    char* buf = manit_alloc(32);
     if (!buf) return NULL;
     snprintf(buf, 32, "%ld", (long)n);
     return buf;
@@ -427,14 +438,14 @@ char* fmt_show_int(int64_t n) { return fmt_int_to_str(n); }
 
 char* fmt_show_float(double f) {
     /* 32 bytes was never enough: 1e300 alone needs 302. */
-    char* buf = malloc(MANIT_FLOAT_BUF);
+    char* buf = manit_alloc(MANIT_FLOAT_BUF);
     if (!buf) return NULL;
     manit_format_float(f, buf, MANIT_FLOAT_BUF);
     return buf;
 }
 
 char* fmt_show_bool(int b) {
-    return strdup(b ? "true" : "false");
+    return manit_strdup(b ? "true" : "false");
 }
 
 /* fmt_show_trit and fmt_show_bool3 were REMOVED on 20 August 2026. They now
@@ -455,7 +466,7 @@ char* fmt_show_bool(int b) {
 
 char* fmt_concat(const char* a, const char* b) {
     size_t la = strlen(a), lb = strlen(b);
-    char* r = malloc(la + lb + 1);
+    char* r = manit_alloc(la + lb + 1);
     if (!r) return NULL;
     memcpy(r, a, la);
     memcpy(r + la, b, lb + 1);
@@ -463,7 +474,7 @@ char* fmt_concat(const char* a, const char* b) {
 }
 
 char* fmt_format(const char* fmt_str, ...) {
-    char* out = malloc(4096);
+    char* out = manit_alloc(4096);
     if (!out) return NULL;
     const char* p = fmt_str;
     char* q = out;
@@ -490,9 +501,9 @@ char* fmt_format(const char* fmt_str, ...) {
 
 char* fmt_pad_zeros(const char* s, int64_t width) {
     size_t slen = strlen(s);
-    if ((int64_t)slen >= width) return strdup(s);
+    if ((int64_t)slen >= width) return manit_strdup(s);
     size_t pad = (size_t)(width - (int64_t)slen);
-    char* r = malloc(width + 1);
+    char* r = manit_alloc(width + 1);
     if (!r) return NULL;
     memset(r, '0', pad);
     memcpy(r + pad, s, slen + 1);
@@ -516,7 +527,7 @@ char* fmt_pad_zeros(const char* s, int64_t width) {
  * there is nothing left to drift. */
 
 char* fmt_to_upper(const char* s) {
-    char* r = strdup(s);
+    char* r = manit_strdup(s);
     if (!r) return NULL;
     for (char* p = r; *p; p++)
         if (*p >= 'a' && *p <= 'z') *p -= 32;
@@ -524,7 +535,7 @@ char* fmt_to_upper(const char* s) {
 }
 
 char* fmt_to_lower(const char* s) {
-    char* r = strdup(s);
+    char* r = manit_strdup(s);
     if (!r) return NULL;
     for (char* p = r; *p; p++)
         if (*p >= 'A' && *p <= 'Z') *p += 32;
@@ -622,11 +633,11 @@ int64_t str_find(const char* s, const char* sub) {
 
 char* str_replace(const char* s, const char* from, const char* to) {
     size_t fl = strlen(from), tl = strlen(to);
-    if (fl == 0) return strdup(s);
+    if (fl == 0) return manit_strdup(s);
     size_t count = 0;
     for (const char* p = strstr(s, from); p; p = strstr(p + fl, from)) count++;
     size_t sl = strlen(s);
-    char* r = malloc(sl - count * fl + count * tl + 1);
+    char* r = manit_alloc(sl - count * fl + count * tl + 1);
     if (!r) return NULL;
     const char* p = s;
     char* q = r;
@@ -658,7 +669,7 @@ char* manit_substr(const char* s, int64_t start, int64_t len) {
     if (start > sl) start = sl;
     if (len < 0) len = 0;
     if (start + len > sl) len = sl - start;
-    char* r = malloc((size_t)len + 1);
+    char* r = manit_alloc((size_t)len + 1);
     if (!r) return NULL;
     memcpy(r, s + start, (size_t)len);
     r[len] = '\0';
@@ -702,7 +713,7 @@ char* str_trim(const char* s) {
  * primitive — every char-dependent str:: function is written in ManiT on top
  * of this and str_char_at. */
 char* str_from_char(int64_t c) {
-    char* out = (char*)malloc(2);
+    char* out = (char*)manit_alloc(2);
     if (!out) return NULL;
     out[0] = (char)(c & 0xFF);
     out[1] = '\0';

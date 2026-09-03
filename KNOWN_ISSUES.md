@@ -201,13 +201,14 @@ quoted.
    > version runs under an 80 MB cap where the region-free version segfaults.
    > `docs/language-reference.md` §23 has the three rules that make it safe.
    >
-   > **What is still true is the list above.** A region reclaims what the
-   > COMPILER allocates — struct, tuple, array and enum cells, and on T3 the
-   > string cells too. The collections and the string routines call `malloc`
-   > directly on LLVM and are not reclaimed: 114 call sites across seven
-   > runtime files. Routing them through the region allocator is the next
-   > step, and the count is here rather than a vague "most" so that the next
-   > person knows what it costs. There is still no `free` a program can call,
+   > **What is still true is the collections half of the list above.** A region
+   > reclaims what the compiler allocates — struct, tuple, array and enum cells
+   > — and, since the same day, **the string routines on both backends**:
+   > fourteen sites in `runtime/core.c`. The collections, the scheduler and
+   > synchronisation handles and the GUI/network resources are NOT reclaimed,
+   > and that is a consequence of the rules rather than an oversight: a handle
+   > may leave a region, so anything reachable from one must not be
+   > region-owned. There is still no `free` a program can call,
    > and that remains deliberate: use-after-free in a language without
    > ownership is a runtime surprise, where a region's rules are compile-time
    > refusals.

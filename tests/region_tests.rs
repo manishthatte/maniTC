@@ -479,3 +479,64 @@ fn main() {
         assert_eq!(ll, "keep0=7\n");
     }
 }
+
+// ---------------------------------------------------------------------------
+// F-4b — the string routines allocate inside the region now
+// ---------------------------------------------------------------------------
+//
+// F-4 shipped reclaiming what the COMPILER allocates. The runtime's own
+// allocations were a stated residual of 114 `malloc` sites, and asking which of
+// them may be region-owned turned out to have an answer the language rules
+// already give: **the region rule lets handles escape, so anything reachable
+// from a handle must not be region-owned.** That excludes the collections'
+// internals, the sched/sync handles and the gui/net resources — and leaves the
+// string routines, whose results are `str`, which is storage and therefore
+// already forbidden from leaving a region.
+//
+// Fourteen sites in `runtime/core.c` now go through `manit_alloc`.
+
+#[test]
+fn f4b_string_work_inside_a_region_is_reclaimed() {
+    // 5,000 passes, each building two strings. Without the region the loop
+    // EXHAUSTS the heap and traps; with it, the same loop completes in under
+    // 200 words. Asserted on T3, where the
+    // number is exact and deterministic — the LLVM half is measured the only
+    // way a host allocator allows, by running the same loop under a memory
+    // cap, and that measurement is in report.txt rather than here because a
+    // `ulimit` in a test row is not portable.
+    let with_region = r#"
+use std::io;
+fn main() {
+    let mut i: int = 0;
+    let mut n: int = 0;
+    while i < 5000 {
+        region {
+            let s: str = str::concat("abcdefghij", "0123456789");
+            let t: str = str::to_upper(s);
+            n = n + str::len(t);
+        }
+        i = i + 1;
+    }
+    io::print("n="); io::println_int(n);
+}
+"#;
+    let without = with_region.replace("region {", "").replace("        }\n        i = i", "        i = i");
+    let (out_r, heap_r) = run_t3(with_region);
+    let (out_n, _heap_n) = run_t3(&without);
+
+    // The control does not merely allocate more — **it cannot run at all**.
+    // 5,000 passes of two strings exhausts the 2,536-word T3 heap long before
+    // the loop ends, which is P63's ceiling reached by exactly the route P77
+    // said no bound could survive: "a bump allocator with no free exhausts any
+    // bound". That is what a region is for, and it is a better demonstration
+    // than a smaller number would have been.
+    assert!(
+        out_n.contains("heap exhausted"),
+        "F-4b: the control should exhaust the heap, and printed {out_n:?}"
+    );
+    assert_eq!(out_r, "n=100000\n", "F-4b: with the region the same loop completes");
+    assert!(
+        heap_r < 200,
+        "F-4b: string cells should be released each pass; peaked at {heap_r}"
+    );
+}
