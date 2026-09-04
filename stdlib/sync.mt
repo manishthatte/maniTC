@@ -55,7 +55,14 @@ impl<T> Mutex<T> {
 }
 
 // Guard returned by Mutex::lock.  Dereference to access the inner value.
-struct MutexGuard<T> {
+//
+// B7 D-1: AFFINE. A guard that can be copied is a guard that can unlock twice,
+// and this struct has no fields, so nothing about its SHAPE said so -- the move
+// checker treated it as a Copy handle. Affinity is the declaration that says
+// otherwise. Method calls still do not consume their receiver (D-2 leaves that
+// open), so ordinary `g.get()` / `g.set(v)` usage is unaffected; what is now
+// refused is binding the guard twice.
+affine struct MutexGuard<T> {
     // native — holds lock until dropped
 }
 

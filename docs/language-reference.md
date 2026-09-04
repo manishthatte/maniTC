@@ -2381,6 +2381,48 @@ across match arms, and does not free anything — see
 `KNOWN_ISSUES` on the absence of a free/destroy API. A move is a compile-time
 restriction on reading a binding, not a runtime transfer of ownership.
 
+### `affine` — a type that may be used once
+
+**Added 4 September 2026.** A struct may be declared `affine`:
+
+```manit
+affine struct Token { }
+```
+
+**Affinity is opted into.** It is a property of the declaration, not of a
+category of type, because the set of types where a copy is observable is small
+and already known.
+
+**What it changes today is narrow, and stating it narrowly is the point.**
+Every struct is already a move type, so an affine binding is refused for a
+reason that predates the marker — `let a = t; let b = t;` is refused with or
+without it. What the marker adds is that **`spawn` may not capture an affine
+value**:
+
+```manit
+affine struct Token { }
+
+fn main() {
+    let t = mk();
+    spawn { let u = t; }   // error: `spawn` would capture `t`, whose type
+                           // `Token` is declared `affine`
+}
+```
+
+A capture is a *copy* (§11.2 of `docs/semantics.md`), and an affine value that
+has been copied exists twice — which is what affinity forbids. Without the
+marker the same capture is allowed, because a fieldless struct is not an
+aggregate.
+
+**What it is FOR is wider than what it does**, and the gap is recorded rather
+than glossed. `is_move_type` grants a Copy exemption *by name* to `AtomicTrit`,
+`Barrier`, `Semaphore`, `MutexGuard`, `Mutex`, `Channel` and `Task`, because a
+handle is a pointer to shared state. `MutexGuard` is declared `affine` in
+`stdlib/sync.mt` — a guard that can be copied is a guard that can unlock twice
+— and **it changes nothing today**, because `Mutex::lock()` returns `Unknown`:
+the guard's type never arrives, and affinity is keyed on a type name.
+`report.txt` P132.
+
 ### What the checker can see: generic bodies
 
 **Added 4 September 2026.** The checker runs over the program the analyzer

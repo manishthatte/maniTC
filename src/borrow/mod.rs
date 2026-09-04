@@ -247,6 +247,11 @@ struct MoveEnv {
     /// fields rather than on a name list, because a name list is a registry
     /// that would have to agree with another registry (permanent rule 5).
     aggregates: std::rc::Rc<HashSet<String>>,
+    /// B7 D-1: the structs declared `affine`. A value of one of these may
+    /// be used ONCE, whatever `is_move_type` would otherwise say about its
+    /// shape -- which is the whole point of an opt-in marker: it can make a
+    /// type affine that this checker was treating as Copy.
+    affine: std::rc::Rc<HashSet<String>>,
 }
 
 impl MoveEnv {
@@ -260,6 +265,7 @@ impl MoveEnv {
             array_is_vararg: false,
             consuming: Default::default(),
             aggregates: Default::default(),
+            affine: Default::default(),
             region_from: None,
         }
     }
@@ -268,10 +274,12 @@ impl MoveEnv {
         rules: MoveRules,
         consuming: std::rc::Rc<HashMap<String, Vec<bool>>>,
         aggregates: std::rc::Rc<HashSet<String>>,
+        affine: std::rc::Rc<HashSet<String>>,
     ) -> Self {
         let mut e = MoveEnv::new(rules);
         e.consuming = consuming;
         e.aggregates = aggregates;
+        e.affine = affine;
         e
     }
 
@@ -501,10 +509,22 @@ fn check_borrows_located(
             .map(|(name, _)| name.clone())
             .collect(),
     );
+    // B7 D-1: the structs a program declared `affine`. Read straight off the
+    // AST definitions `TypedProgram` already carries -- affinity is a property
+    // of the DECLARATION, so there is nothing for the analyzer to infer and no
+    // second registry to keep in agreement (permanent rule 5).
+    let affine: std::rc::Rc<HashSet<String>> = std::rc::Rc::new(
+        program
+            .structs
+            .iter()
+            .filter(|s| s.is_affine)
+            .map(|s| s.name.clone())
+            .collect(),
+    );
     let mut sites = MoveSites::default();
     for func in &program.functions {
         let (result, fn_sites, where_) =
-            check_fn_borrows(func, rules, consuming.clone(), aggregates.clone());
+            check_fn_borrows(func, rules, consuming.clone(), aggregates.clone(), affine.clone());
         sites.add(fn_sites);
         if let Err(e) = result {
             return ((Err(e), sites), where_);
@@ -528,7 +548,7 @@ pub fn survey_move_failures(
     let mut by_module = std::collections::BTreeMap::new();
     for func in &program.functions {
         let (result, _, where_) =
-            check_fn_borrows(func, rules, Default::default(), Default::default());
+            check_fn_borrows(func, rules, Default::default(), Default::default(), Default::default());
         if result.is_err() {
             let module = where_
                 .as_deref()
@@ -589,8 +609,9 @@ fn check_fn_borrows(
     rules: MoveRules,
     consuming: std::rc::Rc<HashMap<String, Vec<bool>>>,
     aggregates: std::rc::Rc<HashSet<String>>,
+    affine: std::rc::Rc<HashSet<String>>,
 ) -> (CompileResult<()>, MoveSites, Option<String>) {
-    let mut env = MoveEnv::with_consuming(rules, consuming, aggregates);
+    let mut env = MoveEnv::with_consuming(rules, consuming, aggregates, affine);
     let result = if let Some(ref body) = func.body {
         for param in &func.params {
             env.declare(&param.name);
@@ -630,7 +651,7 @@ fn consume_if_move(
     loop_from: LoopBoundary,
 ) -> CompileResult<()> {
     if let TypedExprKind::Ident(ref var_name) = expr.kind {
-        if is_move_type(&expr.ty) && !var_name.contains("::") {
+        if is_move_type_in(&expr.ty, &env.affine) && !var_name.contains("::") {
             let depth = env.depth_of(var_name);
             // Variables declared inside the loop body (depth >= boundary) are
             // fresh each iteration -- moving them is fine.
@@ -756,6 +777,10 @@ fn in_scope(rules: MoveRules, span: crate::ast::Span) -> bool {
 fn is_move_site(expr: &TypedExpr) -> bool {
     match expr.kind {
         TypedExprKind::Ident(ref name) => {
+            // The population predicate deliberately asks the SHAPE question
+            // only. An affine type is affine because it was declared so, not
+            // because of its shape, so counting it here would mix a measured
+            // population with a declared one.
             is_move_type(&expr.ty) && !name.contains("::")
         }
         _ => false,
@@ -1304,7 +1329,28 @@ fn check_expr_borrows(
             // the 34 `spawn` sites in both repositories and the corpus capture
             // an aggregate. Every one captures a channel, a `Mutex`/atomic
             // handle, or a scalar.
+            //
+            // **B7 D-4 part 3, reachable as of 4 September 2026.** The decision
+            // was taken on 3 September and could not be implemented, because it
+            // is a rule about affine values and no type could be declared
+            // affine. D-1's marker closes that, and this is the rule falling
+            // out of the one above rather than being a new mechanism: the same
+            // site asks the same question of the capture's type. A capture is a
+            // COPY, and an affine value copied exists twice, which is the thing
+            // affinity forbids.
             for (name, ty) in captures {
+                if let ManiType::Struct(n, _) | ManiType::Generic(n, _) = ty {
+                    if env.affine.contains(n) {
+                        return Err(err(expr.span, format!(
+                            "`spawn` would capture `{name}`, whose type `{n}` is \
+                            declared `affine`. docs/semantics.md §11.2 gives a spawned \
+                            task a COPY of the store, and an affine value that has been \
+                            copied exists twice — which is what `affine` forbids. Send \
+                            it over a channel instead, or read what you need before the \
+                            spawn"
+                        )));
+                    }
+                }
                 if env.reaches_through_a_pointer(ty) {
                     return Err(err(expr.span, format!(
                         "`spawn` would capture `{name}`, which is an aggregate. \
@@ -1371,6 +1417,23 @@ fn check_expr_borrows(
 /// Returns `true` if the type is "moved" when passed / assigned (non-Copy).
 /// Copy types (numeric scalars, bool, trit, char, void, function pointers)
 /// are never moved.
+/// B7 D-1: `is_move_type`, plus the types a program DECLARED affine.
+///
+/// The declared answer wins over the shape answer, and it can only ever make a
+/// type MORE restricted -- which is what makes the marker sound to add to a
+/// language that already has a move checker. `MutexGuard` is the motivating
+/// case and it is the exact inversion this needs: the shape rule below calls it
+/// Copy on purpose (a handle is a pointer to shared state), and a guard that
+/// can be copied is a guard that can unlock twice.
+fn is_move_type_in(ty: &ManiType, affine: &HashSet<String>) -> bool {
+    if let ManiType::Struct(name, _) | ManiType::Generic(name, _) = ty {
+        if affine.contains(name) {
+            return true;
+        }
+    }
+    is_move_type(ty)
+}
+
 fn is_move_type(ty: &ManiType) -> bool {
     match ty {
         // Copy types -- small scalars, function pointers.

@@ -261,6 +261,20 @@ impl Parser {
             f.is_const = true;
             return Ok(Item::FnDef(f));
         }
+        // B7 D-1: `affine struct` — a type that may be used once. Contextual on
+        // the FOLLOWING token, exactly as `const fn` is above, and measured
+        // before it was claimed: `affine` occurs 5 times across both
+        // repositories and 0 times in the 2,507-program corpus, and all five
+        // are the SAME comment line in `stdlib/sync.mt` — "Ownership follows
+        // maniT's affine type rules", written before there were any.
+        if matches!(self.peek(), TokenKind::Ident(k) if k == "affine")
+            && matches!(self.peek2(), TokenKind::Struct)
+        {
+            self.advance();
+            let mut sd = self.parse_struct_def(is_pub)?;
+            sd.is_affine = true;
+            return Ok(Item::StructDef(sd));
+        }
         match self.peek().clone() {
             TokenKind::Fn | TokenKind::Async => {
                 let f = self.parse_fn_def(is_pub)?;
@@ -440,7 +454,7 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(StructDef { name, generics, const_generics, fields, is_pub, span })
+        Ok(StructDef { name, generics, const_generics, fields, is_pub, is_affine: false, span })
     }
 
     // --- enum ---

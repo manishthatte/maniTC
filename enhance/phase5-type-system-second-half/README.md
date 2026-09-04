@@ -207,6 +207,30 @@ something, and the difference is the useful part.
   > so in as many words: the rule that an affine value may not be captured "is
   > unreachable until the first affine type exists".
   >
+  > **D-1's MARKER LANDED LATER THE SAME DAY, and B7 is STILL not finished —
+  > for a third reason, measured rather than guessed.** `affine struct` is
+  > parsed, recorded and enforced (`tests/affine_tests.rs`, 5 rows;
+  > `docs/language-reference.md` §22), and it closed **D-4 part 3** the moment
+  > it existed: `spawn` now refuses to capture an affine value, which was
+  > decided on 3 September and was unimplementable that day.
+  >
+  > **What the marker changes is narrower than the item wants, and the first
+  > version of its test suite claimed otherwise.** A row asserting that
+  > `affine` makes a fieldless struct move-checked PASSED ON THE UNMARKED
+  > CONTROL: `is_move_type` answers `true` for every `ManiType::Struct`, so
+  > every user struct was already affine at the binding level. The marker's
+  > whole observable content for a user type is the `spawn` rule. Corrected in
+  > the suite, which now asserts the PAIR.
+  >
+  > **And the motivating case cannot be reached at all — `report.txt` P132.**
+  > B7 §3 names the `MutexGuard` surface: "a guard that can be copied is a
+  > guard that can unlock twice." `MutexGuard` is now declared `affine` and it
+  > changes nothing, because `Mutex::lock()` returns `Unknown` — the guard's
+  > type never arrives, and affinity is keyed on a type name. P103's field
+  > check does not fire on it either, which is the independent evidence that
+  > the missing thing is the TYPE. So what B7 waits on now is not a decision
+  > and not a marker: it is typing the concurrency surface.
+  >
   > **This is the third status written for B7 in three days, so it is written
   > as a claim a reader can check**, not as a word. Five decisions taken;
   > `MutexGuard`, §11.12's await-twice trap and F-4 wait on the affine MARKER

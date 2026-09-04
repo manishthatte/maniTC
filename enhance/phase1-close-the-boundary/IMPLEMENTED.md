@@ -197,6 +197,20 @@ Both lists now name all 17.
   > clauses are a second registry that must agree with the first, which is
   > exactly the shape permanent rule 5 exists to refuse.
   >
+  > **AND IT INVALIDATES A `deny` LINT TODAY — measured 4 September 2026,
+  > `report.txt` P133.** The count above (2 of 416) is not only step 3's
+  > precondition; it is also the LEAF SET of A2's availability lattice, because
+  > `backend-unavailable-chain` propagates from `declared_fn_avail` and nothing
+  > else. So the strictest-defaulting lint in the compiler runs on every
+  > compilation with almost nothing to propagate. Measured end to end: a
+  > program calling the LLVM-only `fs::read` and compiled `--target t3` gets no
+  > error and no warning, produces a 72-byte image, and RUNS — printing nothing
+  > and exiting 0. Ninety builtins are in that position (P85).
+  >
+  > That joins the two numbers this document already had and nobody had put
+  > together, and it changes what step 3 IS: not a backlog to generate, but the
+  > repair of a check that is already shipping at `deny`.
+  >
   > Note also what step 3 costs the instruments: it edits `stdlib/*.mt`, and
   > each built binary embeds its own copy (`include_str!`), so **R5 is invalid
   > across the change unless its denominator is rebuilt per binary** — P70's

@@ -289,6 +289,14 @@ pub struct StructDef {
     pub const_generics: Vec<ConstParam>,
     pub fields: Vec<FieldDef>,
     pub is_pub: bool,
+    /// B7 D-1: `affine struct G { .. }` — a type that may be used once.
+    ///
+    /// Affinity is OPTED INTO, which is the answer `B7_AFFINE_TYPES.md` D-1
+    /// pushed toward and the reason it is a flag here rather than a rule about
+    /// some category of type: the set of types where a copy is observable is
+    /// small and already known, and every guess the move checker made about
+    /// the rest was invisible.
+    pub is_affine: bool,
     pub span: Span,
 }
 

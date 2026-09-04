@@ -53,6 +53,20 @@ These are the questions, with what this codebase pushes toward. They are
 **not** taken here — taking them is B7's first step, and taking them by
 accident is what §1 is warning against.
 
+> **D-1's MARKER IMPLEMENTED, 4 September 2026.** `affine struct G { .. }`,
+> contextual (measured: `affine` occurs 5 times in both repositories, 0 in the
+> corpus, and all five are the comment line in `stdlib/sync.mt` that promised
+> these rules before they existed). It closed D-4 part 3 immediately.
+>
+> **Its reach is smaller than this section assumes, and measuring is what said
+> so.** Every `ManiType::Struct` is ALREADY a move type, so the marker adds
+> nothing at the binding level for a user type; its whole observable content is
+> that `spawn` may not capture an affine value. The intended content — inverting
+> the Copy exemption `is_move_type` grants BY NAME to the seven handle types —
+> is blocked by **P132**: `Mutex::lock()` returns `Unknown`, so the guard's type
+> never arrives and no rule keyed on a type name can apply. What B7 waits on
+> now is typing the concurrency surface, not a decision and not syntax.
+
 **D-1. What is the default: affine or copy?** Rust's answer (move by default,
 `Copy` for scalars) is one option. This language has a different starting
 point: a `trit` is one machine word and `str` is bytes, so the set of types
