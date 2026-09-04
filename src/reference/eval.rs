@@ -146,7 +146,14 @@ fn trap<T>(msg: impl Into<String>) -> R<T> {
 }
 
 /// §7. `return` is not an expression, so it needs its own control-flow path.
-enum Flow { Normal, Return(Option<Val>) }
+///
+/// A3, 5 September 2026: `Value` is the third state -- a block that ended in a
+/// TAIL EXPRESSION. It is distinct from `Return` because the two do different
+/// things at a block boundary: a `return` unwinds through every enclosing
+/// block to the function, and a tail value stops at the block that produced it
+/// and becomes that block's value. Collapsing them would make
+/// `if c { 1 } else { 2 }` inside a loop return from the function.
+enum Flow { Normal, Return(Option<Val>), Value(Val) }
 
 
 // ---------------------------------------------------------------------------
@@ -696,9 +703,37 @@ where
         // an error, which is why `Unknown` survives it intact.
         match self.stmts(&f.body, &mut env) {
             Ok(Flow::Return(v)) => Ok(v),
+            // A3: a function body whose last statement is a tail expression
+            // returns that value, which is what makes `fn g() -> int { 7 }`
+            // mean what it looks like.
+            Ok(Flow::Value(v)) => Ok(Some(v)),
             Ok(Flow::Normal) => Ok(None),
             Err(Abort::Propagate(v)) => Ok(Some(v)),
             Err(other) => Err(other),
+        }
+    }
+
+    /// A3: run a block in its own scope and take its VALUE.
+    ///
+    /// A `return` inside one still returns from the enclosing FUNCTION rather
+    /// than from the block -- it becomes `Abort::Propagate`, the same path `?`
+    /// uses -- because §7 makes `return` a function-level construct and an
+    /// expression position does not change that.
+    fn block_value(
+        &mut self,
+        body: &'a [Stmt],
+        env: &mut Vec<HashMap<String, (Val, bool)>>,
+    ) -> R<Val> {
+        env.push(HashMap::new());
+        let flow = self.stmts_inner(body, env);
+        env.pop();
+        match flow? {
+            Flow::Value(v) => Ok(v),
+            Flow::Return(v) => Err(Abort::Propagate(v.unwrap_or(Val::Int(0)))),
+            Flow::Normal => Err(Abort::Trap(Trap(
+                "an `if` used as an expression must end in a value in every arm"
+                    .into(),
+            ))),
         }
     }
 
@@ -721,6 +756,13 @@ where
         for s in body {
             self.tick()?;
             match s {
+                // A3. A tail expression is the block's value. `stmts` is the
+                // only place that can know a statement was last, because the
+                // parser has already refused a tail anywhere else.
+                Stmt::Tail(e) => {
+                    let v = self.expr(e, env)?;
+                    return Ok(Flow::Value(v));
+                }
                 Stmt::Let { name, mutable, ty, init } => {
                     let v = self.expr(init, env)?;
                     let v = match ty { Some(t) => coerce_decl(v, t.clone()), None => v };
@@ -752,8 +794,15 @@ where
                     for (c, b) in arms {
                         let cv = self.expr(c, env)?;
                         if truthy(cv) {
-                            if let Flow::Return(v) = self.stmts(b, env)? {
-                                return Ok(Flow::Return(v));
+                            // A3: a Return unwinds to the function; a VALUE is
+                            // the enclosing block's value. Both leave here, so
+                            // `fn f(c: bool) -> int { if c { 1 } else { 2 } }`
+                            // means what it reads as -- the `if` IS the tail
+                            // expression. Only `Normal` falls through.
+                            match self.stmts(b, env)? {
+                                Flow::Return(v) => return Ok(Flow::Return(v)),
+                                Flow::Value(v) => return Ok(Flow::Value(v)),
+                                Flow::Normal => {}
                             }
                             taken = true;
                             break;
@@ -761,8 +810,10 @@ where
                     }
                     if !taken {
                         if let Some(b) = els {
-                            if let Flow::Return(v) = self.stmts(b, env)? {
-                                return Ok(Flow::Return(v));
+                            match self.stmts(b, env)? {
+                                Flow::Return(v) => return Ok(Flow::Return(v)),
+                                Flow::Value(v) => return Ok(Flow::Value(v)),
+                                Flow::Normal => {}
                             }
                         }
                     }
@@ -772,8 +823,10 @@ where
                     let v = self.expr(scrutinee, env)?;
                     let t = self.trit_operand(v, "tif")?;
                     let arm = if t > 0 { pos } else if t == 0 { zero } else { neg };
-                    if let Flow::Return(v) = self.stmts(arm, env)? {
-                        return Ok(Flow::Return(v));
+                    match self.stmts(arm, env)? {
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Value(v) => return Ok(Flow::Value(v)),
+                        Flow::Normal => {}
                     }
                 }
                 // §11.5 (SPAWN). The new task is appended at the back and
@@ -802,8 +855,12 @@ where
                     self.tick()?;
                     let c = self.expr(cond, env)?;
                     if !truthy(c) { break; }
-                    if let Flow::Return(v) = self.stmts(body, env)? {
-                        return Ok(Flow::Return(v));
+                    // A `while` body is NOT a value position: the loop runs
+                    // any number of times, so there is no one value it could
+                    // produce. A Return still unwinds to the function.
+                    match self.stmts(body, env)? {
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Value(_) | Flow::Normal => {}
                     }
                 },
                 Stmt::Return(e) => {
@@ -825,6 +882,22 @@ where
     ) -> R<Val> {
         self.tick()?;
         match e {
+            // A3: `if` in expression position. Each arm is a block, and the
+            // block's value is its tail expression -- so this is the same
+            // machinery as a function body, scoped to one block.
+            //
+            // §5's left-to-right evaluation order applies to the conditions:
+            // they are tested in source order and testing STOPS at the first
+            // true one, so a later condition with a trap in it is not reached.
+            Expr::IfExpr { arms, els } => {
+                for (cond, body) in arms {
+                    let c = self.expr(cond, env)?;
+                    if truthy(c) {
+                        return self.block_value(body, env);
+                    }
+                }
+                self.block_value(els, env)
+            }
             Expr::Int(n) => self.checked(*n as i128, "literal"),
             Expr::TritLit(t) => Ok(Val::Trit(*t)),
             Expr::BoolLit(b) => Ok(Val::Bool(*b)),
@@ -924,6 +997,10 @@ where
                 env.pop();
                 match flow? {
                     Flow::Return(v) => Err(Abort::Propagate(v.unwrap_or(Val::Int(0)))),
+                    // A3: an arm ending in a tail expression is that arm's
+                    // VALUE, which is what makes `match` produce one. Before
+                    // tail expressions existed every arm answered 0 here.
+                    Flow::Value(v) => Ok(v),
                     Flow::Normal => Ok(Val::Int(0)),
                 }
             }

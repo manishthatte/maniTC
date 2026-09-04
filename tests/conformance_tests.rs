@@ -181,6 +181,79 @@ fn conform_lang(name: &str, src: &str, lang: reference::Lang) {
 }
 
 // ---------------------------------------------------------------------------
+// §7.6 tail expressions  (A3, 5 September 2026)
+// ---------------------------------------------------------------------------
+
+/// A block's last expression, written without a `;`, is the block's value.
+///
+/// **The reference was BEHIND the language here, which is the one direction
+/// §1.2 does not let stand.** `docs/semantics.md` §1 listed this construct as
+/// "out of scope but wanted next" while the compiler already accepted it —
+/// measured on the release binary before this row was written, printing
+/// `1 2 7`. So conformance programs were being written with explicit `return`
+/// to avoid a limitation of the third account, not of ManiT.
+#[test]
+fn s76_a_blocks_last_expression_is_its_value() {
+    conform("s76_tail", r#"
+use std::io;
+fn g() -> int { 7 }
+fn f(c: bool) -> int { if c { 1 } else { 2 } }
+fn main() {
+    io::print_int(g()); io::print(" ");
+    io::print_int(f(true)); io::print(" ");
+    io::println_int(f(false));
+}
+"#);
+}
+
+/// `if` in expression position, including as a `let` initialiser and nested.
+#[test]
+fn s76_if_is_an_expression() {
+    conform("s76_ifexpr", r#"
+use std::io;
+fn abs(n: int) -> int { let d = if n > 0 { n } else { 0 - n }; d }
+fn sgn(n: int) -> int { if n > 0 { 1 } elif n < 0 { 0 - 1 } else { 0 } }
+fn main() {
+    io::print_int(abs(-5)); io::print(" ");
+    io::print_int(abs(5)); io::print(" ");
+    io::print_int(sgn(-9)); io::print(" ");
+    io::print_int(sgn(0)); io::print(" ");
+    io::println_int(sgn(9));
+}
+"#);
+}
+
+/// A tail expression and an explicit `return` in the same function, and a
+/// `return` from INSIDE an `if` used as an expression — which must return from
+/// the FUNCTION, not produce the block's value (§7).
+#[test]
+fn s76_return_inside_an_if_expression_leaves_the_function() {
+    conform("s76_tail_return", r#"
+use std::io;
+fn f(n: int) -> int {
+    let v = if n > 100 { return 0 - 1; } else { n * 2 };
+    v + 1
+}
+fn main() {
+    io::print_int(f(3)); io::print(" ");
+    io::println_int(f(200));
+}
+"#);
+}
+
+/// Both language versions, because a syntax change must leave V1 alone as
+/// surely as V2 (R2).
+#[test]
+fn s76_tail_expressions_are_the_same_under_v2() {
+    conform_v2("s76_tail_v2", r#"
+use std::io;
+fn g() -> int { 7 }
+fn f(c: bool) -> int { if c { 1 } else { 2 } }
+fn main() { io::print_int(g()); io::print(" "); io::println_int(f(true)); }
+"#);
+}
+
+// ---------------------------------------------------------------------------
 // §6.1 arithmetic
 // ---------------------------------------------------------------------------
 

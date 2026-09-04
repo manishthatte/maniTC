@@ -117,7 +117,18 @@ impl P {
         let mut out = Vec::new();
         while !self.eat(&Tok::RBrace) {
             if *self.peek() == Tok::Eof { return Err("unterminated block".into()); }
-            out.push(self.stmt()?);
+            let st = self.stmt()?;
+            // A3: a tail expression is the block's VALUE, so it must be last.
+            // Refused here rather than left to the evaluator, because a
+            // mis-placed tail is a syntax error in the language and this
+            // interpreter's contract is that an out-of-core program fails to
+            // parse rather than being silently mis-evaluated.
+            let is_tail = matches!(st, Stmt::Tail(_));
+            out.push(st);
+            if is_tail && *self.peek() != Tok::RBrace {
+                return Err("a tail expression must be the last thing in its block \
+                            (add a `;` to make it a statement)".into());
+            }
         }
         Ok(out)
     }
@@ -209,8 +220,15 @@ impl P {
             }
             _ => {
                 let e = self.expr()?;
-                self.expect(&Tok::Semi)?;
-                Ok(Stmt::Expr(e))
+                // A3: a tail expression is an expression NOT followed by `;`.
+                // The only place that is legal is immediately before the
+                // block's `}`, and `block` enforces that -- here we only
+                // record which of the two we saw.
+                if self.eat(&Tok::Semi) {
+                    Ok(Stmt::Expr(e))
+                } else {
+                    Ok(Stmt::Tail(e))
+                }
             }
         }
     }
@@ -376,6 +394,32 @@ impl P {
     }
 
     fn primary(&mut self) -> R<Expr> {
+        // A3: `if` in expression position. Handled before `bump()` so the
+        // token is still there for the shared arm/else parsing below.
+        if *self.peek() == Tok::If {
+            self.bump();
+            let mut arms = Vec::new();
+            let c = self.expr()?;
+            let b = self.block()?;
+            arms.push((c, b));
+            let els = loop {
+                if self.eat(&Tok::Elif) {
+                    let c = self.expr()?;
+                    let b = self.block()?;
+                    arms.push((c, b));
+                } else if self.eat(&Tok::Else) {
+                    break self.block()?;
+                } else {
+                    // An `if` used for its VALUE must have an `else`: with no
+                    // else arm there is no value to produce when the condition
+                    // is false. `Stmt::If` has no such requirement, which is
+                    // why the two are separate nodes.
+                    return Err("an `if` used as an expression must have an \
+                                `else` arm".into());
+                }
+            };
+            return Ok(Expr::IfExpr { arms, els });
+        }
         match self.bump() {
             Tok::Int(v) => Ok(Expr::Int(v)),
             Tok::Str(s) => Ok(Expr::Str(s)),

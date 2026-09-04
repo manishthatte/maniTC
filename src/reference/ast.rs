@@ -51,6 +51,13 @@ pub enum Expr {
     Try(Box<Expr>),
     /// `match e { Ok(v) => .., Unknown(m) => .., Err(e) => .. }`.
     Match(Box<Expr>, Vec<MatchArm>),
+    /// A3: `if` in EXPRESSION position — `let x = if c { 1 } else { 2 };`.
+    ///
+    /// The same shape as `Stmt::If`, and deliberately a separate node: an `if`
+    /// used for its value must have an `else` (there is no value otherwise),
+    /// and every arm must end in a tail expression. `Stmt::If` requires
+    /// neither, so one node could not carry both rules.
+    IfExpr { arms: Vec<(Expr, Vec<Stmt>)>, els: Vec<Stmt> },
 }
 
 /// One arm of a `match` on a `Result`. The core specifies no other scrutinee
@@ -81,6 +88,19 @@ pub enum Stmt {
     Spawn(Vec<Stmt>),
     /// §11.5 (YIELD).
     Yield,
+    /// A3, 5 September 2026: a block's TAIL EXPRESSION — the last expression
+    /// in a block, written without a `;`, which is the block's value.
+    ///
+    /// `docs/semantics.md` §1 listed this as "out of scope but wanted next",
+    /// and it is the one construct on that list that the COMPILER already
+    /// accepts (`fn f(c: bool) -> int { if c { 1 } else { 2 } }` prints 1 and
+    /// 2 today). So the reference was behind the language rather than ahead of
+    /// it, which is the one direction §1.2 does not allow to stand silently.
+    ///
+    /// A distinct variant rather than a flag on `Expr`, because the difference
+    /// between `e;` and `e` is a property of the STATEMENT's position in its
+    /// block, not of the expression.
+    Tail(Expr),
 }
 
 #[derive(Debug, Clone)]

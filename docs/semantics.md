@@ -73,11 +73,16 @@ the heap. Concurrency was on this list until §11 was written; `Task<T>`,
 `await`, `Mutex`, `Barrier`, `Semaphore` and bounded channels remain on it, and
 §11.1 says why each.
 
-**Out of scope but wanted next: tail expressions.** `fn f() -> int { if c { 1 }
-else { 2 } }` — a block whose last expression is its value, and `if` used as an
-expression — is idiomatic ManiT and the reference interpreter does not yet
-parse it, so conformance programs are written with explicit `return`. That is a
-limitation of the reference, not of the language, and it is the next increment. These are not un-specifiable; they are simply not
+**Tail expressions are IN SCOPE as of 5 September 2026 (§7.6).** This
+paragraph used to read "out of scope but wanted next", and the reason it was
+promoted is worth keeping: it was the one entry on that list where **the
+reference was behind the LANGUAGE**, not ahead of it. The compiler already
+accepted `fn f(c: bool) -> int { if c { 1 } else { 2 } }` and printed `1` and
+`2`; the reference could not parse it, so conformance programs were written
+with explicit `return` to work around a limitation of the third account. §1.2
+requires a section that is ahead of the implementations to say so in its own
+first line — a section that is BEHIND them is the case §1.2 does not cover, and
+it is worse, because nothing announces it. These are not un-specifiable; they are simply not
 specified *yet*. §11 of the recommendations is explicit: specify the core and
 grow it, rather than attempting the language in one pass.
 
@@ -476,8 +481,38 @@ outcomes, and allowing two arms would let one silently vanish.
 `while` re-evaluates its condition before each iteration.
 
 `return` ends the enclosing call with the given value, or with no value from a
-`-> void` function. Falling off the end of a non-void function is rejected
-before evaluation.
+`-> void` function.
+
+### 7.6 Tail expressions
+
+**Added 5 September 2026.** A block's last statement may be an expression
+written **without a trailing `;`**. That expression is the block's **value**.
+
+```
+fn g() -> int { 7 }
+fn f(c: bool) -> int { if c { 1 } else { 2 } }
+```
+
+Four rules, and each is checked by a conformance row:
+
+1. **A tail expression must be last in its block.** An expression not followed
+   by `;` anywhere else is a syntax error, not a statement.
+2. **A function whose body ends in a tail expression returns that value.** This
+   is why "falling off the end of a non-void function is rejected" no longer
+   describes such a function: it does not fall off the end, it ends in a value.
+3. **`if` is an expression when its arms end in tail expressions**, and then
+   every arm must — including an `else`, because an `if` with no `else` has no
+   value when the condition is false. `tif` behaves the same way, and it
+   already requires all three arms for a separate reason (above).
+4. **A `while` body is not a value position.** A loop runs any number of times,
+   so there is no one value for it to produce; a tail expression inside a loop
+   body is evaluated and discarded. **`return` is unaffected everywhere**: it
+   ends the enclosing CALL, so a `return` inside an `if` used as an expression
+   leaves the function rather than producing the block's value.
+
+`return` and a tail value are therefore different control flow, not two
+spellings of one thing, and the reference interpreter models them as two
+distinct states for exactly that reason.
 
 ## 8. Traps
 
