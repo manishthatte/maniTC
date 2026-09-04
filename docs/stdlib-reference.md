@@ -515,7 +515,7 @@ The 27-trit floating-point format, implemented in ManiT over `word`.
 | Function | Signature | Body | Works | Description |
 |---|---|---|---|---|
 | `t27f::abs` | `(x: T27F) -> T27F` | ManiT | not probed | Absolute value. |
-| `t27f::add` | `(a: T27F, b: T27F) -> T27F` | ManiT | not probed | Add two T27F values. Aligns exponents, adds mantissas, normalizes result. |
+| `t27f::add` | `(a: T27F, b: T27F) -> T27F` | ManiT | not probed | — |
 | `t27f::compare` | `(a: T27F, b: T27F) -> trit` | ManiT | not probed | Compare two T27F values. Returns: +1 if a > b, 0 if a == b, -1 if a < b. |
 | `t27f::exponent` | `(x: T27F) -> t9` | ManiT | not probed | Extract the exponent (low 9 trits) from a T27F. |
 | `t27f::float_to_int` | `(f: float) -> word` | ManiT | yes | Convert float to integer (truncate toward zero). |
@@ -524,8 +524,9 @@ The 27-trit floating-point format, implemented in ManiT over `word`.
 | `t27f::int_to_float` | `(n: word) -> float` | ManiT | yes | Convert integer to float. |
 | `t27f::is_zero` | `(x: T27F) -> T3Bool` | ManiT | not probed | Check if a T27F is zero. |
 | `t27f::mantissa` | `(x: T27F) -> word` | ManiT | not probed | Extract the mantissa (high 18 trits) from a T27F. |
-| `t27f::mul` | `(a: T27F, b: T27F) -> T27F` | ManiT | not probed | Multiply two T27F values. Mantissas multiply, exponents add. |
+| `t27f::mul` | `(a: T27F, b: T27F) -> T27F` | ManiT | not probed | **This costs precision and the cost is stated rather than hidden**: a product carries about 13 trits where the format's mantissa is 18, so `mul` is less precise than `add`. Full-width multiplication needs a double-word intermediate the language does not have on T3. |
 | `t27f::neg` | `(x: T27F) -> T27F` | ManiT | not probed | Negate a T27F.  Exact: just negate the mantissa (trit-flip). |
+| `t27f::norm_parts` | `(e: word, m: word) -> T27F` | ManiT | yes | The repair is to normalise the UNPACKED pair, so packing is the last step and the clamp can only ever see a value that already fits. |
 | `t27f::normalize` | `(x: T27F) -> T27F` | ManiT | not probed | Normalize: shift mantissa so it uses maximum precision. In balanced ternary, normalization means the most significant trit of the mantissa is nonzero (unless the value is zero). |
 | `t27f::pow3` | `(n: t9) -> word` | ManiT | yes | Integer power of 3. |
 | `t27f::pow3_float` | `(n: t9) -> float` | ManiT | yes | Float power of 3 (handles negative exponents). |
@@ -643,7 +644,7 @@ Assertions. Pure ManiT over `io::println` and `env::exit`, so it needs nothing f
 
 ## Census
 
-**330 declarations** across 13 modules: **230 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **63 do not work on at least one backend**.
+**331 declarations** across 13 modules: **231 call cleanly on both backends**; 37 were not probed (their parameters are types this census cannot synthesise — a `Vec`, a `Map`, a struct); and **63 do not work on at least one backend**.
 
 The *Works* column records whether a one-line program calling the function compiles and links on each backend. It is a test of existence, not of correctness: a function marked `yes` has a body on both sides, which is exactly what `fmt::`'s twenty-five documented-but-undefined entries did not. A `not probed` row is an admission, not a pass.
 

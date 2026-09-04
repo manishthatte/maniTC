@@ -42,8 +42,12 @@ pub(crate) fn binop_to_ir(op: &BinOpKind, ty: &ManiType, lang: LangVersion) -> I
     // machine word, so checking it would remove the escape hatch. `tryte` and
     // `t9` are narrower than their IR type too, but N5 is about `int`, and
     // widening the change to them would be a separate decision made silently.
+    // C3: `TN(27)` and not `TN(_)`. The guard is about the 27-trit WORD
+    // specifically — `AddT27` emits N5's overflow check against that width —
+    // so a `t<18>` or a `t54` must not acquire it by looking similar. Matching
+    // the width is the whole reason the width is a parameter.
     let checked_word = lang.int_is_27_trits()
-        && matches!(ty, ManiType::Int | ManiType::T27);
+        && matches!(ty, ManiType::Int | ManiType::TN(27));
     match op {
         BinOpKind::Add => if checked_word { IRBinOp::AddT27 } else { IRBinOp::Add },
         BinOpKind::Sub => if checked_word { IRBinOp::SubT27 } else { IRBinOp::Sub },

@@ -188,7 +188,7 @@ impl Parser {
     }
 
     // additive: +, -
-    fn parse_add_expr(&mut self) -> CompileResult<Expr> {
+    pub(super) fn parse_add_expr(&mut self) -> CompileResult<Expr> {
         let mut lhs = self.parse_mul_expr()?;
         loop {
             let op = match self.peek() {
@@ -414,7 +414,33 @@ impl Parser {
             // Float literal
             TokenKind::Float(f) => {
                 self.advance();
+                // C5: `3.5t27f` is a ternary floating-point literal.
+                //
+                // Desugared to `t27f::from_float(3.5)` rather than converted
+                // here, and that is the whole design: the conversion is
+                // `stdlib/t27f.mt`'s and stays there. Computing the raw word
+                // in the compiler would be a SECOND implementation of the
+                // format that has to agree with the first — permanent rule 5's
+                // two-registries mistake, in the one place where disagreement
+                // would be a wrong number rather than a broken build.
+                //
+                // The qualified call is also what pulls the module in:
+                // `stdlib_expand` follows references, so a program that writes
+                // a literal needs no `use`.
+                //
+                // ADJACENCY IS REQUIRED. `3.5 t27f` is two tokens and stays
+                // two tokens; only `3.5t27f` is a literal. Without the column
+                // check a stray identifier after any float would be swallowed.
                 Ok(Expr::Lit(Lit::Float(f), span))
+            }
+            // C5: `3.5t27f` — one token from the lexer, desugared here.
+            TokenKind::T27fLit(f) => {
+                self.advance();
+                Ok(Expr::Call(
+                    Box::new(Expr::Ident("t27f::from_float".to_string(), span)),
+                    vec![Expr::Lit(Lit::Float(f), span)],
+                    span,
+                ))
             }
             // String literal
             TokenKind::Str(s) => {

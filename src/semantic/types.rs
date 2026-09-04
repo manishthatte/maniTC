@@ -10,11 +10,38 @@ pub enum ManiType {
     Float,
     Bool,
     Bool3,
+    /// A single trit — and NOT `TN(1)`, which is why it is its own variant.
+    ///
+    /// **C3 measured the difference rather than assuming it**: on the compiler
+    /// before `t<N>` existed, `a tand b` type-checks for `trit` and is refused
+    /// for `tryte`, `t9`, `t27` and `t54` with "invalid operands: `tand` is a
+    /// three-valued logic operator". So `trit` carries the Kleene role and the
+    /// other four do not, and C3's own premise — "the current five are not a
+    /// design, they are five points sampled from a continuum" — is wrong about
+    /// exactly one of the five.
+    ///
+    /// That is not an irregularity to be tidied away. A width-1 balanced
+    /// ternary number has the values {-, 0, +}, which ARE {False, Unknown,
+    /// True}; the logic role is what width one MEANS here (permanent rule 2 —
+    /// a trit is not a small int). So the surface spelling `t<1>` resolves to
+    /// this variant exactly, and the family is regular at the level below.
     Trit,
-    Tryte,
-    T9,
-    T27,
-    T54,     // 54-trit balanced ternary integer (I64-bounded); `trint` is a source alias
+    /// An N-trit balanced ternary integer: C3's one family.
+    ///
+    /// **This variant REPLACED `Tryte`/`T9`/`T27`/`T54` rather than joining
+    /// them, and the choice was forced by this repository's own record.**
+    /// Adding a sixth variant beside the four would have left every
+    /// `matches!(t, Tryte | T9 | T27 | T54)` valid and no longer true, with
+    /// the compiler unable to say so — P68's and P72's hazard, which cost this
+    /// campaign a silent defect each time. Deleting the four instead makes
+    /// `rustc` name all 52 sites, and the sites it names are the complete set.
+    ///
+    /// The four names survive as SURFACE aliases (`tryte` = `t<6>`, `t9`,
+    /// `t27`, `t54`), because `trit` occurs 2,051 times across both
+    /// repositories against 381 for the five named widths combined: a family
+    /// that replaced the spellings would be 2,400 mechanical edits for no
+    /// gain. The number chose the design before any of it was written.
+    TN(u32),
     Tfloat,  // 27-trit balanced ternary floating-point
     Str,
     Char,
@@ -46,12 +73,12 @@ pub enum ManiType {
 
 impl ManiType {
     pub fn is_ternary(&self) -> bool {
-        matches!(self, ManiType::Trit | ManiType::Tryte | ManiType::T9 | ManiType::T27 | ManiType::T54 | ManiType::Tfloat | ManiType::Bool3)
+        matches!(self, ManiType::Trit | ManiType::TN(_) | ManiType::Tfloat | ManiType::Bool3)
     }
 
     pub fn is_numeric(&self) -> bool {
-        matches!(self, ManiType::Int | ManiType::Float | ManiType::Trit | ManiType::Tryte
-            | ManiType::T9 | ManiType::T27 | ManiType::T54 | ManiType::Tfloat)
+        matches!(self, ManiType::Int | ManiType::Float | ManiType::Trit
+            | ManiType::TN(_) | ManiType::Tfloat)
     }
 
     pub fn is_comparable(&self) -> bool {
@@ -91,17 +118,31 @@ impl ManiType {
             ManiType::Bool => "bool".to_string(),
             ManiType::Bool3 => "bool3".to_string(),
             ManiType::Trit => "trit".to_string(),
-            ManiType::Tryte => "tryte".to_string(),
-            ManiType::T9 => "t9".to_string(),
-            ManiType::T27 => "t27".to_string(),
-            ManiType::T54 => "t54".to_string(),
+            // C3: a width that has a familiar name is DISPLAYED under it, so
+            // every diagnostic that named `tryte`, `t9`, `t27` or `t54` before
+            // `t<N>` existed still names it. Only a width with no name of its
+            // own renders in the new spelling, and then it renders as source
+            // the reader can paste back.
+            ManiType::TN(w) => ternary_width_name(*w),
             // Note: `trint` keyword is an alias for `t54` at the source level
             ManiType::Tfloat => "tfloat".to_string(),
             ManiType::Str => "str".to_string(),
             ManiType::Char => "char".to_string(),
             ManiType::Void => "void".to_string(),
             ManiType::Unknown => "<unknown>".to_string(),
-            ManiType::Array(t, n) => format!("[{}; {:?}]", t.display(), n),
+            // P130: the SURFACE spelling, not Rust's `Option`.
+            //
+            // This rendered `[int; Some(2)]` and `[int; None]` — `{:?}` on an
+            // `Option<usize>` — in a function whose entire purpose is
+            // user-facing output and which P123 had just finished routing two
+            // other messages TO. Reachable from any array type mismatch:
+            // "argument 1 to 'f': expected `[int; Some(2)]`, found `int`".
+            //
+            // `display` is required to round-trip with the surface syntax (see
+            // `ternary_type_from_name`), and `[int; 2]` / `[int]` are what a
+            // reader can paste back.
+            ManiType::Array(t, Some(n)) => format!("[{}; {}]", t.display(), n),
+            ManiType::Array(t, None) => format!("[{}]", t.display()),
             ManiType::Tuple(ts) => format!("({})", ts.iter().map(|t| t.display()).collect::<Vec<_>>().join(", ")),
             ManiType::Struct(n, args) if args.is_empty() => n.clone(),
             ManiType::Struct(n, args) => format!(
@@ -114,6 +155,77 @@ impl ManiType {
             ManiType::Generic(n, args) => format!("{}<{}>", n, args.iter().map(|t| t.display()).collect::<Vec<_>>().join(", ")),
         }
     }
+}
+
+/// The widths that have a name of their own, and the name each one has.
+///
+/// **C3's one authority for the alias table, in the direction both callers
+/// need.** `ternary_width_name` renders a width for a diagnostic and
+/// `ternary_name_width` resolves a source spelling, and they read the same
+/// array — so a width cannot acquire a name in one direction and lose it in
+/// the other. Permanent rule 5 says a registry that must agree with another
+/// registry gets a test; one registry read twice needs no test, which is
+/// better.
+///
+/// **`trit` is deliberately absent.** It is not a `TN` at all (see
+/// `ManiType::Trit`), and listing it here would be the second spelling of one
+/// type that P68 paid for.
+pub const NAMED_TERNARY_WIDTHS: &[(u32, &str)] =
+    &[(6, "tryte"), (9, "t9"), (27, "t27"), (54, "t54")];
+
+/// The widest `t<N>` the language accepts, and the reason is arithmetic
+/// rather than taste: a `t54` is already bounded by the machine word (its true
+/// range, ±(3^54−1)/2 ≈ 2.9×10^25, exceeds an i64), so 54 is the last width at
+/// which the existing five say anything at all. Past it a literal could not be
+/// written, compared or printed, and accepting the type would promise a range
+/// no backend can hold.
+pub const MAX_TERNARY_WIDTH: u32 = 54;
+
+/// How a `TN` width is spelled in a diagnostic.
+pub fn ternary_width_name(w: u32) -> String {
+    for (nw, name) in NAMED_TERNARY_WIDTHS {
+        if *nw == w {
+            return (*name).to_string();
+        }
+    }
+    format!("t<{}>", w)
+}
+
+/// Resolve a ternary type SPELLING to its type, in every surface form.
+///
+/// **This round-trips with `ManiType::display` by construction**, which is the
+/// property worth having: `display` renders an unnamed width as `t<18>`, so a
+/// reader who pastes a diagnostic back into their source gets the type the
+/// diagnostic was about. A rendering that could not be read back would be a
+/// second spelling nobody can use.
+///
+/// `word` and `trint` are NOT here: they are patent and legacy aliases carried
+/// by the resolver that owns every other alias too, and duplicating them would
+/// be the two-registries mistake this file exists to avoid.
+pub fn ternary_type_from_name(name: &str) -> Option<ManiType> {
+    if name == "trit" {
+        return Some(ManiType::Trit);
+    }
+    if let Some(w) = ternary_name_width(name) {
+        return Some(ManiType::TN(w));
+    }
+    let inner = name.strip_prefix("t<")?.strip_suffix('>')?;
+    let w: u32 = inner.parse().ok()?;
+    if w == 1 {
+        return Some(ManiType::Trit);
+    }
+    if w == 0 || w > MAX_TERNARY_WIDTH {
+        return None;
+    }
+    Some(ManiType::TN(w))
+}
+
+/// The width a named ternary type stands for, or `None` if the name is not one.
+pub fn ternary_name_width(name: &str) -> Option<u32> {
+    NAMED_TERNARY_WIDTHS
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(w, _)| *w)
 }
 
 /// Whether a value of type `b` may be used where type `a` is expected

@@ -120,6 +120,7 @@ significant trit comes first.
 | `t9` | 9 | −9841 … +9841 |
 | `t27` | 27 | −3,812,798,742,493 … +3,812,798,742,493 |
 | `t54` | 54 | −9,223,372,036,854,775,807 … +9,223,372,036,854,775,807 |
+| `t<N>` | N | −(3ᴺ−1)/2 … +(3ᴺ−1)/2, for N from 1 to 54 |
 | `bool3` | — | `true` (+1), `unknown` (0), `false` (−1) |
 
 > **Correction, 3 September 2026 (report.txt P122).** Two of these rows were
@@ -503,8 +504,9 @@ let c = tnotw x;      //  -5
 let d = 121 tandw 40; //  40
 ```
 
-**These take words, not trits.** Operands must be integer types (`int`,
-`tryte`, `t9`, `t27`, `t54`); `float`, `tfloat`, `bool` and `bool3` are
+**These take words, not trits.** Operands must be integer types (`int`, or any
+ternary width — `tryte`, `t9`, `t27`, `t54` and every other `t<N>`); `float`,
+`tfloat`, `bool` and `bool3` are
 rejected. A `bool` is one three-valued answer, so asking for 27 lanes of it is
 far more likely to be a typo for `tand` than an intention:
 
@@ -1348,12 +1350,17 @@ the reason is lexical rather than aesthetic: a letter can begin an operand, so
 the run `0t+lo@???` would end at `0t` and fail to lex. `@` cannot begin an
 operand, so the postfix form is unambiguous.
 
-A capture is an `int` whatever its width. A run may be 1 to 39 trits and only
-three widths have names (`tryte`, `t9`, `t27`), so typing a capture by its
-width wants the width-polymorphic `t<N>` of Phase 5's C3, which does not exist
-yet. Thirty-nine is the ceiling because the compilation needs 3^width as a
+A capture is an `int` whatever its width. Thirty-nine is the ceiling because the compilation needs 3^width as a
 machine word, and 3^40 is not one — so a trit pattern cannot span the whole of
 a `t54`.
+
+> **Updated 3 September 2026 (C3).** This paragraph read: "only three widths
+> have names (`tryte`, `t9`, `t27`), so typing a capture by its width wants the
+> width-polymorphic `t<N>` of Phase 5's C3, **which does not exist yet**." It
+> exists now (§24), so a capture of any run length has a type to be given: a
+> 4-trit run is a `t<4>`. The capture itself still *binds* `int` — narrowing it
+> to the run's own width is a separate change with its own measurement owed to
+> it, and this notice records the gap rather than closing it quietly.
 
 #### A three-way match is a three-way branch
 
@@ -1562,8 +1569,8 @@ and enums are not covered by that rule — write the `impl`.
 
 **`Ord` and `PartialOrd` are decided differently, and a user `impl` does not
 enter into it.** They are satisfied by exactly the types `<` and `>` accept:
-`int`, `float`, `trit`, `tryte`, `t9`, `t27`, `t54`, `tfloat`, `bool`, `bool3`
-and `char`. Not `str`, not an array, a tuple, a `Vec<T>`, a `Result<T, E>`, a
+`int`, `float`, `trit`, every ternary width `t<N>` (`tryte`, `t9`, `t27` and
+`t54` among them), `tfloat`, `bool`, `bool3` and `char`. Not `str`, not an array, a tuple, a `Vec<T>`, a `Result<T, E>`, a
 struct or an enum. Writing `impl Ord for str` does not change that and is not
 a workaround: maniT's comparison operators are built into the compiler and
 never dispatch to a user `cmp`, so the `impl` would satisfy a bound whose
@@ -1864,7 +1871,7 @@ functions in the same file and to other files if `pub`.
 
 | Operation | Allowed types |
 |-----------|--------------|
-| `+` `-` `*` `/` `%` | `int`, `float`, `trit`, `tryte`, `t9`, `t27`, `t54` |
+| `+` `-` `*` `/` `%` | `int`, `float`, `trit`, any `t<N>` (`tryte`, `t9`, `t27`, `t54`) |
 | `tand` `tor` `tnot` `txor` | `trit`, `bool3` |
 | `&&` `\|\|` `!` | `bool` |
 | `&` `\|` `^` `<<` `>>` | `int` |
@@ -1973,10 +1980,14 @@ lint deny(shadowing, unknown-type);
 | `division-semantics`  | allow | a `/` or `%` whose meaning depends on the language version |
 | `unsatisfied-bound`   | deny  | a generic argument that fails a trait bound |
 | `literal-out-of-word` | allow | an `int` literal outside the 27-trit range (v1 only) |
+| `unproven-refinement` | allow | a call whose argument a parameter's `where` could not be proved for (§26) |
 | `backend-unavailable-chain` | deny | a call chain that cannot run on this backend |
 | `reserved-type-name`  | deny  | a `struct` or `enum` declared under a name the compiler owns |
+| `unlinkable-user-module` | deny | a `use` of a non-`std` module, whose bodies are never emitted |
+| `colliding-stdlib-symbol` | deny | a function whose name is the mangled name of an expanded stdlib function |
 | `undeclared-type`     | deny  | a type name that is declared nowhere at all |
 | `undeclared-field`    | deny  | a field name the struct does not have |
+| `unchecked-instantiation` | warn | a generic instantiation that does not type-check, so the erased body runs unchecked (§22) |
 
 `--warn-as-error` still means "raise everything to deny".
 
@@ -1987,16 +1998,16 @@ rather than of the lint: a recorded warning is printed after analysis finishes,
 and a program these lints fire on typically fails analysis too, so a
 `warn`-level report would be discarded before anyone saw it. See §14.
 
-> **Added 1 September 2026 (P95).** `undeclared-type` is the reverse of the
-> entry above it. `reserved-type-name` catches a name you DID declare that the
-> compiler answers for first; `undeclared-type` catches a name nothing declares
-> at all. Both used to resolve to the unknown type, which is compatible with
-> everything — so `struct Holder { pub a: NoSuchType, pub b: int }` type-checked,
-> `manitc check` exited 0, and both backends ran the program with the field
-> holding whatever it was given. Measured in thirteen type positions: a struct
-> field, a parameter, a return type, a `let` annotation, an enum variant
-> payload, an array element, a generic argument, a tuple element, a function
-> type's parameter, an `impl` target, a cast target, a global's annotation and a
+> **Added 1 September 2026 (P95).** `undeclared-type` is the reverse of
+> `reserved-type-name`. That one catches a name you DID declare which the
+> compiler answers for first; this one catches a name nothing declares at all.
+> Both used to resolve to the unknown type, which is compatible with everything
+> — so `struct Holder { pub a: NoSuchType, pub b: int }` type-checked, `manitc
+> check` exited 0, and both backends ran the program with the field holding
+> whatever it was given. Measured in thirteen type positions: a struct field, a
+> parameter, a return type, a `let` annotation, an enum variant payload, an
+> array element, a generic argument, a tuple element, a function type's
+> parameter, an `impl` target, a cast target, a global's annotation and a
 > generic struct's argument. `lint allow(undeclared-type);` restores the
 > previous behaviour exactly.
 
@@ -2169,8 +2180,8 @@ section is the whole of it.
 A value of these types is copied wherever it is used, and none of the rules
 below apply to it:
 
-`int`, `float`, `bool`, `bool3`, `trit`, `tryte`, `t9`, `t27`, `t54`,
-`tfloat`, `char`, `void`, and function-pointer types.
+`int`, `float`, `bool`, `bool3`, `trit`, any `t<N>` (`tryte`, `t9`, `t27`,
+`t54` among them), `tfloat`, `char`, `void`, and function-pointer types.
 
 The concurrency handles are also `Copy`, deliberately — `Mutex`, `Channel`,
 `Task`, `AtomicTrit`, `Barrier`, `Semaphore` and `MutexGuard`. Their runtime
@@ -2370,6 +2381,74 @@ across match arms, and does not free anything — see
 `KNOWN_ISSUES` on the absence of a free/destroy API. A move is a compile-time
 restriction on reading a binding, not a runtime transfer of ownership.
 
+### What the checker can see: generic bodies
+
+**Added 4 September 2026.** The checker runs over the program the analyzer
+produced, so **it sees exactly the function bodies the analyzer managed to
+build** — and for a generic function that is more than one body.
+
+A generic function is checked twice over. Once **erased**, with every type
+parameter standing for nothing, where a `T` is not a move type because nothing
+says it is one. And once **per instantiation**, with `T` bound to a real type,
+where it may be. So whether a move inside a generic body is caught can depend
+on the type it is called at, and that is the intended behaviour:
+
+```manit
+struct P { pub x: int }
+
+fn dup<T>(a: T) -> int {
+    let b = a;
+    let c = a;           // a move only when T is a move type
+    return 1;
+}
+
+fn main() {
+    dup(1);              // fine — `int` is a Copy type
+    dup(P { x: 1 });     // error: use of moved value: 'a'
+}
+```
+
+**An instantiation that does not type-check is discarded** and the call keeps
+the erased body (§25 states the same rule for const parameters, where it is an
+error instead). A discarded instantiation was never built, so the move checker
+never saw it — and a move that only that binding would have revealed goes
+unreported:
+
+```manit
+fn dup<T>(a: T) -> int {
+    let b = a;
+    let c = a;
+    let q = a | 1;       // does not check at T = P
+    return 1;
+}
+
+fn main() {
+    // Accepted: the instantiation is discarded, so nothing checked the
+    // two lines above `let q` either.
+    dup(P { x: 1 });
+}
+```
+
+That is a hole in the checker's coverage rather than a decision about moves,
+and the compiler **names it** — `unchecked-instantiation`, §20, `warn` by
+default. It reports the call site and the reason the body failed. Silencing it
+with `lint allow(unchecked-instantiation);` changes nothing else: the
+instantiation is still discarded and the call still keeps the erased path.
+
+**What is declared, rather than inferred, survives the discard.** A parameter
+marked `move` consumes its argument whether or not the callee's body checks at
+that binding, because that is a fact about the signature the reader wrote:
+
+```manit
+fn eat<T>(a: move T) -> int { let q = a | 1; return 1; }
+
+fn main() {
+    let p = P { x: 1 };
+    eat(p);
+    io::print_int(p.x);  // error: use of moved value: 'p' — still caught
+}
+```
+
 ## 23. Allocation regions
 
 *(F-4, 3 September 2026. Both backends.)*
@@ -2501,3 +2580,744 @@ no unsafe ones, which is the direction to be wrong in.
   With other tasks running the region is a no-op — a leak, which is what
   happened before regions existed, rather than corruption. Per-task regions
   want a per-task heap and are future work.
+
+---
+
+## 24. Ternary widths: `t<N>`
+
+*Added 3 September 2026 (Phase 5, C3).*
+
+A balanced ternary integer of **N trits** is written `t<N>`, for N from 1 to
+54. The five names the language has always had are spellings of five of those
+widths, and they remain exactly what they were:
+
+| Spelling | Means | Also spelled |
+|----------|-------|--------------|
+| `trit`   | `t<1>`  | — |
+| `tryte`  | `t<6>`  | — |
+| `t9`     | `t<9>`  | — |
+| `t27`    | `t<27>` | `word` |
+| `t54`    | `t<54>` | `trint` |
+
+`t<6>` and `tryte` are the same type, not two types that convert; a value of
+one may be used wherever the other is expected, because there is only one of
+them.
+
+```
+struct Mantissa { pub m: t<18>, pub e: t9 }
+
+fn scale(x: t<18>, k: t<12>) -> t<18> {
+    return x + (k as t<18>);
+}
+```
+
+`t<N>` is a type, so it appears wherever a type appears: `let` annotations,
+parameters, return types, struct and enum fields, array elements, tuple
+elements, generic arguments and `as` casts.
+
+### Why the widths between the names matter
+
+The five named widths are five points sampled from a continuum, and the gap
+that shows is not hypothetical. `stdlib/t27f.mt` — the 27-trit floating-point
+format — describes itself as a **9-trit exponent and an 18-trit mantissa**, and
+before this section existed the format's own components could not be spelled in
+the type system hosting it. The exponent had a name (`t9`) and the mantissa did
+not. `t<18>` is that type.
+
+### The range is derived, not tabulated
+
+A `t<N>` holds −(3ᴺ−1)/2 … +(3ᴺ−1)/2, and the compiler computes that from N
+rather than looking it up:
+
+```
+let x: t<18> = 193710244;   // (3^18 − 1) / 2 — accepted
+let y: t<18> = 193710245;   // refused: "value 193710245 overflows type
+                            //  't<18>' (range -193710244..193710244)"
+```
+
+For N of 40 and above, 3ᴺ exceeds a machine word, and what binds is the i64 the
+value is held in — which is exactly what `t54` has always done and what its own
+definition says. No width acquires a range the backends cannot represent.
+
+> This is the direct dividend of report.txt **P122**, one day earlier. That
+> finding fixed a `tryte` whose width was recorded as 3 in one place and 6 in
+> another by making one function the sole authority and **deriving** the range
+> from it. Because the range was derived, every width between the names got a
+> correct one for free the moment the syntax existed. A table would have needed
+> fifty-four new rows and would have been the same defect waiting again.
+
+### `trit` is not `t<1>` by accident, and the difference is real
+
+`trit` and `t<1>` are the same type — and it is the only width that carries the
+three-valued logic role:
+
+```
+let a: t<1> = 1;
+let b: t<1> = 0;
+let c = a tand b;     // fine — a width-1 value is a logic value
+
+let p: tryte = 1;
+let q: tryte = 0;
+let r = p tand q;     // refused: "`tand` is a three-valued logic operator"
+```
+
+This is not an irregularity in the family. A width-1 balanced ternary number
+has the values {−, 0, +}, and those **are** {`false`, `unknown`, `true`}; the
+logic role is what width one *means* here. The other widths have 3ᴺ values and
+no such reading, so `tand` on a `tryte` is refused — the same refusal it has
+always given.
+
+### `t` is not a keyword
+
+`t<N>` adds a type without adding a reserved word: the sixteen primitive
+spellings the lexer reserves (§14) are unchanged, and `t` is not among them. It
+is read as a width only in **type** position, so a variable named `t` and a
+comparison `t < 0` continue to mean what they always meant:
+
+```
+let t: int = -3;
+let w: t<18> = 40;
+if t < 0 { io::println("t is negative"); }   // a comparison, not a type
+```
+
+This is decided structurally rather than by preference. Generic arguments are
+parsed in exactly one place — the type parser — and there is no turbofish in
+this language, so `<` after a name can only mean a type argument where a type
+is already expected. An expression never reaches that code.
+
+The measurement came before the syntax: `t` is declared as a variable **855
+times** across both repositories and the model corpus, with **11** of the form
+`t < …`. Reserving it would have deleted every one.
+
+### What is not here
+
+> **Corrected 4 September 2026 (Phase 5, B3).** The first paragraph below was
+> true when written and is now false: **width polymorphism is implemented**,
+> and it is §25. A width may be a `const` generic parameter as well as a
+> literal, so `fn widen<const A: int>(x: t<A>) -> t54` compiles and runs on
+> both backends. The paragraph is kept rather than rewritten because it records
+> what the two refusals looked like and why they differed, which is the
+> observation that placed the feature — and because a corrected document should
+> show the correction (permanent rule 7).
+>
+> Two of its claims survive unchanged and are worth separating out. `fn f<T>(x:
+> t<T>)` is **still refused**, because a type parameter is not a width; what
+> moved is the message, which now names the KIND rather than the token. And the
+> two-parameter form `fn widen<const A: int, const B: int>(x: t<A>) -> t<B>` is
+> **still refused**, for a reason this paragraph did not know: `B` appears only
+> in the return type, and ManiT has no turbofish, so nothing at a call site can
+> name it. See §25.
+
+**Width polymorphism is not implemented.** A width must be a literal:
+
+```
+fn widen<const A: int, const B: int>(x: t<A>) -> t<B>    // NOT accepted
+fn f<T>(x: t<T>)                                          // NOT accepted
+```
+
+They fail in different places, which is worth knowing when reading the error:
+the second is refused by this section's own message — "`t<N>` needs a trit
+width, found `Ident("T")`" — while the first does not reach it at all, because
+`const` is not a generic parameter form the language parses ("expected LParen").
+Writing an algorithm once and instantiating it at whatever width a device
+provides is C3's stated motivation, and it needs const generics (Phase 5's B3).
+This section is the half that does not: a literal width is known at parse time,
+so no constant evaluator is involved.
+
+That is the second time an item's stated prerequisites turned out not to bind —
+C6 (§13) records the same about B4 — and it is recorded rather than assumed,
+because four Phase-4 premises were contradicted by measuring them.
+
+**Widths do not constrain arithmetic.** `t<12> + t<18>` is accepted with no
+cast and yields the numeric sum, and the range check shown above applies to a
+**literal being bound**, not to the result of an operation:
+
+```
+let a: t<18> = 193710244;    // the maximum
+let b: t<12> = 265720;       // the maximum
+let c = a + b;               // 193975964 — past t<18>'s range, and not refused
+```
+
+This is not new and is not C3's: `tryte + t9` behaves identically on the
+compiler before `t<N>` existed, giving 9300 for 300 + 9000. The cast in the
+`scale` example above is therefore explicitness rather than a requirement.
+Proving a result stays inside a width is what Phase 5's B6 (refinement types)
+is for.
+
+**The IR representation is not tight.** A `t9` lowers to an LLVM `i32` where an
+`i16` would hold its ±9,841, and `t<N>` reproduces that step exactly rather
+than narrowing it: `i16` up to 6 trits, `i32` to 9, `i64` beyond. Narrowing
+`t9` would be a representation change to a shipped type arriving as a side
+effect of adding a syntax, so it is left visible here for a change that
+measures it.
+
+## 25. Const generics: `const N: int`
+
+*Added 4 September 2026 (Phase 5, B3).*
+
+A generic parameter written `const N: int` binds an **integer** at
+instantiation, where an ordinary parameter binds a type. It is what lets one
+function be written at no particular width and used at several:
+
+```
+fn widen<const A: int>(x: t<A>) -> t54 {
+    return x as t54;
+}
+
+fn main() {
+    let a: t9 = 5;
+    let b: tryte = 4;
+    io::println_int(widen(a) as int);   // 5
+    io::println_int(widen(b) as int);   // 4
+}
+```
+
+`widen` is compiled twice, once for each width the program used. Neither copy
+carries `A` at run time.
+
+### Where a const parameter may be written
+
+Three positions, all of them compile-time:
+
+| Position | Example |
+|----------|---------|
+| a trit width | `fn f<const A: int>(x: t<A>)` |
+| an array length | `fn g<const N: int>(a: [int; N])` |
+| an integer value | `fn w<const A: int>(x: t<A>) -> int { return A; }` |
+
+The third is what makes the first two useful, because it lets the body compute
+with the width rather than only be annotated by it:
+
+```
+fn f<const A: int>(x: t<A>) -> int {
+    let y: t<A> = 300;
+    return y as int + A;
+}
+
+fn main() {
+    let a: t9 = 1;
+    let b: tryte = 1;
+    io::println_int(f(a));   // 309
+    io::println_int(f(b));   // 306
+}
+```
+
+One body, two answers, and the difference is the width. Inside an
+instantiation `A` is a literal, so it costs nothing at run time.
+
+### A const argument is inferred from the arguments
+
+There is no turbofish in ManiT, so a const parameter is never written at a call
+site. It is bound structurally from the types of the arguments — `t<A>` against
+a `t9` binds `A` to 9, `[int; N]` against a `[int; 3]` binds `N` to 3 — exactly
+as a type parameter is bound from them.
+
+`trit` binds a width of **one**, because `trit` *is* `t<1>` (§24):
+
+```
+fn w<const A: int>(x: t<A>) -> int { return A; }
+
+fn main() {
+    let a: trit = 1;   io::println_int(w(a));   // 1
+    let b: t54  = 1;   io::println_int(w(b));   // 54
+}
+```
+
+A call that pins nothing down is refused rather than compiled at some default:
+
+```
+fn width<const A: int>(x: t<A>) -> int { return A; }
+fn main() {
+    let n: int = 5;
+    width(n);   // refused: `int` is not `t<A>` for any A, so nothing binds `A`
+}
+```
+
+and so is a parameter that appears only in the return type, which nothing at a
+call site could name:
+
+```
+fn make<const B: int>() -> t<B> { return 0; }   // declares
+fn main() { let x: t9 = make(); }               // refused at the call
+```
+
+This is why the two-parameter `fn widen<const A: int, const B: int>(x: t<A>) ->
+t<B>` of the enhancement plan is not writable as such: `A` is bound by `x` and
+`B` is bound by nothing.
+
+### Const parameters come last
+
+A parameter list may mix kinds, and the const ones are written after the type
+ones:
+
+```
+fn f<T, const N: int>(a: [T; N]) -> int { return N; }    // fine
+fn g<const N: int, T>(x: t<N>, y: T) -> int { return N; } // refused
+```
+
+The refusal names the corrected list rather than a column. The two kinds are
+kept as separate lists and recombined by position, so a type parameter written
+after a const one has no reading either list can represent.
+
+`int` is the only type a const parameter may be declared with, and one name may
+not be both kinds:
+
+```
+fn f<const N: str>(x: t<N>)      // refused: `int` is the only type
+fn g<N, const N: int>(x: t<N>)   // refused: `N` would be a type and a value
+```
+
+### `const` is not a keyword
+
+Like `t` in §24 and `move` in §22, `const` is **contextual**: it introduces a
+const parameter only when it is followed by a name inside angle brackets.
+Everywhere else it is an ordinary identifier, and it may still be one:
+
+```
+fn w<const A: int>(x: t<A>) -> int { return A; }
+
+fn main() {
+    let const = 7;                  // still a variable name
+    let a: t9 = 1;
+    io::println_int(const);         // 7
+    io::println_int(w(a));          // 9
+}
+```
+
+A bare `<const>` with no name after it is still a type parameter named `const`,
+which is what it meant before this section existed.
+
+The measurement came before the syntax, as it did for `t`: across both
+repositories and the 2,507-program model corpus the word `const` occurs **four
+times**, three of them inside comments and the fourth in a generated file
+writing Rust. `fn f<const>(x: const)` and `struct const { … }` both compiled on
+the previous compiler, so the name was in use in exactly the positions this
+feature wanted, and reserving it would have deleted them.
+
+### A const generic that does not check is an error
+
+This is the one place const generics behave differently from ordinary generics,
+and the difference is deliberate.
+
+When an ordinary generic's body fails to check at some type, the instantiation
+is discarded and the call keeps the erased body (§14). A const generic instead
+**reports it**, naming both the instantiation and the reason — and the reason keeps its own
+line and column, because the failure is not on the line that caused it:
+
+```
+fn f<const A: int>(x: t<A>) -> int {
+    let y: t<A> = 365;              // fits a t9; does not fit a tryte
+    return y as int;
+}
+
+fn main() {
+    let a: t9 = 1;      io::println_int(f(a));   // 365
+    let b: tryte = 1;   io::println_int(f(b));   // refused: "'f' does not check
+}                       //  at A = 6: 2:38: value 365 overflows type 'tryte'
+                        //  (range -364..364)"
+```
+
+Silence would be worse than a refusal here: the erased body types `t<A>` as the
+unknown type, which accepts anything, so the discarded instantiation would have
+been replaced by a copy that *printed 365* at a width that cannot hold it. The
+strict reading is affordable because nothing can regress — the syntax is new in
+this release, so the population of programs relying on the permissive one is
+zero.
+
+### What is not here
+
+**A const argument cannot be supplied explicitly.** A struct may declare a
+const parameter and its fields resolve, but there is no way to name a width
+when using it:
+
+```
+struct TVec<const N: int> { data: [trit; N] }        // declares
+fn main() { let v: TVec<27> = TVec { data: [0] }; }  // refused
+```
+
+A const argument would have to live in a struct type's argument list, which
+holds types; a value is not one. So const generics today are a property of
+**functions**, and a struct's parameter has nothing to bind it. `impl<const N:
+int>` is refused for the same reason and its message points at the method,
+where a parameter *is* bound from the arguments.
+
+**A const expression is not a width.** Only a literal or a bare parameter:
+
+```
+fn f<const A: int>(x: t<A>) { let y: t<A + 1> = 1; }   // refused
+```
+
+This is the one part of B3 that genuinely needs **B4** (`const fn` and
+compile-time evaluation). The enhancement plan lists B4 as a prerequisite for
+the whole item; measured, a *bound* parameter is already a literal by the time
+anything reads it, so no evaluator is involved in any of the above. Only an
+expression over one needs it.
+
+That makes three items in a row whose stated prerequisites were contradicted by
+measuring them — C6 about B4, C3 about B3 and B4, and now B3 about B4 — and the
+first where the dependency turned out to be real for a *named part* rather than
+for the whole. Recorded rather than assumed, because four Phase-4 premises were
+contradicted the same way.
+
+## 26. Refinement types: `where` on a parameter
+
+*Added 4 September 2026 (Phase 5, B6).*
+
+A parameter may declare the interval its value lies in:
+
+```
+fn scale(x: t27 where -100 <= x <= 100) -> t27 { return x * 3; }
+```
+
+The compiler then refuses a call that cannot satisfy it:
+
+```
+fn main() { let _ = scale(500); }
+// refused: "argument 1 of 'scale' is 500, which cannot satisfy
+//  `where -100 <= x <= 100`. The parameter is declared to lie in -100..100."
+```
+
+### Why this is worth having on this target
+
+T3ISA **traps** on a value that leaves the 27-trit word — it does not saturate,
+and the change that made it trap rather than saturate is recorded as having
+cost a correct answer in `examples/fibonacci.mt`. A trap is a runtime failure
+on the backend whose whole purpose is to be the reference semantics. A bound
+that can be proved at compile time is a trap that never happens.
+
+### The forms a `where` may take
+
+| Form | Example |
+|------|---------|
+| a closed interval | `where -100 <= x <= 100` |
+| either side alone | `where x >= 0` · `where x <= 63` |
+| strict on either side | `where 0 <= x < 10` |
+| a conjunction | `where x >= -5 && x <= 5` |
+| a `const` generic bound | `where 0 <= i < N` |
+
+The last is what makes B6 and §25 compose. An array and its index can state
+their relationship in the signature:
+
+```
+fn get<const N: int>(a: [int; N], i: int where 0 <= i < N) -> int { return a[i]; }
+```
+
+A bound is an integer literal or a `const` generic parameter, and nothing else.
+A call, a global or arithmetic is refused by name: this checker's whole value is
+that its fragment is decidable, and it says where the fragment ends rather than
+guessing past it.
+
+`where` is **contextual**, as `t` is in §24 and `move` is in §22 — it is read as
+a refinement only inside a parameter list. The word occurs 389 times across both
+repositories and the model corpus and not once in code; every occurrence is the
+English word in a comment.
+
+### Chained comparison is legal here and nowhere else
+
+`-100 <= x <= 100` is refused in an ordinary expression — "comparison operators
+cannot be chained" — because C's reading of it is a bug magnet. Inside a `where`
+it is the standard notation for an interval and has exactly one reading, since
+the middle term must be the parameter itself. The two positions are different
+and the refusal stays where it earns its keep.
+
+### Three verdicts, and only one of them is an error
+
+The checker knows an interval for an integer literal, for a refined parameter,
+for an immutable `let` bound to either, and for `+`, `-`, `*` and unary `-` over
+those. Everything else is unknown.
+
+| The argument is | Verdict |
+|-----------------|---------|
+| provably inside the `where` | accepted, silently |
+| provably outside it, for every value | **error** |
+| neither | accepted; listed by `--warn unproven-refinement` |
+
+```
+fn inner(x: int where 0 <= x <= 10) -> int { return x; }
+
+fn a(y: int where 0 <= y <= 3) -> int { return inner(y * 3); }   // 0..9  — proven
+fn b(y: int where 0 <= y <= 3) -> int { return inner(y * 5); }   // 0..15 — unproven
+fn c(y: int where 0 <= y <= 3) -> int { return inner(y + 100); } // 100..103 — refused
+```
+
+The middle row is a **backlog, not a defect**: `y * 5` is correct for some
+values of `y` and wrong for others, and the compiler does not know which the
+program will produce. `unproven-refinement` defaults to `allow` for the reason
+`literal-out-of-word` and `division-semantics` do, and
+`--warn unproven-refinement` generates the list on demand.
+
+An interval survives an immutable binding, so splitting an expression across
+two lines does not lose the bound:
+
+```
+fn c2(y: int where 0 <= y <= 3) -> int { let z = y + 100; return inner(z); }
+```
+
+A `let mut` does not keep one. It can be assigned anything later and this pass
+does not follow assignments, so claiming a range for it would be the checker
+proving something false — which is the one thing it must never do.
+
+### A `where` is checked where it is written
+
+Two declarations are refused at the declaration rather than at every call:
+
+```
+fn f(x: int where 10 <= x <= 5) -> int { return x; }
+fn g(x: tryte where -1000 <= x <= 1000) -> tryte { return x; }
+```
+
+The first is empty — no value satisfies it, so no call could ever be accepted.
+The second reaches outside what a `tryte` holds (-364..364).
+
+That second check runs only for a NAMED width. `int` is deliberately exempt: it
+is 27 trits on T3 and 64 bits on LLVM (§21), so a bound outside 27 trits is
+legal source for one backend and not the other, and refusing it here would make
+this check pick a backend.
+
+### What is not here
+
+**A refinement is a precondition, not a postcondition.** There is no `where` on
+a return type, so a function cannot promise a range to its caller — only demand
+one. That is the natural next increment and nothing in this design blocks it.
+
+**The fragment is constants, not linear arithmetic.** The recommendation calls
+for "the linear-arithmetic fragment", and what is implemented is interval
+arithmetic over literals and refined parameters. `x + y` where both are refined
+is covered; `x < y` between two parameters is not expressible, and neither is a
+bound that mentions another parameter.
+
+**Nothing is checked at run time.** A refinement inserts no code and the emitted
+programs are byte-for-byte what they were without it. A call the checker cannot
+prove is compiled exactly as before, and if the value does leave the word on T3,
+the trap is still what reports it.
+
+## 27. Ternary floating point: `t27f`
+
+*Added 4 September 2026 (Phase 5, C5).*
+
+`t27f` is the balanced ternary floating-point format, and it is a type:
+
+```
+use std::io;
+
+fn twice(x: t27f) -> t27f { return t27f::add(x, x); }
+
+fn main() { io::println_int(t27f::to_int(twice(21.0t27f))); }   // 42
+```
+
+A value is `mantissa × 3^exponent`, packed into one 27-trit word as a **9-trit
+exponent** and an **18-trit mantissa**. What that buys over IEEE 754 is not
+subtle:
+
+| | `t27f` | `float` (IEEE 754 double) |
+|---|---|---|
+| sign | inherent — a negative mantissa is a negative number | a separate sign bit |
+| zero | exactly one | two, `+0.0` and `-0.0` |
+| NaN | none — every 27-trit pattern is a number | many |
+| denormals | none — uniform precision | yes |
+| negation | exact trit flip | exact |
+| range | to about 4.3 × 10⁴⁷⁰³ | to about 1.8 × 10³⁰⁸ |
+| precision | 18 trits, about 8.6 decimal digits | about 15.9 decimal digits |
+
+### The literal
+
+A float literal with a `t27f` suffix is a ternary float:
+
+```
+let x = 3.5t27f;
+io::println_float(t27f::to_float(x));   // 3.4999999883847144
+```
+
+That is not a misprint. 3.5 is not representable in 18 trits, and the error is
+about 3⁻¹⁸ — the format's precision, visible. A literal that printed `3.5`
+exactly would mean the suffix had quietly produced a `float`.
+
+The suffix must be **adjacent** and **complete**: `3.5 t27f` is two tokens and
+`3.5t27foo` is a float followed by an identifier. Neither is a literal.
+
+`3.5t27f` desugars to `t27f::from_float(3.5)`, which is also what pulls the
+module in — a program that writes a literal, or that names `t27f` in a
+signature, needs no `use std::t27f;`.
+
+### The conversion lattice
+
+Everything crosses through the library, in both directions:
+
+| From | To | Call |
+|------|----|------|
+| `float` | `t27f` | `t27f::from_float(f)`, or the literal suffix |
+| `t27f` | `float` | `t27f::to_float(x)` |
+| `t27f` | `word` | `t27f::to_int(x)` |
+| exponent + mantissa | `t27f` | `t27f::from_parts(e, m)` |
+| `t27f` | its parts | `t27f::exponent(x)`, `t27f::mantissa(x)` |
+
+**`as` does not convert a `t27f`.** `x as float` is refused, and that refusal
+is new: it used to be accepted and yielded the value's allocation address
+reinterpreted as a double — about 3.1 × 10⁻³²⁰ for any `t27f` whatsoever. See
+§28 on casts.
+
+### What is not here
+
+**The operators are not overloaded.** `x + y` and `x > y` on two `t27f` values
+are refused by name. This language's arithmetic and comparison operators are
+built in and never dispatch to a user `impl` — the unsatisfied-bound diagnostic
+says so — so `t27f` has a spelling, a literal and a conversion lattice, and its
+arithmetic is `t27f::add`, `t27f::sub`, `t27f::mul`.
+
+**`mul` is less precise than `add`.** The product of two full 18-trit mantissas
+needs about 3.8 × 10¹⁶ and a 27-trit word holds ±3,812,798,742,493, so both
+operands are reduced before multiplying and a product carries about 13 trits
+rather than 18. Full-width multiplication needs a double-word intermediate the
+language does not have on T3.
+
+**There is no `tfloat`.** It was a keyword and a type, and it was IEEE 754
+double — lowered to exactly what `float` lowers to — while its name promised
+this section's format. It is refused, and the message offers both honest
+answers: `float` for the binary format, `t27f` for the ternary one.
+
+## 28. Casts
+
+*Added 4 September 2026 (Phase 5, C5 / report.txt P129).*
+
+`as` converts between **numbers**:
+
+```
+let x: int = 7;
+let f: float = x as float;
+let n: int = 3.9 as int;
+let t: tryte = 2 as tryte;
+```
+
+A struct, enum, array, tuple or container has no numeric value, and a cast
+between one of those and anything else is refused:
+
+```
+struct P { pub v: int }
+let p = P { v: 7 };
+let _n = p as int;      // refused
+let a: [int; 2] = [1, 2];
+let _m = a as int;      // refused
+```
+
+**This refusal is new, and what it replaced was a wrong answer.** `as` was
+unchecked: the compiler resolved the target type and returned it. So `p as int`
+answered **63000** — the heap base, the value's allocation address — and
+`p as float` the same address reinterpreted as a double. Both backends agreed,
+because the mistake was upstream of where they part.
+
+Two things are deliberately still allowed. An aggregate casts to **itself**,
+which is a no-op and harmless. And a cast where either side is not yet known —
+a generic parameter inside an un-instantiated body — is left alone, because
+refusing there would reject a body that is correct at every instantiation.
+
+Measured across both repositories and the 2,507-program model corpus: **0
+programs** are refused by this rule that were not refused before.
+
+## 29. Compile-time evaluation: `const fn`
+
+*Added 4 September 2026 (Phase 5, B4).*
+
+A function declared `const fn` may be **run by the compiler**, and its result
+may be a trit width or an array length:
+
+```
+use std::io;
+
+const fn dbl(x: int) -> int { return x * 2; }
+
+fn main() {
+    let a: [int; dbl(2)] = [1, 2, 3, 4];
+    io::println_int(a[3]);       // 4
+    io::println_int(dbl(21));    // 42 — the same function, at run time
+}
+```
+
+`const` **adds** a capability and removes none. A `const fn` is an ordinary
+function as well: checked, lowered, emitted, and callable at run time like any
+other.
+
+### Where a constant expression may be written
+
+| Position | Example |
+|----------|---------|
+| a trit width | `t<A + 1>` · `t<half(18)>` |
+| an array length | `[int; 2 + 1]` · `[int; N * 2]` · `[int; dbl(2)]` |
+
+and what may appear inside one:
+
+* integer literals;
+* a `const` generic parameter (§25);
+* a module-level constant — a `let` at module scope, which already had to have
+  a compile-time initialiser;
+* `+ - * / %`, unary `-`, comparisons and `&&` / `||`;
+* calls to `const fn`, which may themselves use `let`, assignment, `if`,
+  `while` and `return`.
+
+```
+const fn fact(n: int) -> int {
+    let mut r = 1; let mut i = 1;
+    while i <= n { r = r * i; i = i + 1; }
+    return r;
+}
+
+fn main() { let a: [int; fact(3)] = [1, 2, 3, 4, 5, 6]; }
+```
+
+### A width's `>` is a bracket, never an operator
+
+Inside `t<…>` the expression fragment stops **below comparison**, so the first
+`>` can only be the closing bracket:
+
+```
+fn f<const A: int>(x: t<A>) -> int { let y: t<A + 1> = 1; return y as int; }
+```
+
+needs no braces. Rust spells the same construct `t<{A + 1}>` because its
+fragment includes comparison and the `>` would otherwise be ambiguous. A width
+is a **number** and never a bool, so the precedence floor settles it here
+instead. The consequence is that `t<1 < 2>` is not a comparison and is refused.
+
+### Termination is bought, not assumed
+
+A `const fn` may loop, so evaluation carries a step budget:
+
+```
+const fn spin(n: int) -> int { let mut i = 0; while i >= 0 { i = i + 1; } return i; }
+fn main() { let _a: [int; spin(1)] = [1]; }
+// refused: "… did not finish within 100000 evaluation steps — a `const fn`
+//  must terminate"
+```
+
+A compiler that hangs on a program is the one failure mode a compile-time
+evaluator must not have, so exhausting the budget is an ordinary diagnostic.
+
+A constant expression that is broken is reported where it is written — division
+by zero, a negative length, a width outside 1…54, and a call to a function that
+is not `const`.
+
+### What is not here
+
+**An expression cannot be inferred from.** `fn f<const A: int>(x: t<A + 1>)`
+called with a `t9` would need the compiler to invert `A + 1`, and it does not.
+Only a bare parameter binds a const argument; an expression is *checked*, never
+solved.
+
+**The fragment is integers.** A compile-time `float` would have to agree with
+the other constant folder about rounding as well as arithmetic, and widths and
+lengths are integers.
+
+**`const` is contextual.** Only the pair `const fn` is claimed, and only inside
+angle brackets is `const N: int` (§25). A bare `const` is still an ordinary
+identifier — `let const = 7;` compiles — which is what the measurement asked
+for: the word occurs four times across both repositories and the
+2,507-program model corpus, three of them inside comments.
+
+### On this item's stated reach
+
+The enhancement plan lists `const fn` as a prerequisite for const generics
+(§25), for C6's pattern compilation (§13), and for compile-time trit tables.
+Measuring found the first two false and the third untried: a **bound** const
+parameter is already a literal by the time anything reads it, and a trit
+pattern's fixed trits are known at parse time. What genuinely needed this
+section was one construct — `t<A + 1>`, an expression *over* a bound
+parameter — which §25 recorded as its own limit and this section closes.

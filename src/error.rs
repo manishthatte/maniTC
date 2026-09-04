@@ -311,6 +311,14 @@ pub enum WarningKind {
     /// at all — `int` means 27 trits, so the literal has no value and the
     /// analyzer rejects it outright.
     LiteralOutOfWord,
+    /// B6: a call whose argument the checker could not PROVE satisfies the
+    /// parameter's `where`.
+    ///
+    /// The verification backlog, and `allow` by default for the reason
+    /// `literal-out-of-word` and `division-semantics` are: an unproven call is
+    /// not a wrong one. A call that is provably WRONG is an error and not this
+    /// lint — the two are different claims and must not share a level.
+    UnprovenRefinement,
     /// C4/R2: a `/` or `%` on an integer type, whose meaning differs between
     /// language versions. The migration backlog for the division change.
     DivisionSemantics,
@@ -318,6 +326,15 @@ pub enum WarningKind {
     /// answers WITHOUT consulting the struct table, so the declaration cannot
     /// be reached through that spelling.
     ReservedTypeName,
+    /// ENHANCEMENT_PLAN 0.3: a top-level user function whose name equals the
+    /// MANGLED name of a stdlib function the same program expands, so the
+    /// module emits a second definition of that symbol.
+    CollidingStdlibSymbol,
+    /// ENHANCEMENT_PLAN 0.4: a `use` of a USER module (anything but `std::`).
+    /// The analyzer resolves the file and registers its public signatures, and
+    /// nothing downstream ever emits the bodies, so the call dies at link time
+    /// against a symbol the programmer never typed.
+    UnlinkableUserModule,
     /// P95: a type name that is declared nowhere at all.
     ///
     /// P70's mechanism with the sign reversed — that was a declared name a
@@ -349,6 +366,24 @@ pub enum WarningKind {
     /// the other cannot is WHICH PATH makes an ordinary ManiT function
     /// uncompilable.
     BackendUnavailableChain,
+    /// B7 D-5: a generic instantiation the analyzer could not type, so its
+    /// body was never built and the move checker never saw it.
+    ///
+    /// P65's design is that a failed instantiation is DISCARDED and the call
+    /// keeps the erased path, which is right and is what lets monomorphisation
+    /// improve a program's types without rejecting it. That verdict was also,
+    /// silently, answering a second question — *has this body's move behaviour
+    /// under this binding been checked?* — and the honest answer when the
+    /// first is no is "no, and here", not silence.
+    ///
+    /// P71 split the same verdict once already: the NAME waits on the body,
+    /// the RETURN TYPE does not, because a return type is a function of the
+    /// declaration. This is the third question at the same fork, and the one
+    /// the borrow checker cares about: `borrow/mod.rs` runs over the
+    /// `TypedProgram`, so its coverage is exactly the set of bodies the
+    /// analyzer managed to produce, and a discarded instantiation is a hole
+    /// in it that nothing named.
+    UncheckedInstantiation,
 }
 
 /// A compiler warning — non-fatal but indicates likely mistakes.

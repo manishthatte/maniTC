@@ -79,6 +79,21 @@ pub enum Item {
 pub struct FnDef {
     pub name: String,
     pub generics: Vec<String>,
+    /// B3: the `const N: int` parameters, kept SEPARATE from `generics` and
+    /// declared after them.
+    ///
+    /// Separate for the same reason `bounds` is separate: every existing
+    /// consumer of `generics` reads it as "the type parameters", and a const
+    /// parameter appearing there would leave all of them still compiling and
+    /// no longer true — `for gp in &f.generics { type_params.insert(gp, ..) }`
+    /// would silently make `N` usable as a type name. That is the hazard a
+    /// second list removes rather than documents.
+    ///
+    /// The cost is that const parameters must come LAST in the angle brackets,
+    /// because the two lists are recombined positionally when a type argument
+    /// list is matched against them. That restriction is real, is diagnosed by
+    /// name, and is what `rustc` itself required until 2021.
+    pub const_generics: Vec<ConstParam>,
     /// B1: declared bounds on the generic parameters, from either the angle
     /// brackets (`<T: Ord>`) or a `where` clause. Kept beside `generics`
     /// rather than inside it because every existing consumer keys on the bare
@@ -103,6 +118,14 @@ pub struct FnDef {
     pub available: Option<Vec<String>>,
     pub is_pub: bool,
     pub is_async: bool,
+    /// **B4**: `const fn f(x: int) -> int`. The body may be RUN at compile
+    /// time, by `semantic::const_eval`, to produce a width or a length.
+    ///
+    /// Contextual, like every other keyword this language has added: `const`
+    /// is an ordinary identifier everywhere the shape `const fn` does not
+    /// appear, and `const fn` occurs zero times across both repositories and
+    /// the 2,507-program corpus.
+    pub is_const: bool,
     pub span: Span,
 }
 
@@ -115,6 +138,57 @@ pub struct FnDef {
 pub struct GenericBound {
     pub param: String,
     pub traits: Vec<String>,
+    pub span: Span,
+}
+
+/// B6: one bound of a refinement — the `-100` of `where -100 <= x <= 100`.
+///
+/// A bound is a LITERAL or the name of a `const` generic parameter in scope,
+/// and the second is what makes B6 and B3 compose: `fn f<const N: int>(a:
+/// [int; N], i: int where 0 <= i < N)` states the index invariant of the array
+/// it is given. Anything else — a call, a global, arithmetic — is refused by
+/// name, because this checker's whole value is that its fragment is decidable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefineBound {
+    Lit(i64),
+    /// A `const` generic parameter, resolved at instantiation.
+    ConstParam(String),
+}
+
+/// B6: the interval a refined parameter is declared to lie in.
+///
+/// Half-open on either side: `where x >= 0` has no upper bound. Both bounds
+/// carry their own strictness, so `0 <= x < N` — the array-index idiom, and
+/// the reason strictness is per-bound rather than one flag — is expressible.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refinement {
+    pub lo: Option<RefineBound>,
+    pub lo_inclusive: bool,
+    pub hi: Option<RefineBound>,
+    pub hi_inclusive: bool,
+    /// The predicate as the author wrote it, for diagnostics. A message that
+    /// re-renders a normalised interval makes the reader match it back to
+    /// their own source, which is work the compiler can do instead.
+    pub text: String,
+    pub span: Span,
+}
+
+/// B3: one const generic parameter — the `const N: int` of
+/// `struct TVec<const N: int>`.
+///
+/// It binds an INTEGER at instantiation, not a type, and that is the whole
+/// distinction from a `generics` entry. It can be written as a trit width
+/// (`t<N>`), as an array length (`[trit; N]`), and as an ordinary integer
+/// value in the body.
+///
+/// `ty` is the annotation as written. Only `int` is accepted today and
+/// anything else is refused by name rather than ignored: a `const N: str`
+/// that silently became an integer parameter would be the kind of quiet
+/// reinterpretation this compiler's record is full of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstParam {
+    pub name: String,
+    pub ty: String,
     pub span: Span,
 }
 
@@ -170,6 +244,13 @@ pub struct Param {
     pub name: String,
     pub ty: Type,
     pub span: Span,
+    /// **B6**: `fn scale(x: t27 where -100 <= x <= 100)`. The interval the
+    /// parameter's value is declared to lie in.
+    ///
+    /// `None` on every parameter that does not write one, which is every
+    /// parameter in both repositories and the corpus at the time this landed —
+    /// so nothing that exists is checked differently.
+    pub refinement: Option<Refinement>,
     /// **B7's D-2**: `fn consume(x: move str)`. Passing an argument to a
     /// `move` parameter CONSUMES it, so the caller may not use it afterwards.
     ///
@@ -204,6 +285,8 @@ pub struct FieldDef {
 pub struct StructDef {
     pub name: String,
     pub generics: Vec<String>,
+    /// B3: the `const N: int` parameters. See `FnDef::const_generics`.
+    pub const_generics: Vec<ConstParam>,
     pub fields: Vec<FieldDef>,
     pub is_pub: bool,
     pub span: Span,
@@ -234,6 +317,8 @@ pub struct ImplBlock {
     /// collection methods are resolved in `semantic/analyzer/type_inference.rs`
     /// against `Vec`/`Map`/`Set` regardless of element type.
     pub generics: Vec<String>,
+    /// B3: the `const N: int` parameters of `impl<const N: int> TVec<N>`.
+    pub const_generics: Vec<ConstParam>,
     pub trait_: Option<String>,
     pub methods: Vec<FnDef>,
     pub span: Span,
@@ -782,17 +867,157 @@ impl Pattern {
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+/// B3: the length written in an array type.
+///
+/// Was a bare `Option<usize>` until const generics: `Some(3)` for `[int; 3]`
+/// and `None` for `[int]`. A const generic parameter adds a third case that
+/// neither of those can spell, and it is a NAME rather than a number until the
+/// instantiation that binds it.
+///
+/// Spelled as an enum rather than as a second optional field so that `rustc`
+/// names every site that reads a length — the sites it forces you to visit are
+/// the safe half, and a length silently read as "unsized" would compile.
+#[derive(Debug, Clone)]
+pub enum ArrayLen {
+    /// `[int; 3]` — known where it is written.
+    Fixed(usize),
+    /// **B4**: `[trit; N]`, `[int; 2 + 1]`, `[trit; N * 2]` — an expression in
+    /// the integer constant fragment, evaluated at instantiation.
+    ///
+    /// This REPLACED B3's `Param(String)` rather than joining it. A bare name
+    /// is `Expr(Ident(n))`, so const-argument inference matches that shape
+    /// instead of its own variant, and there is one representation of "a
+    /// compile-time integer written in type position" rather than two that
+    /// must agree.
+    Expr(Box<Expr>),
+    /// `[int]` — no length written.
+    Unsized,
+}
+
+/// B4: two lengths are equal when they are WRITTEN the same way.
+///
+/// `Expr` cannot derive `PartialEq` — it holds blocks, lambdas and `f64` —
+/// so the comparison is on the rendering, which answers the question this
+/// equality is actually asked: are these two annotations the same annotation?
+/// It is deliberately NOT a claim that two expressions denote the same value;
+/// `N + 1` and `1 + N` compare unequal, and nothing here needs them to.
+impl PartialEq for ArrayLen {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ArrayLen::Fixed(a), ArrayLen::Fixed(b)) => a == b,
+            (ArrayLen::Unsized, ArrayLen::Unsized) => true,
+            (ArrayLen::Expr(a), ArrayLen::Expr(b)) => expr_sketch(a) == expr_sketch(b),
+            _ => false,
+        }
+    }
+}
+
+/// Type equality, by the same rule and for the same reason.
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        use Type::*;
+        match (self, other) {
+            (Named(a, _), Named(b, _)) => a == b,
+            (Path(a, _), Path(b, _)) => a == b,
+            (Ref(a, ma, _), Ref(b, mb, _)) | (Ptr(a, ma, _), Ptr(b, mb, _)) => {
+                ma == mb && a == b
+            }
+            (Array(a, la, _), Array(b, lb, _)) => la == lb && a == b,
+            (Tuple(a, _), Tuple(b, _)) => a == b,
+            (Fn(pa, ra, _), Fn(pb, rb, _)) => pa == pb && ra == rb,
+            (Generic(na, aa, _), Generic(nb, ab, _)) => na == nb && aa == ab,
+            (TernaryWidth(a, _), TernaryWidth(b, _)) => expr_sketch(a) == expr_sketch(b),
+            (Infer(_), Infer(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+impl ArrayLen {
+    /// The length as a number, for the callers that had an `Option<usize>`
+    /// and still want one. A parameter answers `None`: it has no length YET,
+    /// which is the same answer an unsized array gives and the same thing
+    /// those callers already do with it.
+    pub fn fixed(&self) -> Option<usize> {
+        match self {
+            ArrayLen::Fixed(n) => Some(*n),
+            ArrayLen::Expr(_) | ArrayLen::Unsized => None,
+        }
+    }
+
+    /// The bare parameter name, when the length is exactly one — which is what
+    /// const-argument inference can bind. An expression over a parameter binds
+    /// nothing: `[trit; N * 2]` against a `[trit; 12]` would need the compiler
+    /// to invert the expression, and it does not.
+    pub fn bare_param(&self) -> Option<&str> {
+        match self {
+            ArrayLen::Expr(e) => match &**e {
+                Expr::Ident(n, _) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Type {
     Named(String, Span),
     Path(Vec<String>, Span),
     Ref(Box<Type>, bool, Span),   // bool = mutable
     Ptr(Box<Type>, bool, Span),   // bool = mutable
-    Array(Box<Type>, Option<usize>, Span),
+    Array(Box<Type>, ArrayLen, Span),
     Tuple(Vec<Type>, Span),
     Fn(Vec<Type>, Box<Type>, Span),
     Generic(String, Vec<Type>, Span), // e.g. Result<T, E>
+    /// **C3/B3/B4**: `t<N>` where N is not a literal — a bare `const`
+    /// parameter (`t<A>`) or an expression over one (`t<A + 1>`).
+    ///
+    /// A literal width never reaches here: the parser resolves `t<18>` to its
+    /// canonical spelling, because a width that can be computed where it is
+    /// written is computed there. This variant carries the ones that cannot.
+    ///
+    /// It replaced B3's encoding as `Generic("t", [Named(A)])`, which could
+    /// not hold an expression at all — a `Vec<Type>` has nowhere to put
+    /// `A + 1`.
+    TernaryWidth(Box<Expr>, Span),
     Infer(Span),                      // _
+}
+
+/// B4: a one-line rendering of a constant expression, for a type's `display`.
+///
+/// Deliberately not a full pretty-printer: the shapes that reach a width or a
+/// length are small, and anything else renders as `…` rather than as a
+/// misleading approximation of the author's source.
+pub fn expr_sketch(e: &Expr) -> String {
+    match e {
+        Expr::Lit(Lit::Int(v), _) => v.to_string(),
+        Expr::Ident(n, _) => n.clone(),
+        Expr::UnOp(UnOpKind::Neg, i, _) => format!("-{}", expr_sketch(i)),
+        Expr::BinOp(a, op, b, _) => {
+            let sym = match op {
+                BinOpKind::Add => "+",
+                BinOpKind::Sub => "-",
+                BinOpKind::Mul => "*",
+                BinOpKind::Div => "/",
+                BinOpKind::Rem => "%",
+                _ => "?",
+            };
+            format!("{} {} {}", expr_sketch(a), sym, expr_sketch(b))
+        }
+        Expr::Call(c, args, _) => {
+            let name = match &**c {
+                Expr::Ident(n, _) => n.clone(),
+                _ => "…".to_string(),
+            };
+            format!(
+                "{}({})",
+                name,
+                args.iter().map(expr_sketch).collect::<Vec<_>>().join(", ")
+            )
+        }
+        _ => "…".to_string(),
+    }
 }
 
 impl Type {
@@ -808,8 +1033,11 @@ impl Type {
             Type::Ref(t, false, _) => format!("&{}", t.display()),
             Type::Ptr(t, true, _) => format!("*mut {}", t.display()),
             Type::Ptr(t, false, _) => format!("*{}", t.display()),
-            Type::Array(t, Some(n), _) => format!("[{}; {}]", t.display(), n),
-            Type::Array(t, None, _) => format!("[{}]", t.display()),
+            Type::Array(t, ArrayLen::Fixed(n), _) => format!("[{}; {}]", t.display(), n),
+            Type::Array(t, ArrayLen::Expr(e), _) => {
+                format!("[{}; {}]", t.display(), expr_sketch(e))
+            }
+            Type::Array(t, ArrayLen::Unsized, _) => format!("[{}]", t.display()),
             Type::Tuple(ts, _) => format!(
                 "({})",
                 ts.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "),
@@ -819,6 +1047,7 @@ impl Type {
                 ps.iter().map(|t| t.display()).collect::<Vec<_>>().join(", "),
                 r.display(),
             ),
+            Type::TernaryWidth(e, _) => format!("t<{}>", expr_sketch(e)),
             Type::Generic(n, args, _) => format!(
                 "{}<{}>",
                 n,
@@ -835,6 +1064,7 @@ impl Type {
             Type::Ref(_, _, s) => *s,
             Type::Ptr(_, _, s) => *s,
             Type::Array(_, _, s) => *s,
+            Type::TernaryWidth(_, s) => *s,
             Type::Tuple(_, s) => *s,
             Type::Fn(_, _, s) => *s,
             Type::Generic(_, _, s) => *s,

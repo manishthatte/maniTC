@@ -28,11 +28,21 @@ impl SemanticAnalyzer {
         if matches!(self.current_fn_ret, ManiType::Void)
             && !matches!(ty, ManiType::Void | ManiType::Unknown)
         {
+            // P123: `display()`, not `{:?}`. This message PRESCRIBES A REMEDY —
+            // "add `-> Tryte`" — and the Rust `Debug` name is not a spelling
+            // the language has, so a reader who followed it got a second
+            // error: "`Tryte` names no type". P45's shape, where the
+            // diagnostic was worse than the defect it reported.
+            //
+            // It is loud only because of P95. Before undeclared types were
+            // refused, `-> Tryte` resolved to `Unknown`, which is compatible
+            // with everything — so the program COMPILED and the wrong return
+            // type was never mentioned again.
             return Err(self.err(span, format!(
                 "function has no declared return type but returns a value of \
-                 type '{:?}' — add `-> {:?}` to its signature, or drop the \
+                 type '{}' — add `-> {}` to its signature, or drop the \
                  value from `return`",
-                ty, ty,
+                ty.display(), ty.display(),
             )));
         }
         Ok(())
@@ -191,8 +201,9 @@ impl SemanticAnalyzer {
                         if let Some((lo, hi)) = range {
                             if val < lo || val > hi {
                                 return Err(self.err(ls.span, format!(
-                                    "value {} overflows type '{:?}' (range {}..{})",
-                                    val, final_ty, lo, hi,
+                                    // P123, the same defect one message along.
+                                    "value {} overflows type '{}' (range {}..{})",
+                                    val, final_ty.display(), lo, hi,
                                 )));
                             }
                         }
@@ -224,6 +235,28 @@ impl SemanticAnalyzer {
                     self.symbols.define(&ls.name, ty.clone(), true);
                     (None, ty)
                 };
+                // B6: carry the initialiser's interval onto the binding.
+                //
+                // Without this the fragment stops at the first `let`:
+                // `let z = y + 100; inner(z)` loses everything the `where` on
+                // `y` established, and the checker that refuses `inner(y +
+                // 100)` accepts the same program written in two lines.
+                //
+                // Only an IMMUTABLE binding keeps its interval. A `let mut` can
+                // be assigned anything later, and this pass does not follow
+                // assignments — claiming a range for it would be the checker
+                // proving something false, which is the one thing it must
+                // never do.
+                if !ls.mutable && matches!(ls.pat, ast::LetPat::Ident(_)) {
+                    if let Some(te) = &init {
+                        let iv = self.expr_interval(te);
+                        if !iv.is_unknown() {
+                            self.value_intervals.insert(ls.name.clone(), iv);
+                        } else {
+                            self.value_intervals.remove(ls.name.as_str());
+                        }
+                    }
+                }
                 Ok(TypedStmt::Let(TypedLetStmt {
                     name: ls.name.clone(),
                     pat: ls.pat.clone(),

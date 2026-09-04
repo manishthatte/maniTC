@@ -183,11 +183,25 @@ impl IRType {
             ManiType::Bool => IRType::Bool,
             ManiType::Bool3 => IRType::I8,
             ManiType::Trit => IRType::Trit,
-            ManiType::Tryte => IRType::I16, // 6 trits: max 364, fits I16 (not I8)
-            ManiType::T9 => IRType::I32,
-            ManiType::T27 => IRType::I64, // 27 trits: max ±3.8×10^12, overflows I32
-            ManiType::T54 => IRType::I64,
-            // ManiType::Trint is merged into T54 (both map to I64)
+            // C3: derived from the WIDTH, and the steps are the four shipped
+            // types rather than the tightest fit — deliberately.
+            //
+            // `I16`/`I32` are load-bearing on LLVM: they render as real `i16`
+            // and `i32` and select `sext` against `trunc`. A tight derivation
+            // would put `t9` (max 9,841) in `I16` where it has been `I32`
+            // since the type existed, which is a representation change to a
+            // shipped type arriving as a side effect of adding a syntax. So
+            // the boundaries are placed AT the four names: every existing
+            // program lowers to the byte it lowered to before.
+            //
+            // The looseness is therefore recorded rather than repaired —
+            // narrowing `t9` is a real change with a real measurement owed to
+            // it (rule 11), and it is not this one.
+            ManiType::TN(w) => match w {
+                0..=6 => IRType::I16,  // ≤6 trits: max 364, needs more than I8
+                7..=9 => IRType::I32,  // as `t9` has always been
+                _ => IRType::I64,      // 27 and 54 trits, and everything between
+            },
             ManiType::Tfloat => IRType::F64,
             ManiType::Str => IRType::Ptr(Box::new(IRType::I8)),
             ManiType::Char => IRType::Char,

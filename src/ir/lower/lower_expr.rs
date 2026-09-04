@@ -726,10 +726,7 @@ impl IRLowerer {
                                     });
                                     self.emit(IRInstr::PrintStr(IRValue::Temp(t)));
                                 }
-                                ManiType::Tryte
-                                | ManiType::T9
-                                | ManiType::T27
-                                | ManiType::T54
+                                ManiType::TN(_)
                                 | ManiType::Bool
                                 | ManiType::Unknown => {
                                     self.emit(IRInstr::PrintInt(val))
@@ -1648,10 +1645,7 @@ impl IRLowerer {
             ManiType::Int
             | ManiType::Trit
             | ManiType::Bool3
-            | ManiType::Tryte
-            | ManiType::T9
-            | ManiType::T27
-            | ManiType::T54
+            | ManiType::TN(_)
             | ManiType::Char => "fmt::show_int",
             // Unknown and composites: assume the caller already produced a
             // string (the documented [fmt::show_*(..)] pattern).

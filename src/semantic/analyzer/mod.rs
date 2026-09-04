@@ -69,6 +69,28 @@ pub enum MonoState {
     Failed,
 }
 
+/// B3: one instantiation's arguments — the types AND the values.
+///
+/// Before const generics this was a bare `Vec<(String, ManiType)>` threaded
+/// through `mono_name`, `ensure_mono` and `mono_ret_ty`. A const parameter
+/// binds an INTEGER, and an integer is not a `ManiType`: the tempting encoding
+/// — bind `N` to the width type `TN(9)` — was measured against the item's own
+/// example and refused by it, because `struct TVec<const N: int> { data:
+/// [trit; N] }` has array lengths that are not bounded by 54 and a width type
+/// is. So the two live side by side, and the pair travels as one value so a
+/// call site cannot pass a type binding with somebody else's constants.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MonoBinding {
+    pub tys: Vec<(String, ManiType)>,
+    pub consts: Vec<(String, i64)>,
+}
+
+impl MonoBinding {
+    pub(crate) fn from_tys(tys: Vec<(String, ManiType)>) -> Self {
+        MonoBinding { tys, consts: Vec::new() }
+    }
+}
+
 pub struct SemanticAnalyzer {
     pub(crate) symbols: SymbolTable,
     pub(crate) functions: HashMap<String, (Vec<ManiType>, ManiType)>,
@@ -126,6 +148,11 @@ pub struct SemanticAnalyzer {
     pub warnings: WarningCollector,
     /// Track which variables have been read (for unused variable detection)
     pub(crate) read_vars: std::collections::HashSet<String>,
+    /// ENHANCEMENT_PLAN 0.3: mangled name -> the `mod::fn` it came from, for
+    /// every source module THIS program expands. Empty when no module was
+    /// merged, which is why the check cannot fire on a program that does not
+    /// pull the module in.
+    expanded_module_symbols: std::collections::HashMap<String, String>,
     /// Names registered by register_builtins (user functions may shadow these)
     pub(crate) builtin_names: std::collections::HashSet<String>,
     /// Prefixes ("foo" / "foo::bar") of successfully loaded user modules
@@ -202,6 +229,13 @@ pub struct SemanticAnalyzer {
     /// Inferring a literal's type arguments, and resolving a field's type once
     /// they are known, both need the declaration back.
     pub(crate) struct_generics: HashMap<String, Vec<String>>,
+    /// B3: the declared const generic parameters of every struct, keyed by
+    /// struct name and in declaration order.
+    ///
+    /// Separate from `struct_generics` for the reason `FnDef::const_generics`
+    /// is separate from `FnDef::generics`: a const parameter binds a value,
+    /// and every reader of `struct_generics` treats its entries as types.
+    pub(crate) struct_const_generics: HashMap<String, Vec<crate::ast::ConstParam>>,
     pub(crate) struct_field_ast: HashMap<String, Vec<(String, crate::ast::Type)>>,
     /// P65: the AST of every generic free function with a body, keyed by name.
     ///
@@ -226,11 +260,55 @@ pub struct SemanticAnalyzer {
     pub(crate) mono_state: HashMap<String, MonoState>,
     /// P65: the instantiated functions, appended to the program at the end.
     pub(crate) mono_fns: Vec<TypedFnDef>,
+    /// B3: why an instantiation failed, keyed by mangled name.
+    ///
+    /// P65 DISCARDS a failed instantiation and keeps the erased path, which is
+    /// right for a type parameter and wrong for a const one: `let y: t<A> =
+    /// 365` inside `fn f<const A: int>` instantiated at A=6 fails (a `tryte`
+    /// holds ±364), is discarded, and the erased body — where `t<A>` is
+    /// `Unknown` — then PRINTS 365. Measured, on this increment, before this
+    /// field existed. The message is kept so the call site can report the real
+    /// reason instead of "instantiation failed".
+    pub(crate) mono_failure: HashMap<String, String>,
     /// P65: when set, `check_fn` binds the function's type parameters to these
     /// concrete types instead of to `Unknown`. That single substitution is the
     /// whole of monomorphisation's type work, because `resolve_type` already
     /// consults `type_params` before anything else.
     pub(crate) mono_binding: Option<HashMap<String, ManiType>>,
+    /// B3: the const half of `mono_binding` — what each `const N: int` is
+    /// worth in the instantiation being checked. `None` outside one.
+    pub(crate) mono_const_binding: Option<HashMap<String, i64>>,
+    /// B3: the const generic parameters in scope, and what each is bound to.
+    ///
+    /// `Some(v)` is an instantiation: `N` is 27 here. `None` is the ERASED
+    /// copy — the generic's own body, checked once with nothing bound — and it
+    /// is a distinct state rather than an absent key on purpose. Absent means
+    /// "no such parameter", and that is the error; present-and-unbound means
+    /// "a width nobody has chosen yet", and that is `Unknown`, exactly as an
+    /// erased type parameter is.
+    pub(crate) const_params: HashMap<String, Option<i64>>,
+    /// B6: the declared refinement of every parameter of every function, by
+    /// name and position. `None` in a slot means that parameter has no `where`,
+    /// which is every parameter of every program that existed when B6 landed.
+    /// B4: every `const fn` the program declared, by name.
+    ///
+    /// Kept whole, because evaluating a call means running the BODY. The same
+    /// reason `generic_fn_asts` keeps one.
+    pub(crate) const_fns: HashMap<String, crate::ast::FnDef>,
+    /// B4: module-level constants whose initialiser folded to an integer.
+    ///
+    /// A module-level `let` is already required to have a compile-time
+    /// constant initialiser (P108), so this is not a new restriction — it is
+    /// the value that check already computed, kept instead of discarded.
+    pub(crate) const_ints: HashMap<String, i64>,
+    pub(crate) fn_param_refinements: HashMap<String, Vec<Option<crate::ast::Refinement>>>,
+    /// B6: what is known about each in-scope value's magnitude.
+    ///
+    /// Populated from a refined parameter's own `where`, and from `let`
+    /// bindings whose initialiser the fragment can evaluate. Absent means
+    /// unknown, which is the answer for everything the fragment does not
+    /// cover — and unknown is never refused.
+    pub(crate) value_intervals: HashMap<String, crate::semantic::interval::Interval>,
     /// R2: the language version being checked against.
     ///
     /// The checker's only use of it is the `division-semantics` lint, whose
@@ -421,6 +499,7 @@ impl SemanticAnalyzer {
             loaded_modules: std::collections::HashSet::new(),
             warnings: WarningCollector::new(),
             read_vars: std::collections::HashSet::new(),
+            expanded_module_symbols: std::collections::HashMap::new(),
             builtin_names: std::collections::HashSet::new(),
             loaded_module_prefixes: std::collections::HashSet::new(),
             module_private_items: HashMap::new(),
@@ -434,11 +513,19 @@ impl SemanticAnalyzer {
             bodied_fns: std::collections::HashSet::new(),
             fn_generic_sigs: HashMap::new(),
             struct_generics: HashMap::new(),
+            struct_const_generics: HashMap::new(),
             struct_field_ast: HashMap::new(),
             generic_fn_asts: HashMap::new(),
             generic_impl_owner: HashMap::new(),
             mono_state: HashMap::new(),
             mono_fns: Vec::new(),
+            mono_failure: HashMap::new(),
+            const_params: HashMap::new(),
+            const_fns: HashMap::new(),
+            const_ints: HashMap::new(),
+            fn_param_refinements: HashMap::new(),
+            value_intervals: HashMap::new(),
+            mono_const_binding: None,
             mono_binding: None,
             lang: crate::lang::LangVersion::default(),
         };
@@ -573,7 +660,9 @@ impl SemanticAnalyzer {
             Lit::Int(v) | Lit::TernaryInt(v) => *v,
             _ => return Ok(()),
         };
-        if !matches!(ty, ManiType::Int | ManiType::T27) {
+        // C3: `TN(27)`, not `TN(_)` — see `ir/lower/helpers.rs`. This is the
+        // 27-trit word's overflow check, not every ternary width's.
+        if !matches!(ty, ManiType::Int | ManiType::TN(27)) {
             return Ok(());
         }
         // Balanced ternary is symmetric — no extra negative value — so one
@@ -586,7 +675,7 @@ impl SemanticAnalyzer {
             return Err(self.err(
                 span,
                 format!(
-                    "the literal {} does not fit `int`: under --lang v2 an `int` is \
+                    "the value {} does not fit `int`: under --lang v2 an `int` is \
                      a 27-trit word and holds [{}, {}]. `trint` is the wider type \
                      for a value that needs the machine word.",
                     v,
@@ -607,15 +696,54 @@ impl SemanticAnalyzer {
             span.line,
             span.col,
             format!(
-                "the literal {} is outside the 27-trit range [{}, {}]: it fits `int` \
-                 on the LLVM backend and is reshaped on T3, and it will not compile \
-                 under --lang v2. `trint` is the wider type.",
+                "the value {} is outside the 27-trit range [{}, {}]: it fits `int` \
+                 on the LLVM backend and TRAPS at run time on T3, and it will not \
+                 compile under --lang v2. `trint` is the wider type.",
                 v,
                 crate::lang::T27_MIN,
                 crate::lang::T27_MAX,
             ),
         ));
         Ok(())
+    }
+
+    /// P125: apply the out-of-word check to a CONSTANT-FOLDED result.
+    ///
+    /// `check_literal_fits_word` sees the literal a programmer wrote.
+    /// `3812798742493 + 3812798742493` writes no such literal, so under
+    /// `--lang v2` — where N5 says an `int` IS a 27-trit word and the value
+    /// therefore does not exist — the program COMPILED. Measured before this
+    /// existed: the written form is a hard error and the folded form is
+    /// accepted, which is the same value getting two answers. And under v1 the
+    /// lint is `docs/semantics.md`'s stated MIGRATION PLAN, so a backlog that
+    /// lists only written literals under-reports the work.
+    ///
+    /// **Reported at the innermost expression that leaves the word.** An outer
+    /// expression containing an out-of-word sub-expression is out of word too,
+    /// so reporting every level would give one fault several messages; the
+    /// operand test below names the first place the value stopped fitting.
+    pub(crate) fn check_folded_fits_word(
+        &mut self,
+        e: &TypedExpr,
+        span: crate::ast::Span,
+    ) -> CompileResult<()> {
+        use crate::semantic::const_fold::fold_int;
+        if !matches!(e.ty, ManiType::Int | ManiType::TN(27)) {
+            return Ok(());
+        }
+        let Some(v) = fold_int(e) else { return Ok(()) };
+        if v.unsigned_abs() <= crate::lang::T27_MAX as u64 {
+            return Ok(());
+        }
+        if let TypedExprKind::BinOp(a, _, b) = &e.kind {
+            let out = |x: &TypedExpr| {
+                fold_int(x).is_some_and(|n| n.unsigned_abs() > crate::lang::T27_MAX as u64)
+            };
+            if out(a) || out(b) {
+                return Ok(()); // already reported further in
+            }
+        }
+        self.check_literal_fits_word(&crate::ast::Lit::Int(v), &e.ty, span)
     }
 
     fn register_builtins(&mut self) {
@@ -640,9 +768,12 @@ impl SemanticAnalyzer {
             // I/O intrinsics
             ("println",       vec![Unknown], Void),
             ("print",         vec![Unknown], Void),
-            // Math
-            ("abs",           vec![Int],     Int),
-            ("sqrt",          vec![Float],   Float),
+            // Math: `abs` and `sqrt` are deliberately absent. See the note
+            // below on the five `str_*` names — these two were the same defect
+            // and are removed by the same argument, with one difference worth
+            // recording: they carry no module prefix, so the levenshtein
+            // suggester cannot reach `math::abs` from `abs` (distance 6, and
+            // the cutoff is 3). `suggest_qualified` below exists for them.
             // fmt module
             ("fmt::format",      vec![Str, Unknown], Str),
             ("fmt::show_int",    vec![Int],           Str),
@@ -653,18 +784,41 @@ impl SemanticAnalyzer {
             ("str_find",         ss.clone(),          Int),
             ("str_concat",       ss.clone(),          Str),
             ("str_slice",        sii.clone(),         Str),
-            ("str_substr",       sii.clone(),         Str),
             ("str_trim",         s.clone(),           Str),
             ("str_replace",      sss.clone(),         Str),
-            ("str_parse_int",    s.clone(),           Int),
-            ("str_ends_with",    ss.clone(),          Bool),
-            ("str_starts_with",  ss.clone(),          Bool),
-            ("str_from_int",     vec![Int],           Str),
             ("str_from_char",    vec![Int],           Str),
             // str_to_upper / str_to_lower are deliberately absent: they became
             // ManiT source in stdlib/str.mt on 19 Aug 2026, so the analyzer
             // sees their real declared signature. A static entry here would be
             // a second source of truth that can drift from the stdlib.
+            //
+            // ENHANCEMENT_PLAN 0.1, 29 Aug 2026. That second source of truth
+            // DID drift, and the comment above was written beside the two
+            // names that had already been moved rather than the seven that had
+            // not. `str_substr`, `str_parse_int`, `str_ends_with`,
+            // `str_starts_with`, `str_from_int` and (above) `abs`, `sqrt` were
+            // entries here with NO definition anywhere in the linkable world:
+            // not in runtime/*.c, not intercepted by either emitter, and the
+            // flat spelling does not trigger the stdlib pull-in that would
+            // emit one. So they type-checked and then failed to link on BOTH
+            // backends -- `use of undefined value '@str_from_int'` on LLVM,
+            // `Undefined label: str_from_int` on T3.
+            //
+            // All seven have a working qualified spelling (str::substr,
+            // str::parse_int, str::ends_with, str::starts_with, str::from_int,
+            // math::abs, math::sqrt), and deleting the entry turns the silent
+            // link failure into the diagnostic str_to_lower already gave:
+            // "unknown identifier 'str_from_int' -- did you mean
+            // 'str::from_int'?".
+            //
+            // Pre-existing, not a regression: all seven fail identically on
+            // manitc-release-96c6f5c7-preexisting (25 Aug, before the Phase-4
+            // campaign). The recorded population was FIVE; probing every name
+            // in this table against both backends measured SEVEN, which is
+            // report.txt P70's lesson again -- a population recorded by
+            // reading is a lower bound on the population measured by running.
+            // The check that keeps it at zero is registry_tests::
+            // every_registered_builtin_is_linkable.
             // async module
             ("async::yield_now",   vec![],                 Void),
             ("async::sleep",       vec![Int],              Void),
@@ -922,13 +1076,121 @@ impl SemanticAnalyzer {
         ))
     }
 
+    /// B3: the width `t<N>` stands for when `N` is a const generic parameter.
+    ///
+    /// Three answers, and the middle one is the whole reason `const_params`
+    /// stores an `Option` rather than a value:
+    ///
+    /// - bound (`N` is 18 at this instantiation) — the width type, obtained
+    ///   from the SINGLE width authority by asking it for the spelling
+    ///   `t<18>`, so this adds no second table to keep in step;
+    /// - declared but unbound — the generic's own erased body, where no width
+    ///   has been chosen. `Unknown`, exactly as an erased type parameter is;
+    /// - not declared — an error that names what `N` would have to be.
+    fn resolve_ternary_width_expr(
+        &self,
+        e: &crate::ast::Expr,
+        span: Span,
+    ) -> CompileResult<ManiType> {
+        let sketch = crate::ast::expr_sketch(e);
+        let w = match self.eval_const_expr(e) {
+            // The erased copy. Deliberately NOT an error: the generic's body
+            // is checked once with nothing bound, and refusing it there would
+            // refuse every width-polymorphic function ever written.
+            Ok(None) => return Ok(ManiType::Unknown),
+            Ok(Some(w)) => w,
+            Err(err) => {
+                return Err(self.err(
+                    span,
+                    format!(
+                        "`t<{sketch}>` {}. A width must be an integer known at \
+                         compile time: a literal, a `const` generic parameter, a \
+                         module-level constant, or arithmetic and `const fn` calls \
+                         over those.",
+                        err.describe()
+                    ),
+                ))
+            }
+        };
+        crate::semantic::types::ternary_type_from_name(&format!("t<{w}>")).ok_or_else(|| {
+            self.err(
+                span,
+                format!(
+                    "`t<{sketch}>` is `t<{w}>` here, which is not a valid trit width: \
+                     a width runs from 1 to {}.",
+                    crate::semantic::types::MAX_TERNARY_WIDTH
+                ),
+            )
+        })
+    }
+
+    /// B3: the length an array type carries, once a const parameter can be one.
+    ///
+    /// Mirrors `resolve_ternary_width_expr`'s three answers. An unbound
+    /// parameter gives `None` — the same length an unsized `[int]` has, which
+    /// is what every existing reader of an array length already handles.
+    fn resolve_array_len(
+        &self,
+        len: &crate::ast::ArrayLen,
+        span: Span,
+    ) -> CompileResult<Option<usize>> {
+        use crate::ast::ArrayLen;
+        match len {
+            ArrayLen::Fixed(n) => Ok(Some(*n)),
+            ArrayLen::Unsized => Ok(None),
+            // B4: any expression in the integer constant fragment.
+            ArrayLen::Expr(e) => match self.eval_const_expr(e) {
+                Ok(None) => Ok(None), // erased generic body
+                Ok(Some(v)) if v >= 0 => Ok(Some(v as usize)),
+                Ok(Some(v)) => Err(self.err(
+                    span,
+                    format!(
+                        "the array length `{}` is {v} here, and a length cannot be \
+                         negative.",
+                        crate::ast::expr_sketch(e)
+                    ),
+                )),
+                Err(err) => Err(self.err(
+                    span,
+                    format!(
+                        "the array length `{}` {}. A length must be an integer known \
+                         at compile time: a literal, a `const` generic parameter, a \
+                         module-level constant, or arithmetic and `const fn` calls \
+                         over those.",
+                        crate::ast::expr_sketch(e),
+                        err.describe()
+                    ),
+                )),
+            },
+        }
+    }
+
     // Convert AST type to ManiType
     fn resolve_type(&self, ty: &Type) -> CompileResult<ManiType> {
         match ty {
+            // B3/B4: `t<A>` and `t<A + 1>`.
+            Type::TernaryWidth(e, span) => self.resolve_ternary_width_expr(e, *span),
             Type::Named(name, span) => {
                 // Generic type params take priority over everything else
                 if let Some(ty) = self.type_params.get(name.as_str()) {
                     return Ok(ty.clone());
+                }
+                // B3: a const generic parameter is a VALUE, and a value is not
+                // a type. Caught here rather than left to `name_to_manitype`
+                // because P95's remedy for an unknown name is "did you mean"
+                // over the declared types, and `N` is not a misspelling of a
+                // type — it is a name that exists and is the wrong kind.
+                if self.const_params.contains_key(name.as_str()) {
+                    return Err(self.err(
+                        *span,
+                        format!(
+                            "`{name}` is a `const` generic parameter, which binds an \
+                             integer rather than a type, so it cannot be written as \
+                             one. To use it as a trit width write `t<{name}>`; as an \
+                             array length, `[trit; {name}]`; as a value, just \
+                             `{name}`."
+                        ),
+                    ));
                 }
                 Ok(self.name_to_manitype(name, *span)?)
             }
@@ -1013,9 +1275,9 @@ impl SemanticAnalyzer {
                     }
                 }
             }
-            Type::Array(inner, size, _) => {
+            Type::Array(inner, size, span) => {
                 let inner_ty = self.resolve_type(inner)?;
-                Ok(ManiType::Array(Box::new(inner_ty), *size))
+                Ok(ManiType::Array(Box::new(inner_ty), self.resolve_array_len(size, *span)?))
             }
             Type::Tuple(types, _) => {
                 let resolved: CompileResult<Vec<ManiType>> =
@@ -1159,7 +1421,13 @@ impl SemanticAnalyzer {
         Err(self.err(
             *span,
             format!(
-                "`{name}` names no type: it is not a primitive, not a built-in                  generic, and no struct, enum or type parameter of that name is                  declared{hint}. It used to resolve to the unknown type, which                  is compatible with everything, so the program type-checked and                  the field or binding simply held whatever it was given.                  (`lint allow(undeclared-type);` restores the previous                  behaviour, in which this was silent.)"
+                "`{name}` names no type: it is not a primitive, not a built-in \
+                 generic, and no struct, enum or type parameter of that name is \
+                 declared{hint}. It used to resolve to the unknown type, which \
+                 is compatible with everything, so the program type-checked and \
+                 the field or binding simply held whatever it was given. \
+                 (`lint allow(undeclared-type);` restores the previous \
+                 behaviour, in which this was silent.)"
             ),
         ))
     }
@@ -1177,13 +1445,55 @@ impl SemanticAnalyzer {
             "float" | "f64" => Ok(ManiType::Float),
             "bool" => Ok(ManiType::Bool),
             "bool3" | "tribool" | "T3Bool" => Ok(ManiType::Bool3),
-            "trit" => Ok(ManiType::Trit),
-            "tryte" => Ok(ManiType::Tryte),
-            "t9" => Ok(ManiType::T9),
-            "t27" | "word" => Ok(ManiType::T27),
-            "t54" => Ok(ManiType::T54),
-            "trint" => Ok(ManiType::T54), // trint is a source-level alias for t54
-            "tfloat" => Ok(ManiType::Tfloat),
+            // C3: `trit`, the four named widths, and the `t<N>` spelling all
+            // resolve through the one authority in `semantic::types`, so the
+            // alias table is read here rather than repeated here.
+            "word" => Ok(ManiType::TN(27)),  // patent alias for t27
+            "trint" => Ok(ManiType::TN(54)), // source-level alias for t54
+            n if crate::semantic::types::ternary_type_from_name(n).is_some() => {
+                Ok(crate::semantic::types::ternary_type_from_name(n).unwrap())
+            }
+            // C5/P127: `tfloat` WAS A PHANTOM and is refused by name.
+            //
+            // It was a keyword (`TfloatKw`), a `ManiType` variant, and
+            // resolvable — and `ManiType::Tfloat => IRType::F64`, identical to
+            // `Float`. Measured on the previous compiler, it matched `float`
+            // in every observable property, including the two the ternary
+            // format exists to eliminate: `0.0/0.0` gave `NaN`, where
+            // `stdlib/t27f.mt` says "No NaN: every 27-trit pattern is a valid
+            // number"; and 1e600 overflowed to `inf`, where the format claims
+            // a range to ~4.3e4703. It kept 17 significant decimal digits,
+            // where an 18-trit mantissa gives about 8.6.
+            //
+            // BOTH BACKENDS LOWERED IT TO F64, so the parity matrix and the
+            // cross-backend oracle were blind to it by construction — the
+            // documented "shared mistakes, again". This is the `Pair` phantom
+            // in `resolve_type` a second time, and worse: `Pair` failed
+            // loudly at link time, while `tfloat` silently handed you a
+            // double.
+            //
+            // Refused rather than redefined. Making it an alias for the real
+            // format would change what already-written source MEANS, and the
+            // one file that used it — `tests/27_ir_regressions.mt`, 8
+            // occurrences across both repositories and the 2,507-program
+            // corpus — was testing FLOAT comparisons and wanted `float`.
+            "tfloat" => Err(self.err(
+                _span,
+                "there is no `tfloat` type. It named IEEE 754 double — the same \
+                 type as `float`, lowered identically — while claiming to be the \
+                 27-trit ternary format, which has no NaN, one zero and a range \
+                 to about 4.3e4703. Write `float` for the binary format, or \
+                 `t27f` for the ternary one (`use std::t27f;`)."
+                    .to_string(),
+            )),
+            // C5: `t27f` is the ternary floating-point format, as a type.
+            //
+            // It resolves to the library's own struct rather than to a new
+            // primitive, which is what makes the promotion honest: the format
+            // IS `stdlib/t27f.mt`, and a second implementation in the compiler
+            // would be two registries that must agree (permanent rule 5) in
+            // the one place where disagreeing is a wrong number.
+            "t27f" | "T27F" => Ok(ManiType::Struct("T27F".to_string(), Vec::new())),
             "str" | "String" => Ok(ManiType::Str),
             "char" => Ok(ManiType::Char),
             "void" | "()" => Ok(ManiType::Void),
@@ -1446,10 +1756,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             ManiType::Bool => Some("bool".to_string()),
             ManiType::Bool3 => Some("bool3".to_string()),
             ManiType::Trit => Some("trit".to_string()),
-            ManiType::Tryte => Some("tryte".to_string()),
-            ManiType::T9 => Some("t9".to_string()),
-            ManiType::T27 => Some("t27".to_string()),
-            ManiType::T54 => Some("t54".to_string()),
+            ManiType::TN(w) => Some(crate::semantic::types::ternary_width_name(*w)),
             ManiType::Tfloat => Some("tfloat".to_string()),
             _ => None,
         }
@@ -1601,9 +1908,14 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     Some(ManiType::Generic(n.clone(), resolved))
                 }
             }
-            AT::Array(inner, size, _) => Some(ManiType::Array(
+            AT::Array(inner, size, span) => Some(ManiType::Array(
                 Box::new(self.resolve_type_bound(inner, binding)?),
-                *size,
+                // B3: an unbound const parameter answers `None`, the same
+                // length an unsized `[int]` carries. This path resolves a
+                // field's type under a struct's TYPE binding, and a struct's
+                // const parameters are not instantiated (see §25's limit), so
+                // a length written `[trit; N]` is not yet a number here.
+                self.resolve_array_len(size, *span).ok().flatten(),
             )),
             AT::Tuple(items, _) => {
                 let ts: Option<Vec<ManiType>> = items
@@ -1627,12 +1939,25 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
     /// The `$` separator is deliberate: it cannot appear in a maniT
     /// identifier, so an instantiation can never collide with a user function,
     /// and both backends accept it in a symbol.
-    pub(crate) fn mono_name(base: &str, binding: &[(String, ManiType)]) -> String {
+    pub(crate) fn mono_name(base: &str, binding: &MonoBinding) -> String {
         let mut out = String::from(base);
-        for (_, ty) in binding {
+        for (_, ty) in &binding.tys {
             out.push('$');
             for c in ty.display().chars() {
                 out.push(if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' });
+            }
+        }
+        // B3: const arguments extend the same scheme. A negative value is
+        // spelled `n` rather than losing its sign to the sanitiser: `f$_3` and
+        // `f$3` would differ by one character that means nothing, and two
+        // instantiations that mangle alike are one wrong answer.
+        for (_, v) in &binding.consts {
+            out.push('$');
+            if *v < 0 {
+                out.push('n');
+                out.push_str(&v.unsigned_abs().to_string());
+            } else {
+                out.push_str(&v.to_string());
             }
         }
         out
@@ -1649,7 +1974,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         &self,
         callee: &str,
         arg_tys: &[ManiType],
-    ) -> Option<Vec<(String, ManiType)>> {
+    ) -> Option<MonoBinding> {
         let ast = self.generic_fn_asts.get(callee)?;
         let mut map: HashMap<String, ManiType> = HashMap::new();
         for (declared, actual) in ast.params.iter().map(|p| &p.ty).zip(arg_tys.iter()) {
@@ -1663,7 +1988,114 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             }
             out.push((g.clone(), ty.clone()));
         }
+        Some(MonoBinding { tys: out, consts: Self::const_binding_for(ast, arg_tys)? })
+    }
+
+    /// B3: the const arguments a call supplies, in the callee's declared order.
+    ///
+    /// `Some(vec![])` for a callee with no const parameters, which is what
+    /// keeps every pre-existing instantiation's mangled name byte-identical.
+    /// `None` when any const parameter is unbound — the same answer an unbound
+    /// TYPE parameter gives, and the same consequence: the call keeps the
+    /// erased path it has always had rather than getting a half-instantiation.
+    ///
+    /// **There is no inference from anywhere but the arguments.** A parameter
+    /// that appears only in the return type — the `B` of
+    /// `fn widen<const A: int, const B: int>(x: t<A>) -> t<B>`, which is the
+    /// item's own example — cannot be bound here, because this language has no
+    /// turbofish and nothing at the call site names it. That is a real limit
+    /// of what B3 delivers and §25 states it rather than implying it.
+    fn const_binding_for(
+        ast: &crate::ast::FnDef,
+        arg_tys: &[ManiType],
+    ) -> Option<Vec<(String, i64)>> {
+        if ast.const_generics.is_empty() {
+            return Some(Vec::new());
+        }
+        let names: Vec<&str> = ast.const_generics.iter().map(|c| c.name.as_str()).collect();
+        let mut map: HashMap<String, i64> = HashMap::new();
+        for (declared, actual) in ast.params.iter().map(|p| &p.ty).zip(arg_tys.iter()) {
+            Self::bind_const_generics(declared, actual, &names, &mut map);
+        }
+        let mut out = Vec::new();
+        for c in &ast.const_generics {
+            out.push((c.name.clone(), *map.get(&c.name)?));
+        }
         Some(out)
+    }
+
+    /// B3: bind const generic parameters to the values an argument's TYPE
+    /// carries, structurally — the value half of `bind_generics`.
+    ///
+    /// Two positions supply a value, and both are widths or lengths rather
+    /// than data: `t<A>` against a `t9` argument binds `A` to 9, and
+    /// `[trit; N]` against a `[trit; 12]` binds `N` to 12. A parameter that
+    /// binds twice keeps the FIRST binding, exactly as `bind_generics` does,
+    /// so that a conflict stays a separate question from an unbound one.
+    fn bind_const_generics(
+        declared: &crate::ast::Type,
+        actual: &ManiType,
+        params: &[&str],
+        out: &mut HashMap<String, i64>,
+    ) {
+        use crate::ast::Type as AT;
+        match declared {
+            // `t<A>`. `Trit` is width ONE and binds as such: C3 made `t<1>`
+            // resolve to `trit` exactly, so the inverse has to hold or a
+            // round trip through the type system would change the width.
+            // B4: only a BARE parameter binds a width. `t<A + 1>` against a
+            // `t9` would need the compiler to invert the expression.
+            AT::TernaryWidth(e, _) => {
+                if let crate::ast::Expr::Ident(p, _) = &**e {
+                    if params.contains(&p.as_str()) && !out.contains_key(p) {
+                        let w = match actual {
+                            ManiType::Trit => Some(1i64),
+                            ManiType::TN(w) => Some(*w as i64),
+                            _ => None,
+                        };
+                        if let Some(w) = w {
+                            out.insert(p.clone(), w);
+                        }
+                    }
+                }
+            }
+            AT::Array(inner, len, _) => {
+                if let ManiType::Array(a, n) = actual {
+                    // B4: only a BARE name binds. `[trit; N * 2]` against a
+                    // `[trit; 12]` would need the compiler to invert the
+                    // expression, and it does not — so an expression length
+                    // is checked, never inferred from.
+                    if let (Some(p), Some(n)) = (len.bare_param(), n) {
+                        if params.contains(&p) && !out.contains_key(p) {
+                            out.insert(p.to_string(), *n as i64);
+                        }
+                    }
+                    Self::bind_const_generics(inner, a, params, out);
+                }
+            }
+            AT::Ref(inner, _, _) | AT::Ptr(inner, _, _) => {
+                Self::bind_const_generics(inner, actual, params, out);
+            }
+            AT::Tuple(items, _) => {
+                if let ManiType::Tuple(actuals) = actual {
+                    for (d, a) in items.iter().zip(actuals.iter()) {
+                        Self::bind_const_generics(d, a, params, out);
+                    }
+                }
+            }
+            AT::Generic(_, args, _) => {
+                let actual_args = match actual {
+                    ManiType::Generic(_, a) | ManiType::Struct(_, a) => Some(a),
+                    _ => None,
+                };
+                if let Some(actual_args) = actual_args {
+                    for (d, a) in args.iter().zip(actual_args.iter()) {
+                        Self::bind_const_generics(d, a, params, out);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// P69: the complete type environment an instantiation of `base` is
@@ -1681,15 +2113,15 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
     fn mono_env(
         &self,
         base: &str,
-        binding: &[(String, ManiType)],
+        binding: &MonoBinding,
     ) -> HashMap<String, ManiType> {
-        let mut map: HashMap<String, ManiType> = binding.iter().cloned().collect();
+        let mut map: HashMap<String, ManiType> = binding.tys.iter().cloned().collect();
         if let Some((owner, _)) = self.generic_impl_owner.get(base) {
             map.insert(
                 "Self".to_string(),
                 ManiType::Struct(
                     owner.clone(),
-                    binding.iter().map(|(_, t)| t.clone()).collect(),
+                    binding.tys.iter().map(|(_, t)| t.clone()).collect(),
                 ),
             );
         }
@@ -1710,7 +2142,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         &self,
         qname: &str,
         args: &[ManiType],
-    ) -> Option<Vec<(String, ManiType)>> {
+    ) -> Option<MonoBinding> {
         let ast = self.generic_fn_asts.get(qname)?;
         let &(_, n) = self.generic_impl_owner.get(qname)?;
         // The receiver must supply exactly as many arguments as the impl
@@ -1719,13 +2151,20 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         if args.len() != n || ast.generics.len() < n {
             return None;
         }
-        Some(
+        // B3: a method with its own const parameters has nothing to bind them
+        // from on this path — the binding comes from the RECEIVER's type
+        // arguments, and a const parameter is not one of those. Refusing keeps
+        // the erased path rather than instantiating at a value nobody chose.
+        if !ast.const_generics.is_empty() {
+            return None;
+        }
+        Some(MonoBinding::from_tys(
             ast.generics[..n]
                 .iter()
                 .cloned()
                 .zip(args[..n].iter().cloned())
                 .collect(),
-        )
+        ))
     }
 
     /// P65: the declared return type of a generic callee under one binding.
@@ -1737,16 +2176,29 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
     pub(crate) fn mono_ret_ty(
         &mut self,
         callee: &str,
-        binding: &[(String, ManiType)],
+        binding: &MonoBinding,
     ) -> Option<ManiType> {
         let ast = self.generic_fn_asts.get(callee).cloned()?;
         let rt = ast.ret_ty.as_ref()?;
         let saved = std::mem::take(&mut self.type_params);
+        let saved_consts = std::mem::take(&mut self.const_params);
         for (g, ty) in self.mono_env(callee, binding) {
             self.type_params.insert(g, ty);
         }
+        // B3: `-> t<A>` is a return type that needs the CONST binding, not the
+        // type binding, and it is the return position that makes width
+        // polymorphism worth having. Every const parameter is declared here,
+        // bound ones with their value: an undeclared one must still resolve to
+        // the error that names it rather than to `Unknown`.
+        for c in &ast.const_generics {
+            self.const_params.insert(c.name.clone(), None);
+        }
+        for (g, v) in &binding.consts {
+            self.const_params.insert(g.clone(), Some(*v));
+        }
         let out = self.resolve_type(rt).ok();
         self.type_params = saved;
+        self.const_params = saved_consts;
         out
     }
 
@@ -1776,7 +2228,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
     /// of recursing forever. On failure everything generated inside the
     /// window is discarded too, because only bodies inside the window can
     /// name it.
-    pub(crate) fn ensure_mono(&mut self, base: &str, binding: &[(String, ManiType)]) -> bool {
+    pub(crate) fn ensure_mono(&mut self, base: &str, binding: &MonoBinding) -> bool {
         let mangled = Self::mono_name(base, binding);
         match self.mono_state.get(&mangled) {
             Some(MonoState::Ok) | Some(MonoState::InProgress) => return true,
@@ -1795,17 +2247,30 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         // fails, which is invisible when analysis aborts and corrupting when
         // it does not.
         let saved_tp = std::mem::take(&mut self.type_params);
+        // B3: `check_fn` leaves `const_params` replaced when its body fails,
+        // for exactly the reason the comment above gives about `type_params` —
+        // the `?` in `check_block` skips the restore. A failed instantiation
+        // is not an error here, so the corruption would be silent and would
+        // outlive the window.
+        let saved_cp = std::mem::take(&mut self.const_params);
+        let saved_iv = std::mem::take(&mut self.value_intervals);
         let saved_ret = self.current_fn_ret.clone();
         let saved_fn = self.current_fn.clone();
         let depth = self.symbols.depth();
         let warn_mark = self.warnings.warnings.len();
         let fns_mark = self.mono_fns.len();
         let saved_binding = self.mono_binding.replace(self.mono_env(base, binding));
+        let saved_cbinding = self
+            .mono_const_binding
+            .replace(binding.consts.iter().cloned().collect());
 
         let res = self.check_fn(&inst);
 
         self.mono_binding = saved_binding;
+        self.mono_const_binding = saved_cbinding;
         self.type_params = saved_tp;
+        self.const_params = saved_cp;
+        self.value_intervals = saved_iv;
         self.current_fn_ret = saved_ret;
         self.current_fn = saved_fn;
         self.symbols.truncate_to(depth);
@@ -1820,11 +2285,503 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 self.mono_state.insert(mangled, MonoState::Ok);
                 true
             }
-            Err(_) => {
+            Err(e) => {
                 self.mono_fns.truncate(fns_mark);
+                let d = e.diagnostic();
+                self.mono_failure
+                    .insert(mangled.clone(), format!("{}:{}: {}", d.line, d.col, d.message));
                 self.mono_state.insert(mangled, MonoState::Failed);
                 false
             }
+        }
+    }
+
+    /// B7 D-5: say that an instantiation was discarded, so its body was never
+    /// checked under this binding.
+    ///
+    /// **One helper for both call sites on purpose.** P65's fork is reached
+    /// from the free-function path and from the `impl` method path, and this
+    /// repository's record is full of one fix landing at one of a shape's
+    /// sites — a backwards guard that lived at four, a missing width guard
+    /// that lived at two. The message is written once so the two cannot drift.
+    ///
+    /// The diagnostic is at the CALL SITE rather than at the generic's
+    /// declaration, because the binding is a property of the call: the same
+    /// body checks at one type and not at another, and the reader can only act
+    /// where the type was chosen.
+    pub(crate) fn warn_unchecked_instantiation(
+        &mut self,
+        base: &str,
+        mangled: &str,
+        span: crate::ast::Span,
+    ) {
+        let why = self
+            .mono_failure
+            .get(mangled)
+            .cloned()
+            .unwrap_or_else(|| "the body does not check".to_string());
+        self.warnings.push(CompileWarning::new(
+            WarningKind::UncheckedInstantiation,
+            &self.dfile(span),
+            span.line,
+            span.col,
+            format!(
+                "'{base}' does not check at this instantiation, so the erased body \
+                 is what runs and its own checks — including the move checker — \
+                 never saw it: {why}"
+            ),
+        ));
+    }
+
+    /// P129: refuse a cast between an aggregate and something that is not it.
+    ///
+    /// **`as` was UNCHECKED.** The arm resolved the target type and returned
+    /// it, so every cast was accepted and an aggregate cast to a number gave
+    /// its ALLOCATION ADDRESS. Measured before this existed:
+    ///
+    /// ```text
+    /// struct P { pub v: int }
+    /// let p = P { v: 7 };
+    /// p as int      // 63000 — HEAP_BASE, the address
+    /// p as float    // the same address reinterpreted, ~3.1e-320
+    /// p as str      // empty
+    /// ```
+    ///
+    /// That is A4's defect in a second syntax: A4's `max(P{9}, P{1})` returned
+    /// `P{1}` because `>` compared allocation addresses, and this returns the
+    /// address itself. Both backends agree on it, so the differential oracle
+    /// never saw either.
+    ///
+    /// The rule is deliberately narrow — an aggregate converts only to itself,
+    /// and a cast with `Unknown` on either side is left alone because that is
+    /// the permissive placeholder every erased generic wears. Numeric casts,
+    /// which are all 2,891 casts in both repositories and the corpus, are
+    /// untouched.
+    fn check_cast_is_defined(
+        &self,
+        from: &ManiType,
+        to: &ManiType,
+        span: Span,
+    ) -> CompileResult<()> {
+        let aggregate = |t: &ManiType| {
+            matches!(
+                t,
+                ManiType::Struct(..) | ManiType::Enum(_) | ManiType::Array(..)
+                    | ManiType::Tuple(_) | ManiType::Generic(..)
+            )
+        };
+        if !aggregate(from) && !aggregate(to) {
+            return Ok(());
+        }
+        if from == to {
+            return Ok(());
+        }
+        // Never refuse on what the checker does not know. An erased generic
+        // parameter is `Unknown`, and refusing there would reject bodies that
+        // are correct at every instantiation.
+        if matches!(from, ManiType::Unknown) || matches!(to, ManiType::Unknown) {
+            return Ok(());
+        }
+        Err(self.err(
+            span,
+            format!(
+                "`{}` cannot be cast to `{}`. `as` converts between numbers; a \
+                 struct, enum, array, tuple or container has no numeric value, and \
+                 this cast used to yield its ALLOCATION ADDRESS. Read the field or \
+                 element you meant, or call a conversion function.",
+                from.display(),
+                to.display(),
+            ),
+        ))
+    }
+
+    /// B4: evaluate a constant expression written in TYPE position.
+    ///
+    /// The environment is the `const` generic parameters that are bound here,
+    /// plus the module's own constants, plus every `const fn`. An UNBOUND
+    /// const parameter — the erased copy of a generic — makes this answer
+    /// `None` rather than an error, for `resolve_ternary_width_expr`'s reason:
+    /// a width nobody has chosen yet is `Unknown`, not a mistake.
+    pub(crate) fn eval_const_expr(
+        &self,
+        e: &crate::ast::Expr,
+    ) -> Result<Option<i64>, crate::semantic::const_eval::EvalError> {
+        use crate::semantic::const_eval::{eval_int, ConstCtx};
+        let mut ints = self.const_ints.clone();
+        let mut erased = false;
+        for (k, v) in &self.const_params {
+            match v {
+                Some(n) => {
+                    ints.insert(k.clone(), *n);
+                }
+                None => erased = true,
+            }
+        }
+        let ctx = ConstCtx { ints: &ints, fns: &self.const_fns };
+        match eval_int(e, &ctx) {
+            Ok(v) => Ok(Some(v)),
+            // An unbound const parameter in scope is the erased body. Anything
+            // else that is unbound is a real error.
+            Err(crate::semantic::const_eval::EvalError::Unbound(ref n))
+                if erased && self.const_params.contains_key(n.as_str()) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// B6: the interval a written refinement denotes, with `const` generic
+    /// parameters substituted.
+    ///
+    /// `None` when a bound names a const parameter that is not bound here —
+    /// the erased copy of a generic — because an interval half-substituted is
+    /// worse than no interval: it would refuse calls the instantiation accepts.
+    pub(crate) fn refinement_interval(
+        &self,
+        r: &crate::ast::Refinement,
+    ) -> Option<crate::semantic::interval::Interval> {
+        use crate::ast::RefineBound;
+        use crate::semantic::interval::Interval;
+        let resolve = |b: &RefineBound| -> Option<i64> {
+            match b {
+                RefineBound::Lit(v) => Some(*v),
+                RefineBound::ConstParam(n) => *self.const_params.get(n.as_str())?,
+            }
+        };
+        // A STRICT bound is narrowed to the inclusive one beside it, which is
+        // exact for integers: `x < 10` is `x <= 9`. Doing it here rather than
+        // at every comparison keeps `Interval` a plain closed range and means
+        // the strictness cannot be forgotten at one of the sites.
+        let lo = match &r.lo {
+            None => None,
+            Some(b) => {
+                let v = resolve(b)?;
+                Some(if r.lo_inclusive { v } else { v.checked_add(1)? })
+            }
+        };
+        let hi = match &r.hi {
+            None => None,
+            Some(b) => {
+                let v = resolve(b)?;
+                Some(if r.hi_inclusive { v } else { v.checked_sub(1)? })
+            }
+        };
+        Some(Interval::new(lo, hi))
+    }
+
+    /// B6: what the checker knows about a typed expression's value.
+    ///
+    /// The fragment: integer literals, names whose interval is in scope, and
+    /// `+`, `-`, `*` and unary `-` over those. Everything else is UNKNOWN, and
+    /// unknown is never refused — this is a refuter, not a prover.
+    pub(crate) fn expr_interval(
+        &self,
+        e: &TypedExpr,
+    ) -> crate::semantic::interval::Interval {
+        use crate::semantic::interval::Interval;
+        use crate::ast::{BinOpKind, Lit, UnOpKind};
+        match &e.kind {
+            TypedExprKind::Lit(Lit::Int(v)) | TypedExprKind::Lit(Lit::TernaryInt(v)) => {
+                Interval::exact(*v)
+            }
+            TypedExprKind::Ident(n) => {
+                self.value_intervals.get(n.as_str()).copied().unwrap_or(Interval::UNKNOWN)
+            }
+            TypedExprKind::UnOp(UnOpKind::Neg, inner) => self.expr_interval(inner).neg(),
+            TypedExprKind::BinOp(a, op, b) => {
+                let (ia, ib) = (self.expr_interval(a), self.expr_interval(b));
+                match op {
+                    BinOpKind::Add => ia.add(&ib),
+                    BinOpKind::Sub => ia.sub(&ib),
+                    BinOpKind::Mul => ia.mul(&ib),
+                    _ => Interval::UNKNOWN,
+                }
+            }
+            _ => Interval::UNKNOWN,
+        }
+    }
+
+    /// B6: check a call's arguments against the callee's declared refinements.
+    ///
+    /// **Refutation only.** An argument is refused when its interval is
+    /// PROVABLY disjoint from the refinement, and is accepted in every other
+    /// case, including when nothing is known. That is the honest reading of a
+    /// checker whose fragment is literals and refined parameters: it moves a
+    /// class of runtime traps to compile time, which is what the item claims,
+    /// and it does not pretend to move all of them.
+    pub(crate) fn check_refinements_at_call(
+        &mut self,
+        callee: &str,
+        args: &[TypedExpr],
+        span: Span,
+    ) -> CompileResult<()> {
+        let Some(refs) = self.fn_param_refinements.get(callee).cloned() else {
+            return Ok(());
+        };
+        for (i, slot) in refs.iter().enumerate() {
+            let Some(r) = slot else { continue };
+            let Some(arg) = args.get(i) else { continue };
+            let Some(want) = self.refinement_interval(r) else { continue };
+            let got = self.expr_interval(arg);
+            if got.within(&want) {
+                continue; // proven
+            }
+            if !got.disjoint_from(&want) {
+                // Neither proven nor refuted. The backlog, not a defect.
+                if self.warnings.effective_level(&WarningKind::UnprovenRefinement)
+                    != crate::lint::LintLevel::Allow
+                {
+                    self.warnings.push(CompileWarning::new(
+                        WarningKind::UnprovenRefinement,
+                        &self.dfile(span),
+                        span.line,
+                        span.col,
+                        format!(
+                            "argument {} of '{}' is {}, and `where {}` needs {} — the \
+                             checker cannot prove it holds for every value.",
+                            i + 1,
+                            callee,
+                            got.display(),
+                            r.text,
+                            want.display(),
+                        ),
+                    ));
+                }
+                continue;
+            }
+            return Err(self.err(
+                span,
+                format!(
+                    "argument {} of '{callee}' is {}, which cannot satisfy `where {}`. \
+                     The parameter is declared to lie in {}.",
+                    i + 1,
+                    got.display(),
+                    r.text,
+                    want.display(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// B6: check a refinement where it is WRITTEN, against itself and against
+    /// the type it refines.
+    ///
+    /// Two declarations are refused here rather than at every call that fails:
+    /// an empty interval (`where 10 <= x <= 5`), which no argument can ever
+    /// satisfy; and one that reaches outside the range its own type can hold
+    /// (`x: tryte where -1000 <= x <= 1000`, when a `tryte` holds ±364), which
+    /// promises the caller something the type cannot keep.
+    fn check_refinement_decl(&self, p: &crate::ast::Param, owner: &str) -> CompileResult<()> {
+        let Some(r) = &p.refinement else { return Ok(()) };
+        let Some(iv) = self.refinement_interval(r) else { return Ok(()) };
+        if iv.is_empty() {
+            return Err(self.err(
+                r.span,
+                format!(
+                    "the `where` on `{}` of '{owner}' is empty: `{}` denotes {}, which \
+                     no value satisfies, so no call to '{owner}' could ever be \
+                     accepted.",
+                    p.name, r.text, iv.display()
+                ),
+            ));
+        }
+        // The declared type's own range, when it has one. `int` deliberately
+        // has none here: it is 27 trits on T3 and 64 bits on LLVM, so a bound
+        // outside 27 trits is legal source for one backend and not the other,
+        // and refusing it would make this check pick a backend. A NAMED width
+        // is the same on both and can be checked.
+        if let Ok(ty) = self.resolve_type(&p.ty) {
+            // P122's single width authority, reused rather than duplicated
+            // (permanent rule 5: a registry that must agree with another gets
+            // a test, and the way to need neither is to have one).
+            if let Some((tl, th)) = self::type_inference::ternary_type_range(&ty) {
+                let tiv = crate::semantic::interval::Interval::new(Some(tl), Some(th));
+                if !iv.within(&tiv) {
+                    return Err(self.err(
+                        r.span,
+                        format!(
+                            "the `where` on `{}` of '{owner}' reaches outside `{}`: \
+                             `{}` denotes {}, and a `{}` holds {}. Widen the type or \
+                             narrow the bound.",
+                            p.name, ty.display(), r.text, iv.display(),
+                            ty.display(), tiv.display(),
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// B3: check one declaration's generic parameter list.
+    ///
+    /// Three rules, and each was written because the compiler ACCEPTED the
+    /// violation silently when it was measured:
+    ///
+    /// - `const N: str` type-checked and then bound `N` to a trit width;
+    /// - `<N, const N: int>` declared the same name twice, one a type and one
+    ///   a value, and the type won every lookup;
+    /// - `<const N: int, T>` reached the type resolver as an undeclared type
+    ///   `T`, so the reader was told to declare something they had declared.
+    ///
+    /// The third is the one the parser cannot decide alone, which is why it
+    /// marks the parameter and leaves the diagnostic here (see
+    /// `Parser::CONST_ORDER_MARKER`).
+    pub(crate) fn check_const_generic_decl(
+        &self,
+        generics: &[String],
+        const_generics: &[crate::ast::ConstParam],
+        kind: &str,
+        owner: &str,
+        span: Span,
+    ) -> CompileResult<()> {
+        if let Some(marker) = generics
+            .iter()
+            .find(|g| g.starts_with(crate::parser::Parser::CONST_ORDER_MARKER))
+        {
+            let bare = &marker[crate::parser::Parser::CONST_ORDER_MARKER.len()..];
+            let consts = const_generics
+                .iter()
+                .map(|c| format!("const {}: {}", c.name, c.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(self.err(
+                span,
+                format!(
+                    "in {kind} '{owner}', the type parameter `{bare}` is declared after \
+                     a `const` parameter. Const parameters come LAST: write \
+                     `<{bare}, {consts}>`. The two are separate lists and are \
+                     recombined by position, so a type parameter after a const one \
+                     has no reading."
+                ),
+            ));
+        }
+        for c in const_generics {
+            if c.ty != "int" {
+                return Err(self.err(
+                    c.span,
+                    format!(
+                        "`const {}: {}` — a const generic parameter is an integer, and \
+                         `int` is the only type it may be declared with today. Write \
+                         `const {}: int`.",
+                        c.name,
+                        if c.ty.is_empty() { "<nothing>" } else { c.ty.as_str() },
+                        c.name
+                    ),
+                ));
+            }
+            if generics.iter().any(|g| g == &c.name) {
+                return Err(self.err(
+                    c.span,
+                    format!(
+                        "`{}` is declared twice in {kind} '{owner}': once as a type \
+                         parameter and once as `const {}: int`. One name cannot be \
+                         both a type and a value.",
+                        c.name, c.name
+                    ),
+                ));
+            }
+            if const_generics.iter().filter(|o| o.name == c.name).count() > 1 {
+                return Err(self.err(
+                    c.span,
+                    format!("`const {}: int` is declared twice in {kind} '{owner}'.", c.name),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// B3: refuse a call whose const generic arguments nothing pins down.
+    ///
+    /// **This is an ERROR where P65 makes a failed TYPE instantiation silent,
+    /// and the difference is the population.** P65's rule — "a failed
+    /// instantiation is not an error" — exists because reporting one would
+    /// reject programs that compile today, and two tests say so in as many
+    /// words. No program uses a const generic today: the syntax is new in this
+    /// increment, measured at zero occurrences across both repositories and
+    /// the 2,507-program corpus. So refusing costs nothing and buys the thing
+    /// that matters, because the alternative was measured too: `width(n)` with
+    /// an `int` argument reached the erased body, substituted 0 for `A`, and
+    /// PRINTED 0. A width that silently becomes zero is the exact shape of
+    /// wrong answer this compiler's record is full of.
+    ///
+    /// Two calls fail here, and the second is the item's own example:
+    /// an argument that carries no width (`int` is not `t<A>` for any A), and
+    /// a parameter that appears ONLY in the return type — `fn make<const B:
+    /// int>() -> t<B>` — which nothing at the call site could name, because
+    /// this language has no turbofish.
+    pub(crate) fn check_const_generic_call(
+        &mut self,
+        callee: &str,
+        arg_tys: &[ManiType],
+        span: crate::ast::Span,
+    ) -> CompileResult<()> {
+        let Some(ast) = self.generic_fn_asts.get(callee) else {
+            return Ok(());
+        };
+        if ast.const_generics.is_empty() {
+            return Ok(());
+        }
+        if Self::const_binding_for(ast, arg_tys).is_some() {
+            return Ok(());
+        }
+        // Name the parameters that failed, not just the call. Recomputed
+        // rather than returned from `const_binding_for`, which answers a
+        // yes/no question for the monomorphiser and should keep doing so.
+        let names: Vec<&str> = ast.const_generics.iter().map(|c| c.name.as_str()).collect();
+        let mut map: HashMap<String, i64> = HashMap::new();
+        for (declared, actual) in ast.params.iter().map(|p| &p.ty).zip(arg_tys.iter()) {
+            Self::bind_const_generics(declared, actual, &names, &mut map);
+        }
+        let unbound: Vec<String> = ast
+            .const_generics
+            .iter()
+            .filter(|c| !map.contains_key(&c.name))
+            .map(|c| c.name.clone())
+            .collect();
+        let in_params = ast.const_generics.iter().any(|c| {
+            ast.params.iter().any(|p| Self::type_mentions_const(&p.ty, &c.name))
+        });
+        let advice = if in_params {
+            "a const parameter is bound from the ARGUMENTS: pass a value whose \
+             type carries the width or length it names, such as a `t9` for a \
+             `t<A>`"
+        } else {
+            "this parameter appears only in the return type, and ManiT has no \
+             turbofish, so nothing at the call site can name it — move it into \
+             a parameter's type"
+        };
+        Err(self.err(
+            span,
+            format!(
+                "the call to '{callee}' does not pin down its `const` generic \
+                 parameter{} {}: {advice}.",
+                if unbound.len() == 1 { "" } else { "s" },
+                unbound
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        ))
+    }
+
+    /// B3: does this declared type mention the const parameter `name`?
+    fn type_mentions_const(ty: &crate::ast::Type, name: &str) -> bool {
+        use crate::ast::Type as AT;
+        match ty {
+            AT::TernaryWidth(e, _) => {
+                matches!(&**e, crate::ast::Expr::Ident(p, _) if p == name)
+            }
+            AT::Array(inner, len, _) => {
+                len.bare_param() == Some(name) || Self::type_mentions_const(inner, name)
+            }
+            AT::Ref(inner, _, _) | AT::Ptr(inner, _, _) => Self::type_mentions_const(inner, name),
+            AT::Tuple(items, _) => items.iter().any(|t| Self::type_mentions_const(t, name)),
+            AT::Generic(_, args, _) => args.iter().any(|t| Self::type_mentions_const(t, name)),
+            _ => false,
         }
     }
 
@@ -2092,6 +3049,24 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             None => program,
         };
 
+        // ENHANCEMENT_PLAN 0.3: what will this program's modules emit?
+        //
+        // Read off the EXPANDED program rather than off `SOURCE_MODULES`, so
+        // a module the program never pulls in contributes nothing — see
+        // `check_colliding_stdlib_symbol` for the file that makes the
+        // difference observable.
+        self.expanded_module_symbols.clear();
+        for item in &program.items {
+            if let Item::FnDef(f) = item {
+                if f.name.contains("::") {
+                    self.expanded_module_symbols.insert(
+                        crate::codegen_llvm::helpers::mangle_func_name(&f.name),
+                        f.name.clone(),
+                    );
+                }
+            }
+        }
+
         // First pass: collect type definitions and function signatures
         self.collect_declarations(program)?;
 
@@ -2202,6 +3177,15 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                         // unrepresentable initialiser such as a struct literal
                         // became a null pointer that faulted at first use.
                         // Fold it here, and say so when it will not fold.
+                        // B4: keep the integer value the check just computed.
+                        //
+                        // A module-level `let` is already required to have a
+                        // compile-time constant initialiser, so this adds no
+                        // restriction — it stops DISCARDING the answer, which
+                        // is what lets `[int; N]` and `t<N>` name one.
+                        if let Some(v) = crate::semantic::const_fold::fold_int(&te) {
+                            self.const_ints.insert(gv.name.clone(), v);
+                        }
                         if let Err(e) = crate::semantic::const_fold::fold(&te) {
                             return Err(self.err(gv.span, format!(
                                 "the initialiser of global '{}' {}. A module-level `let` is \
@@ -2557,9 +3541,23 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             match item {
                 Item::FnDef(f) if f.body.is_some() => {
                     self.bodied_fns.insert(f.name.clone());
-                    if !f.generics.is_empty() {
+                    // B4: a `const fn` is kept whole, because evaluating a
+                    // call to it means running its body. It is ALSO an
+                    // ordinary function — it is checked, lowered and emitted
+                    // like any other — so `const` adds a capability rather
+                    // than removing one.
+                    if f.is_const {
+                        self.const_fns.insert(f.name.clone(), f.clone());
+                    }
+                    if !f.generics.is_empty() || !f.const_generics.is_empty() {
                         // P65: kept whole, because instantiating means checking
                         // the BODY again under a different binding.
+                        //
+                        // B3: `|| !f.const_generics.is_empty()` is what makes
+                        // `fn widen<const A: int>(x: t<A>)` reach the
+                        // monomorphiser at all — its `generics` list is EMPTY,
+                        // so the original condition excluded exactly the
+                        // functions const generics exist for.
                         self.generic_fn_asts.insert(f.name.clone(), f.clone());
                     }
                     if !f.bounds.is_empty() {
@@ -2634,9 +3632,24 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     // why P68 had to keep the field AST to recover which
                     // parameter each field was — and it is what stops
                     // `pub first: A` being reported as an undeclared type.
+                    self.check_const_generic_decl(
+                        &s.generics,
+                        &s.const_generics,
+                        "struct",
+                        &s.name,
+                        s.span,
+                    )?;
                     let saved_tp = self.type_params.clone();
                     for gp in &s.generics {
                         self.type_params.insert(gp.clone(), ManiType::Unknown);
+                    }
+                    // B3: and the struct's const parameters, by the same rule
+                    // and for the same reason — `data: [trit; N]` must resolve
+                    // while the declaration is being collected, or the struct
+                    // cannot be declared at all.
+                    let saved_cp = std::mem::take(&mut self.const_params);
+                    for cp in &s.const_generics {
+                        self.const_params.insert(cp.name.clone(), None);
                     }
                     for f in &s.fields {
                         let ty = self.resolve_type(&f.ty)?;
@@ -2644,17 +3657,22 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                         pub_fields.push((f.name.clone(), f.is_pub));
                     }
                     self.type_params = saved_tp;
+                    self.const_params = saved_cp;
                     self.structs.insert(s.name.clone(), fields);
                     self.struct_pub_fields.insert(s.name.clone(), pub_fields);
                     // P68: keep the declaration for generic structs. The
                     // resolved `fields` above have already lost which type
                     // parameter each one was.
-                    if !s.generics.is_empty() {
+                    if !s.generics.is_empty() || !s.const_generics.is_empty() {
                         self.struct_generics.insert(s.name.clone(), s.generics.clone());
                         self.struct_field_ast.insert(
                             s.name.clone(),
                             s.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
                         );
+                    }
+                    if !s.const_generics.is_empty() {
+                        self.struct_const_generics
+                            .insert(s.name.clone(), s.const_generics.clone());
                     }
                 }
                 Item::EnumDef(e) => {
@@ -2674,6 +3692,7 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                     self.enums.insert(e.name.clone(), variants);
                 }
                 Item::FnDef(f) => {
+                    self.check_colliding_stdlib_symbol(f)?;
                     self.register_fn(f)?;
                 }
                 Item::TraitDef(tr) => {
@@ -2731,6 +3750,25 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 // struct case above: a parameter bound to `Unknown` resolves to
                 // exactly what the fallback returned for it.
                 let saved_impl_tp = self.type_params.clone();
+                // B3: an impl's own const parameters have nothing to bind
+                // them. The impl target is a bare `String` on the AST — the
+                // `<N>` of `impl<const N: int> TVec<N>` is not parsed as an
+                // argument list at all — so a value could only come from a
+                // struct instantiation, which this increment does not build.
+                // Refused by name rather than accepted and ignored.
+                if !imp.const_generics.is_empty() {
+                    return Err(self.err(
+                        imp.span,
+                        format!(
+                            "`impl` blocks cannot declare `const` generic parameters \
+                             yet: nothing binds `{}` for `impl {}`, because a struct \
+                             is not instantiated at a const argument in this \
+                             increment. Declare the parameter on the METHOD instead, \
+                             where it is bound from the arguments.",
+                            imp.const_generics[0].name, imp.ty
+                        ),
+                    ));
+                }
                 for gp in &imp.generics {
                     self.type_params.insert(gp.clone(), ManiType::Unknown);
                 }
@@ -2837,6 +3875,56 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         "t27f", "crypto", "bridge", "tritfs", "test", "trit",
     ];
 
+    /// ENHANCEMENT_PLAN 0.3 — a user function that will emit a second
+    /// definition of a stdlib symbol.
+    ///
+    /// `stdlib_expand` merges a source module's functions under `mod::name`,
+    /// and `codegen_llvm::helpers::mangle_func_name` is
+    /// `name.replace("::", "_")` — so `str::count` becomes `@str_count`, and a
+    /// top-level `fn str_count` becomes a second `@str_count`. clang refuses
+    /// the module (`invalid redefinition of function 'str_count'`); the T3
+    /// assembler accepts it and runs. `manitc check` exits 0 for both.
+    ///
+    /// **Keyed on the collision, not on the name.** The mangled forms of the
+    /// stdlib number 341, and a check against that list alone would reject
+    /// `manitc/tests/05_ternary_types.mt`, which declares `fn trit_abs`
+    /// against `trit::abs` and links today — because it never references
+    /// `trit::`, so the module is never expanded and no second definition is
+    /// emitted. Measured, not reasoned: that file is the reason this reads
+    /// `expanded_module_symbols`, populated from the program the analyzer was
+    /// actually handed, rather than from `SOURCE_MODULES`.
+    fn check_colliding_stdlib_symbol(&self, f: &FnDef) -> CompileResult<()> {
+        if f.name.contains("::") {
+            return Ok(());
+        }
+        let Some(origin) = self.expanded_module_symbols.get(&f.name) else {
+            return Ok(());
+        };
+        if !self
+            .warnings
+            .effective_level(&WarningKind::CollidingStdlibSymbol)
+            .is_error()
+        {
+            return Ok(());
+        }
+        Err(self.err(
+            f.span,
+            format!(
+                "`fn {name}` collides with the standard library: this program \
+                 expands `{origin}`, which the LLVM backend emits under the \
+                 mangled name `{name}`, so the module would define that symbol \
+                 twice. clang rejects it (`invalid redefinition of function \
+                 '{name}'`) while the T3 assembler accepts it and runs, so the \
+                 two backends disagree about whether the program is legal. \
+                 Rename the function. \
+                 (`lint allow(colliding-stdlib-symbol);` restores the previous \
+                 behaviour, in which this was silent.)",
+                name = f.name,
+                origin = origin,
+            ),
+        ))
+    }
+
     fn resolve_use(&mut self, decl: &UseDecl) -> CompileResult<()> {
         if decl.path.is_empty() {
             return Ok(());
@@ -2856,8 +3944,53 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             }
             Ok(())
         } else {
-            // User module — resolve to filesystem
-            self.load_user_module(decl)
+            // ENHANCEMENT_PLAN 0.4 — a user module resolves at check time and
+            // is emitted by nobody, so refuse it here rather than at link.
+            //
+            // The plan's own wording for this item was "make `use
+            // unknown_module;` an error at check time". Measured, that case is
+            // ALREADY an error: `load_user_module` reads the file and returns
+            // `cannot load module 'no_such_module'` with rc=1. The silent case
+            // is the opposite one — a `use` of a module that EXISTS, whose
+            // signatures register cleanly and whose bodies are then dropped.
+            // A plan item aimed at the failure that is loud, while the quiet
+            // one wears the same words.
+            //
+            // Reported AFTER `load_user_module`, and the order is the whole
+            // of the difference between two diagnostics. Refusing first was
+            // written first and measured wrong: `use no_such_module;` then
+            // reported THIS message — which says the bodies are never emitted
+            // — about a file that does not exist. Loading first lets the more
+            // specific failure win, so a missing file still reports
+            // `cannot load module 'no_such_module': No such file or directory`
+            // and only a module that genuinely resolves reaches the refusal.
+            self.load_user_module(decl)?;
+            if self
+                .warnings
+                .effective_level(&WarningKind::UnlinkableUserModule)
+                .is_error()
+            {
+                let path = decl.path.join("::");
+                return Err(self.err(
+                    decl.span,
+                    format!(
+                        "`use {path};` imports a user module, and a user module's \
+                         bodies are never emitted: the analyzer registers \
+                         `{path}::…` signatures and the code generator has nothing \
+                         to define them with, so a call to one fails at link \
+                         (`use of undefined value '@{mangled}_…'` on LLVM, \
+                         `Undefined label: {path}::…` on T3) rather than here. \
+                         Concatenate the sources instead — that is what \
+                         `studioMani/build.sh` does and why the kernel repeats \
+                         `struct PCB` three times. \
+                         (`lint allow(unlinkable-user-module);` restores the \
+                         previous behaviour, in which this was silent.)",
+                        path = path,
+                        mangled = decl.path.join("_"),
+                    ),
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -2979,10 +4112,25 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         if self.functions.contains_key(&f.name) && !self.builtin_names.contains(&f.name) {
             return Err(self.err(f.span, format!("duplicate function definition `{}`", f.name)));
         }
+        self.check_const_generic_decl(
+            &f.generics,
+            &f.const_generics,
+            "function",
+            &f.name,
+            f.span,
+        )?;
         // Push generic type params as Unknown so they resolve correctly
         let saved_type_params = self.type_params.clone();
         for gp in &f.generics {
             self.type_params.insert(gp.clone(), ManiType::Unknown);
+        }
+        // B3: a const parameter is in scope for the SIGNATURE too — `fn
+        // widen<const A: int>(x: t<A>)` resolves `t<A>` here, before any body
+        // is checked, and without this the declaration itself would not
+        // resolve.
+        let saved_const_params = std::mem::take(&mut self.const_params);
+        for cp in &f.const_generics {
+            self.const_params.insert(cp.name.clone(), None);
         }
         let param_tys: CompileResult<Vec<ManiType>> =
             f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
@@ -2993,7 +4141,24 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
             ManiType::Void
         };
         self.functions.insert(f.name.clone(), (param_tys, ret_ty));
+        // B6: check each `where` where it is WRITTEN, and record it for the
+        // call sites. Done before `const_params` is restored, so a bound that
+        // names a const generic parameter resolves.
+        for p in &f.params {
+            if let Err(e) = self.check_refinement_decl(p, &f.name) {
+                self.type_params = saved_type_params;
+                self.const_params = saved_const_params;
+                return Err(e);
+            }
+        }
+        if f.params.iter().any(|p| p.refinement.is_some()) {
+            self.fn_param_refinements.insert(
+                f.name.clone(),
+                f.params.iter().map(|p| p.refinement.clone()).collect(),
+            );
+        }
         self.type_params = saved_type_params;
+        self.const_params = saved_const_params;
         Ok(())
     }
 
@@ -3017,6 +4182,32 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
                 .and_then(|m| m.get(gp).cloned())
                 .unwrap_or(ManiType::Unknown);
             self.type_params.insert(gp.clone(), bound);
+        }
+        // B3: the same rule, one kind down. A const parameter is `None` in
+        // the erased copy — declared, in scope, bound to no width yet — and
+        // carries its value in an instantiation. `resolve_type` consults
+        // `const_params` for `t<N>` and `[T; N]` exactly as it consults
+        // `type_params` for `T`, so this single substitution is the whole of
+        // width polymorphism's work too.
+        let saved_const_params = std::mem::take(&mut self.const_params);
+        for cp in &f.const_generics {
+            let bound = self
+                .mono_const_binding
+                .as_ref()
+                .and_then(|m| m.get(&cp.name).copied());
+            self.const_params.insert(cp.name.clone(), bound);
+        }
+        // B6: a refined parameter's own `where` is what the body knows about
+        // it. This is where the checker gets anything to reason WITH: without
+        // it every value in a body is unknown and the fragment covers only
+        // literals. Bound after `const_params`, because a bound may name one.
+        let saved_intervals = std::mem::take(&mut self.value_intervals);
+        for p in &f.params {
+            if let Some(r) = &p.refinement {
+                if let Some(iv) = self.refinement_interval(r) {
+                    self.value_intervals.insert(p.name.clone(), iv);
+                }
+            }
         }
         // P69: `Self` inside an instantiated `impl<T>` method. Not one of
         // `f.generics` — it is not written in any generic list — but it is
@@ -3100,6 +4291,8 @@ Ok(ManiType::Struct(name.to_string(), Vec::new()))
         self.current_fn_ret = old_ret;
         self.current_fn = old_fn;
         self.type_params = saved_type_params;
+        self.const_params = saved_const_params;
+        self.value_intervals = saved_intervals;
 
         Ok(TypedFnDef {
             name: f.name.clone(),
@@ -3161,6 +4354,122 @@ mod member_list_tests {
             "these builtins are registered but invisible to the member list, so \
              calling them would be rejected as unknown: {:#?}",
             missing
+        );
+    }
+
+    /// ENHANCEMENT_PLAN 0.2 — every FLAT builtin the analyzer registers must
+    /// be honourable by the code generator.
+    ///
+    /// The sibling test above compares `mod::item` names against the member
+    /// list and `continue`s on any name without `::`. Every flat name was
+    /// therefore unchecked, and seven of them were entries here with no
+    /// definition anywhere in the linkable world: `abs`, `sqrt`,
+    /// `str_substr`, `str_parse_int`, `str_ends_with`, `str_starts_with` and
+    /// `str_from_int`. They type-checked and then failed to link on BOTH
+    /// backends — `use of undefined value '@str_from_int'` from clang,
+    /// `Undefined label: str_from_int` from the T3 assembler. `manitc check`
+    /// exiting 0 did not mean the program links, and nothing compared the two
+    /// registries; that is report.txt N1/P60/P61/P62's family, and this is the
+    /// check P60's own rule asks for: *a registry that must agree with another
+    /// registry should be checked, not described.*
+    ///
+    /// A name is honourable if either backend can emit it:
+    ///
+    ///   * the LLVM backend declares it — `helpers.rs` carries the module
+    ///     preamble as text, and `declare i64 @str_len(ptr)` is what makes
+    ///     clang accept the call; or
+    ///   * a backend or the lowerer intercepts it by name — `println` and
+    ///     `print` are lowered to an IR instruction and never become a call,
+    ///     so no `declare` exists for them and none should.
+    ///
+    /// Those two are read as TEXT for the reason the sibling test gives: the
+    /// backends keep these names in `match` arms rather than in any table a
+    /// test could import, and text is what the two registries have in common.
+    ///
+    /// The discriminator was validated against the ground truth rather than
+    /// trusted: each of the 106 flat names was compiled to both backends, and
+    /// the static answer here agrees with whether clang and the T3 assembler
+    /// actually accepted the program on every one — `print` and `println`
+    /// being the only names with no `declare`, which is the interception arm
+    /// above.
+    ///
+    /// **This test does not assert that a name links on T3.** Ninety of them
+    /// do not: the whole `gui_*` surface (57), `fs_*` (13), `io_*` (7),
+    /// `terminal_*` (4), `env_*` (3), `path_*` (3) and one each of `net_*`,
+    /// `process_*`, `shell_*` compile and link on LLVM and have no T3ISA
+    /// syscall at all. That is ENHANCEMENT_PLAN §3.4, a much larger surface
+    /// than the plan's own text records, and it is a missing implementation
+    /// rather than a broken registry. Asserting it here would make this test
+    /// red for a reason it cannot fix, and a test that is red for a known
+    /// reason stops being read.
+    #[test]
+    fn every_registered_flat_builtin_is_linkable() {
+        const LLVM_PREAMBLE: &str = include_str!("../../codegen_llvm/helpers.rs");
+        const INTERCEPTORS: &[&str] = &[
+            include_str!("../../codegen_t3/emitter/emit_instr.rs"),
+            include_str!("../../codegen_llvm/helpers.rs"),
+            include_str!("../../ir/lower/lower_expr.rs"),
+        ];
+
+        // `declare <ret> @<name>(` — the name must be the WHOLE symbol, or
+        // `str_len` would be answered by `declare i64 @str_length(ptr)`.
+        let is_declared = |name: &str| {
+            LLVM_PREAMBLE.lines().any(|l| {
+                let l = l.trim_start();
+                if !l.starts_with("declare ") {
+                    return false;
+                }
+                match l.find('@') {
+                    Some(at) => {
+                        let rest = &l[at + 1..];
+                        let ident: String = rest
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                            .collect();
+                        ident == name && rest[ident.len()..].starts_with('(')
+                    }
+                    None => false,
+                }
+            })
+        };
+
+        let analyzer = SemanticAnalyzer::new();
+        let mut orphans: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for name in &analyzer.builtin_names {
+            // Qualified names are the sibling test's job.
+            if name.contains("::") {
+                continue;
+            }
+            checked += 1;
+            let quoted = format!("\"{}\"", name);
+            let intercepted = INTERCEPTORS.iter().any(|s| s.contains(&quoted));
+            if !is_declared(name) && !intercepted {
+                orphans.push(name.clone());
+            }
+        }
+
+        // A run that checked nothing would pass. report.txt P44: a sweep
+        // reporting no misses because it performed no lookups is not evidence.
+        assert!(
+            checked > 50,
+            "only {} flat builtins were examined — the registry moved and this \
+             test is no longer looking at it",
+            checked
+        );
+
+        orphans.sort();
+        assert!(
+            orphans.is_empty(),
+            "these names are registered builtins but nothing can emit them, so \
+             a program calling one type-checks and then fails to link on both \
+             backends: {:#?}\n\
+             Either delete the entry from `register_builtins` (the flat \
+             spelling then becomes \"unknown identifier — did you mean \
+             'str::from_int'?\", which is the remedy), or give it a `declare` \
+             in codegen_llvm/helpers.rs and an emitter arm.",
+            orphans
         );
     }
 

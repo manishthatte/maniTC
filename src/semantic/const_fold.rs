@@ -221,8 +221,7 @@ fn fold_cast(v: ConstValue, ty: &crate::semantic::types::ManiType) -> Folded {
     // lowers through `IRConst::Int`.
     let integral = matches!(
         ty,
-        ManiType::Int | ManiType::Char | ManiType::Tryte
-            | ManiType::T9 | ManiType::T27 | ManiType::T54
+        ManiType::Int | ManiType::Char | ManiType::TN(_)
     );
     let floating = matches!(ty, ManiType::Float | ManiType::Tfloat);
 

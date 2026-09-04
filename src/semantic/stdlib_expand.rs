@@ -115,6 +115,67 @@ const SOURCE_MODULES: &[(&str, &str)] = &[
 ];
 
 /// Expand any used source-implemented stdlib modules into `program`.
+/// Every `module::name` spelling of a bare `name` that the standard library
+/// actually declares.
+///
+/// ENHANCEMENT_PLAN 0.1, 29 Aug 2026. Deleting the seven orphan entries from
+/// `register_builtins` turned a silent link failure into an "unknown
+/// identifier" error, which is the point — but the levenshtein suggester
+/// behind that error cannot reach the remedy for a name carrying no module
+/// prefix. `sqrt` to `math::sqrt` is distance 6 and the cutoff is 3, so the
+/// five `str_*` names got a perfect hint ("did you mean 'str::from_int'?",
+/// distance 2, `_` to `::`) while `sqrt` got the generic C-runtime fallback
+/// and `abs` got **"did you mean 'main'?"** — the enclosing function, at
+/// distance exactly 3. Measured, not predicted.
+///
+/// The answer is an exact TAIL match rather than a closer edit distance: a
+/// bare name is not a misspelling of the qualified one, it is the qualified
+/// one with the module dropped. So this asks each module whether it declares
+/// that exact name, and any hit outranks any levenshtein guess.
+///
+/// It reads `SOURCE_MODULES` — the stdlib text this binary carries via
+/// `include_str!` — rather than a hand-written list of names, which is
+/// report.txt P60's rule ("a registry that must agree with another registry
+/// should be checked, not described") applied to the suggester: a name added
+/// to or removed from `stdlib/*.mt` moves this answer with it, and no second
+/// source of truth is created. That is the same drift the deleted entries were.
+///
+/// Only column-0 `fn` declarations count. A method inside an `impl` block is
+/// indented and is not callable as `module::name`, so matching it would
+/// suggest a spelling that does not compile.
+pub(crate) fn qualified_spellings(bare: &str) -> Vec<String> {
+    if bare.is_empty() || bare.contains(':') {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (module, src) in SOURCE_MODULES {
+        for line in src.lines() {
+            let rest = match line.strip_prefix("fn ") {
+                Some(r) => r,
+                None => match line.strip_prefix("pub fn ") {
+                    Some(r) => r,
+                    None => continue,
+                },
+            };
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // The identifier must be the WHOLE name and be followed by the
+            // parameter list, or `fn absolute_value` would answer for `abs`.
+            if ident == bare && rest[ident.len()..].trim_start().starts_with('(') {
+                let q = format!("{}::{}", module, bare);
+                if !out.contains(&q) {
+                    out.push(q);
+                }
+                break;
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Returns `None` when the program uses none of them (the common case).
 pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
     // Which source modules does the program import?
@@ -145,6 +206,18 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
     // The reference set comes from the same traversal that does the rewriting
     // (Rewrite::observed), so a new expression form cannot be handled by one
     // and missed by the other.
+    // C5: a TYPE mention pulls its module in too.
+    //
+    // `module_refs` walks expressions — function bodies and global
+    // initialisers — so `fn f(x: t27f) -> t27f` referenced nothing it could
+    // see, and the type resolved to `Struct("T27F")` with no such struct
+    // anywhere. That is the phantom shape P127 had just removed from `tfloat`,
+    // arriving by a different door: a name that resolves and has nothing
+    // behind it. Constructing a value always pulls the module in — the `3.5t27f`
+    // literal desugars to `t27f::from_float`, which IS an expression
+    // reference — so this covers the one case that construction does not: a
+    // signature that only passes a value through.
+    let type_referenced = types_mention(program, "T27F") || types_mention(program, "t27f");
     let (referenced, methods) = module_refs(program);
     for (name, src) in SOURCE_MODULES {
         if used.contains(name) {
@@ -158,7 +231,7 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
         let by_method = methods
             .iter()
             .any(|m| bodied_fn_names(src).contains(m.trim_start_matches('.')));
-        if referenced.contains(*name) || by_method {
+        if referenced.contains(*name) || by_method || (*name == "t27f" && type_referenced) {
             used.push(name);
         }
     }
@@ -554,6 +627,41 @@ pub fn expand(program: &Program) -> CompileResult<Option<Program>> {
 /// Runs the ordinary rewrite traversal over a throwaway clone purely to collect
 /// `Rewrite::observed`. Sharing the traversal is the point: a hand-written
 /// second visitor would silently stop seeing new `Expr` variants.
+/// C5: does any DECLARED type in the program mention `want`?
+///
+/// Signatures, struct fields, globals and externs — the positions
+/// `module_refs` does not reach, because it walks expressions. A `let` inside
+/// a body is deliberately not walked: a `let` needs an initialiser, and an
+/// initialiser that produces a `T27F` is an expression reference already.
+fn types_mention(program: &Program, want: &str) -> bool {
+    fn in_ty(t: &crate::ast::Type, want: &str) -> bool {
+        use crate::ast::Type as T;
+        match t {
+            T::Named(n, _) => n == want,
+            T::Path(parts, _) => parts.last().is_some_and(|n| n == want),
+            T::Ref(i, _, _) | T::Ptr(i, _, _) | T::Array(i, _, _) => in_ty(i, want),
+            T::Tuple(items, _) => items.iter().any(|i| in_ty(i, want)),
+            T::Generic(_, args, _) => args.iter().any(|a| in_ty(a, want)),
+            T::Fn(ps, r, _) => ps.iter().any(|p| in_ty(p, want)) || in_ty(r, want),
+            // B4: a width expression names no TYPE, so it can mention nothing
+            // this function is looking for.
+            T::TernaryWidth(..) => false,
+            T::Infer(_) => false,
+        }
+    }
+    let in_fn = |f: &crate::ast::FnDef| {
+        f.params.iter().any(|p| in_ty(&p.ty, want))
+            || f.ret_ty.as_ref().is_some_and(|t| in_ty(t, want))
+    };
+    program.items.iter().any(|item| match item {
+        Item::FnDef(f) => in_fn(f),
+        Item::StructDef(sd) => sd.fields.iter().any(|fd| in_ty(&fd.ty, want)),
+        Item::GlobalVar(g) => in_ty(&g.ty, want),
+        Item::ImplBlock(imp) => imp.methods.iter().any(in_fn),
+        _ => false,
+    })
+}
+
 fn module_refs(program: &Program) -> (HashSet<String>, HashSet<String>) {
     let probe = Rewrite {
         prefix: String::new(),
@@ -816,6 +924,10 @@ impl Rewrite {
             }
             Type::Ref(inner, _, _) | Type::Ptr(inner, _, _) => self.rewrite_type(inner),
             Type::Array(inner, _, _) => self.rewrite_type(inner),
+            // B4: a width expression contains no type name to qualify. Its
+            // identifiers are `const` parameters and module constants, which
+            // are values and are not merged under a module prefix.
+            Type::TernaryWidth(..) => {}
             Type::Tuple(tys, _) => {
                 for t in tys {
                     self.rewrite_type(t);
@@ -1022,6 +1134,8 @@ fn rewrite_host_type(ty: &mut Type, map: &HashMap<String, String>) {
             }
         }
         Type::Ref(inner, _, _) | Type::Ptr(inner, _, _) => rewrite_host_type(inner, map),
+        // B4: see `rewrite_type` — a width expression names no type.
+        Type::TernaryWidth(..) => {}
         Type::Array(inner, _, _) => rewrite_host_type(inner, map),
         Type::Tuple(tys, _) => {
             for t in tys {

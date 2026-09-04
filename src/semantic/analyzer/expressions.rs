@@ -15,6 +15,33 @@ impl SemanticAnalyzer {
             Expr::Ident(name, _) => {
                 // Track variable reads for unused-variable detection
                 self.read_vars.insert(name.clone());
+                // B3: a const generic parameter USED AS A VALUE.
+                //
+                // It becomes a literal here rather than an `Ident`, which is
+                // what makes `A` free at run time: the instantiation knows the
+                // number, so the backends never see a name. That is the whole
+                // of "compile-time evaluation" this feature needs, and it is
+                // why B3 did not turn out to need B4 — the item lists it as a
+                // prerequisite and a BOUND PARAMETER is a literal, not an
+                // expression to evaluate.
+                //
+                // Placed after the symbol lookup, so an inner `let A = ..`
+                // shadows the parameter exactly as it shadows anything else.
+                if self.symbols.lookup(name).is_none() {
+                    if let Some(bound) = self.const_params.get(name.as_str()) {
+                        // The erased copy has no value to substitute. It types
+                        // as `int` so the body can be checked once, and it is
+                        // never CALLED: a call whose const arguments cannot be
+                        // bound is refused at the call site rather than
+                        // silently sent here (see `check_const_generic_call`).
+                        let v = bound.unwrap_or(0);
+                        return Ok(TypedExpr {
+                            kind: TypedExprKind::Lit(crate::ast::Lit::Int(v)),
+                            ty: ManiType::Int,
+                            span,
+                        });
+                    }
+                }
                 let ty = if let Some(sym) = self.symbols.lookup(name) {
                     sym.ty.clone()
                 } else if let Some((params, ret)) = self.functions.get(name) {
@@ -63,7 +90,8 @@ impl SemanticAnalyzer {
                     if let Some(n) = self.enum_variant_arity(name) {
                         if n > 0 {
                             return Err(self.err(span, format!(
-                                "enum variant '{}' carries {} value(s), so it cannot be                                  named on its own — write `{}({})`",
+                                "enum variant '{}' carries {} value(s), so it cannot be \
+                                 named on its own — write `{}({})`",
                                 name, n, name,
                                 std::iter::repeat("…").take(n).collect::<Vec<_>>().join(", "),
                             )));
@@ -229,14 +257,35 @@ impl SemanticAnalyzer {
                     // functions are collected in a pre-pass, so calling one
                     // defined later in the file never reached this branch.
                     if !name.contains('<') && !RESULT_CONSTRUCTORS.contains(&name.as_str()) {
-                        let var_names = self.symbols.all_names();
-                        let fn_names = self.functions.keys().cloned();
-                        let candidates = var_names.chain(fn_names);
-                        let hint = did_you_mean(name, candidates).unwrap_or_else(|| {
-                            ". If this names a C runtime symbol, declare it: \
-                             `fn <name>(<params>) -> <type> ;  // native`"
-                                .to_string()
-                        });
+                        // An exact module-qualified spelling outranks any
+                        // edit-distance guess. ENHANCEMENT_PLAN 0.1: a bare
+                        // name is not a misspelling of the qualified one, it
+                        // is the qualified one with the module dropped, and
+                        // levenshtein cannot see that -- `sqrt` to
+                        // `math::sqrt` is distance 6 against a cutoff of 3,
+                        // and `abs` was answered with "did you mean 'main'?".
+                        let qualified =
+                            crate::semantic::stdlib_expand::qualified_spellings(name);
+                        let hint = if !qualified.is_empty() {
+                            if qualified.len() == 1 {
+                                format!(" — did you mean '{}'?", qualified[0])
+                            } else {
+                                format!(" — did you mean one of {}?",
+                                    qualified.iter()
+                                        .map(|q| format!("'{}'", q))
+                                        .collect::<Vec<_>>()
+                                        .join(", "))
+                            }
+                        } else {
+                            let var_names = self.symbols.all_names();
+                            let fn_names = self.functions.keys().cloned();
+                            let candidates = var_names.chain(fn_names);
+                            did_you_mean(name, candidates).unwrap_or_else(|| {
+                                ". If this names a C runtime symbol, declare it: \
+                                 `fn <name>(<params>) -> <type> ;  // native`"
+                                    .to_string()
+                            })
+                        };
                         return Err(self.err(span, format!(
                             "unknown identifier '{}'{}", name, hint,
                         )));
@@ -301,11 +350,15 @@ impl SemanticAnalyzer {
                     }
                 }
 
-                Ok(TypedExpr {
+                let folded = TypedExpr {
                     kind: TypedExprKind::BinOp(Box::new(tlhs), op.clone(), Box::new(trhs)),
                     ty,
                     span,
-                })
+                };
+                // P125: the word check must see the constant the COMPILER
+                // computed, not only the one the programmer wrote.
+                self.check_folded_fits_word(&folded, span)?;
+                Ok(folded)
             }
 
             Expr::UnOp(op, operand, _) => {
@@ -518,6 +571,8 @@ impl SemanticAnalyzer {
                         typed_args.iter().map(|a| a.ty.clone()).collect();
                     let name = display_name.clone();
                     self.check_generic_bounds(&name, &arg_tys, span);
+                    self.check_const_generic_call(&name, &arg_tys, span)?;
+                    self.check_refinements_at_call(&name, &typed_args, span)?;
 
                     // P65: point this call at an instantiation of the callee
                     // for the types it was actually given.
@@ -571,6 +626,47 @@ impl SemanticAnalyzer {
                         if body_ok {
                             tcallee.kind =
                                 TypedExprKind::Ident(Self::mono_name(&name, &binding));
+                        } else if !binding.consts.is_empty() {
+                            // B3: a failed instantiation of a CONST generic is
+                            // an error, where P65 makes a failed instantiation
+                            // of a type generic silent.
+                            //
+                            // The fallback P65 chose — discard the
+                            // instantiation, keep the erased body — is what
+                            // makes a width vanish: `let y: t<A> = 365` inside
+                            // `f<const A: int>` called at A=6 fails, because a
+                            // `tryte` holds ±364; the erased body types `t<A>`
+                            // as `Unknown`; and the program PRINTED 365.
+                            // Measured on this increment before this arm
+                            // existed. The population that could regress is
+                            // zero — the syntax is new — so the strict reading
+                            // is free, and the erased body of a const generic
+                            // is now unreachable rather than merely unlikely.
+                            let mangled = Self::mono_name(&name, &binding);
+                            let why = self
+                                .mono_failure
+                                .get(&mangled)
+                                .cloned()
+                                .unwrap_or_else(|| "the body does not check".to_string());
+                            let at = binding
+                                .consts
+                                .iter()
+                                .map(|(k, v)| format!("{k} = {v}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            return Err(self.err(span, format!(
+                                "'{name}' does not check at {at}: {why}",
+                            )));
+                        } else {
+                            // B7 D-5. The third question at P71's fork. The
+                            // NAME waits on the body's verdict (P65) and the
+                            // RETURN TYPE does not (P71); what the same
+                            // verdict was ALSO deciding, silently, is whether
+                            // `borrow::check_borrows` ever sees this body —
+                            // it runs over the `TypedProgram`, and a
+                            // discarded instantiation puts no body in it.
+                            let mangled = Self::mono_name(&name, &binding);
+                            self.warn_unchecked_instantiation(&name, &mangled, span);
                         }
                     }
                 }
@@ -673,6 +769,11 @@ impl SemanticAnalyzer {
                             }
                             if body_ok {
                                 mono_callee = Some(Self::mono_name(&qname, &binding));
+                            } else {
+                                // B7 D-5, the same hole reached through a
+                                // method. One helper, two sites.
+                                let mangled = Self::mono_name(&qname, &binding);
+                                self.warn_unchecked_instantiation(&qname, &mangled, span);
                             }
                         }
                     }
@@ -1202,6 +1303,7 @@ impl SemanticAnalyzer {
             Expr::Cast(inner, ty, _) => {
                 let tinner = self.check_expr(inner, None)?;
                 let cast_ty = self.resolve_type(ty)?;
+                self.check_cast_is_defined(&tinner.ty, &cast_ty, span)?;
                 Ok(TypedExpr {
                     kind: TypedExprKind::Cast(Box::new(tinner), cast_ty.clone()),
                     ty: cast_ty,

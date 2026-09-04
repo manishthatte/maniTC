@@ -16,6 +16,13 @@ greenfield feature; it is an existing checker with an undocumented rule set,
 and B7 is the job of making that rule set principled rather than of inventing
 one.
 
+> **The count is dated, 4 September 2026: it is now 1,953 lines.** The 860 was
+> measured on 2 September, before D-1, D-2, D-3 and D-4 were built into it, and
+> it is left standing because the sentence around it is the point — the file
+> was already large and already rejecting programs before B7 began.
+> `documented_line_counts_match_the_source_files` cannot hold this figure: it
+> reads `**File:**` lines in `docs/`, and this is prose in a plan.
+
 `consume_if_move` is called at exactly **four** sites, and re-probing them on
 2 September 2026 reproduces P51's finding to the letter:
 
@@ -111,6 +118,73 @@ written eighteen days apart and have never been read together.
 before lowering. An affine check needs types, so it stays there — but note that
 P65 DISCARDS a failed generic instantiation, so a move error inside one would
 vanish. That is the same shape as P71 and wants the same split.
+
+> **TAKEN, 4 September 2026 — and the question's premise held, which is the
+> first time in this document that it did.** D-4's premise was false when
+> measured. This one reproduced exactly as written, and the reproduction is
+> `report.txt` P131.
+>
+> **Measured first.** A generic function is move-checked TWICE: once erased,
+> where a `T` is not a move type because nothing says it is, and once per
+> instantiation, where it may be. So the three states are distinguishable and
+> were probed:
+>
+> ```text
+> fn dup<T>(a: T) { let b = a; let c = a; }
+>   dup(1)                  accepted   — int is Copy, and refusing would be wrong
+>   dup(P { .. })           REFUSED    — the instantiation is checked
+>   ...with `let q = a | 1` added, which does not check at T = P:
+>   dup(P { .. })           ACCEPTED   — the instantiation is discarded
+> ```
+>
+> The move error is reported or not according to whether an UNRELATED line in
+> the same body type-checks under the same binding. That is not a rule anyone
+> would choose in either direction.
+>
+> **Population, before deciding anything:** discarded instantiations occur in
+> **0 of 2,507 model-corpus programs** and **4 of 366 files across maniTC and
+> thatteOS** — and all four of the four are fixtures written to exercise this
+> fallback (`p71_failed_inst_freefn`, `p71_failed_inst_impl_method`,
+> `ord63_address_theory`, `ord63_str_via_bound`). Real code has none.
+>
+> So D-5 is decided in three parts:
+>
+> 1. **The check stays in `borrow/mod.rs`**, over the `TypedProgram`, after the
+>    analyzer and before lowering. An affine check needs types and that is
+>    where the types are. Nothing moves.
+> 2. **Its coverage is therefore exactly the bodies the analyzer BUILT**, and
+>    that is now a stated property rather than an accident — `docs/
+>    language-reference.md` §22, "What the checker can see: generic bodies".
+> 3. **A body it could not see is REPORTED, not passed over in silence.**
+>    `unchecked-instantiation` (§20, `warn`) fires at the call site, names the
+>    instantiation and the reason its body failed. `warn` because the
+>    population is zero, so there is no backlog to bury a reader under;
+>    `allow` restores the previous compiler exactly.
+>
+> **This is P71's split with a third question at the same fork.** P71 found one
+> verdict answering two: the NAME must wait on the body's verdict, the RETURN
+> TYPE must not, because a return type is a function of the declaration. The
+> third is coverage, and it is the borrow checker's. **P65's rule stands
+> untouched** — a failed instantiation is still not an error, the call still
+> keeps the erased path — because denying here would reject programs that
+> compile today, and the four fixtures are the proof.
+>
+> **What is NOT closed, stated as a limit with a row that goes red the day it
+> is:** the move error itself is still unreported, and the reason is
+> mechanical rather than a preference. `check_fn` returned `Err`, so no typed
+> body was ever produced; and `consume_if_move` reads the type on each USE-SITE
+> expression, which in the erased body is `Unknown` for every `T`. Substituting
+> after the fact means retyping a whole body — which is precisely the work that
+> just failed. Closing it wants either partial typing or B3's answer for const
+> parameters (make the failure an error), and that is a language decision with
+> its own measured step. The row is
+> `tests/move_coverage_tests.rs::limit_a_move_inside_a_discarded_instantiation_is_still_unreported`.
+>
+> **What was already right, and is now pinned rather than assumed:** a
+> parameter declared `move` consumes its argument whether or not the callee's
+> body checks at that binding. That is D-2's answer being a DECLARATION, and it
+> is why D-2's shape was the correct one — an inferred rule would have had this
+> hole too.
 
 ## 3. What is waiting on it
 

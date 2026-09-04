@@ -74,6 +74,11 @@ pub enum TokenKind {
     T54Kw,
     TrintKw,
     TfloatKw,
+    /// C5: `3.5t27f` — a ternary floating-point literal, carrying the decimal
+    /// value the suffix was written on. Desugared by the parser into a call to
+    /// `t27f::from_float`, so the format's arithmetic stays in `stdlib/t27f.mt`
+    /// and the compiler holds no second copy of it.
+    T27fLit(f64),
     IntKw,
     FloatKw,
     Bool3Kw,   // also accepted as "tribool"
@@ -363,6 +368,18 @@ impl Lexer {
 
     fn peek2(&self) -> Option<char> {
         self.source.get(self.pos + 1).copied()
+    }
+
+    /// C5: the character `n` positions ahead, for a suffix's trailing check.
+    fn peek_at_offset(&self, n: usize) -> Option<char> {
+        self.source.get(self.pos + n).copied()
+    }
+
+    /// C5: does the un-consumed source begin with `word`?
+    fn rest_starts_with(&self, word: &str) -> bool {
+        word.chars()
+            .enumerate()
+            .all(|(i, c)| self.source.get(self.pos + i).copied() == Some(c))
     }
 
     fn advance(&mut self) -> Option<char> {
@@ -691,6 +708,27 @@ impl Lexer {
                 }
             }
             let v: f64 = s.parse().map_err(|_| self.err_at(span, format!("invalid float literal: {}", s)))?;
+            // C5: `3.5t27f` — a ternary floating-point literal.
+            //
+            // Recognised HERE, where the source characters are, rather than in
+            // the parser. The first attempt tested adjacency by reconstructing
+            // the literal's width from its value, and `format!("{}", 100.0)` is
+            // `"100"` — three characters for a five-character literal — so
+            // `100.0t27f` was not recognised while `3.5t27f` was. The lexer has
+            // the text and does not have to guess at it.
+            //
+            // The trailing check is what keeps `3.5t27foo` an error rather
+            // than a literal followed by `oo`.
+            if self.rest_starts_with("t27f")
+                && !self
+                    .peek_at_offset(4)
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                for _ in 0..4 {
+                    self.advance();
+                }
+                return Ok(Token::new(TokenKind::T27fLit(v), span));
+            }
             Ok(Token::new(TokenKind::Float(v), span))
         } else {
             // A21: `i64::MIN` has no positive magnitude, so a decimal literal

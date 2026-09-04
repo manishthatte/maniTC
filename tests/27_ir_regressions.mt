@@ -1,6 +1,6 @@
 // Test: IR-layer regressions — uniform aggregate slot layout (trit fields),
 //        struct value semantics on `let b = a`, for-loop variable shadowing,
-//        string/float match patterns, tfloat comparison, return inside an
+//        string/float match patterns, float comparison, return inside an
 //        if-arm feeding a value binding, or-pattern per-alternative binding
 use std::io;
 
@@ -155,15 +155,15 @@ fn test_string_match() {
 }
 
 // ---------------------------------------------------------------------------
-// tfloat comparisons must use float compares, not integer-on-bits
+// float comparisons must use float compares, not integer-on-bits
 // ---------------------------------------------------------------------------
 
-fn test_tfloat_compare() {
-    let a: tfloat = -2.5;
-    let b: tfloat = 1.5;
-    check("tfloat: -2.5 < 1.5",  a < b);
-    check("tfloat: 1.5 > -2.5",  b > a);
-    check("tfloat: -2.5 <= -2.5", a <= a);
+fn test_float_compare() {
+    let a: float = -2.5;
+    let b: float = 1.5;
+    check("float: -2.5 < 1.5",  a < b);
+    check("float: 1.5 > -2.5",  b > a);
+    check("float: -2.5 <= -2.5", a <= a);
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +250,8 @@ fn main() {
     io::println("-- string match --");
     test_string_match();
 
-    io::println("-- tfloat compare --");
-    test_tfloat_compare();
+    io::println("-- float compare --");
+    test_float_compare();
 
     io::println("-- if with return arm --");
     test_if_return_arm();

@@ -1379,11 +1379,7 @@ fn is_move_type(ty: &ManiType) -> bool {
         | ManiType::Bool
         | ManiType::Bool3
         | ManiType::Trit
-        | ManiType::Tryte
-        | ManiType::T9
-        | ManiType::T27
-        | ManiType::T54
-        // ManiType::Trint merged into T54
+        | ManiType::TN(_)
         | ManiType::Tfloat
         | ManiType::Char
         | ManiType::Void

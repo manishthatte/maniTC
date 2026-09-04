@@ -306,21 +306,29 @@ fn s6_user_fn_arg_type_is_checked() {
     );
 }
 
+// S6 is about builtin ARITY and ARGUMENT TYPES being checked; `abs` and
+// `sqrt` were only the vehicle, and ENHANCEMENT_PLAN 0.1 deleted them from
+// `register_builtins` on 29 Aug 2026 because they were declared there and
+// defined nowhere in the linkable world — `abs(-3)` type-checked and then
+// failed to link on both backends. `str_len` replaces them: same table, same
+// two properties, and it is one of the nine flat builtins measured to link on
+// BOTH backends, so the vehicle cannot rot the same way. The property these
+// rows assert has not changed and neither have the expected messages.
 #[test]
-fn s6_builtin_abs_arity_is_checked() {
+fn s6_builtin_arity_is_checked() {
     assert_check_error(
-        "s6_abs.mt",
-        "fn main() { let x = abs(); }\n",
+        "s6_arity_builtin.mt",
+        "fn main() { let x = str_len(); }\n",
         "expects 1 argument(s), found 0",
     );
 }
 
 #[test]
-fn s6_builtin_sqrt_arg_type_is_checked() {
+fn s6_builtin_arg_type_is_checked() {
     assert_check_error(
-        "s6_sqrt.mt",
-        "fn main() { let x = sqrt(\"hi\"); }\n",
-        "argument 1 to 'sqrt'",
+        "s6_argty_builtin.mt",
+        "fn main() { let x = str_len(1); }\n",
+        "argument 1 to 'str_len'",
     );
 }
 
@@ -460,6 +468,23 @@ fn main() {
 
 // ===========================================================================
 // S11 — module privacy and transitive imports
+//
+// ENHANCEMENT_PLAN 0.4, 29 Aug 2026: each of the four rows below now opens
+// with `lint allow(unlinkable-user-module);`.
+//
+// A `use` of a user module is refused by default from that change, because
+// `load_user_module` registers signatures and drops every body — the call is
+// emitted, the definition never is, and the program dies at link against a
+// symbol the programmer never typed. What these rows assert is UNAFFECTED and
+// deliberately kept: privacy, transitive resolution, and that a user module
+// shadowing a stdlib name is not measured against the stdlib member list. All
+// three are real design and all three are still checked; they are simply now
+// checked on the opt-in path, which is exactly what `allow` restores.
+//
+// They are also the evidence for the finding. Four tests covered check-time
+// module resolution and not one of them compiled a module import to a binary,
+// which is `manitc check` exiting 0 without predicting a link, in this
+// suite's own coverage.
 // ===========================================================================
 
 #[test]
@@ -470,7 +495,7 @@ fn s11_private_module_item_is_error() {
     );
     assert_check_error(
         "s11_priv_main.mt",
-        "use privmod;\nfn main() { let x = privmod::hidden(); }\n",
+        "lint allow(unlinkable-user-module);\nuse privmod;\nfn main() { let x = privmod::hidden(); }\n",
         "private",
     );
 }
@@ -483,7 +508,7 @@ fn s11_public_module_item_is_ok() {
     );
     let out = assert_checks(
         "s11_pub_main.mt",
-        "use pubmod;\nfn main() { let x = pubmod::visible(); }\n",
+        "lint allow(unlinkable-user-module);\nuse pubmod;\nfn main() { let x = pubmod::visible(); }\n",
     );
     assert!(
         !out.contains("has no item"),
@@ -497,11 +522,11 @@ fn s11_transitive_use_is_registered() {
     write_source("basemod.mt", "pub fn base_fn() -> int { 7 }\n");
     write_source(
         "midmod.mt",
-        "use basemod;\npub fn mid_fn() -> int { basemod::base_fn() }\n",
+        "lint allow(unlinkable-user-module);\nuse basemod;\npub fn mid_fn() -> int { basemod::base_fn() }\n",
     );
     let out = assert_checks(
         "s11_trans_main.mt",
-        r#"
+        r#"lint allow(unlinkable-user-module);
 use midmod;
 fn main() {
     let a = midmod::mid_fn();
@@ -604,7 +629,7 @@ fn s12_user_module_shadowing_a_stdlib_name_still_only_warns() {
     write_source("math.mt", "pub let SHADOW_ANSWER: int = 42;\n");
     let out = assert_checks(
         "s12_shadow.mt",
-        "use math;\nfn main() { let x = math::SHADOW_ANSWER; }\n",
+        "lint allow(unlinkable-user-module);\nuse math;\nfn main() { let x = math::SHADOW_ANSWER; }\n",
     );
     assert!(
         out.contains("has no item 'SHADOW_ANSWER'"),

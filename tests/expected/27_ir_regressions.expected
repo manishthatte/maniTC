@@ -23,10 +23,10 @@ PASS for-shadow: outer e restored
 PASS match-str: concat hits arm 1
 PASS match-str: concat hits arm 2
 PASS match-str: wildcard still ok
--- tfloat compare --
-PASS tfloat: -2.5 < 1.5
-PASS tfloat: 1.5 > -2.5
-PASS tfloat: -2.5 <= -2.5
+-- float compare --
+PASS float: -2.5 < 1.5
+PASS float: 1.5 > -2.5
+PASS float: -2.5 <= -2.5
 -- if with return arm --
 PASS if-ret: else path
 PASS if-ret: return path

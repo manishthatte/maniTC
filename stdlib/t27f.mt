@@ -177,6 +177,42 @@ fn to_int(x: T27F) -> word {
 
 // Add two T27F values.
 // Aligns exponents, adds mantissas, normalizes result.
+// report.txt P128. `normalize(from_parts(e, m))` DESTROYS `m` BEFORE
+// NORMALISING IT, because `from_parts` clamps the mantissa to MANTISSA_MAX and
+// `normalize` then has nothing left to renormalise. Measured before the fix:
+//
+//     t27f::add(from_float(100.0), from_float(25.0))  ==  40      (want 125)
+//     t27f::sub(from_float(100.0), from_float(25.0))  ==  40      (want  75)
+//     t27f::mul(from_float(100.0), from_float(25.0))  ==   0 on LLVM,
+//                                                       TRAP on T3 (want 2500)
+//
+// The two operands there have DIFFERENT exponents, which is what makes the
+// aligned sum exceed the 18-trit mantissa; with equal exponents and small
+// mantissas — `from_parts(0, 100)` and `from_parts(0, 25)` — nothing overflows
+// and the old code answered 125 correctly. That is why the module's own usage
+// example never showed it.
+//
+// The repair is to normalise the UNPACKED pair, so packing is the last step
+// and the clamp can only ever see a value that already fits.
+fn norm_parts(e: word, m: word) -> T27F {
+    if m == 0 {
+        return ZERO;
+    }
+    let mut m_norm: word = m;
+    let mut e_norm: word = e;
+    // Shift down while the mantissa does not fit.
+    while m_norm > MANTISSA_MAX || m_norm < 0 - MANTISSA_MAX {
+        m_norm = tdiv(m_norm, 3);
+        e_norm = e_norm + 1;
+    }
+    // Then up, while it still fits, to keep the most significant trits.
+    while m_norm * 3 <= MANTISSA_MAX && m_norm * 3 >= 0 - MANTISSA_MAX {
+        m_norm = m_norm * 3;
+        e_norm = e_norm - 1;
+    }
+    from_parts(e_norm as t9, m_norm)
+}
+
 fn add(a: T27F, b: T27F) -> T27F {
     let ea = exponent(a);
     let eb = exponent(b);
@@ -189,14 +225,14 @@ fn add(a: T27F, b: T27F) -> T27F {
         let shift = ea - eb;
         let ma_scaled = ma * pow3(shift);
         let sum = ma_scaled + mb;
-        normalize(from_parts(eb, sum))
+        norm_parts(eb as word, sum)
     } elif ea < eb {
         let shift = eb - ea;
         let mb_scaled = mb * pow3(shift);
         let sum = ma + mb_scaled;
-        normalize(from_parts(ea, sum))
+        norm_parts(ea as word, sum)
     } else {
-        normalize(from_parts(ea, ma + mb))
+        norm_parts(ea as word, ma + mb)
     }
 }
 
@@ -207,12 +243,54 @@ fn sub(a: T27F, b: T27F) -> T27F {
 
 // Multiply two T27F values.
 // Mantissas multiply, exponents add.
+// report.txt P128, second half. The product of two full 18-trit mantissas
+// needs about 3.8e16, and a 27-trit `word` holds +/-3,812,798,742,493 — so on
+// T3 `ma * mb` did not merely clamp, it TRAPPED, while on LLVM (where a word
+// is an i64) it clamped to MANTISSA_MAX and answered 0.
+//
+// Both operands are therefore reduced BEFORE multiplying, to a magnitude whose
+// square the word can hold: 3^13 gives (3^13-1)/2 = 797,161 per side and a
+// product below 6.4e11. The larger operand is reduced first, so a small
+// multiplier keeps its precision and only what must be dropped is dropped.
+//
+// **This costs precision and the cost is stated rather than hidden**: a
+// product carries about 13 trits where the format's mantissa is 18, so `mul`
+// is less precise than `add`. Full-width multiplication needs a double-word
+// intermediate the language does not have on T3.
 fn mul(a: T27F, b: T27F) -> T27F {
     let ea = exponent(a);
     let eb = exponent(b);
-    let ma = mantissa(a);
-    let mb = mantissa(b);
-    normalize(from_parts(ea + eb, ma * mb))
+    let mut ma: word = mantissa(a);
+    let mut mb: word = mantissa(b);
+    let mut ea_adj: word = ea as word;
+    let mut eb_adj: word = eb as word;
+
+    // The comparison is on MAGNITUDES, and it has to be.
+    //
+    // Written as `if ma > mb` it compared SIGNED values, so with one negative
+    // operand a positive `ma` was forever "the larger", was reduced forever,
+    // and `mb` never shrank — `mul(7, -6)` ran to the emulator's step limit
+    // while `mul(-6, 7)` answered -42. Caught by rule 8, which asks for both
+    // orderings of every pair, on the first run of the row that has them.
+    let half_max: word = 797161;   // (3^13 - 1) / 2
+    let mut mag_a: word = ma;
+    let mut mag_b: word = mb;
+    if mag_a < 0 { mag_a = 0 - mag_a; }
+    if mag_b < 0 { mag_b = 0 - mag_b; }
+    while mag_a > half_max || mag_b > half_max {
+        if mag_a >= mag_b {
+            ma = tdiv(ma, 3);
+            ea_adj = ea_adj + 1;
+            mag_a = ma;
+            if mag_a < 0 { mag_a = 0 - mag_a; }
+        } else {
+            mb = tdiv(mb, 3);
+            eb_adj = eb_adj + 1;
+            mag_b = mb;
+            if mag_b < 0 { mag_b = 0 - mag_b; }
+        }
+    }
+    norm_parts(ea_adj + eb_adj, ma * mb)
 }
 
 // Negate a T27F.  Exact: just negate the mantissa (trit-flip).
@@ -260,21 +338,12 @@ fn normalize(x: T27F) -> T27F {
         return ZERO;
     }
 
-    // Shift mantissa up (multiply by 3, decrease exponent) while it fits
-    let mut m_norm = m;
-    let mut e_norm = e;
-    while m_norm * 3 <= MANTISSA_MAX && m_norm * 3 >= 0 - MANTISSA_MAX {
-        m_norm = m_norm * 3;
-        e_norm = e_norm - 1;
-    }
-
-    // Shift mantissa down if it overflows
-    while m_norm > MANTISSA_MAX || m_norm < 0 - MANTISSA_MAX {
-        m_norm = tdiv(m_norm, 3);
-        e_norm = e_norm + 1;
-    }
-
-    from_parts(e_norm, m_norm)
+    // P128: delegated, so there is ONE normalisation and it operates on
+    // unpacked values. `x` has already been through `from_parts`, so its
+    // mantissa fits by construction and only the upward shift can fire here —
+    // which is exactly why this entry point could not repair an overflowing
+    // sum and `add` had to stop routing through it.
+    norm_parts(e as word, m)
 }
 
 // ---------------------------------------------------------------------------

@@ -9,10 +9,7 @@ impl SemanticAnalyzer {
                     match h {
                         ManiType::Float => ManiType::Float,
                         ManiType::Trit => ManiType::Trit,
-                        ManiType::Tryte => ManiType::Tryte,
-                        ManiType::T9 => ManiType::T9,
-                        ManiType::T27 => ManiType::T27,
-                        ManiType::T54 => ManiType::T54,
+                        ManiType::TN(w) => ManiType::TN(*w),
                         _ => ManiType::Int,
                     }
                 } else {
@@ -166,10 +163,14 @@ impl SemanticAnalyzer {
                 // Safe to reject: instrumenting `binop_type` and checking all
                 // 268 shipped `.mt` files found ZERO sites. Nothing shipped is
                 // miscompiled today, and nothing shipped stops compiling.
+                // C3: this is the predicate that used to carry its OWN width
+                // table — the one P122 found disagreeing with the range table
+                // about `tryte`. It cannot disagree with anything now: the
+                // question "is this wider than a trit" is `TN(_)`, and the
+                // width it reports comes from `ternary_type_width`.
                 let too_wide = |t: &ManiType| matches!(
                     t,
-                    ManiType::Tryte | ManiType::T9 | ManiType::T27
-                        | ManiType::T54 | ManiType::Tfloat
+                    ManiType::TN(_) | ManiType::Tfloat
                 );
                 if too_wide(lhs) || too_wide(rhs) {
                     let wide = if too_wide(lhs) { lhs } else { rhs };
@@ -277,8 +278,7 @@ impl SemanticAnalyzer {
         if matches!(op, UnOpKind::Tnot | UnOpKind::Tposs | UnOpKind::Tnec)
             && matches!(
                 operand,
-                ManiType::Tryte | ManiType::T9 | ManiType::T27
-                    | ManiType::T54 | ManiType::Tfloat
+                ManiType::TN(_) | ManiType::Tfloat
             )
         {
             let name = match op {
@@ -666,10 +666,7 @@ impl SemanticAnalyzer {
             scrut_ty,
             ManiType::Int
                 | ManiType::Trit
-                | ManiType::Tryte
-                | ManiType::T9
-                | ManiType::T27
-                | ManiType::T54
+                | ManiType::TN(_)
                 | ManiType::Unknown
         );
         if !ok {
@@ -1077,11 +1074,12 @@ impl Default for SemanticAnalyzer {
 /// into a `tryte` and ±13 cannot hold one.
 pub(super) fn ternary_type_width(ty: &ManiType) -> Option<u32> {
     match ty {
+        // C3: `Trit` answers 1 and is still its own arm, because it is its
+        // own type — see `ManiType::Trit`. Every other width is the type's own
+        // parameter, so this table cannot go stale as widths are added: that
+        // is the whole of what P122 asked for, one variant later.
         ManiType::Trit => Some(1),
-        ManiType::Tryte => Some(6),
-        ManiType::T9 => Some(9),
-        ManiType::T27 => Some(27),
-        ManiType::T54 => Some(54),
+        ManiType::TN(w) => Some(*w),
         _ => None,
     }
 }

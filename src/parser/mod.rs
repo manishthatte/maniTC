@@ -248,6 +248,19 @@ impl Parser {
     fn parse_item(&mut self) -> CompileResult<Item> {
         let is_pub = self.eat(&TokenKind::Pub);
 
+        // B4: `const fn` — a function whose body may be evaluated at compile
+        // time. Contextual on the FOLLOWING token, exactly as `const` is
+        // inside a generic parameter list (B3): a bare `const` is still an
+        // ordinary identifier, and `const fn` occurs zero times across both
+        // repositories and the corpus.
+        if matches!(self.peek(), TokenKind::Ident(k) if k == "const")
+            && matches!(self.peek2(), TokenKind::Fn)
+        {
+            self.advance();
+            let mut f = self.parse_fn_def(is_pub)?;
+            f.is_const = true;
+            return Ok(Item::FnDef(f));
+        }
         match self.peek().clone() {
             TokenKind::Fn | TokenKind::Async => {
                 let f = self.parse_fn_def(is_pub)?;
@@ -342,7 +355,7 @@ impl Parser {
         // A keyword is a legal name here — nothing else can follow `fn`.
         let name = self.expect_name("function name")?;
 
-        let (generics, mut bounds) = self.parse_generic_params_bounded();
+        let (generics, mut bounds, const_generics) = self.parse_generic_params_bounded();
 
         self.expect(&TokenKind::LParen)?;
 
@@ -360,13 +373,15 @@ impl Parser {
                     // receiver is a separate decision (see `method_recv` in the
                     // move-site sweep, which counts it and never consumes it).
                     is_move: false,
+                    refinement: None,
                 });
             } else {
                 let (pname, _) = self.expect_ident()?;
                 self.expect(&TokenKind::Colon)?;
                 let is_move = self.eat_move_annotation();
                 let ty = self.parse_type()?;
-                params.push(Param { name: pname, ty, span: pspan, is_move });
+                let refinement = self.parse_refinement(&pname)?;
+                params.push(Param { name: pname, ty, span: pspan, is_move, refinement });
             }
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -398,7 +413,7 @@ impl Parser {
             None
         };
 
-        Ok(FnDef { name, generics, bounds, params, ret_ty, body, available, is_pub, is_async, span })
+        Ok(FnDef { name, generics, const_generics, bounds, params, ret_ty, body, available, is_pub, is_async, is_const: false, span })
     }
 
     // --- struct ---
@@ -408,7 +423,7 @@ impl Parser {
         self.expect(&TokenKind::Struct)?;
         let (name, _) = self.expect_ident()?;
 
-        let generics = self.parse_generic_params();
+        let (generics, const_generics) = self.parse_generic_params();
 
         self.expect(&TokenKind::LBrace)?;
 
@@ -425,7 +440,7 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(StructDef { name, generics, fields, is_pub, span })
+        Ok(StructDef { name, generics, const_generics, fields, is_pub, span })
     }
 
     // --- enum ---
@@ -468,8 +483,9 @@ impl Parser {
     /// (fn and struct) and `impl` had none, which is exactly how the third site
     /// came to be missing: there was no single place that adding a declaration
     /// form would have made you look at.
-    fn parse_generic_params(&mut self) -> Vec<String> {
-        self.parse_generic_params_bounded().0
+    fn parse_generic_params(&mut self) -> (Vec<String>, Vec<ConstParam>) {
+        let (g, _, c) = self.parse_generic_params_bounded();
+        (g, c)
     }
 
     /// Generic parameters and any bounds written in the angle brackets.
@@ -478,15 +494,67 @@ impl Parser {
     /// bound could not be written at all, which is why A4's soundness hole had
     /// no expressible fix. The two results are returned separately because
     /// every existing caller wants only the names.
-    fn parse_generic_params_bounded(&mut self) -> (Vec<String>, Vec<GenericBound>) {
+    fn parse_generic_params_bounded(
+        &mut self,
+    ) -> (Vec<String>, Vec<GenericBound>, Vec<ConstParam>) {
         let mut generics = Vec::new();
         let mut bounds = Vec::new();
+        let mut consts: Vec<ConstParam> = Vec::new();
         if *self.peek() == TokenKind::Lt {
             self.advance(); // consume <
             loop {
                 let bspan = self.span();
-                if let TokenKind::Ident(gname) = self.peek().clone() {
-                    generics.push(gname.clone());
+                // B3: `const N: int` is a CONST generic parameter; a bare
+                // `const` is still an ordinary type parameter named `const`.
+                //
+                // Contextual on the following token, and the number is what
+                // made that the design rather than a hard keyword. `const` is
+                // a legal identifier today: `fn f<const>(x: const)` and
+                // `struct const { .. }` both compile on the previous compiler,
+                // measured. Across both repositories and the model corpus —
+                // 2,873 maniT programs — the word occurs FOUR times, three of
+                // them inside comments and the fourth in a generated file
+                // writing Rust. So reserving it outright would break nothing
+                // that exists, and being contextual breaks nothing that could.
+                // This is P104's lesson met before it bit, for the fifth time
+                // (`t` in C3, `move` in D-2, `fs::move`).
+                let is_const_param = matches!(self.peek(), TokenKind::Ident(k) if k == "const")
+                    && matches!(self.peek2(), TokenKind::Ident(_));
+                if is_const_param {
+                    self.advance(); // consume `const`
+                    let TokenKind::Ident(cname) = self.peek().clone() else {
+                        unreachable!("guarded by peek2 above")
+                    };
+                    let cspan = self.span();
+                    self.advance();
+                    // The annotation is REQUIRED and is kept as written. A
+                    // bare `<const N>` would have to mean `int` by default,
+                    // and a default is the thing you cannot add a second type
+                    // to later without changing what already-written source
+                    // means.
+                    // Parsed as a TYPE rather than as an identifier, because
+                    // `int` is a keyword token and not an `Ident` — reading it
+                    // as a name accepted `const N: Foo` and rejected the one
+                    // spelling the feature is for.
+                    let cty = if self.eat(&TokenKind::Colon) {
+                        match self.parse_type() {
+                            Ok(t) => t.display(),
+                            Err(_) => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    consts.push(ConstParam { name: cname, ty: cty, span: cspan });
+                } else if let TokenKind::Ident(gname) = self.peek().clone() {
+                    if !consts.is_empty() {
+                        // Recorded as a parameter named with the marker below
+                        // rather than as a parse error, so that the analyzer
+                        // owns the diagnostic and can name both parameters.
+                        // Erroring here would report a column and not a rule.
+                        generics.push(format!("{}{}", Self::CONST_ORDER_MARKER, gname));
+                    } else {
+                        generics.push(gname.clone());
+                    }
                     self.advance();
                     if self.eat(&TokenKind::Colon) {
                         let traits = self.parse_bound_list();
@@ -499,7 +567,201 @@ impl Parser {
             }
             self.eat_gt(); // consume >
         }
-        (generics, bounds)
+        (generics, bounds, consts)
+    }
+
+    /// B3: prefix stamped on a type parameter written AFTER a const parameter.
+    ///
+    /// The two lists are recombined positionally when a type-argument list is
+    /// matched against a declaration, so `<const N: int, T>` has no reading
+    /// that both lists can represent. The marker carries the violation out of
+    /// the parser to the analyzer, which is the stage that can name the
+    /// parameters and say what to write instead.
+    pub(crate) const CONST_ORDER_MARKER: &'static str = "\u{1}const-after$";
+
+    /// B6: `where -100 <= x <= 100` on a parameter, having just parsed its type.
+    ///
+    /// **`where` is contextual and the number said it could be.** It occurs
+    /// **389 times** across both repositories and the 2,507-program corpus and
+    /// **not once in code** — every occurrence is the English word inside a
+    /// comment ("does not depend on where the arrays differ"). The generic
+    /// `where T: Ord` clause the parser already accepts is used by **zero**
+    /// programs. So the word was free, and it is read as a refinement only
+    /// INSIDE a parameter list, where nothing else can appear.
+    ///
+    /// **This parser is its own, and that is the point.** The expression
+    /// grammar deliberately REFUSES chained comparison — `a < b < c` gives
+    /// "comparison operators cannot be chained", a message that exists because
+    /// C's reading of it is a bug magnet. But `-100 <= x <= 100` is the
+    /// standard notation for an interval and has exactly one reading when the
+    /// middle term is a named parameter. Measured before it was written: the
+    /// item's own example is refused by the expression parser, so reusing it
+    /// would have meant rejecting the syntax the item asks for. The two
+    /// positions are distinct and the refusal stays where it earns its keep.
+    fn parse_refinement(&mut self, pname: &str) -> CompileResult<Option<Refinement>> {
+        if !matches!(self.peek(), TokenKind::Ident(k) if k == "where") {
+            return Ok(None);
+        }
+        let span = self.span();
+        self.advance(); // `where`
+        let start = self.pos;
+        let mut lo: Option<RefineBound> = None;
+        let mut hi: Option<RefineBound> = None;
+        let mut lo_incl = true;
+        let mut hi_incl = true;
+
+        loop {
+            self.parse_refine_term(pname, &mut lo, &mut lo_incl, &mut hi, &mut hi_incl)?;
+            if !self.eat(&TokenKind::AndAnd) {
+                break;
+            }
+        }
+        if lo.is_none() && hi.is_none() {
+            return Err(self.err(format!(
+                "the `where` on `{pname}` bounds nothing. Write a range — \
+                 `where -100 <= {pname} <= 100` — or one side of one, \
+                 `where {pname} >= 0`."
+            )));
+        }
+        let text = self.rendered_tokens(start, self.pos);
+        Ok(Some(Refinement { lo, lo_inclusive: lo_incl, hi, hi_inclusive: hi_incl, text, span }))
+    }
+
+    /// One comparison of a refinement: `x <= 100`, `0 <= x`, or the chained
+    /// `0 <= x <= 100` in a single term.
+    fn parse_refine_term(
+        &mut self,
+        pname: &str,
+        lo: &mut Option<RefineBound>,
+        lo_incl: &mut bool,
+        hi: &mut Option<RefineBound>,
+        hi_incl: &mut bool,
+    ) -> CompileResult<()> {
+        // Either the parameter comes first (`x <= 100`) or a bound does
+        // (`0 <= x`, and possibly `0 <= x <= 100`).
+        if matches!(self.peek(), TokenKind::Ident(n) if n == pname) {
+            self.advance();
+            let (op, incl) = self.parse_refine_op(pname)?;
+            let b = self.parse_refine_bound(pname)?;
+            // `x <= B` bounds ABOVE; `x >= A` bounds BELOW.
+            if op { *hi = Some(b); *hi_incl = incl; } else { *lo = Some(b); *lo_incl = incl; }
+            return Ok(());
+        }
+        let first = self.parse_refine_bound(pname)?;
+        let (op, incl) = self.parse_refine_op(pname)?;
+        if !matches!(self.peek(), TokenKind::Ident(n) if n == pname) {
+            return Err(self.err(format!(
+                "a `where` on `{pname}` must compare `{pname}` itself. This checker's \
+                 fragment is one parameter against constant bounds, which is what \
+                 makes it decidable."
+            )));
+        }
+        self.advance(); // the parameter
+        // `A <= x` bounds BELOW.
+        if op { *lo = Some(first); *lo_incl = incl; } else { *hi = Some(first); *hi_incl = incl; }
+        // A chained upper bound may follow: `A <= x <= B`.
+        if matches!(self.peek(), TokenKind::Lt | TokenKind::LtEq | TokenKind::Gt | TokenKind::GtEq) {
+            let (op2, incl2) = self.parse_refine_op(pname)?;
+            let b = self.parse_refine_bound(pname)?;
+            if op2 { *hi = Some(b); *hi_incl = incl2; } else { *lo = Some(b); *lo_incl = incl2; }
+        }
+        Ok(())
+    }
+
+    /// A comparison operator inside a refinement.
+    ///
+    /// Returns `(points_upward, inclusive)` — `true` for `<`/`<=`, meaning the
+    /// thing on the RIGHT is the larger, which is what decides whether the
+    /// bound just read is a floor or a ceiling.
+    fn parse_refine_op(&mut self, pname: &str) -> CompileResult<(bool, bool)> {
+        let r = match self.peek() {
+            TokenKind::LtEq => (true, true),
+            TokenKind::Lt => (true, false),
+            TokenKind::GtEq => (false, true),
+            TokenKind::Gt => (false, false),
+            other => {
+                return Err(self.err(format!(
+                    "a `where` on `{pname}` needs a comparison — `<`, `<=`, `>` or \
+                     `>=` — found {other:?}. Equality is not one: a parameter pinned \
+                     to a single value is a constant, and this is a range."
+                )))
+            }
+        };
+        self.advance();
+        Ok(r)
+    }
+
+    /// One bound: an integer literal, optionally negated, or the name of a
+    /// `const` generic parameter.
+    fn parse_refine_bound(&mut self, pname: &str) -> CompileResult<RefineBound> {
+        let neg = self.eat(&TokenKind::Minus);
+        match self.peek().clone() {
+            TokenKind::Int(v) => {
+                self.advance();
+                Ok(RefineBound::Lit(if neg { -v } else { v }))
+            }
+            TokenKind::Ident(n) if !neg && n != pname => {
+                self.advance();
+                // A CALL is the tempting thing to write here and the one this
+                // fragment cannot decide. Caught by the `(` rather than left
+                // to the next `expect`, which reported "expected RParen, found
+                // LParen" — a message about the parameter list, for a mistake
+                // in the refinement.
+                if self.peek() == &TokenKind::LParen {
+                    return Err(self.err(format!(
+                        "a bound in a `where` on `{pname}` must be an integer literal \
+                         or a `const` generic parameter, and `{n}(…)` is a call. The \
+                         checker's value is that it decides, and it can only decide \
+                         over constants."
+                    )));
+                }
+                Ok(RefineBound::ConstParam(n))
+            }
+            other => Err(self.err(format!(
+                "a bound in a `where` on `{pname}` must be an integer literal or a \
+                 `const` generic parameter, found {other:?}. A call or a global \
+                 cannot be one: the checker's value is that it decides, and it can \
+                 only decide over constants."
+            ))),
+        }
+    }
+
+    /// The source text of a token range, for a diagnostic that quotes what the
+    /// author wrote rather than a normalised re-rendering of it.
+    fn rendered_tokens(&self, from: usize, to: usize) -> String {
+        let mut out = String::new();
+        let mut tight = false; // no space after a unary `-`
+        for i in from..to.min(self.tokens.len()) {
+            let k = &self.tokens[i].kind;
+            let t = Self::render_token(k);
+            if t.is_empty() {
+                continue;
+            }
+            if !out.is_empty() && !tight {
+                out.push(' ');
+            }
+            out.push_str(&t);
+            // A `-` here is always a sign: the grammar admits no binary minus
+            // inside a refinement. Rendering `- 100` where the author wrote
+            // `-100` is the same defect as P124 one level down — a message
+            // that quotes the source and does not match it.
+            tight = matches!(k, TokenKind::Minus);
+        }
+        out
+    }
+
+    fn render_token(k: &TokenKind) -> String {
+        match k {
+            TokenKind::Int(v) => v.to_string(),
+            TokenKind::Ident(n) => n.clone(),
+            TokenKind::LtEq => "<=".into(),
+            TokenKind::Lt => "<".into(),
+            TokenKind::GtEq => ">=".into(),
+            TokenKind::Gt => ">".into(),
+            TokenKind::Minus => "-".into(),
+            TokenKind::AndAnd => "&&".into(),
+            other => format!("{other:?}"),
+        }
     }
 
     /// One bound list: `Ord`, or `Ord + Display`.
@@ -700,7 +962,12 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let is_move = self.eat_move_annotation();
             let ty = self.parse_type()?;
-            params.push(Param { name: pname, ty, span: pspan, is_move });
+            // B6: an extern carries a refinement too. A native function that
+            // requires a range is exactly the case where the compiler cannot
+            // look at the body to find out, so the annotation is worth more
+            // here than anywhere.
+            let refinement = self.parse_refinement(&pname)?;
+            params.push(Param { name: pname, ty, span: pspan, is_move, refinement });
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -794,7 +1061,7 @@ impl Parser {
         // the language's own Vec, Future and Mutex -- did not parse. They are
         // the three modules STDLIB_SOURCES describes as having "known parse
         // gaps"; this was the gap.
-        let generics = self.parse_generic_params();
+        let (generics, const_generics) = self.parse_generic_params();
 
         // The name that follows may itself carry generic ARGUMENTS
         // (`impl<T> Vec<T>`), so parse a full type rather than a bare
@@ -820,7 +1087,7 @@ impl Parser {
             methods.push(m);
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(ImplBlock { ty, generics, trait_, methods, span })
+        Ok(ImplBlock { ty, generics, const_generics, trait_, methods, span })
     }
 
     // --- trait ---

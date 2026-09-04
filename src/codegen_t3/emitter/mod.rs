@@ -173,6 +173,19 @@ impl AsmEmitter {
     /// Single TLIT when |imm| ≤ 797161 (the balanced 13-trit wide-imm bound).
     /// Larger values are decomposed recursively as hi*1000 + lo.
     ///
+    /// **P125: for a constant the word cannot hold, an INTERMEDIATE of this
+    /// decomposition is what traps, and the trap names it rather than the
+    /// constant.** `7625597484986` is built as `7625597484 * 1000 + 986`, and
+    /// the multiply overflows first — so the run-time message reports
+    /// "int multiplication overflow: result 7625597484000" for a program whose
+    /// only operator is `+`. That is not repaired HERE: `docs/semantics.md`
+    /// §10.1 specifies that such a program compiles on T3 and traps, and P79
+    /// and P116 pin it, so refusing it in the emitter moved three rows and
+    /// contradicted a normative section. What P125 fixed instead is that the
+    /// SEMANTIC pass now sees folded constants, so `--lang v2` rejects the
+    /// value and `--warn literal-out-of-word` lists it before it ever reaches
+    /// this function.
+    ///
     /// The magnitude is taken with `unsigned_abs` and not `abs`, because
     /// `i64::MIN.abs()` has no i64 answer: in release it wraps back to
     /// `i64::MIN`, which is ≤ MAX_LIT, so the one value that most needs the

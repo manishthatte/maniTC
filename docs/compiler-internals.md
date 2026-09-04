@@ -188,7 +188,7 @@ CompileError::codegen(msg)                  // from backends (no location)
 
 ## 4. lexer.rs — tokenisation
 
-**File:** `maniTC/src/lexer.rs` (~1,130 lines)
+**File:** `maniTC/src/lexer.rs` (~1,268 lines)
 
 ### `Span`
 
@@ -269,7 +269,7 @@ Accumulates `digit * 3^position`.
 
 ## 5. ast.rs — abstract syntax tree
 
-**File:** `maniTC/src/ast.rs` (~840 lines)
+**File:** `maniTC/src/ast.rs` (~1,074 lines)
 
 The AST represents the programmer's source code **after parsing** but **before**
 type checking. Every node carries a `Span` for error reporting.

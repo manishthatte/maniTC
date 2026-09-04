@@ -151,6 +151,20 @@ pub const LINTS: &[(WarningKind, &str, LintLevel)] = &[
     // it the way it rejects any literal that does not fit its type. A lint
     // level cannot allow away a value that does not exist.
     (WarningKind::LiteralOutOfWord, "literal-out-of-word", LintLevel::Allow),
+    // B6. A call the refinement checker could not PROVE satisfies a `where`.
+    //
+    // `allow` by default, and this is the third time that default has been
+    // chosen for the same reason: the list is a BACKLOG, not a defect report.
+    // A call whose argument is `0..15` against a `where 0 <= x <= 10` is wrong
+    // for some inputs and right for others, and the compiler does not know
+    // which the program will produce. Warning by default would report working
+    // programs, exactly as `literal-out-of-word` would.
+    //
+    // What is NOT this lint: a call whose argument is PROVABLY outside the
+    // range for every input. That is an error, unconditionally, because no
+    // execution of it can be correct — and keeping the two apart is the whole
+    // reason a refuter can be strict and a prover can be quiet.
+    (WarningKind::UnprovenRefinement, "unproven-refinement", LintLevel::Allow),
     // P70. A `struct` or `enum` declared under a name the type resolver
     // answers before it ever consults the struct table.
     //
@@ -166,16 +180,71 @@ pub const LINTS: &[(WarningKind, &str, LintLevel)] = &[
     // `stdlib/collections.mt` and `stdlib/sync.mt` use it because their
     // declarations ARE the built-ins this lint protects.
     (WarningKind::ReservedTypeName, "reserved-type-name", LintLevel::Deny),
-    // P95. `deny` for exactly P70's measured reason, one entry above: the
-    // diagnostic is returned as an Err rather than pushed as a warning, because
-    // `main` prints warnings only after `analyze` RETURNS and `analyze`'s `?`
-    // on the first type error discards them — so a `warn` default would be
-    // silent in a large share of the cases that motivate the lint.
+    // ENHANCEMENT_PLAN 0.4. A `use` of a user module — anything whose first
+    // path segment is not `std`.
+    //
+    // `deny` by default for the reason P70's entry gives just above: every
+    // observable case ends in a failure, so a `warn` default would be silent
+    // in exactly the case it exists for. Here the failure is at LINK rather
+    // than at check, which is worse — the diagnostic that reaches the reader
+    // is `use of undefined value '@lib_a_helper'` from clang, or
+    // `Undefined label: lib_a::helper` from the T3 assembler, neither of which
+    // carries a line, a column, or any visible relation to the `use`.
+    //
+    // What is broken is measured rather than assumed, and it is BOTH halves:
+    //   * a FUNCTION is registered by signature only — `load_user_module`
+    //     inserts `(param_types, ret_ty)` and drops the body — so the call is
+    //     emitted and the definition never is. Fails on both backends.
+    //   * a STRUCT is registered with its layout, which needs no body, and it
+    //     very nearly works: T3 runs `lib_b::Point { x: 3, y: 4 }` and prints
+    //     the right answer. LLVM emits `%struct.lib_b::Point = type { i64,
+    //     i64 }`, and `::` is not legal in an unquoted LLVM identifier, so
+    //     clang rejects the MODULE with a syntax error. The backends disagree
+    //     about whether the program is expressible at all.
+    //
+    // `allow` is an exact restoration of the previous compiler: the `use` is
+    // resolved exactly as before and simply stops being reported. It is the
+    // escape hatch for anyone who wants the T3-only struct path, and it is
+    // what the cross-file-bodies work will remove.
+    (WarningKind::UnlinkableUserModule, "unlinkable-user-module", LintLevel::Deny),
+    // ENHANCEMENT_PLAN 0.3. A top-level user function colliding with the
+    // mangled name of a stdlib function the program actually expands.
+    //
+    // `str::count` is ManiT source and the LLVM backend mangles it with
+    // `mangle_func_name`, which is `name.replace("::", "_")` — so it emits
+    // `@str_count`, and a user's `fn str_count` emits a second definition of
+    // the same symbol. **The backends disagree about whether the program is
+    // legal**: clang refuses the module with `invalid redefinition of function
+    // 'str_count'` and the T3 assembler accepts it and runs.
+    //
+    // Conditional on EXPANSION, not on the name, and the difference is not
+    // hypothetical. 341 mangled names could collide; exactly one is declared
+    // anywhere in the two repositories — `fn trit_abs` in
+    // `manitc/tests/05_ternary_types.mt`, against `trit::abs`. That file
+    // never references `trit::`, so the module is never expanded, no second
+    // definition is emitted, and it links today. A check on the NAME would
+    // reject working, shipped code; a check on the collision does not.
+    (WarningKind::CollidingStdlibSymbol, "colliding-stdlib-symbol", LintLevel::Deny),
+    // P95. A type name declared nowhere at all.
+    //
+    // `deny` for exactly P70's measured reason, above: the diagnostic is
+    // returned as an Err rather than pushed as a warning, because `main` prints
+    // warnings only after `analyze` RETURNS and `analyze`'s `?` on the first
+    // type error discards them — so a `warn` default would be silent in a large
+    // share of the cases that motivate the lint.
     //
     // `allow` is an exact restoration of the pre-P95 compiler: the name still
     // resolves to `Unknown` and nothing is checked differently, it simply stops
     // being reported.
     (WarningKind::UndeclaredType, "undeclared-type", LintLevel::Deny),
+    // P103. `deny` for P95's reason, and the same `allow` guarantee: the field
+    // still resolves to `Unknown` and the lowerer still reads slot 0, it simply
+    // stops being reported.
+    //
+    // Measured before it was written, which is what made `deny` defensible:
+    // **0 misses across every `.mt` file in maniTC and thatteOS, and 0 across
+    // all 2,507 files of the model corpus.** The one real instance in either
+    // repository was found by this instrument and is report.txt P102(b).
     // NAMED `undeclared-field`, not `unknown-field`, and the reason is
     // measured rather than stylistic: the lexer reads `unknown` as the
     // three-valued literal, so `lint allow(unknown-field);` is a PARSE ERROR.
@@ -186,6 +255,30 @@ pub const LINTS: &[(WarningKind, &str, LintLevel)] = &[
     // `undeclared-field` also matches `undeclared-type` and
     // `undeclared-native`, which is what it belongs beside.
     (WarningKind::UnknownField, "undeclared-field", LintLevel::Deny),
+    // B7 D-5. A generic instantiation the analyzer could not type, whose body
+    // was therefore never built and never move-checked.
+    //
+    // `warn` and NOT `deny`, and the reason is P65's design rather than a
+    // preference: a failed instantiation is deliberately not an error —
+    // `ensure_mono` says so in as many words, and two pinned rows state that
+    // bounds are opt-in — so denying here would reject programs that compile
+    // today. Four files in this repository prove it, and all four are
+    // fixtures written to exercise exactly this fallback.
+    //
+    // `warn` and NOT `allow`, and that is measured: the population in real
+    // code is **zero**. 0 of 2,507 model-corpus files and 4 of 366 files
+    // across maniTC and thatteOS discard an instantiation, and every one of
+    // the four is `tests/fixtures/oracle_repros/` — `p71_failed_inst_freefn`,
+    // `p71_failed_inst_impl_method`, `ord63_address_theory`,
+    // `ord63_str_via_bound`. So this lint has no backlog to bury a reader
+    // under, which is what made `undeclared-native` default to `allow` with
+    // its 413. A diagnostic nobody sees costs nothing; a diagnostic nobody
+    // can see costs the whole finding.
+    //
+    // `allow` restores the previous compiler EXACTLY: the instantiation is
+    // still discarded, the call still keeps the erased path, the return type
+    // still comes from the declaration (P71). Only the report goes away.
+    (WarningKind::UncheckedInstantiation, "unchecked-instantiation", LintLevel::Warn),
 ];
 
 /// Resolve a lint name to its kind. `None` for an unknown name.

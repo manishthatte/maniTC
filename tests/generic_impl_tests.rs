@@ -826,6 +826,35 @@ fn p70_the_reference_tables_agree_with_the_compiler() {
             }
         }
     }
+    // P126: THE OTHER DIRECTION, which this test did not check.
+    //
+    // The loop above walks `lint::LINTS` and asks whether the table documents
+    // each one. Nothing walked the TABLE, so a row for a lint that does not
+    // exist was invisible — and it was not hypothetical: a tree was measured in
+    // which §20 documented `unlinkable-user-module` and the compiler answered
+    // "unknown lint 'unlinkable-user-module'; known lints: ...". A reader
+    // following the reference got an error from the thing the reference is for.
+    //
+    // Permanent rule 5 says a registry that must agree with another registry
+    // gets a test rather than a comment. A ONE-DIRECTIONAL test is the same
+    // defect one level up: it is a comment about half the agreement.
+    let known: Vec<&str> = manitc::lint::LINTS.iter().map(|(_, n, _)| *n).collect();
+    let phantom: Vec<String> = s20
+        .lines()
+        .filter(|l| l.starts_with('|'))
+        .filter_map(|l| {
+            let cell = l.split('|').nth(1)?.trim();
+            let name = cell.strip_prefix('`')?.strip_suffix('`')?;
+            (!known.contains(&name)).then(|| name.to_string())
+        })
+        .collect();
+    assert!(
+        phantom.is_empty(),
+        "language-reference.md §20's lint table documents lints the compiler does \
+         not have, so `-W <name>` on one of them fails with \"unknown lint\": {:#?}",
+        phantom,
+    );
+
     assert!(
         wrong.is_empty(),
         "language-reference.md §20's lint table disagrees with `lint::LINTS`: \
@@ -958,7 +987,13 @@ fn ord63_bound_agrees_with_the_operator() {
         ("t9", "", "t9", "1 as t9", "2 as t9"),
         ("t27", "", "t27", "1 as t27", "2 as t27"),
         ("t54", "", "t54", "1 as t54", "2 as t54"),
-        ("tfloat", "", "tfloat", "1.5 as tfloat", "2.5 as tfloat"),
+        // C5/P127: `tfloat` was here and was a PHANTOM — IEEE double wearing a
+        // ternary name — so it is gone. `t27f` replaces it and asks a
+        // different and better question: the ternary float is a STRUCT, so
+        // both `>` and an `Ord`-bounded call must refuse it, and refuse it
+        // alike. This row is why the removal could not go quietly: the guard
+        // below caught that the control had stopped compiling.
+        ("t27f", "", "t27f", "1.5t27f", "2.5t27f"),
         ("str", "", "str", "\"aa\"", "\"bb\""),
         ("array", "", "[int; 2]", "[1, 2]", "[3, 4]"),
         ("tuple", "", "(int, int)", "(1, 2)", "(3, 4)"),
@@ -1934,5 +1969,213 @@ fn p71_a_failed_float_instantiation_still_returns_the_bit_pattern() {
         got.starts_with("0.0000") && got.ends_with("5"),
         "P65's denormal is the documented remaining behaviour here; got {:?}",
         got
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ENHANCEMENT_PLAN Phase 0 — a clean `check` must predict a link
+// ---------------------------------------------------------------------------
+
+/// 0.1 — the seven orphan builtins are refused, and refused WITH THE REMEDY.
+///
+/// Each of these was an entry in `register_builtins` with no definition
+/// anywhere in the linkable world, so the program type-checked and then died
+/// at link on both backends. The population recorded in ENHANCEMENT_PLAN §3.1
+/// was five; probing every name in the table against both backends measured
+/// seven — `abs` and `sqrt` are the two the reading missed, and they are the
+/// two a programmer is likeliest to reach for.
+///
+/// The assertion is on the REMEDY, not on the refusal. A row that only checked
+/// the exit status would pass against a compiler that says "unknown identifier
+/// 'abs'" and stops, and that message is worse than useless here: `math::abs`
+/// exists and works. Measured before this was written — with the entries
+/// merely deleted, `sqrt` got the generic C-runtime fallback and **`abs` was
+/// answered "did you mean 'main'?"**, the enclosing function, which levenshtein
+/// puts at distance exactly 3.
+#[test]
+fn p0_1_orphan_builtins_are_refused_and_name_the_qualified_spelling() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("abs",             "abs(-3)",                  "math::abs"),
+        ("sqrt",            "sqrt(9.0)",                "math::sqrt"),
+        ("str_from_int",    "str_from_int(42)",         "str::from_int"),
+        ("str_parse_int",   "str_parse_int(\"42\")",    "str::parse_int"),
+        ("str_substr",      "str_substr(\"abc\",0,2)",  "str::substr"),
+        ("str_starts_with", "str_starts_with(\"ab\",\"a\")", "str::starts_with"),
+        ("str_ends_with",   "str_ends_with(\"ab\",\"b\")",   "str::ends_with"),
+    ];
+    for (name, call, remedy) in cases {
+        let src = format!("fn main() {{ {}; }}\n", call);
+        let (ok, err) = check_source_out(&format!("p0_1_{}", name), &src);
+        assert!(!ok, "`{}` still type-checks, and it links on neither backend", name);
+        assert!(
+            err.contains(&format!("unknown identifier '{}'", name)),
+            "`{}` must be refused by name; got: {}", name, err
+        );
+        assert!(
+            err.contains(remedy),
+            "refusing `{}` without naming `{}` leaves the reader worse off than \
+             the link error did — the qualified spelling is the whole remedy. \
+             got: {}",
+            name, remedy, err
+        );
+    }
+}
+
+/// 0.1's suggester reads the stdlib, so it answers for names nobody listed.
+///
+/// The mapping is not a table of the seven: `qualified_spellings` scans the
+/// `SOURCE_MODULES` text the binary carries, so any bare spelling of a stdlib
+/// function is answered. `min` was never a registered builtin and never an
+/// orphan — it is here as the control that distinguishes "the seven were
+/// special-cased" from "the mechanism reads the library".
+#[test]
+fn p0_1_the_suggester_is_derived_from_the_stdlib_not_a_list() {
+    let (ok, err) = check_source_out("p0_1_derived", "fn main() { min(1, 2); }\n");
+    assert!(!ok);
+    assert!(
+        err.contains("math::min"),
+        "a bare stdlib name the seven never mentioned must still be answered; got: {}",
+        err
+    );
+
+    // And a name the stdlib genuinely does not have falls back rather than
+    // inventing a module — the failure mode a tail match could easily have.
+    let (ok, err) = check_source_out("p0_1_nomatch", "fn main() { zzq_not_real(1); }\n");
+    assert!(!ok);
+    assert!(
+        !err.contains("::"),
+        "no module declares `zzq_not_real`, so no qualified spelling may be \
+         proposed; got: {}",
+        err
+    );
+}
+
+/// 0.4 — `use` of a user module is refused, because nothing emits its bodies.
+///
+/// ENHANCEMENT_PLAN 0.4 asked for `use unknown_module;` to become an error.
+/// Measured, that case was ALREADY an error, and the silent one is its
+/// opposite: a module that RESOLVES. `load_user_module` registers signatures
+/// and drops every body, so the call is emitted and the definition never is.
+///
+/// The two arms below are the whole finding. A missing module must keep its
+/// own, more specific diagnostic — refusing before loading was written first
+/// and reported "the bodies are never emitted" about a file that does not
+/// exist.
+#[test]
+fn p0_4_use_of_a_user_module_is_refused_but_a_missing_one_says_so() {
+    let dir = tmp("p0_4_dir");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib_p04.mt"), "pub fn helper(x: int) -> int { return x * 2; }\n")
+        .expect("write module");
+
+    let main = dir.join("main.mt");
+    std::fs::write(&main, "use lib_p04;\nfn main() { io::println(fmt::show_int(lib_p04::helper(21))); }\n")
+        .expect("write main");
+    let o = Command::new(manitc()).args(["check", main.to_str().unwrap()])
+        .output().expect("check");
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(!o.status.success(), "a call into a user module links on neither backend");
+    assert!(
+        err.contains("bodies are never emitted"),
+        "the diagnostic must say why, not merely refuse; got: {}", err
+    );
+
+    // The more specific failure still wins.
+    let missing = dir.join("missing.mt");
+    std::fs::write(&missing, "use no_such_module_p04;\nfn main() { io::println(\"hi\"); }\n")
+        .expect("write");
+    let o = Command::new(manitc()).args(["check", missing.to_str().unwrap()])
+        .output().expect("check");
+    let err = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(!o.status.success());
+    assert!(
+        err.contains("cannot load module"),
+        "a `use` of a file that does not exist must report the missing file, \
+         which is the more specific of the two diagnostics; got: {}", err
+    );
+}
+
+/// 0.4's escape hatch is an EXACT restoration, which is what makes it safe.
+///
+/// Asserted by running the program, not by an exit status: under `allow` the
+/// T3 backend still compiles and runs a user-module struct and prints the
+/// right answer, which is the capability the lint withdraws by default. (On
+/// LLVM the same program emits `%struct.lib_p04b::Point`, and `::` is not
+/// legal in an unquoted LLVM identifier, so clang rejects the module — the
+/// two backends disagree about whether it is expressible at all.)
+#[test]
+fn p0_4_allow_restores_the_previous_behaviour_exactly() {
+    let dir = tmp("p0_4_allow_dir");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib_p04b.mt"), "pub struct Point { pub x: int, pub y: int }\n")
+        .expect("write module");
+    let main = dir.join("main.mt");
+    std::fs::write(&main,
+        "lint allow(unlinkable-user-module);\nuse lib_p04b;\n\
+         fn main() { let p: lib_p04b::Point = lib_p04b::Point { x: 3, y: 4 }; \
+         io::println(fmt::show_int(p.x + p.y)); }\n").expect("write main");
+
+    let out = dir.join("a.t3b");
+    let c = Command::new(manitc())
+        .args(["compile", main.to_str().unwrap(), "--target", "t3", "-o", out.to_str().unwrap()])
+        .output().expect("compile");
+    assert!(c.status.success(), "`allow` must restore the previous compiler exactly");
+    let r = Command::new(manitc())
+        .args(["run-t3", out.to_str().unwrap()])
+        .output().expect("run");
+    let got: String = String::from_utf8_lossy(&r.stdout)
+        .lines().filter(|l| !l.starts_with("[T3ISA]")).collect::<Vec<_>>().join("");
+    assert_eq!(got.trim(), "7", "the restored path must still compute the right answer");
+}
+
+/// 0.3 — a user function colliding with an expanded stdlib symbol is refused.
+///
+/// `str::count` is ManiT source; `mangle_func_name` is `replace("::", "_")`,
+/// so the module emits `@str_count` and a user's `fn str_count` emits a
+/// second one. clang refuses the module; the T3 assembler accepts it and
+/// runs. Both arms below were checked against the pre-change compiler: the
+/// refused program fails to link there with `invalid redefinition of function
+/// 'str_count'`, so this rejects nothing that ever worked.
+///
+/// The second arm is the one that shaped the check. Keyed on the NAME, this
+/// would reject `manitc/tests/05_ternary_types.mt`, which declares
+/// `fn trit_abs` against `trit::abs` and links today — the module is never
+/// referenced, so it is never expanded. Keyed on the EXPANSION, as it is, that
+/// file is untouched. `trit::abs` is also a `// native` declaration, and
+/// `stdlib_expand` skips body-less items by construction, so a native can
+/// never enter the map at all.
+#[test]
+fn p0_3_a_user_fn_colliding_with_an_expanded_stdlib_symbol_is_refused() {
+    let (ok, err) = check_source_out(
+        "p0_3_collide",
+        "fn str_count(hay: str, needle: str) -> int { return 7; }\n\
+         fn main() { io::println(str::concat(\"a\", \"b\")); }\n",
+    );
+    assert!(!ok, "this program does not link on LLVM and must not check clean");
+    assert!(
+        err.contains("collides with the standard library") && err.contains("str::count"),
+        "the diagnostic must name BOTH spellings — the user's and the one it \
+         collides with — or the reader cannot tell which to rename; got: {}",
+        err
+    );
+
+    // A module that is never referenced is never expanded, so the same
+    // declaration is legal. This is the arm that separates a check on the
+    // collision from a check on the name.
+    assert!(
+        check_source("p0_3_no_expansion",
+            "fn trit_abs(t: trit) -> int { tif t { + => 1, 0 => 0, - => 1 } }\n\
+             fn main() { let a: trit = -; io::println(fmt::show_int(trit_abs(a))); }\n"),
+        "`fn trit_abs` collides with nothing unless `trit::` is referenced, and \
+         `manitc/tests/05_ternary_types.mt` ships exactly this shape"
+    );
+
+    // And the escape hatch restores the previous compiler exactly.
+    assert!(
+        check_source("p0_3_allowed",
+            "lint allow(colliding-stdlib-symbol);\n\
+             fn str_count(hay: str, needle: str) -> int { return 7; }\n\
+             fn main() { io::println(str::concat(\"a\", \"b\")); }\n"),
+        "`allow` must restore the previous behaviour"
     );
 }
